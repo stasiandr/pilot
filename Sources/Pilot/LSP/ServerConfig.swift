@@ -79,6 +79,7 @@ enum ServerRegistry {
                           "--logLevel=Warning",
                           "--extensionLogDirectory=\(NSTemporaryDirectory())pilot-roslyn",
                           "--stdio"],
+                environment: DotnetRuntime.environment(forAppHost: roslyn),
                 opensSolution: true,
                 displayName: "Roslyn"))
         }
@@ -179,5 +180,74 @@ enum ServerRegistry {
                 opensSolution: dict["opensSolution"] as? Bool ?? false,
                 displayName: dict["displayName"] as? String ?? id)
         }
+    }
+}
+
+// MARK: - Рантайм .NET для серверов на .NET
+
+/// Roslyn из расширения VS Code — это apphost, собранный под свежий .NET
+/// (сейчас 10). Системный `/usr/local/share/dotnet` часто старее, и тогда
+/// сервер падает на старте с «You must install or update .NET». VS Code
+/// обходит это, подсовывая свой рантайм через DOTNET_ROOT; делаем так же.
+enum DotnetRuntime {
+
+    /// Окружение для запуска apphost: DOTNET_ROOT с подходящим рантаймом
+    /// и его `dotnet` первым в PATH — чтобы и загрузчик проектов Roslyn
+    /// (MSBuild) взял тот же SDK, а не системный.
+    static func environment(forAppHost appHost: String) -> [String: String] {
+        let required = requiredMajor(forAppHost: appHost) ?? 0
+        guard let root = findRoot(minimumMajor: required) else { return [:] }
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+        return ["DOTNET_ROOT": root, "PATH": "\(root):\(path)"]
+    }
+
+    /// Мажорная версия Microsoft.NETCore.App из `<app>.runtimeconfig.json`.
+    static func requiredMajor(forAppHost appHost: String) -> Int? {
+        let config = appHost + ".runtimeconfig.json"
+        guard let data = FileManager.default.contents(atPath: config),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let options = json["runtimeOptions"] as? [String: Any] else { return nil }
+        let frameworks = (options["frameworks"] as? [[String: Any]])
+            ?? [options["framework"] as? [String: Any]].compactMap { $0 }
+        let core = frameworks.first { $0["name"] as? String == "Microsoft.NETCore.App" }
+        guard let version = core?["version"] as? String else { return nil }
+        return majorVersion(version)
+    }
+
+    /// Первый корень .NET, где есть рантайм не старше нужного. Корни с SDK
+    /// предпочтительнее: без SDK Roslyn поднимется, но не загрузит проекты.
+    static func findRoot(minimumMajor: Int, candidates: [String]? = nil) -> String? {
+        let roots = candidates ?? candidateRoots()
+        let suitable = roots.filter { root in
+            installedVersions(in: root, "shared/Microsoft.NETCore.App")
+                .contains { $0 >= minimumMajor }
+        }
+        return suitable.first { !installedVersions(in: $0, "sdk").isEmpty } ?? suitable.first
+    }
+
+    static func candidateRoots() -> [String] {
+        let home = NSHomeDirectory()
+        var roots: [String] = []
+        if let env = ProcessInfo.processInfo.environment["DOTNET_ROOT"] { roots.append(env) }
+        roots.append("\(home)/.dotnet")
+        // Рантаймы, которые скачало расширение .NET Install Tool для VS Code.
+        let acquired = "\(home)/Library/Application Support/Code/User/globalStorage/ms-dotnettools.vscode-dotnet-runtime/.dotnet"
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: acquired) {
+            let sorted = entries.sorted { (majorVersion($0) ?? 0) > (majorVersion($1) ?? 0) }
+            roots += sorted.map { "\(acquired)/\($0)" }
+        }
+        roots += ["/usr/local/share/dotnet", "/opt/homebrew/share/dotnet"]
+        return roots
+    }
+
+    private static func installedVersions(in root: String, _ subdirectory: String) -> [Int] {
+        let dir = (root as NSString).appendingPathComponent(subdirectory)
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        return entries.compactMap(majorVersion)
+    }
+
+    /// "10.0.12~arm64" -> 10, "8.0.3" -> 8.
+    static func majorVersion(_ text: String) -> Int? {
+        Int(text.prefix { $0.isNumber })
     }
 }

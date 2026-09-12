@@ -140,7 +140,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.isHorizontallyResizable = true
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width, .height]
-        textView.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.font = font
         textView.backgroundColor = .clear
         textView.drawsBackground = false

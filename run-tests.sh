@@ -18,6 +18,7 @@ cat > "$TMP/Package.swift" <<'MANIFEST'
 import PackageDescription
 let package = Package(
     name: "coretests",
+    platforms: [.macOS(.v14)],
     targets: [.executableTarget(name: "coretests", path: "Sources/coretests",
               swiftSettings: [.swiftLanguageMode(.v5)])]
 )
