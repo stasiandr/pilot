@@ -68,12 +68,43 @@ final class Workspace: ObservableObject {
     // MARK: - Открытие воркспейса
 
     func openLastOrPrompt() {
+        if openLaunchTarget() { return }
         if let last = recentRoots.first,
            FileManager.default.fileExists(atPath: last.path) {
             open(root: last)
         } else {
             promptForFolder()
         }
+    }
+
+    /// Путь из командной строки: `Pilot /path/to/project` или `Pilot /path/File.cs`.
+    /// Для файла корнем проекта становится ближайший git-репозиторий над ним.
+    private func openLaunchTarget() -> Bool {
+        // macOS может дописать свои аргументы вида `-NSFoo YES` — берём
+        // первый абсолютный путь, который существует на диске.
+        var isDirectory: ObjCBool = false
+        guard let path = CommandLine.arguments.dropFirst().first(where: {
+            $0.hasPrefix("/") && FileManager.default.fileExists(atPath: $0, isDirectory: &isDirectory)
+        }) else { return false }
+
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        if isDirectory.boolValue {
+            open(root: url)
+        } else {
+            open(root: Self.projectRoot(containing: url))
+            open(file: url)
+        }
+        return true
+    }
+
+    private static func projectRoot(containing file: URL) -> URL {
+        let fm = FileManager.default
+        var dir = file.deletingLastPathComponent()
+        while dir.path != "/" {
+            if fm.fileExists(atPath: dir.appendingPathComponent(".git").path) { return dir }
+            dir = dir.deletingLastPathComponent()
+        }
+        return file.deletingLastPathComponent()
     }
 
     func promptForFolder() {
