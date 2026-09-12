@@ -1,4 +1,4 @@
-# Flint
+# Pilot
 
 Мгновенный просмотрщик кода для macOS. Нативный SwiftUI + AppKit, Liquid Glass.
 
@@ -10,8 +10,8 @@
 Нужны только Command Line Tools, Xcode-проект не требуется.
 
 ```
-./build.sh          # собирает Flint.app
-open Flint.app
+./build.sh          # собирает Pilot.app
+open Pilot.app
 ```
 
 Для Liquid Glass нужен SDK macOS 26 (Xcode 26). На более старом Xcode
@@ -55,7 +55,7 @@ open Flint.app
 подряд идущие символы, совпадение в имени файла; smart case; учёт того,
 насколько запрос покрывает имя файла. Замер: **~25 мс на 100 000 файлов**.
 
-**Кэш индекса.** Список путей пишется в `~/Library/Caches/Flint/`.
+**Кэш индекса.** Список путей пишется в `~/Library/Caches/Pilot/`.
 При повторном открытии проекта поиск доступен сразу, а пересканирование
 идёт фоном и молча заменяет индекс.
 
@@ -128,7 +128,7 @@ PHP, shell, SQL, JSON, YAML, TOML, XML/HTML, CSS, Markdown.
 Если в корне лежит `.sln`, он передаётся серверу явно: без этого Roslyn и
 csharp-ls угадывают, что грузить, и часто угадывают не то.
 
-Свои серверы — в `~/.config/flint/servers.json`. Клиент к C# не привязан,
+Свои серверы — в `~/.config/pilot/servers.json`. Клиент к C# не привязан,
 это обычный LSP:
 
 ```json

@@ -43,7 +43,7 @@ final class Workspace: ObservableObject {
     let lsp = LSPService()
 
     private var index: FileIndex?
-    private let work = DispatchQueue(label: "flint.index", qos: .userInitiated)
+    private let work = DispatchQueue(label: "pilot.index", qos: .userInitiated)
     private let scanGeneration = AtomicCounter()
     private let searchGeneration = AtomicCounter()
     private let loadGeneration = AtomicCounter()
@@ -51,7 +51,7 @@ final class Workspace: ObservableObject {
     /// Полный список использований; поле ввода фильтрует его на месте.
     private var allReferences: [PaletteItem] = []
 
-    private let recentKey = "flint.recentRoots"
+    private let recentKey = "pilot.recentRoots"
 
     var recentRoots: [URL] {
         (UserDefaults.standard.array(forKey: recentKey) as? [String] ?? [])
@@ -590,7 +590,7 @@ enum IndexCache {
     private static var directory: URL? {
         guard let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
         else { return nil }
-        let dir = base.appendingPathComponent("Flint", isDirectory: true)
+        let dir = base.appendingPathComponent("Pilot", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

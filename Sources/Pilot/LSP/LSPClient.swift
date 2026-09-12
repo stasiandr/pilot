@@ -28,7 +28,7 @@ final class LSPClient: @unchecked Sendable {
     private var openDocuments: Set<String> = []
     private var stderrTail: [String] = []
 
-    private let writeQueue = DispatchQueue(label: "flint.lsp.write")
+    private let writeQueue = DispatchQueue(label: "pilot.lsp.write")
 
     // NSLock нельзя держать через await: между lock и unlock задача может
     // переехать на другой поток. Поэтому любой доступ к общему состоянию
@@ -141,7 +141,7 @@ final class LSPClient: @unchecked Sendable {
     func initialize() async throws {
         var params: [String: Any] = [
             "processId": Int(ProcessInfo.processInfo.processIdentifier),
-            "clientInfo": ["name": "Flint", "version": "0.2.0"],
+            "clientInfo": ["name": "Pilot", "version": "0.2.0"],
             "rootUri": root.absoluteString,
             "rootPath": root.path,
             "workspaceFolders": [["uri": root.absoluteString, "name": root.lastPathComponent]],

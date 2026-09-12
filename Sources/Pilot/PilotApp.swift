@@ -2,12 +2,12 @@ import SwiftUI
 import AppKit
 
 @main
-struct FlintApp: App {
+struct PilotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var workspace = Workspace()
 
     var body: some Scene {
-        Window("Flint", id: "main") {
+        Window("Pilot", id: "main") {
             RootView(workspace: workspace)
                 .task {
                     // Открываем последний проект уже после первого кадра:

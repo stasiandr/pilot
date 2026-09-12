@@ -9,7 +9,7 @@ struct PaletteView: View {
     @State private var keyMonitor: Any?
 
     var body: some View {
-        FlintGlassGroup(spacing: 14) {
+        PilotGlassGroup(spacing: 14) {
             VStack(spacing: 0) {
                 queryField
                 if !workspace.items.isEmpty {
@@ -20,7 +20,7 @@ struct PaletteView: View {
                 }
             }
             .frame(width: 660)
-            .flintGlass(cornerRadius: 20)
+            .pilotGlass(cornerRadius: 20)
             .overlay(
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
                     .strokeBorder(.white.opacity(0.12), lineWidth: 0.5)

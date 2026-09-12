@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "Flint",
+    name: "Pilot",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "Flint",
-            path: "Sources/Flint",
+            name: "Pilot",
+            path: "Sources/Pilot",
             swiftSettings: [
                 .swiftLanguageMode(.v5),
                 .unsafeFlags(["-Ounchecked"], .when(configuration: .release)),

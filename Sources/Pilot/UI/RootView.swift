@@ -61,7 +61,7 @@ struct RootView: View {
                 .foregroundStyle(Color.accentColor)
 
             VStack(spacing: 6) {
-                Text("Flint").font(.system(size: 26, weight: .semibold))
+                Text("Pilot").font(.system(size: 26, weight: .semibold))
                 Text("Мгновенный просмотрщик кода")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)

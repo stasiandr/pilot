@@ -10,33 +10,33 @@ extension View {
 
     /// Стеклянная панель (палитра, поповеры).
     @ViewBuilder
-    func flintGlass(cornerRadius: CGFloat) -> some View {
+    func pilotGlass(cornerRadius: CGFloat) -> some View {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             self.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
         } else {
-            self.flintMaterial(.hudWindow, cornerRadius: cornerRadius)
+            self.pilotMaterial(.hudWindow, cornerRadius: cornerRadius)
         }
         #else
-        self.flintMaterial(.hudWindow, cornerRadius: cornerRadius)
+        self.pilotMaterial(.hudWindow, cornerRadius: cornerRadius)
         #endif
     }
 
     /// Интерактивный стеклянный элемент (реагирует на курсор).
     @ViewBuilder
-    func flintGlassInteractive(cornerRadius: CGFloat) -> some View {
+    func pilotGlassInteractive(cornerRadius: CGFloat) -> some View {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             self.glassEffect(.regular.interactive(), in: .rect(cornerRadius: cornerRadius))
         } else {
-            self.flintMaterial(.selection, cornerRadius: cornerRadius)
+            self.pilotMaterial(.selection, cornerRadius: cornerRadius)
         }
         #else
-        self.flintMaterial(.selection, cornerRadius: cornerRadius)
+        self.pilotMaterial(.selection, cornerRadius: cornerRadius)
         #endif
     }
 
-    func flintMaterial(_ material: NSVisualEffectView.Material, cornerRadius: CGFloat) -> some View {
+    func pilotMaterial(_ material: NSVisualEffectView.Material, cornerRadius: CGFloat) -> some View {
         self.background(VisualEffectBackground(material: material))
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
@@ -44,7 +44,7 @@ extension View {
 
 /// Группирующий контейнер: на macOS 26 соседние стеклянные элементы
 /// внутри него корректно сливаются друг с другом.
-struct FlintGlassGroup<Content: View>: View {
+struct PilotGlassGroup<Content: View>: View {
     var spacing: CGFloat = 12
     @ViewBuilder var content: Content
 

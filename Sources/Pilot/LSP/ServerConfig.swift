@@ -77,7 +77,7 @@ enum ServerRegistry {
                 fileExtensions: ["cs", "csx"],
                 command: [roslyn,
                           "--logLevel=Warning",
-                          "--extensionLogDirectory=\(NSTemporaryDirectory())flint-roslyn",
+                          "--extensionLogDirectory=\(NSTemporaryDirectory())pilot-roslyn",
                           "--stdio"],
                 opensSolution: true,
                 displayName: "Roslyn"))
@@ -154,10 +154,10 @@ enum ServerRegistry {
 
     static var configURL: URL {
         URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".config/flint/servers.json")
+            .appendingPathComponent(".config/pilot/servers.json")
     }
 
-    /// Читает ~/.config/flint/servers.json. Разбираем вручную, а не через
+    /// Читает ~/.config/pilot/servers.json. Разбираем вручную, а не через
     /// Codable, чтобы `initializationOptions` мог быть произвольным JSON.
     static func userDefined() -> [ServerConfig] {
         guard let data = try? Data(contentsOf: configURL),
