@@ -1,8 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// Палитра. Один компонент на три режима: файлы (⌘P), символы (⌘T),
-/// использования (⌘R) — отличаются только источником строк.
+/// Палитра. Один компонент на все режимы: файлы (⌘P), классы (⇧⇧),
+/// структура файла (⌘⇧O), символы (⌘T), использования (⌘R) — отличаются
+/// только источником строк.
 struct PaletteView: View {
     @ObservedObject var workspace: Workspace
     @FocusState private var focused: Bool
@@ -50,13 +51,21 @@ struct PaletteView: View {
                 .focused($focused)
                 .onSubmit { workspace.activateSelection() }
 
-            if workspace.paletteBusy || (workspace.paletteMode == .files && workspace.isIndexing) {
+            if workspace.paletteBusy || isIndexingForMode {
                 ProgressView().controlSize(.small).scaleEffect(0.8)
             }
             counter
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 15)
+    }
+
+    private var isIndexingForMode: Bool {
+        switch workspace.paletteMode {
+        case .files:   return workspace.isIndexing
+        case .classes: return workspace.isIndexing || workspace.isTypeIndexing
+        case .outline, .symbols, .references, .changes: return false
+        }
     }
 
     @ViewBuilder
@@ -67,6 +76,11 @@ struct PaletteView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help("Файлов в индексе")
+        case .classes:
+            Text("\(workspace.typeCount)")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .help("Типов в индексе")
         case .symbols, .references, .outline, .changes:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
@@ -92,6 +106,12 @@ struct PaletteView: View {
         switch workspace.paletteMode {
         case .files:
             return "Ничего не найдено"
+        case .classes:
+            if !workspace.query.isEmpty { return "Ничего не найдено" }
+            if workspace.isTypeIndexing && workspace.typeCount == 0 {
+                return "Собираю классы проекта… Файлы ищутся уже сейчас"
+            }
+            return "Начните вводить имя класса — можно заглавными: USvc → UserService"
         case .symbols:
             if !workspace.lsp.isReady { return lspNotReadyMessage }
             return workspace.query.isEmpty ? "Начните вводить имя символа" : "Ничего не найдено"

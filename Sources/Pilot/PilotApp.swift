@@ -39,6 +39,9 @@ struct PilotApp: App {
             CommandGroup(after: .toolbar) {
                 Button("Перейти к файлу…") { workspace.openPalette(mode: .files) }
                     .keyboardShortcut("p", modifiers: .command)
+                // Двойной Shift меню назначить не умеет — его ловит
+                // DoubleShiftMonitor, а здесь он только подписан.
+                Button("Найти класс…  ⇧⇧") { workspace.openClassSearch() }
                 Button("Структура файла…") { workspace.openPalette(mode: .outline) }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                 Button("Символ в проекте…") { workspace.openPalette(mode: .symbols) }

@@ -7,6 +7,9 @@ final class Workspace: ObservableObject {
     @Published private(set) var root: URL?
     @Published private(set) var isIndexing = false
     @Published private(set) var fileCount = 0
+    /// Индекс типов строится после индекса файлов и заметно дольше.
+    @Published private(set) var isTypeIndexing = false
+    @Published private(set) var typeCount = 0
     /// Дерево папок для боковой панели. Строится из того же индекса, что и ⌘P.
     @Published private(set) var fileTree: FileTree?
     @Published var query = "" { didSet { queryChanged() } }
@@ -62,7 +65,11 @@ final class Workspace: ObservableObject {
     }
 
     private var index: FileIndex?
+    private var typeIndex: TypeIndex?
     private let work = DispatchQueue(label: "pilot.index", qos: .userInitiated)
+    /// Отдельная очередь: на крупном проекте разбор всех исходников — секунды, и на `work`
+    /// он задержал бы и поиск файлов, и открытие файла.
+    private let typeWork = DispatchQueue(label: "pilot.types", qos: .utility)
     private let scanGeneration = AtomicCounter()
     private let searchGeneration = AtomicCounter()
     private let loadGeneration = AtomicCounter()
@@ -143,6 +150,19 @@ final class Workspace: ObservableObject {
 
         let generation = scanGeneration.bump()
         isIndexing = true
+        typeIndex = nil
+        typeCount = 0
+        isTypeIndexing = true
+
+        typeWork.async { [weak self] in
+            guard let cached = IndexCache.loadTypes(root: url) else { return }
+            Task { @MainActor in
+                // Свежий индекс мог успеть раньше — тогда кэш уже не нужен.
+                guard let self, self.scanGeneration.isCurrent(generation),
+                      self.typeIndex == nil else { return }
+                self.adoptTypes(cached, indexing: true)
+            }
+        }
 
         work.async { [weak self] in
             guard let self else { return }
@@ -167,6 +187,7 @@ final class Workspace: ObservableObject {
             Task { @MainActor in
                 guard self.scanGeneration.isCurrent(generation) else { return }
                 self.adopt(fresh, tree: tree, indexing: false)
+                self.rebuildTypeIndex(files: fresh.display, root: url, generation: generation)
             }
         }
     }
@@ -178,6 +199,30 @@ final class Workspace: ObservableObject {
         isIndexing = indexing
         if let tree { fileTree = tree }
         runFileSearch()
+        runClassSearch()
+    }
+
+    /// Типы разбираются по уже готовому списку файлов — второй раз
+    /// обходить диск незачем.
+    private func rebuildTypeIndex(files: [String], root url: URL, generation: Int) {
+        let counter = scanGeneration
+        typeWork.async { [weak self] in
+            guard let fresh = TypeIndex.build(root: url, files: files,
+                                              shouldStop: { !counter.isCurrent(generation) })
+            else { return }
+            IndexCache.saveTypes(fresh, root: url)
+            Task { @MainActor in
+                guard let self, counter.isCurrent(generation) else { return }
+                self.adoptTypes(fresh, indexing: false)
+            }
+        }
+    }
+
+    private func adoptTypes(_ newIndex: TypeIndex, indexing: Bool) {
+        typeIndex = newIndex
+        typeCount = newIndex.count
+        isTypeIndexing = indexing
+        runClassSearch()
     }
 
     /// Путь открытого файла относительно корня — чтобы найти его в дереве.
@@ -236,6 +281,7 @@ final class Workspace: ObservableObject {
         isPaletteOpen = true
         switch mode {
         case .files:      runFileSearch()
+        case .classes:    runClassSearch()
         case .symbols:    runSymbolSearch()
         case .outline:    buildOutlineItems()
         case .changes:    buildChangeItems()
@@ -243,10 +289,17 @@ final class Workspace: ObservableObject {
         }
     }
 
+    /// ⇧⇧. Повторное ⇧⇧ при уже открытом поиске не стирает набранное.
+    func openClassSearch() {
+        if isPaletteOpen && paletteMode == .classes { return }
+        openPalette(mode: .classes)
+    }
+
     private func queryChanged() {
         selection = 0
         switch paletteMode {
         case .files:      runFileSearch()
+        case .classes:    runClassSearch()
         case .symbols:    runSymbolSearch()
         case .references: filterReferences()
         case .outline:    buildOutlineItems()
@@ -287,7 +340,7 @@ final class Workspace: ObservableObject {
         switch paletteMode {
         case .files:   runFileSearch()
         case .changes: buildChangeItems()
-        case .outline, .symbols, .references: break
+        case .classes, .outline, .symbols, .references: break
         }
     }
 
@@ -478,6 +531,80 @@ final class Workspace: ObservableObject {
                         trailing: self.git.changedFiles[path]?.letter,
                         target: NavTarget(url: index.absoluteURL(hit.id), range: nil))
                 }
+                if self.selection >= self.items.count {
+                    self.selection = max(0, self.items.count - 1)
+                }
+            }
+        }
+    }
+
+    // MARK: - Поиск по классам
+    //
+    // В основном — типы проекта из лексического индекса. Под ними несколько
+    // файлов: если искомое оказалось не классом, а конфигом или README,
+    // не нужно переключаться на ⌘P. Пока индекс типов строится впервые,
+    // эти файлы — вообще всё, что есть.
+
+    private func runClassSearch() {
+        guard paletteMode == .classes else { return }
+        let generation = searchGeneration.bump()
+        let counter = searchGeneration
+        let q = query
+        guard !q.trimmingCharacters(in: .whitespaces).isEmpty else {
+            items = []
+            return
+        }
+        let types = typeIndex
+        let files = index
+
+        work.async { [weak self] in
+            let stop = { !counter.isCurrent(generation) }
+            let typeHits = types?.search(q, limit: 150, shouldStop: stop) ?? []
+            // Файл, где объявлен уже найденный тип, — повтор той же строки.
+            let typeFiles = Set(typeHits.lazy.compactMap { types?.relPath($0.id) })
+            var fileHits: [SearchHit] = []
+            if let files {
+                fileHits = Array(files.search(q, limit: 30, shouldStop: stop)
+                    .filter { !typeFiles.contains(files.relPath($0.id)) }
+                    .prefix(10))
+            }
+
+            Task { @MainActor in
+                guard let self, counter.isCurrent(generation), self.paletteMode == .classes else { return }
+                var built: [PaletteItem] = []
+                built.reserveCapacity(typeHits.count + fileHits.count)
+                if let types {
+                    for hit in typeHits {
+                        let declaration = types.declaration(hit.id)
+                        let path = types.relPath(hit.id)
+                        var secondary = path
+                        if let container = declaration.container, !container.isEmpty {
+                            secondary = "\(container) · \(path)"
+                        }
+                        built.append(PaletteItem(
+                            id: built.count,
+                            icon: TypeIndex.icon(forKeyword: declaration.keyword),
+                            primary: declaration.name,
+                            positions: hit.positions,
+                            secondary: secondary,
+                            trailing: declaration.keyword,
+                            target: types.target(hit.id)))
+                    }
+                }
+                if let files {
+                    for hit in fileHits {
+                        let path = files.relPath(hit.id)
+                        built.append(PaletteItem(
+                            id: built.count,
+                            icon: Self.icon(forPath: path),
+                            primary: path,
+                            nameOffset: files.nameOffset(hit.id),
+                            positions: hit.positions,
+                            trailing: "file",
+                            target: NavTarget(url: files.absoluteURL(hit.id), range: nil)))
+                    }
+                }
+                self.items = built
                 if self.selection >= self.items.count {
                     self.selection = max(0, self.items.count - 1)
                 }
@@ -757,11 +884,11 @@ enum IndexCache {
         return dir
     }
 
-    private static func fileURL(root: URL) -> URL? {
+    private static func fileURL(root: URL, extension ext: String = "idx") -> URL? {
         guard let dir = directory else { return nil }
         var hash: UInt64 = 0xcbf29ce484222325
         for b in root.path.utf8 { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
-        return dir.appendingPathComponent(String(format: "%016llx.idx", hash))
+        return dir.appendingPathComponent(String(format: "%016llx.", hash) + ext)
     }
 
     static func save(_ index: FileIndex, root: URL) {
@@ -781,5 +908,19 @@ enum IndexCache {
             index.appendCached(rel: String(line))
         }
         return index.count > 0 ? index : nil
+    }
+
+    // Типы лежат рядом, в соседнем файле с тем же хэшем.
+
+    static func saveTypes(_ index: TypeIndex, root: URL) {
+        guard let url = fileURL(root: root, extension: "types") else { return }
+        try? index.serialized().data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
+    static func loadTypes(root: URL) -> TypeIndex? {
+        guard let url = fileURL(root: root, extension: "types"),
+              let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        return TypeIndex.deserialize(text, root: root)
     }
 }

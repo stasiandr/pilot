@@ -3,6 +3,7 @@ import AppKit
 
 struct RootView: View {
     @ObservedObject var workspace: Workspace
+    @State private var doubleShift: DoubleShiftMonitor?
     /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
 
@@ -27,6 +28,9 @@ struct RootView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 480)
+        .onAppear {
+            doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
+        }
     }
 
     /// На стартовом экране дереву показывать нечего — панель прячется,
