@@ -12,8 +12,10 @@ struct FileTreeView: NSViewRepresentable {
     /// Открытый файл — подсвечивается в дереве, папки до него раскрываются.
     let selectedPath: String?
     let root: URL?
+    /// Отфильтрованное дерево маленькое и показывается раскрытым целиком.
+    var expandAll = false
     /// Изменённые относительно HEAD файлы — подкрашиваются, как в VS Code.
-    let gitFiles: [String: GitFileState]
+    var gitFiles: [String: GitFileState] = [:]
     let onOpen: (_ relPath: String, _ focusEditor: Bool) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -55,7 +57,7 @@ struct FileTreeView: NSViewRepresentable {
         let coordinator = context.coordinator
         coordinator.onOpen = onOpen
         coordinator.root = root
-        coordinator.update(tree: tree, selectedPath: selectedPath)
+        coordinator.update(tree: tree, selectedPath: selectedPath, expandAll: expandAll)
         coordinator.update(gitFiles: gitFiles)
     }
 
@@ -80,7 +82,7 @@ struct FileTreeView: NSViewRepresentable {
         /// как пользовательское — иначе переоткрытие проекта раскроет всё подряд.
         private var isRestoring = false
 
-        func update(tree newTree: FileTree?, selectedPath: String?) {
+        func update(tree newTree: FileTree?, selectedPath: String?, expandAll: Bool) {
             guard let outline else { return }
 
             // Сравнение по идентичности: дерево меняется целиком и редко,
@@ -91,7 +93,15 @@ struct FileTreeView: NSViewRepresentable {
                 if newTree == nil { expanded.removeAll() }
                 tree = newTree
                 outline.reloadData()
-                restoreExpansion()
+                if expandAll {
+                    // Раскрытое фильтром — не выбор пользователя: в `expanded`
+                    // не пишем, чтобы после фильтра дерево стало как было.
+                    isRestoring = true
+                    outline.expandItem(nil, expandChildren: true)
+                    isRestoring = false
+                } else {
+                    restoreExpansion()
+                }
                 shownSelection = nil
             }
 
@@ -307,7 +317,7 @@ struct FileTreeView: NSViewRepresentable {
         }
 
         func outlineViewItemDidCollapse(_ notification: Notification) {
-            guard let node = notification.userInfo?["NSObject"] as? FileTree.Node else { return }
+            guard !isRestoring, let node = notification.userInfo?["NSObject"] as? FileTree.Node else { return }
             expanded.remove(node.relPath)
         }
     }
@@ -361,11 +371,12 @@ private final class FileCell: NSTableCellView {
 
     func configure(with node: FileTree.Node, git state: GitFileState?) {
         label.stringValue = node.name
-        let symbol = node.isDirectory ? "folder.fill" : Workspace.icon(forPath: node.name)
+        // Цветные иконки по типу файла, как в навигаторе Xcode.
+        let style = node.isDirectory ? Theme.folderIcon : Theme.fileIcon(forName: node.name)
         let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+        icon.image = NSImage(systemSymbolName: style.symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(config)
-        icon.contentTintColor = node.isDirectory ? Theme.sidebarFolder : Theme.sidebarFile
+        icon.contentTintColor = style.color
 
         // У папки вместо буквы точка: бледно-жёлтое имя на стекле сайдбара
         // почти не отличить от белого, а изменение внутри видно и так.

@@ -36,6 +36,46 @@ extension View {
         #endif
     }
 
+    /// Стеклянная кнопка. `prominent` — залитая акцентом, для главного действия.
+    @ViewBuilder
+    func pilotGlassButton(prominent: Bool = false) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            if prominent { self.buttonStyle(.glassProminent) } else { self.buttonStyle(.glass) }
+        } else {
+            if prominent { self.buttonStyle(.borderedProminent) } else { self.buttonStyle(.bordered) }
+        }
+        #else
+        if prominent { self.buttonStyle(.borderedProminent) } else { self.buttonStyle(.bordered) }
+        #endif
+    }
+
+    /// Тулбар без собственной подложки: над редактором видна его же тема,
+    /// и стеклянные капсулы висят прямо над кодом — как в Xcode 26.
+    @ViewBuilder
+    func pilotTransparentToolbar() -> some View {
+        if #available(macOS 15.0, *) {
+            self.toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        } else {
+            self
+        }
+    }
+
+    /// Панель у края прокручиваемого списка. На macOS 26 — safeAreaBar:
+    /// содержимое под ней мягко размывается, как под фильтром в Xcode.
+    @ViewBuilder
+    func pilotEdgeBar<Bar: View>(_ edge: VerticalEdge, @ViewBuilder bar: () -> Bar) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            self.safeAreaBar(edge: edge, spacing: 0, content: bar)
+        } else {
+            self.safeAreaInset(edge: edge, spacing: 0, content: bar)
+        }
+        #else
+        self.safeAreaInset(edge: edge, spacing: 0, content: bar)
+        #endif
+    }
+
     func pilotMaterial(_ material: NSVisualEffectView.Material, cornerRadius: CGFloat) -> some View {
         self.background(VisualEffectBackground(material: material))
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
@@ -57,6 +97,24 @@ struct PilotGlassGroup<Content: View>: View {
         }
         #else
         content
+        #endif
+    }
+}
+
+extension ToolbarContent {
+    /// Элемент тулбара без стеклянной подложки. На macOS 26 каждый элемент
+    /// по умолчанию сидит в стеклянной капсуле — заголовку окна она не нужна,
+    /// в Xcode его текст лежит прямо на тулбаре.
+    @ToolbarContentBuilder
+    func pilotWithoutGlassBackground() -> some ToolbarContent {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            self.sharedBackgroundVisibility(.hidden)
+        } else {
+            self
+        }
+        #else
+        self
         #endif
     }
 }

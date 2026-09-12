@@ -1,6 +1,9 @@
 import SwiftUI
 import AppKit
 
+/// Окно в духе Xcode 26: плавающий стеклянный навигатор слева, над
+/// редактором — jump bar, в тулбаре — заголовок с веткой и капсула
+/// активности посередине.
 struct RootView: View {
     @ObservedObject var workspace: Workspace
     @State private var doubleShift: DoubleShiftMonitor?
@@ -8,32 +11,25 @@ struct RootView: View {
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
 
     var body: some View {
-        ZStack {
-            NavigationSplitView(columnVisibility: columnVisibility) {
-                sidebar
-                    .navigationSplitViewColumnWidth(min: 180, ideal: 250, max: 480)
-            } detail: {
-                ZStack {
-                    Color(nsColor: Theme.editorBackground).ignoresSafeArea()
-
-                    VStack(spacing: 0) {
-                        content
-                        statusBar
-                    }
-                }
-            }
-
-            if workspace.isPaletteOpen {
-                paletteOverlay
-            }
+        NavigationSplitView(columnVisibility: columnVisibility) {
+            NavigatorView(workspace: workspace)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 480)
+        } detail: {
+            detail
+                .toolbar { toolbar }
+                .pilotTransparentToolbar()
         }
-        .frame(minWidth: 760, minHeight: 480)
+        .navigationTitle(workspace.root?.lastPathComponent ?? "Pilot")
+        .overlay {
+            if workspace.isPaletteOpen { paletteOverlay }
+        }
+        .frame(minWidth: 860, minHeight: 520)
         .onAppear {
             doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
         }
     }
 
-    /// На стартовом экране дереву показывать нечего — панель прячется,
+    /// На стартовом экране навигатору показывать нечего — панель прячется,
     /// но выбор пользователя не трогаем: откроется проект — вернётся.
     private var columnVisibility: Binding<NavigationSplitViewVisibility> {
         Binding(
@@ -41,25 +37,19 @@ struct RootView: View {
             set: { if workspace.root != nil { showsSidebar = $0 != .detailOnly } })
     }
 
-    // MARK: - Боковая панель
+    // MARK: - Редактор
 
-    @ViewBuilder
-    private var sidebar: some View {
-        if workspace.fileTree != nil {
-            FileTreeView(tree: workspace.fileTree,
-                         selectedPath: workspace.openFilePath,
-                         root: workspace.root,
-                         gitFiles: workspace.git.changedFiles,
-                         onOpen: { relPath, focusEditor in
-                             guard let root = workspace.root else { return }
-                             workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),
-                                                              range: nil))
-                             if focusEditor { workspace.focusEditor() }
-                         })
-        } else {
-            ProgressView().controlSize(.small)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+    private var detail: some View {
+        VStack(spacing: 0) {
+            if workspace.root != nil {
+                JumpBar(workspace: workspace)
+            }
+            content
+            if workspace.root != nil {
+                statusBar
+            }
         }
+        .background(Color(nsColor: Theme.editorBackground).ignoresSafeArea())
     }
 
     @ViewBuilder
@@ -78,8 +68,7 @@ struct RootView: View {
         } else if workspace.root == nil {
             StartView(workspace: workspace)
         } else {
-            notice(icon: "magnifyingglass",
-                   title: "Нажмите ⌘P, чтобы найти файл")
+            noEditor
         }
     }
 
@@ -96,53 +85,131 @@ struct RootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - Статусная строка
-
-    private var statusBar: some View {
-        HStack(spacing: 12) {
-            historyControls
-
-            if let doc = workspace.document {
-                Text(doc.url.lastPathComponent).font(.system(size: 11, weight: .medium))
-                Text(doc.languageName).font(.system(size: 11)).foregroundStyle(.secondary)
-                if !workspace.breadcrumb.isEmpty {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(.quaternary)
-                    Text(workspace.breadcrumb)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .help("Где сейчас курсор. ⌃↑ и ⌃↓ — по объявлениям.")
-                } else {
-                    Text("\(doc.model.lineCount) строк")
-                        .font(.system(size: 11)).foregroundStyle(.tertiary)
-                }
-            } else if let root = workspace.root {
-                Image(systemName: "folder").font(.system(size: 10))
-                Text(root.lastPathComponent).font(.system(size: 11, weight: .medium))
-            }
-
-            Spacer()
-
-            blameLabel
-            languageServerChip
-            branchChip
-
-            if workspace.isIndexing {
-                HStack(spacing: 5) {
-                    ProgressView().controlSize(.small).scaleEffect(0.6)
-                    Text("Индексация…").font(.system(size: 11)).foregroundStyle(.secondary)
-                }
-            } else if workspace.fileCount > 0 {
-                Text("\(workspace.fileCount) файлов")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+    /// Пустой редактор, как «No Editor» в Xcode: крупная приглушённая
+    /// надпись и подсказки по клавишам.
+    private var noEditor: some View {
+        VStack(spacing: 18) {
+            Text("Нет открытого файла")
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(.tertiary)
+            VStack(alignment: .leading, spacing: 8) {
+                shortcutHint(["⌘", "P"], "Перейти к файлу")
+                shortcutHint(["⇧", "⇧"], "Найти класс")
+                shortcutHint(["⌘", "⇧", "O"], "Структура файла")
+                shortcutHint(["⌘", "⇧", "W"], "Закрыть проект")
             }
         }
-        .padding(.horizontal, 14)
-        .frame(height: 26)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .top) { Divider().opacity(0.5) }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func shortcutHint(_ keys: [String], _ title: String) -> some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 3) {
+                ForEach(Array(keys.enumerated()), id: \.offset) { _, key in
+                    Text(key)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .frame(minWidth: 20, minHeight: 20)
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.white.opacity(0.08)))
+                }
+            }
+            .frame(width: 76, alignment: .trailing)
+            Text(title).font(.system(size: 12))
+        }
+        .foregroundStyle(.secondary)
+    }
+
+    // MARK: - Тулбар
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            titleView
+        }
+        .pilotWithoutGlassBackground()
+
+        ToolbarItem(placement: .principal) {
+            ActivityView(workspace: workspace)
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button { workspace.openPalette(mode: .outline) } label: {
+                Label("Структура файла", systemImage: "list.bullet.indent")
+            }
+            .help("Структура файла (⌘⇧O)")
+            .disabled(workspace.document == nil)
+
+            Button { workspace.openPalette(mode: .symbols) } label: {
+                Label("Символ в проекте", systemImage: "number")
+            }
+            .help("Символ в проекте (⌘T)")
+            .disabled(!workspace.lsp.isReady)
+        }
+    }
+
+    /// Как в Xcode: иконка ветки, под именем проекта — текущая ветка.
+    /// Сначала она прочитана из HEAD при открытии, затем её сменяет живой
+    /// статус git — и после checkout в терминале заголовок обновится.
+    private var titleView: some View {
+        let branch = workspace.git.status?.headLabel ?? workspace.branch
+        return HStack(spacing: 8) {
+            if branch != nil {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                Text(workspace.root?.lastPathComponent ?? "Pilot")
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                if let branch {
+                    Text(branch)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: 170, alignment: .leading)
+        }
+        .padding(.horizontal, 4)
+        .help(workspace.git.status.map { branchHelp($0, changed: workspace.git.changedCount) } ?? "")
+    }
+
+    // MARK: - Статусная строка
+
+    /// Как нижняя полоса редактора Xcode: язык слева, позиция курсора справа.
+    private var statusBar: some View {
+        HStack(spacing: 10) {
+            if let doc = workspace.document {
+                let icon = Theme.fileIcon(forName: doc.url.lastPathComponent)
+                Image(systemName: icon.symbol)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color(nsColor: icon.color))
+                Text(doc.languageName)
+                Text(Theme.count(doc.model.lineCount, "строка", "строки", "строк"))
+                    .foregroundStyle(.tertiary)
+
+                Spacer()
+
+                blameLabel
+                changesChip
+                let position = doc.model.position(at: workspace.caretOffset)
+                Text("Строка: \(position.line + 1)   Столбец: \(position.character + 1)")
+                    .monospacedDigit()
+            } else {
+                Spacer()
+                changesChip
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .frame(height: 24)
+        .background(Color(nsColor: Theme.editorBackground))
+        .overlay(alignment: .top) {
+            Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
+        }
     }
 
     // MARK: - Git
@@ -155,18 +222,16 @@ struct RootView: View {
            let commit = workspace.git.blame?.commit(atLine: doc.model.line(containing: workspace.caretOffset)) {
             if commit.isUncommitted {
                 Text("Не закоммичено")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiary)
                     .help("Строка отличается от HEAD")
             } else {
                 HStack(spacing: 6) {
                     Text("\(commit.author), \(Self.ago(commit.time))")
-                        .foregroundStyle(.secondary)
                         .layoutPriority(1)
                     Text(commit.summary)
                         .foregroundStyle(.tertiary)
                         .truncationMode(.tail)
                 }
-                .font(.system(size: 11))
                 .lineLimit(1)
                 .frame(maxWidth: 420, alignment: .trailing)
                 .help("\(commit.shortSHA) · \(commit.author) · \(Self.fullDate(commit.time))\n\(commit.summary)")
@@ -180,27 +245,26 @@ struct RootView: View {
         }
     }
 
-    /// Ветка. Клик — список изменённых файлов, как и ⌃⇧G.
+    /// Сколько файлов изменено и насколько ветка разошлась с upstream.
+    /// Ветка сама — в заголовке окна; клик здесь — список изменений, как ⌃⇧G.
     @ViewBuilder
-    private var branchChip: some View {
+    private var changesChip: some View {
         if let status = workspace.git.status {
             let changed = workspace.git.changedCount
-            Button { workspace.openPalette(mode: .changes) } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.triangle.branch").font(.system(size: 10))
-                    Text(status.headLabel).fontWeight(.medium)
-                    if status.ahead > 0 { Text("↑\(status.ahead)") }
-                    if status.behind > 0 { Text("↓\(status.behind)") }
-                    if changed > 0 {
-                        Text("±\(changed)").foregroundStyle(Color(nsColor: Theme.gitModified))
+            if changed > 0 || status.ahead > 0 || status.behind > 0 {
+                Button { workspace.openPalette(mode: .changes) } label: {
+                    HStack(spacing: 4) {
+                        if status.ahead > 0 { Text("↑\(status.ahead)") }
+                        if status.behind > 0 { Text("↓\(status.behind)") }
+                        if changed > 0 {
+                            Text("±\(changed)").foregroundStyle(Color(nsColor: Theme.gitModified))
+                        }
                     }
+                    .monospacedDigit()
                 }
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .buttonStyle(.plain)
+                .help(branchHelp(status, changed: changed))
             }
-            .buttonStyle(.plain)
-            .help(branchHelp(status, changed: changed))
         }
     }
 
@@ -242,75 +306,118 @@ struct RootView: View {
         date.map(fullFormatter.string(from:)) ?? ""
     }
 
-    // MARK: - Состояние языкового сервера
-
-    /// Фишка в статус-строке — единственное место, где LSP вообще виден,
-    /// пока он не готов. Всё остальное приложение о нём не знает.
-    @ViewBuilder
-    private var languageServerChip: some View {
-        switch workspace.lsp.state {
-        case .stopped:
-            EmptyView()
-
-        case .starting(let detail):
-            HStack(spacing: 5) {
-                ProgressView().controlSize(.small).scaleEffect(0.55)
-                Text("\(workspace.lsp.serverName ?? "LSP") · \(detail)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .help("Языковой сервер готовится. Просмотр и поиск работают уже сейчас.")
-
-        case .ready:
-            HStack(spacing: 5) {
-                Circle().fill(.green).frame(width: 6, height: 6)
-                Text(workspace.lsp.serverName ?? "LSP")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            .help("Переход к определению: ⌘B или ⌘+клик. Символы: ⌘T. Использования: ⌘R.")
-
-        case .failed(let why):
-            HStack(spacing: 5) {
-                Circle().fill(.orange).frame(width: 6, height: 6)
-                Text(workspace.lsp.serverName ?? "LSP")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            .help("Языковой сервер не поднялся:\n\(why)")
-        }
-    }
-
-    /// Кнопки назад/вперёд появляются только когда есть куда идти.
-    @ViewBuilder
-    private var historyControls: some View {
-        if workspace.canGoBack || workspace.canGoForward {
-            HStack(spacing: 2) {
-                Button { workspace.goBack() } label: {
-                    Image(systemName: "chevron.left").font(.system(size: 10, weight: .semibold))
-                }
-                .disabled(!workspace.canGoBack)
-                Button { workspace.goForward() } label: {
-                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold))
-                }
-                .disabled(!workspace.canGoForward)
-            }
-            .buttonStyle(.borderless)
-            .help("Назад / вперёд по переходам (⌘[ и ⌘])")
-        }
-    }
-
     // MARK: - Оверлей палитры
 
     private var paletteOverlay: some View {
         ZStack(alignment: .top) {
             // Клик мимо палитры закрывает её.
-            Color.black.opacity(0.18)
+            Color.black.opacity(0.22)
                 .ignoresSafeArea()
                 .onTapGesture { workspace.isPaletteOpen = false }
 
             PaletteView(workspace: workspace)
-                .padding(.top, 90)
+                .padding(.top, 60)
         }
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+}
+
+// MARK: - Капсула активности
+
+/// Центральная капсула тулбара — как activity view в Xcode: слева «что
+/// открыто», справа «что происходит». Клик — переход к файлу, как ⌘P.
+struct ActivityView: View {
+    @ObservedObject var workspace: Workspace
+
+    var body: some View {
+        Button {
+            if workspace.root != nil { workspace.openPalette(mode: .files) }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text(workspace.root?.lastPathComponent ?? "Pilot")
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+
+                if let doc = workspace.document {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                    let icon = Theme.fileIcon(forName: doc.url.lastPathComponent)
+                    Image(systemName: icon.symbol)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(nsColor: icon.color))
+                    Text(doc.url.lastPathComponent)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .layoutPriority(1)
+                }
+
+                // Не Spacer: Spacer внутри элемента тулбара SwiftUI принимает
+                // за гибкий пробел и молча выбрасывает весь элемент.
+                Color.clear.frame(minWidth: 24, maxWidth: .infinity, maxHeight: 1)
+                // Статус не сжимается: ужимается имя проекта, как в Xcode.
+                status.fixedSize()
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 12)
+            .frame(minWidth: 280, idealWidth: 440, maxWidth: 520, minHeight: 28)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Перейти к файлу (⌘P)")
+    }
+
+    @ViewBuilder
+    private var status: some View {
+        HStack(spacing: 6) {
+            if workspace.root == nil {
+                Text("Нет открытого проекта").foregroundStyle(.secondary)
+            } else if workspace.isIndexing {
+                ProgressView().controlSize(.mini)
+                Text("Индексация…").foregroundStyle(.secondary)
+            } else {
+                Text("Готово").foregroundStyle(.secondary)
+                Text("|").foregroundStyle(.quaternary)
+                Text(Theme.count(workspace.fileCount, "файл", "файла", "файлов"))
+                    .foregroundStyle(.tertiary)
+            }
+            languageServer
+        }
+        .lineLimit(1)
+    }
+
+    /// Состояние языкового сервера — единственное место, где он виден,
+    /// пока не готов. Всё остальное приложение о нём не знает.
+    @ViewBuilder
+    private var languageServer: some View {
+        let name = workspace.lsp.serverName ?? "LSP"
+        switch workspace.lsp.state {
+        case .stopped:
+            EmptyView()
+        case .starting(let detail):
+            divider
+            ProgressView().controlSize(.mini)
+            Text(name).foregroundStyle(.secondary)
+                .help("\(name): \(detail). Просмотр и поиск работают уже сейчас.")
+        case .ready:
+            divider
+            Circle().fill(.green).frame(width: 6, height: 6)
+            Text(name).foregroundStyle(.secondary)
+                .help("Переход к определению: ⌘B или ⌘+клик. Символы: ⌘T. Использования: ⌘R.")
+        case .failed(let why):
+            divider
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(.orange)
+            Text(name).foregroundStyle(.secondary)
+                .help("Языковой сервер не поднялся:\n\(why)")
+        }
+    }
+
+    private var divider: some View {
+        Text("|").foregroundStyle(.quaternary)
     }
 }

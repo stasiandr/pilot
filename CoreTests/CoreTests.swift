@@ -1148,6 +1148,25 @@ check(PaletteMode.symbols.requiresLanguageServer, "символы проекта
 check(PaletteMode.references.requiresLanguageServer, "использования требуют LSP")
 check(!PaletteMode.changes.requiresLanguageServer, "изменённые файлы не требуют LSP")
 
+// ────────────────────────── Фильтр навигатора ──────────────────────────
+section("Фильтр навигатора")
+let idx7 = FileIndex(root: URL(fileURLWithPath: "/"))
+for p in ["Sources/UI/CodeView.swift", "Sources/Code/Lexer.swift", "README.md", "codegen.sh"] {
+    idx7.appendCached(rel: p)
+}
+let byName = idx7.filter(name: "code", limit: 10, shouldStop: { false }).map { idx7.relPath($0) }
+check(byName == ["Sources/UI/CodeView.swift", "codegen.sh"],
+      "фильтр ищет по имени файла, а не по пути, без учёта регистра (получено: \(byName))")
+check(idx7.filter(name: "", limit: 10, shouldStop: { false }).isEmpty, "пустой фильтр — пусто")
+check(idx7.filter(name: "e", limit: 2, shouldStop: { false }).count == 2, "фильтр уважает лимит")
+check(idx7.filter(name: "view.swift", limit: 10, shouldStop: { false }).count == 1, "совпадение в конце имени")
+
+section("Git")
+check(GitInfo.parse(head: "ref: refs/heads/main\n") == "main", "ветка из HEAD")
+check(GitInfo.parse(head: "ref: refs/heads/claude/feature-x") == "claude/feature-x", "ветка со слешем")
+check(GitInfo.parse(head: "29970deadb287d5457bc98c3dcc0b28c522c90c3\n") == "29970de", "отсоединённый HEAD — короткий хэш")
+check(GitInfo.parse(head: "") == nil, "пустой HEAD")
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)
