@@ -7,6 +7,7 @@ import AppKit
 struct RootView: View {
     @ObservedObject var workspace: Workspace
     @State private var doubleShift: DoubleShiftMonitor?
+    @State private var paletteSpace: CGSize = .zero
     /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
 
@@ -213,9 +214,16 @@ struct RootView: View {
                 .ignoresSafeArea()
                 .onTapGesture { workspace.isPaletteOpen = false }
 
-            PaletteView(workspace: workspace)
+            PaletteView(workspace: workspace, available: paletteSpace)
                 .padding(.top, 60)
         }
+        // Место под палитрой меряем фоном: GeometryReader поверх затемнения
+        // перехватил бы клик мимо палитры.
+        .background(GeometryReader { geo in
+            Color.clear
+                .onAppear { paletteSpace = geo.size }
+                .onChange(of: geo.size) { _, size in paletteSpace = size }
+        })
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
 }

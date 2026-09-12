@@ -901,6 +901,67 @@ print(String(format: "  разбор 2000 файлов на %d строк (од�
 check(typeTotal == 2000 * 8, "в каждом файле найдено ровно 8 типов")
 check(typesMs < 5000, "2000 файлов разбираются быстрее 5 с даже в один поток")
 
+// ──────────────────────── Предпросмотр в палитре ────────────────────────
+section("Предпросмотр")
+
+// большой файл: цель в середине, фрагмент — окно вокруг неё
+let previewSource = (0..<500).map { i in
+    i == 250 ? "public sealed class Target : Base { // цель" : "    var line\(i) = \"text\"; /* c */"
+}.joined(separator: "\n")
+let previewModel = SyntaxModel(text: previewSource, spec: Languages.csharp)
+let focusRange = LSPRange(start: LSPPosition(line: 250, character: 20), end: LSPPosition(line: 250, character: 26))
+let focused = FilePreview.make(model: previewModel, range: focusRange)
+check(focused.focusLine == 250, "строка цели запомнена")
+check(focused.lineCount == 500, "известно число строк файла")
+check(focused.lines.first?.number == 250 - FilePreview.linesBefore, "фрагмент начинается выше цели")
+check(focused.lines.last?.number == 250 + FilePreview.linesAfter, "фрагмент заканчивается ниже цели")
+if let line = focused.lines.first(where: { $0.number == 250 }) {
+    check(line.text == "public sealed class Target : Base { // цель", "текст строки собран из отрезков без потерь")
+    check(line.segments.filter(\.focused).map(\.text) == ["Target"],
+          "подсвечено ровно имя цели (получено \(line.segments.filter(\.focused).map(\.text)))")
+    check(line.segments.first?.kind == .keyword && line.segments.first?.text == "public",
+          "ключевое слово — отдельным отрезком с видом keyword")
+    check(line.segments.last?.kind == .comment, "комментарий в конце строки распознан")
+}
+check(focused.lines.filter { $0.segments.contains(where: \.focused) }.count == 1,
+      "подсветка цели только в одной строке")
+check(focused.lines.first { $0.number == 100 + 150 - 1 }?.segments.contains { $0.kind == .string } == true,
+      "строковые литералы в соседних строках раскрашены")
+
+// без цели — начало файла
+let top = FilePreview.make(model: previewModel, range: nil)
+check(top.focusLine == nil && top.lines.first?.number == 0, "без цели показывается начало файла")
+check(top.lines.count == FilePreview.linesBefore + FilePreview.linesAfter + 1, "без цели — полное окно строк")
+
+// цель у самого начала и у самого конца — окно подрезается границами файла
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 2, character: 0),
+                                                           end: LSPPosition(line: 2, character: 1))).lines.first?.number == 0,
+      "окно не уходит выше первой строки")
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 499, character: 0),
+                                                           end: LSPPosition(line: 499, character: 1))).lines.last?.number == 499,
+      "окно не уходит ниже последней строки")
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 9999, character: 0),
+                                                           end: LSPPosition(line: 9999, character: 1))).focusLine == 499,
+      "цель за концом файла прижимается к последней строке")
+
+// табуляции, CRLF, длинные строки, многострочный комментарий, файл без языка
+let tabbed = FilePreview.make(model: SyntaxModel(text: "\tint x;\r\nnext", spec: Languages.csharp), range: nil)
+check(tabbed.lines.first?.text == "    int x;", "табуляция раскрыта в пробелы, \\r\\n отрезан (получено \(tabbed.lines.first?.text ?? "nil"))")
+let longLine = FilePreview.make(model: SyntaxModel(text: String(repeating: "a", count: 5000), spec: nil), range: nil)
+check(longLine.lines.first.map { $0.text.count } == FilePreview.maxLineLength + 2, "длинная строка обрезана с многоточием")
+let block = FilePreview.make(model: SyntaxModel(text: "/* начало\nпродолжение */ int x;", spec: Languages.csharp), range: nil)
+check(block.lines.last?.segments.first?.kind == .comment && block.lines.last?.segments.first?.text == "продолжение */",
+      "многострочный комментарий раскрашен и во второй строке")
+let plain = FilePreview.make(model: SyntaxModel(text: "просто текст", spec: nil), range: nil)
+check(plain.lines.first?.segments == [FilePreview.Segment(text: "просто текст", kind: .plain, focused: false)],
+      "файл без языка — одним простым отрезком")
+
+let tPreview = Date()
+for _ in 0..<200 { _ = FilePreview.make(model: bigModel, range: focusRange) }
+let previewMs = Date().timeIntervalSince(tPreview) * 1000 / 200
+print(String(format: "  фрагмент для предпросмотра в файле на 200k строк: %.2f мс", previewMs))
+check(previewMs < 20, "фрагмент строится быстрее 20 мс даже в огромном файле")
+
 // ─────────────────────────────── ⇧⇧ ───────────────────────────────
 section("Двойной Shift")
 

@@ -33,6 +33,18 @@ struct LoadedDocument: Sendable {
     static let maxBytes = 64 * 1024 * 1024
 
     static func load(url: URL) throws -> LoadedDocument {
+        let text = try readText(url: url, maxBytes: maxBytes)
+        let spec = Languages.detect(filename: url.lastPathComponent)
+        let model = SyntaxModel(text: text, spec: spec)
+        let outline = OutlineBuilder.build(model: model)
+        return LoadedDocument(url: url, text: text, model: model,
+                              languageName: spec?.name ?? "Plain Text",
+                              outline: outline)
+    }
+
+    /// Текст файла с теми же проверками, что и при открытии: размер,
+    /// бинарность, кодировка. Нужен и предпросмотру в палитре.
+    static func readText(url: URL, maxBytes: Int) throws -> String {
         let data: Data
         do {
             data = try Data(contentsOf: url, options: .mappedIfSafe)
@@ -45,21 +57,10 @@ struct LoadedDocument: Sendable {
         let probe = data.prefix(8192)
         if probe.contains(0) { throw LoadError.binary }
 
-        let text: String
-        if let s = String(data: data, encoding: .utf8) {
-            text = s
-        } else if let s = String(data: data, encoding: .isoLatin1) {
-            text = s   // фолбэк, чтобы не падать на legacy-кодировках
-        } else {
-            throw LoadError.binary
-        }
-
-        let spec = Languages.detect(filename: url.lastPathComponent)
-        let model = SyntaxModel(text: text, spec: spec)
-        let outline = OutlineBuilder.build(model: model)
-        return LoadedDocument(url: url, text: text, model: model,
-                              languageName: spec?.name ?? "Plain Text",
-                              outline: outline)
+        if let s = String(data: data, encoding: .utf8) { return s }
+        // фолбэк, чтобы не падать на legacy-кодировках
+        if let s = String(data: data, encoding: .isoLatin1) { return s }
+        throw LoadError.binary
     }
 }
 
