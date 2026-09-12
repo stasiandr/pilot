@@ -4,14 +4,23 @@ import AppKit
 struct RootView: View {
     @ObservedObject var workspace: Workspace
     @State private var doubleShift: DoubleShiftMonitor?
+    /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
+    @AppStorage("pilot.showsSidebar") private var showsSidebar = true
 
     var body: some View {
         ZStack {
-            Color(nsColor: Theme.editorBackground).ignoresSafeArea()
+            NavigationSplitView(columnVisibility: columnVisibility) {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 180, ideal: 250, max: 480)
+            } detail: {
+                ZStack {
+                    Color(nsColor: Theme.editorBackground).ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                content
-                statusBar
+                    VStack(spacing: 0) {
+                        content
+                        statusBar
+                    }
+                }
             }
 
             if workspace.isPaletteOpen {
@@ -24,6 +33,34 @@ struct RootView: View {
         }
     }
 
+    /// На стартовом экране дереву показывать нечего — панель прячется,
+    /// но выбор пользователя не трогаем: откроется проект — вернётся.
+    private var columnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { showsSidebar && workspace.root != nil ? .all : .detailOnly },
+            set: { if workspace.root != nil { showsSidebar = $0 != .detailOnly } })
+    }
+
+    // MARK: - Боковая панель
+
+    @ViewBuilder
+    private var sidebar: some View {
+        if workspace.fileTree != nil {
+            FileTreeView(tree: workspace.fileTree,
+                         selectedPath: workspace.openFilePath,
+                         root: workspace.root,
+                         onOpen: { relPath, focusEditor in
+                             guard let root = workspace.root else { return }
+                             workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),
+                                                              range: nil))
+                             if focusEditor { workspace.focusEditor() }
+                         })
+        } else {
+            ProgressView().controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
     @ViewBuilder
     private var content: some View {
         if let error = workspace.loadError {
@@ -33,10 +70,11 @@ struct RootView: View {
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
+                     focusRequest: workspace.editorFocusRequest,
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) })
         } else if workspace.root == nil {
-            welcome
+            StartView(workspace: workspace)
         } else {
             notice(icon: "magnifyingglass",
                    title: "Нажмите ⌘P, чтобы найти файл")
@@ -52,54 +90,6 @@ struct RootView: View {
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: - Стартовый экран
-
-    private var welcome: some View {
-        VStack(spacing: 22) {
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 42, weight: .medium))
-                .foregroundStyle(Color.accentColor)
-
-            VStack(spacing: 6) {
-                Text("Pilot").font(.system(size: 26, weight: .semibold))
-                Text("Мгновенный просмотрщик кода")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-            }
-
-            Button("Открыть папку…") { workspace.promptForFolder() }
-                .controlSize(.large)
-                .keyboardShortcut("o", modifiers: .command)
-
-            if !workspace.recentRoots.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Недавние")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                        .padding(.bottom, 2)
-                    ForEach(workspace.recentRoots.prefix(5), id: \.path) { url in
-                        Button {
-                            workspace.open(root: url)
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "folder").font(.system(size: 11))
-                                Text(url.lastPathComponent).font(.system(size: 12))
-                                Text(url.deletingLastPathComponent().path)
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                    .truncationMode(.head)
-                            }
-                        }
-                        .buttonStyle(.link)
-                    }
-                }
-                .frame(maxWidth: 420, alignment: .leading)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

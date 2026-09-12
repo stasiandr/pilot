@@ -714,6 +714,49 @@ print(String(format: "  вхождения в файле на 120k строк: %
 check(occMs < 600, "поиск вхождений в большом файле быстрее 600 мс")
 
 
+// ─────────────────────────── Дерево файлов ───────────────────────────
+section("Дерево файлов")
+
+let tree = FileTree.build(paths: [
+    "src/b/file10.cs",
+    "README.md",
+    "src/b/file2.cs",
+    "src/a.cs",
+    "src/b/deep/x.cs",
+    "Assets/Scripts/Player.cs",
+    "src/a.cs",                      // дубликат не должен породить второй узел
+])
+check(tree.fileCount == 6, "файлов шесть, дубликат не считается (получено \(tree.fileCount))")
+check(tree.root.children.map(\.name) == ["Assets", "src", "README.md"],
+      "в корне папки впереди файлов (получено \(tree.root.children.map(\.name)))")
+
+let srcNode = tree.node(at: "src")
+check(srcNode?.isDirectory == true, "src — папка")
+check(srcNode?.children.map(\.name) == ["b", "a.cs"], "внутри src папка b раньше a.cs")
+
+let bNode = tree.node(at: "src/b")
+check(bNode?.children.map(\.name) == ["deep", "file2.cs", "file10.cs"],
+      "естественный порядок: file2 раньше file10 (получено \(bNode?.children.map(\.name) ?? []))")
+
+let deepFile = tree.node(at: "src/b/deep/x.cs")
+check(deepFile?.isDirectory == false, "глубокий файл найден по пути")
+check(deepFile?.ancestors.map(\.relPath) == ["src", "src/b", "src/b/deep"],
+      "цепочка папок до файла — от корня вниз, без самого корня")
+check(tree.node(at: "README.md")?.ancestors.isEmpty == true, "у файла в корне предков нет")
+check(tree.node(at: "src/nope.cs") == nil, "несуществующий путь -> nil")
+
+let emptyTree = FileTree.build(paths: [])
+check(emptyTree.root.children.isEmpty && emptyTree.fileCount == 0, "пустой индекс -> пустое дерево")
+
+let tTree = Date()
+let bigTree = FileTree.build(paths: synthetic.display)
+let treeMs = Date().timeIntervalSince(tTree) * 1000
+print(String(format: "  дерево из 100k файлов: %.0f мс", treeMs))
+check(bigTree.fileCount == 100_000, "в большом дереве все 100k файлов")
+check(bigTree.root.children.count == 1 && bigTree.node(at: "src")?.children.count == 200,
+      "большое дерево: src и 200 модулей в нём")
+check(treeMs < 1500, "дерево из 100k файлов строится быстрее 1.5 с (получено \(Int(treeMs)) мс)")
+
 // ─────────────────────────── Индекс типов ───────────────────────────
 section("Индекс типов")
 
@@ -893,6 +936,7 @@ check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28), ("s", 0.4), (
 check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28),
                    ("s", 0.4), ("0", 0.48), ("s", 0.6), ("0", 0.68)]) == 2,
       "четыре нажатия -> два раза")
+
 
 // ────────────────────────── Режимы палитры ──────────────────────────
 section("Режимы палитры")
