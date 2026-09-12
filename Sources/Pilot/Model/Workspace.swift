@@ -6,6 +6,8 @@ final class Workspace: ObservableObject {
     @Published private(set) var root: URL?
     @Published private(set) var isIndexing = false
     @Published private(set) var fileCount = 0
+    /// Дерево папок для боковой панели. Строится из того же индекса, что и ⌘P.
+    @Published private(set) var fileTree: FileTree?
     @Published var query = "" { didSet { queryChanged() } }
     @Published private(set) var results: [SearchHit] = []
     @Published private(set) var items: [PaletteItem] = []
@@ -30,6 +32,11 @@ final class Workspace: ObservableObject {
         revealCounter += 1
         reveal = RevealRequest(seq: revealCounter, range: range)
     }
+    /// Просьба перевести фокус клавиатуры в текст; счётчик — по той же причине, что и у reveal.
+    @Published private(set) var editorFocusRequest = 0
+
+    func focusEditor() { editorFocusRequest += 1 }
+
     /// Позиция курсора в открытом документе — отсюда берутся запросы к LSP.
     @Published private(set) var caretOffset: Int = 0
     /// Вхождения идентификатора под курсором — подсвечиваются в тексте.
@@ -88,6 +95,7 @@ final class Workspace: ObservableObject {
         query = ""
         results = []
         items = []
+        fileTree = nil
         history.removeAll()
         historyIndex = -1
         rememberRecent(url)
@@ -99,29 +107,43 @@ final class Workspace: ObservableObject {
         work.async { [weak self] in
             guard let self else { return }
             // 1. Кэш делает повторное открытие проекта мгновенным.
-            if let cached = IndexCache.load(root: url) {
+            let cached = IndexCache.load(root: url)
+            if let cached {
+                let tree = FileTree.build(paths: cached.display)
                 Task { @MainActor in
                     guard self.scanGeneration.isCurrent(generation) else { return }
-                    self.adopt(cached, indexing: true)
+                    self.adopt(cached, tree: tree, indexing: true)
                 }
             }
             // 2. Всё равно пересканируем — кэш мог устареть.
             let counter = self.scanGeneration
             let fresh = FileIndex.build(root: url, shouldStop: { !counter.isCurrent(generation) })
+            guard counter.isCurrent(generation) else { return }
             IndexCache.save(fresh, root: url)
 
+            // Обычно кэш совпадает с диском один в один — тогда дерево
+            // не пересобираем, и панель не перерисовывается впустую.
+            let tree = cached?.display == fresh.display ? nil : FileTree.build(paths: fresh.display)
             Task { @MainActor in
                 guard self.scanGeneration.isCurrent(generation) else { return }
-                self.adopt(fresh, indexing: false)
+                self.adopt(fresh, tree: tree, indexing: false)
             }
         }
     }
 
-    private func adopt(_ newIndex: FileIndex, indexing: Bool) {
+    /// `tree == nil` — оставить текущее дерево: список файлов не изменился.
+    private func adopt(_ newIndex: FileIndex, tree: FileTree?, indexing: Bool) {
         index = newIndex
         fileCount = newIndex.count
         isIndexing = indexing
+        if let tree { fileTree = tree }
         runFileSearch()
+    }
+
+    /// Путь открытого файла относительно корня — чтобы найти его в дереве.
+    var openFilePath: String? {
+        guard let url = document?.url, let root, url.path.hasPrefix(root.path + "/") else { return nil }
+        return String(url.path.dropFirst(root.path.count + 1))
     }
 
     private func rememberRecent(_ url: URL) {

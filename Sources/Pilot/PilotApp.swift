@@ -19,6 +19,7 @@ struct PilotApp: App {
         .windowToolbarStyle(.unified(showsTitle: true))
         .defaultSize(width: 1100, height: 720)
         .commands {
+            SidebarCommands()   // «Показать/скрыть боковую панель», ⌃⌘S
             CommandGroup(replacing: .newItem) {
                 Button("Открыть папку…") { workspace.promptForFolder() }
                     .keyboardShortcut("o", modifiers: .command)

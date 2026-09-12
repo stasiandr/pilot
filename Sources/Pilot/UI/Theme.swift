@@ -39,6 +39,11 @@ enum Theme {
 
     static var gutterTextCurrent: NSColor { Macchiato.lavender }
 
+    /// Иконки боковой панели: папки заметнее файлов, чтобы структура
+    /// читалась с одного взгляда.
+    static var sidebarFolder: NSColor { Macchiato.blue }
+    static var sidebarFile: NSColor { Macchiato.overlay2 }
+
     /// Шрифт редактора: Hack Nerd Font Mono, если установлен, иначе системный моноширинный.
     static func editorFont(size: CGFloat) -> NSFont {
         if let f = NSFont(name: "HackNFM-Regular", size: size) { return f }

@@ -3,14 +3,23 @@ import AppKit
 
 struct RootView: View {
     @ObservedObject var workspace: Workspace
+    /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
+    @AppStorage("pilot.showsSidebar") private var showsSidebar = true
 
     var body: some View {
         ZStack {
-            Color(nsColor: Theme.editorBackground).ignoresSafeArea()
+            NavigationSplitView(columnVisibility: columnVisibility) {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 180, ideal: 250, max: 480)
+            } detail: {
+                ZStack {
+                    Color(nsColor: Theme.editorBackground).ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                content
-                statusBar
+                    VStack(spacing: 0) {
+                        content
+                        statusBar
+                    }
+                }
             }
 
             if workspace.isPaletteOpen {
@@ -18,6 +27,37 @@ struct RootView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 480)
+    }
+
+    private var columnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { showsSidebar ? .all : .detailOnly },
+            set: { showsSidebar = $0 != .detailOnly })
+    }
+
+    // MARK: - Боковая панель
+
+    @ViewBuilder
+    private var sidebar: some View {
+        if workspace.fileTree != nil {
+            FileTreeView(tree: workspace.fileTree,
+                         selectedPath: workspace.openFilePath,
+                         root: workspace.root,
+                         onOpen: { relPath, focusEditor in
+                             guard let root = workspace.root else { return }
+                             workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),
+                                                              range: nil))
+                             if focusEditor { workspace.focusEditor() }
+                         })
+        } else if workspace.root != nil {
+            ProgressView().controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            Text("Нет открытой папки")
+                .font(.system(size: 12))
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 
     @ViewBuilder
@@ -29,6 +69,7 @@ struct RootView: View {
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
+                     focusRequest: workspace.editorFocusRequest,
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) })
         } else if workspace.root == nil {
