@@ -1,0 +1,83 @@
+import SwiftUI
+import AppKit
+
+@main
+struct FlintApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var workspace = Workspace()
+
+    var body: some Scene {
+        Window("Flint", id: "main") {
+            RootView(workspace: workspace)
+                .task {
+                    // Открываем последний проект уже после первого кадра:
+                    // окно должно появиться мгновенно, а индексация идёт фоном.
+                    workspace.openLastOrPrompt()
+                }
+                .animation(.easeOut(duration: 0.14), value: workspace.isPaletteOpen)
+        }
+        .windowToolbarStyle(.unified(showsTitle: true))
+        .defaultSize(width: 1100, height: 720)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("Открыть папку…") { workspace.promptForFolder() }
+                    .keyboardShortcut("o", modifiers: .command)
+            }
+            CommandGroup(after: .toolbar) {
+                Button("Перейти к файлу…") { workspace.openPalette(mode: .files) }
+                    .keyboardShortcut("p", modifiers: .command)
+                Button("Структура файла…") { workspace.openPalette(mode: .outline) }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("Символ в проекте…") { workspace.openPalette(mode: .symbols) }
+                    .keyboardShortcut("t", modifiers: .command)
+                    .disabled(!workspace.lsp.isReady)
+                Divider()
+                Button("Следующее объявление") { workspace.jumpToMember(1) }
+                    .keyboardShortcut(.downArrow, modifiers: .control)
+                Button("Предыдущее объявление") { workspace.jumpToMember(-1) }
+                    .keyboardShortcut(.upArrow, modifiers: .control)
+                Button("Следующее вхождение") { workspace.jumpToOccurrence(1) }
+                    .keyboardShortcut(.downArrow, modifiers: .option)
+                Button("Предыдущее вхождение") { workspace.jumpToOccurrence(-1) }
+                    .keyboardShortcut(.upArrow, modifiers: .option)
+                Divider()
+                // Не требует LSP: если сервер не готов, работает лексический
+                // поиск объявления в пределах файла.
+                Button("Перейти к объявлению") {
+                    workspace.goToDefinition(at: workspace.caretOffset)
+                }
+                .keyboardShortcut("b", modifiers: .command)
+                Button("Найти использования") {
+                    workspace.findReferences(at: workspace.caretOffset)
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(!workspace.lsp.isReady)
+                Divider()
+                Button("Назад") { workspace.goBack() }
+                    .keyboardShortcut("[", modifiers: .command)
+                    .disabled(!workspace.canGoBack)
+                Button("Вперёд") { workspace.goForward() }
+                    .keyboardShortcut("]", modifiers: .command)
+                    .disabled(!workspace.canGoForward)
+                Divider()
+                Button("Крупнее") { workspace.fontSize += 1 }
+                    .keyboardShortcut("=", modifiers: .command)   // ⌘+ без Shift
+                Button("Мельче") { workspace.fontSize -= 1 }
+                    .keyboardShortcut("-", modifiers: .command)
+                Button("Исходный размер") { workspace.fontSize = 12.5 }
+                    .keyboardShortcut("0", modifiers: .command)
+            }
+        }
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}

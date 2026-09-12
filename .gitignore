@@ -1,0 +1,4 @@
+.build/
+Flint.app/
+*.xcodeproj
+.DS_Store
