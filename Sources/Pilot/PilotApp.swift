@@ -10,9 +10,10 @@ struct PilotApp: App {
         Window("Pilot", id: "main") {
             RootView(workspace: workspace)
                 .task {
-                    // Открываем последний проект уже после первого кадра:
+                    // Путь из командной строки открываем после первого кадра:
                     // окно должно появиться мгновенно, а индексация идёт фоном.
-                    workspace.openLastOrPrompt()
+                    // Без пути остаётся стартовый экран с выбором проекта.
+                    workspace.start()
                 }
                 .animation(.easeOut(duration: 0.14), value: workspace.isPaletteOpen)
         }
@@ -22,6 +23,17 @@ struct PilotApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Открыть папку…") { workspace.promptForFolder() }
                     .keyboardShortcut("o", modifiers: .command)
+                Menu("Открыть недавний") {
+                    ForEach(workspace.recentRoots, id: \.path) { url in
+                        Button("\(url.lastPathComponent) — \((url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath)") {
+                            workspace.open(root: url)
+                        }
+                    }
+                }
+                .disabled(workspace.recentRoots.isEmpty)
+                Button("Закрыть проект") { workspace.closeProject() }
+                    .keyboardShortcut("w", modifiers: [.command, .shift])
+                    .disabled(workspace.root == nil)
             }
             CommandGroup(after: .toolbar) {
                 Button("Перейти к файлу…") { workspace.openPalette(mode: .files) }

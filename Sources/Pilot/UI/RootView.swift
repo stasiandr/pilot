@@ -32,7 +32,7 @@ struct RootView: View {
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) })
         } else if workspace.root == nil {
-            welcome
+            StartView(workspace: workspace)
         } else {
             notice(icon: "magnifyingglass",
                    title: "Нажмите ⌘P, чтобы найти файл")
@@ -48,54 +48,6 @@ struct RootView: View {
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: - Стартовый экран
-
-    private var welcome: some View {
-        VStack(spacing: 22) {
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 42, weight: .medium))
-                .foregroundStyle(Color.accentColor)
-
-            VStack(spacing: 6) {
-                Text("Pilot").font(.system(size: 26, weight: .semibold))
-                Text("Мгновенный просмотрщик кода")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-            }
-
-            Button("Открыть папку…") { workspace.promptForFolder() }
-                .controlSize(.large)
-                .keyboardShortcut("o", modifiers: .command)
-
-            if !workspace.recentRoots.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Недавние")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                        .padding(.bottom, 2)
-                    ForEach(workspace.recentRoots.prefix(5), id: \.path) { url in
-                        Button {
-                            workspace.open(root: url)
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "folder").font(.system(size: 11))
-                                Text(url.lastPathComponent).font(.system(size: 12))
-                                Text(url.deletingLastPathComponent().path)
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                    .truncationMode(.head)
-                            }
-                        }
-                        .buttonStyle(.link)
-                    }
-                }
-                .frame(maxWidth: 420, alignment: .leading)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
