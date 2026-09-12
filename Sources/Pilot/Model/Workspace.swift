@@ -36,6 +36,61 @@ final class Workspace: ObservableObject {
     @Published private(set) var occurrences: [NSRange] = []
     /// Где мы находимся: «Класс › Метод».
     @Published private(set) var breadcrumb: String = ""
+    /// Объявление, внутри которого курсор, — для jump bar и навигатора структуры.
+    @Published private(set) var currentOutlineItem: OutlineItem?
+    /// Ветка git — подзаголовок окна, как в Xcode.
+    @Published private(set) var branch: String?
+
+    // MARK: Навигатор
+
+    enum NavigatorTab: Hashable, CaseIterable {
+        case project, outline, recent
+
+        var icon: String {
+            switch self {
+            case .project: return "folder"
+            case .outline: return "list.bullet.indent"
+            case .recent:  return "clock"
+            }
+        }
+
+        var selectedIcon: String {
+            switch self {
+            case .project: return "folder.fill"
+            case .outline: return "list.bullet.indent"
+            case .recent:  return "clock.fill"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .project: return "Проект"
+            case .outline: return "Структура файла"
+            case .recent:  return "Недавние проекты"
+            }
+        }
+    }
+
+    @Published var navigatorTab: NavigatorTab = .project
+    @Published private(set) var navigatorRows: [FileTreeRow] = []
+    /// Растёт при каждой пересборке строк: по нему список понимает, что
+    /// перерисовываться пора, не сравнивая тысячи строк.
+    @Published private(set) var navigatorVersion = 0
+    @Published private(set) var navigatorSelection: String?
+    /// Фильтр вкладки «Структура» — отдельный, чтобы не сбрасывать дерево.
+    @Published var outlineFilter = ""
+    @Published var navigatorFilter = "" {
+        didSet { if navigatorFilter != oldValue { navigatorFilterChanged() } }
+    }
+
+    private(set) var fileTree: FileTreeNode?
+    private var filteredTree: FileTreeNode?
+    private var expandedFolders: Set<String> = [""]
+    private let treeQueue = DispatchQueue(label: "pilot.tree", qos: .userInitiated)
+    private let treeGeneration = AtomicCounter()
+    private let filterGeneration = AtomicCounter()
+    /// Больше строк фильтр не показывает: дальше человек всё равно уточнит запрос.
+    nonisolated static let navigatorFilterLimit = 2000
 
     private var occurrenceTask: Task<Void, Never>?
     private var occurrenceWord: String?
@@ -90,6 +145,15 @@ final class Workspace: ObservableObject {
         items = []
         history.removeAll()
         historyIndex = -1
+        currentOutlineItem = nil
+        branch = GitInfo.branch(at: url)
+        fileTree = nil
+        filteredTree = nil
+        expandedFolders = [""]
+        navigatorSelection = nil
+        navigatorFilter = ""
+        _ = treeGeneration.bump()
+        rebuildNavigatorRows()
         rememberRecent(url)
         lsp.workspaceChanged(to: url)
 
@@ -122,6 +186,106 @@ final class Workspace: ObservableObject {
         fileCount = newIndex.count
         isIndexing = indexing
         runFileSearch()
+        buildTree(from: newIndex)
+    }
+
+    // MARK: - Навигатор проекта
+
+    /// Дерево строится в своей очереди, чтобы не задерживать поиск ⌘P,
+    /// который живёт в `work`.
+    private func buildTree(from index: FileIndex) {
+        let generation = treeGeneration.bump()
+        let counter = treeGeneration
+        let rootName = index.root.lastPathComponent
+        treeQueue.async { [weak self] in
+            let tree = FileTreeNode.build(rootName: rootName, paths: index.display)
+            Task { @MainActor in
+                guard let self, counter.isCurrent(generation) else { return }
+                self.fileTree = tree
+                self.rebuildNavigatorRows()
+                if !self.navigatorFilter.isEmpty { self.navigatorFilterChanged() }
+            }
+        }
+    }
+
+    private func rebuildNavigatorRows() {
+        if !navigatorFilter.isEmpty {
+            navigatorRows = filteredTree?.flatten(expanded: [], expandAll: true) ?? []
+        } else {
+            navigatorRows = fileTree?.flatten(expanded: expandedFolders) ?? []
+        }
+        navigatorVersion += 1
+    }
+
+    func toggleFolder(_ path: String) {
+        guard navigatorFilter.isEmpty else { return }   // в фильтре раскрыто всё
+        if expandedFolders.contains(path) {
+            expandedFolders.remove(path)
+        } else {
+            expandedFolders.insert(path)
+        }
+        rebuildNavigatorRows()
+    }
+
+    func setFolder(_ path: String, expanded: Bool) {
+        guard navigatorFilter.isEmpty, expandedFolders.contains(path) != expanded else { return }
+        toggleFolder(path)
+    }
+
+    /// Клик по строке навигатора: файл открывается, папка раскрывается.
+    func selectInNavigator(_ path: String?) {
+        guard let path, let root else { return }
+        navigatorSelection = path
+        guard let row = navigatorRows.first(where: { $0.id == path }) else { return }
+        if row.node.isDirectory { return }
+        let url = root.appendingPathComponent(path)
+        guard document?.url != url else { return }
+        navigate(to: NavTarget(url: url, range: nil))
+    }
+
+    /// Открытый файл подсвечивается в дереве, а его папки раскрываются.
+    private func revealInNavigator(_ url: URL) {
+        guard let root, url.path.hasPrefix(root.path + "/") else { return }
+        let path = relativePath(for: url)
+        navigatorSelection = path
+        guard navigatorFilter.isEmpty else { return }
+        let missing = FileTreeNode.ancestors(of: path).filter { !expandedFolders.contains($0) }
+        if !missing.isEmpty {
+            expandedFolders.formUnion(missing)
+            rebuildNavigatorRows()
+        }
+    }
+
+    /// Показать папку в дереве — из меню jump bar.
+    func revealFolder(_ path: String) {
+        navigatorTab = .project
+        navigatorFilter = ""
+        expandedFolders.formUnion(FileTreeNode.ancestors(of: path))
+        expandedFolders.insert(path)
+        navigatorSelection = path
+        rebuildNavigatorRows()
+    }
+
+    private func navigatorFilterChanged() {
+        let needle = navigatorFilter.trimmingCharacters(in: .whitespaces)
+        let generation = filterGeneration.bump()
+        guard !needle.isEmpty, let index else {
+            filteredTree = nil
+            rebuildNavigatorRows()
+            return
+        }
+        let counter = filterGeneration
+        let rootName = index.root.lastPathComponent
+        treeQueue.async { [weak self] in
+            let ids = index.filter(name: needle, limit: Self.navigatorFilterLimit,
+                                   shouldStop: { !counter.isCurrent(generation) })
+            let tree = FileTreeNode.build(rootName: rootName, paths: ids.map { index.relPath($0) })
+            Task { @MainActor in
+                guard let self, counter.isCurrent(generation) else { return }
+                self.filteredTree = tree
+                self.rebuildNavigatorRows()
+            }
+        }
     }
 
     private func rememberRecent(_ url: URL) {
@@ -214,12 +378,17 @@ final class Workspace: ObservableObject {
     }
 
     private func updateBreadcrumb() {
-        guard let document, !document.outline.isEmpty else { breadcrumb = ""; return }
+        guard let document, !document.outline.isEmpty else {
+            breadcrumb = ""
+            currentOutlineItem = nil
+            return
+        }
         // Объемлющее объявление — последнее, начавшееся до курсора.
         var current: OutlineItem?
         for item in document.outline {
             if item.range.location <= caretOffset { current = item } else { break }
         }
+        currentOutlineItem = current
         guard let current else { breadcrumb = ""; return }
         if let container = current.container, !container.isEmpty {
             breadcrumb = "\(container) › \(current.name)"
@@ -252,6 +421,12 @@ final class Workspace: ObservableObject {
     }
 
     // MARK: - Прыжки внутри файла
+
+    /// Переход к объявлению из навигатора структуры или jump bar.
+    func jump(to item: OutlineItem) {
+        guard let document else { return }
+        navigate(to: NavTarget(url: document.url, range: rangeFor(item, in: document)))
+    }
 
     /// Следующее/предыдущее объявление относительно курсора.
     func jumpToMember(_ direction: Int) {
@@ -535,6 +710,8 @@ final class Workspace: ObservableObject {
                     self.occurrences = []
                     self.occurrenceWord = nil
                     self.breadcrumb = ""
+                    self.currentOutlineItem = nil
+                    self.revealInNavigator(url)
                     self.requestReveal(reveal)
                     // Сервер поднимается здесь — лениво, при первом файле
                     // подходящего языка, а не при запуске приложения.
@@ -567,16 +744,7 @@ final class Workspace: ObservableObject {
     }
 
     static func icon(forPath path: String) -> String {
-        switch (path as NSString).pathExtension.lowercased() {
-        case "cs", "swift", "java", "kt", "go", "rs", "py", "rb", "php":
-            return "chevron.left.forwardslash.chevron.right"
-        case "json", "yaml", "yml", "toml", "xml", "plist", "csproj":
-            return "list.bullet.indent"
-        case "md", "markdown", "txt":  return "doc.text"
-        case "png", "jpg", "jpeg", "gif", "svg", "pdf": return "photo"
-        case "sh", "bash", "zsh":      return "terminal"
-        default:                        return "doc"
-        }
+        Theme.fileIcon(forName: (path as NSString).lastPathComponent).symbol
     }
 }
 

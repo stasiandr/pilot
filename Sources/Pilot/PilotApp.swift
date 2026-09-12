@@ -16,7 +16,8 @@ struct PilotApp: App {
                 }
                 .animation(.easeOut(duration: 0.14), value: workspace.isPaletteOpen)
         }
-        .windowToolbarStyle(.unified(showsTitle: true))
+        // Заголовок рисуем сами — с веткой git, как в Xcode.
+        .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1100, height: 720)
         .commands {
             CommandGroup(replacing: .newItem) {

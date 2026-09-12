@@ -708,6 +708,46 @@ check(!PaletteMode.outline.requiresLanguageServer, "структура файл�
 check(PaletteMode.symbols.requiresLanguageServer, "символы проекта требуют LSP")
 check(PaletteMode.references.requiresLanguageServer, "использования требуют LSP")
 
+// ────────────────────────── Дерево навигатора ──────────────────────────
+section("Дерево файлов")
+
+let tree = FileTreeNode.build(rootName: "proj", paths: [
+    "src/b.swift", "README.md", "src/a/x.swift", "src/file10.swift", "src/file2.swift", "Package.swift",
+])
+let collapsed = tree.flatten(expanded: [""])
+check(collapsed.map(\.node.name) == ["proj", "src", "Package.swift", "README.md"],
+      "свёрнутое дерево: корень, папки раньше файлов (получено: \(collapsed.map(\.node.name)))")
+let opened = tree.flatten(expanded: ["", "src"])
+check(opened.map(\.node.name) == ["proj", "src", "a", "b.swift", "file2.swift", "file10.swift",
+                                  "Package.swift", "README.md"],
+      "раскрытая src: натуральная сортировка file2 < file10 (получено: \(opened.map(\.node.name)))")
+check(opened.first { $0.node.name == "b.swift" }?.depth == 2, "глубина файла в src — 2")
+check(opened.first { $0.node.name == "a" }?.node.path == "src/a", "путь папки относительный")
+check(tree.flatten(expanded: [], expandAll: true).count == 9, "expandAll показывает всё дерево")
+check(FileTreeNode.ancestors(of: "src/a/x.swift") == ["", "src", "src/a"], "предки файла")
+check(FileTreeNode.ancestors(of: "README.md") == [""], "у файла в корне предок — только корень")
+check(tree.children(ofDirectory: "src").map(\.name) == ["a", "b.swift", "file2.swift", "file10.swift"],
+      "содержимое папки для jump bar")
+check(tree.children(ofDirectory: "nope").isEmpty, "несуществующая папка — пусто")
+
+section("Фильтр навигатора")
+let idx7 = FileIndex(root: URL(fileURLWithPath: "/"))
+for p in ["Sources/UI/CodeView.swift", "Sources/Code/Lexer.swift", "README.md", "codegen.sh"] {
+    idx7.appendCached(rel: p)
+}
+let byName = idx7.filter(name: "code", limit: 10, shouldStop: { false }).map { idx7.relPath($0) }
+check(byName == ["Sources/UI/CodeView.swift", "codegen.sh"],
+      "фильтр ищет по имени файла, а не по пути, без учёта регистра (получено: \(byName))")
+check(idx7.filter(name: "", limit: 10, shouldStop: { false }).isEmpty, "пустой фильтр — пусто")
+check(idx7.filter(name: "e", limit: 2, shouldStop: { false }).count == 2, "фильтр уважает лимит")
+check(idx7.filter(name: "view.swift", limit: 10, shouldStop: { false }).count == 1, "совпадение в конце имени")
+
+section("Git")
+check(GitInfo.parse(head: "ref: refs/heads/main\n") == "main", "ветка из HEAD")
+check(GitInfo.parse(head: "ref: refs/heads/claude/feature-x") == "claude/feature-x", "ветка со слешем")
+check(GitInfo.parse(head: "29970deadb287d5457bc98c3dcc0b28c522c90c3\n") == "29970de", "отсоединённый HEAD — короткий хэш")
+check(GitInfo.parse(head: "") == nil, "пустой HEAD")
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

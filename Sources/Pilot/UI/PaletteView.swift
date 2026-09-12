@@ -133,11 +133,19 @@ struct PaletteView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 8)
             }
-            .frame(maxHeight: 420)
+            .frame(height: resultListHeight)
             .onChange(of: workspace.selection) { _, new in
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(new, anchor: .center) }
             }
         }
+    }
+
+    /// ScrollView сам по себе занимает всю предложенную высоту, и с одним
+    /// результатом стеклянная панель висела бы полупустой. Поэтому высоту
+    /// считаем по строкам: однострочная ~29 pt, с подписью ~43 pt.
+    private var resultListHeight: CGFloat {
+        let rowHeight: CGFloat = workspace.items.first?.secondary?.isEmpty == false ? 43 : 29
+        return min(420, CGFloat(workspace.items.count) * rowHeight + 16)
     }
 
     // MARK: - Клавиатура
@@ -184,7 +192,7 @@ struct PaletteRow: View {
         HStack(spacing: 10) {
             Image(systemName: item.icon)
                 .font(.system(size: 13))
-                .foregroundStyle(isSelected ? .primary : .secondary)
+                .foregroundStyle(iconStyle)
                 .frame(width: 17)
 
             VStack(alignment: .leading, spacing: 1) {
@@ -219,6 +227,14 @@ struct PaletteRow: View {
             }
         }
         .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+    }
+
+    /// Файлы — цветной иконкой, как в навигаторе; остальное приглушённо.
+    private var iconStyle: AnyShapeStyle {
+        if isSelected { return AnyShapeStyle(.primary) }
+        let file = Theme.fileIcon(forName: (item.primary as NSString).lastPathComponent)
+        if file.symbol == item.icon { return AnyShapeStyle(Color(nsColor: file.color)) }
+        return AnyShapeStyle(.secondary)
     }
 
     /// Собираем строку отрезками: совпавшие символы выделены,

@@ -8,7 +8,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/Sources/coretests"
-cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,GitIgnore,AtomicCounter,PaletteItem}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Highlight/{Language,Lexer,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient}.swift "$TMP/Sources/coretests/"
 cp CoreTests/CoreTests.swift "$TMP/Sources/coretests/main.swift"
