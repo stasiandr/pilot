@@ -58,34 +58,36 @@ final class Workspace: ObservableObject {
     /// Полный список использований; поле ввода фильтрует его на месте.
     private var allReferences: [PaletteItem] = []
 
-    private let recentKey = "pilot.recentRoots"
+    private static let recentKey = "pilot.recentRoots"
 
-    var recentRoots: [URL] {
-        (UserDefaults.standard.array(forKey: recentKey) as? [String] ?? [])
+    /// Недавние проекты, свежие первыми. Папки, которых больше нет
+    /// на диске, отсеиваются при чтении — в список их не выводим.
+    @Published private(set) var recentRoots: [URL] = Workspace.loadRecentRoots()
+
+    private static func loadRecentRoots() -> [URL] {
+        let fm = FileManager.default
+        return (UserDefaults.standard.array(forKey: recentKey) as? [String] ?? [])
+            .filter { fm.fileExists(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
     }
 
     // MARK: - Открытие воркспейса
 
-    func openLastOrPrompt() {
-        if openLaunchTarget() { return }
-        if let last = recentRoots.first,
-           FileManager.default.fileExists(atPath: last.path) {
-            open(root: last)
-        } else {
-            promptForFolder()
-        }
+    /// Старт приложения. Путь из командной строки открывается сразу,
+    /// иначе остаётся стартовый экран с выбором из недавних проектов.
+    func start() {
+        openLaunchTarget()
     }
 
     /// Путь из командной строки: `Pilot /path/to/project` или `Pilot /path/File.cs`.
     /// Для файла корнем проекта становится ближайший git-репозиторий над ним.
-    private func openLaunchTarget() -> Bool {
+    private func openLaunchTarget() {
         // macOS может дописать свои аргументы вида `-NSFoo YES` — берём
         // первый абсолютный путь, который существует на диске.
         var isDirectory: ObjCBool = false
         guard let path = CommandLine.arguments.dropFirst().first(where: {
             $0.hasPrefix("/") && FileManager.default.fileExists(atPath: $0, isDirectory: &isDirectory)
-        }) else { return false }
+        }) else { return }
 
         let url = URL(fileURLWithPath: path).standardizedFileURL
         if isDirectory.boolValue {
@@ -94,7 +96,6 @@ final class Workspace: ObservableObject {
             open(root: Self.projectRoot(containing: url))
             open(file: url)
         }
-        return true
     }
 
     private static func projectRoot(containing file: URL) -> URL {
@@ -177,11 +178,44 @@ final class Workspace: ObservableObject {
         return String(url.path.dropFirst(root.path.count + 1))
     }
 
+    /// Назад на стартовый экран. Индексация и языковой сервер
+    /// старого проекта останавливаются.
+    func closeProject() {
+        // Новое поколение отменяет обход ФС и загрузку файла, что ещё идут.
+        _ = scanGeneration.bump()
+        _ = loadGeneration.bump()
+        lsp.workspaceChanged(to: nil)
+        root = nil
+        index = nil
+        fileTree = nil
+        document = nil
+        loadError = nil
+        isIndexing = false
+        fileCount = 0
+        isPaletteOpen = false
+        query = ""
+        results = []
+        items = []
+        occurrences = []
+        breadcrumb = ""
+        history.removeAll()
+        historyIndex = -1
+    }
+
     private func rememberRecent(_ url: URL) {
-        var list = recentRoots.map(\.path).filter { $0 != url.path }
-        list.insert(url.path, at: 0)
+        var list = recentRoots.filter { $0.path != url.path }
+        list.insert(url, at: 0)
         if list.count > 10 { list.removeSubrange(10...) }
-        UserDefaults.standard.set(list, forKey: recentKey)
+        saveRecent(list)
+    }
+
+    func forgetRecent(_ url: URL) {
+        saveRecent(recentRoots.filter { $0.path != url.path })
+    }
+
+    private func saveRecent(_ list: [URL]) {
+        recentRoots = list
+        UserDefaults.standard.set(list.map(\.path), forKey: Self.recentKey)
     }
 
     // MARK: - Палитра
