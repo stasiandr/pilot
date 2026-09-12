@@ -431,7 +431,7 @@ namespace Acme.Billing
 let cs = outline(csFile, Languages.csharp)
 
 // объявления, которые обязаны найтись
-for expected in ["Acme", "IInvoiceStore", "InvoiceService", "FindAsync",
+for expected in ["Acme.Billing", "IInvoiceStore", "InvoiceService", "FindAsync",
                  "InvoiceService", "Map", "Validate", "RetryCount", "Name"] {
     check(names(cs).contains(expected), "C#: найдено объявление \(expected)")
 }
@@ -444,7 +444,11 @@ for callSite in ["WriteLine", "Get", "Query", "Where", "ToList", "Count",
 check(named(cs, "InvoiceService")?.kind == .type, "C#: InvoiceService — тип")
 check(named(cs, "Map")?.kind == .method, "C#: Map — метод (лямбда-тело)")
 check(named(cs, "RetryCount")?.kind == .property, "C#: RetryCount — свойство")
-check(named(cs, "Acme")?.kind == .namespace, "C#: namespace распознан")
+check(named(cs, "Acme.Billing")?.kind == .namespace, "C#: namespace распознан, имя целиком")
+check(named(outline("package com.acme.billing;\nclass A {}", Languages.java), "com.acme.billing")?.kind == .namespace,
+      "Java: package распознан, имя целиком")
+check(named(outline("namespace App.Core;\npublic class A {}", Languages.csharp), "A")?.container == "App.Core",
+      "C#: файловый namespace — контейнер типа")
 check(named(cs, "FindAsync")?.container == "InvoiceService" || named(cs, "FindAsync")?.container == "IInvoiceStore",
       "C#: у метода проставлен содержащий тип")
 
@@ -505,6 +509,23 @@ for callSite in ["append", "print", "copy"] {
 check(named(sw, "Store")?.kind == .type, "Swift: Store — тип")
 check(named(sw, "save")?.kind == .method, "Swift: save — метод")
 check(named(sw, "fast")?.kind == .enumCase, "Swift: case перечисления распознан")
+check(named(sw, "Store")?.keyword == "class", "Swift: у объявления запомнено ключевое слово")
+check(sw.filter { $0.name == "Store" }.map(\.keyword) == ["class", "extension"],
+      "Swift: extension отличается от самого класса по ключевому слову")
+
+// `class func` и `class var` — члены класса, а не новые типы
+let swClassMembers = outline("""
+class Factory {
+    class func make() -> Factory { Factory() }
+    class var shared: Factory { Factory() }
+}
+""", Languages.swift)
+check(named(swClassMembers, "make")?.kind == .method, "Swift: class func — метод, а не тип")
+check(named(swClassMembers, "shared")?.kind == .property, "Swift: class var — свойство, а не тип")
+check(named(outline("export const enum Color { Red }", Languages.javascript), "Color")?.kind == .type,
+      "TS: const enum — тип")
+check(named(outline("public record struct Point(int X);", Languages.csharp), "Point")?.keyword == "record",
+      "C#: record struct — тип с ключевым словом record")
 check(sw.contains { $0.kind == .initializer }, "Swift: init распознан")
 
 // Python — блоки по отступам
@@ -693,18 +714,199 @@ print(String(format: "  вхождения в файле на 120k строк: %
 check(occMs < 600, "поиск вхождений в большом файле быстрее 600 мс")
 
 
+// ─────────────────────────── Индекс типов ───────────────────────────
+section("Индекс типов")
+
+func typeNames(_ text: String, _ spec: LanguageSpec) -> [String] {
+    TypeIndex.declarations(in: text, spec: spec).map(\.name)
+}
+
+// в индекс попадают только типы — ни методы, ни пространства имён
+let csTypes = TypeIndex.declarations(in: csFile, spec: Languages.csharp)
+check(csTypes.map(\.name) == ["IInvoiceStore", "InvoiceService"],
+      "C#: в индексе ровно типы файла (получено \(csTypes.map(\.name)))")
+check(csTypes.map(\.keyword) == ["interface", "class"], "C#: ключевые слова типов")
+check(csTypes.first?.container == "Acme.Billing", "C#: контейнер — пространство имён целиком")
+if let service = csTypes.last {
+    let lineText = csFile.split(separator: "\n", omittingEmptySubsequences: false)[Int(service.line)]
+    let u = Array(lineText.utf16)
+    let name = String(decoding: u[Int(service.column)..<Int(service.column + service.length)], as: UTF16.self)
+    check(name == "InvoiceService", "C#: строка и колонка указывают ровно на имя (получено \(name))")
+}
+
+check(typeNames(swiftFile, Languages.swift) == ["Storing", "Store", "Mode"],
+      "Swift: протокол, класс, enum — без extension (получено \(typeNames(swiftFile, Languages.swift)))")
+check(typeNames(pyFile, Languages.python) == ["Repo"], "Python: класс найден")
+check(typeNames(goFile, Languages.golang) == ["Server"], "Go: type найден")
+check(typeNames(tsFile, Languages.javascript) == ["Widget"], "TS: класс найден, функция — нет")
+check(typeNames("struct Point { x: i32 }\nimpl Point { fn new() -> Self { todo!() } }\ntrait Shape {}",
+                Languages.rust) == ["Point", "Shape"], "Rust: struct и trait, без impl")
+
+let nestedTypes = TypeIndex.declarations(in: """
+public class Outer {
+    public class Inner { }
+    private enum State { On, Off }
+}
+""", spec: Languages.csharp)
+check(nestedTypes.map(\.name) == ["Outer", "Inner", "State"], "C#: вложенные типы найдены")
+check(nestedTypes.first { $0.name == "Inner" }?.container == "Outer", "C#: у вложенного типа контейнер — внешний")
+
+// какие файлы вообще разбираются
+check(TypeIndex.spec(forPath: "src/App.cs") != nil, "файл .cs разбирается")
+check(TypeIndex.spec(forPath: "src/app.py") != nil, "файл .py разбирается")
+check(TypeIndex.spec(forPath: "package.json") == nil, "JSON не разбирается")
+check(TypeIndex.spec(forPath: "README.md") == nil, "Markdown не разбирается")
+check(TypeIndex.spec(forPath: "build.sh") == nil, "shell не разбирается — типов там нет")
+check(TypeIndex.icon(forKeyword: "class") == "c.square", "иконка класса")
+check(TypeIndex.icon(forKeyword: "interface") == "i.square", "иконка интерфейса")
+
+// построение по настоящим файлам на диске
+let typeRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-types-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: typeRoot)
+let typeFiles: [String: String] = [
+    "src/Services/UserService.cs": "namespace App { public class UserService { } }",
+    "src/Models/User.cs": "namespace App { public sealed class User { public class Settings { } } }",
+    "src/Models/UserRole.cs": "namespace App { public enum UserRole { Admin } }",
+    "tests/UserServiceTests.cs": "public class UserServiceTests { }",
+    "src/Ui/Settings.swift": "struct Settings { }\nextension Settings { }",
+    "docs/User.md": "class NotAType",
+    "src/Big.cs": "public class Huge { }" + String(repeating: " ", count: TypeIndex.maxFileBytes),
+]
+for (path, text) in typeFiles {
+    let url = typeRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                             withIntermediateDirectories: true)
+    try? text.write(to: url, atomically: true, encoding: .utf8)
+}
+let built = TypeIndex.build(root: typeRoot, files: Array(typeFiles.keys), shouldStop: { false })
+check(built != nil, "индекс типов построен")
+let types = built ?? TypeIndex(root: typeRoot)
+let allTypeNames = (0..<types.count).map { types.declaration(Int32($0)).name }.sorted()
+check(allTypeNames == ["Settings", "Settings", "User", "UserRole", "UserService", "UserServiceTests"],
+      "в индексе типы из исходников, без Markdown и огромных файлов (получено \(allTypeNames))")
+
+func findTypes(_ q: String) -> [String] {
+    types.search(q, limit: 50, shouldStop: { false }).map { types.declaration($0.id).name }
+}
+check(findTypes("USvc").first == "UserService", "аббревиатура USvc -> UserService (получено \(findTypes("USvc")))")
+check(findTypes("user").first == "User", "точное имя выигрывает у длинных (получено \(findTypes("user")))")
+check(findTypes("userrole").first == "UserRole", "полное имя в нижнем регистре")
+check(findTypes("").isEmpty, "пустой запрос ничего не находит")
+check(findTypes("zzz").isEmpty, "несовпадающий запрос -> пусто")
+
+// без точки матчится только имя: `app` не цепляется за контейнер App
+check(findTypes("app").isEmpty, "без точки контейнер не участвует (получено \(findTypes("app")))")
+let qualified = types.search("User.Settings", limit: 10, shouldStop: { false })
+check(qualified.first.map { types.declaration($0.id).container } == "User",
+      "запрос с точкой находит вложенный тип по контейнеру")
+if let hit = qualified.first {
+    check(hit.positions == Array(0..<8).map(Int32.init), "позиции подсветки — внутри имени (получено \(hit.positions))")
+}
+let settings = types.search("settings", limit: 10, shouldStop: { false })
+check(settings.count == 2, "одноимённые типы из разных файлов оба в выдаче")
+check(settings.first.map { types.relPath($0.id) } == "src/Ui/Settings.swift",
+      "при равных очках выше тип, названный как его файл")
+
+if let hit = types.search("UserRole", limit: 1, shouldStop: { false }).first {
+    let target = types.target(hit.id)
+    check(target.url.path.hasSuffix("src/Models/UserRole.cs"), "переход ведёт в нужный файл")
+    check(target.range?.start == LSPPosition(line: 0, character: 28)
+          && target.range?.end == LSPPosition(line: 0, character: 36),
+          "переход подсвечивает ровно имя (получено \(String(describing: target.range)))")
+}
+
+// кэш: сериализация туда и обратно
+let restored = TypeIndex.deserialize(types.serialized(), root: typeRoot)
+check(restored?.count == types.count, "кэш типов восстанавливается целиком")
+check(restored.map { r in (0..<r.count).map { r.declaration(Int32($0)) } }
+        == (0..<types.count).map { types.declaration(Int32($0)) },
+      "кэш типов восстанавливается без искажений")
+check(restored?.search("USvc", limit: 1, shouldStop: { false }).first.map { restored!.declaration($0.id).name }
+        == "UserService", "поиск по восстановленному кэшу")
+check(TypeIndex.deserialize("что-то чужое\nF\tx", root: typeRoot) == nil, "чужой формат кэша отвергается")
+check(TypeIndex.deserialize("pilot-types 1\nclass\tA\t\t1\t2\t3", root: typeRoot) == nil,
+      "строка типа без файла отвергается")
+
+check(TypeIndex.build(root: typeRoot, files: Array(typeFiles.keys), shouldStop: { true }) == nil,
+      "прерванное построение не отдаёт половину индекса")
+try? FileManager.default.removeItem(at: typeRoot)
+
+// производительность: 2000 файлов по ~100 строк, в памяти — без диска
+let typeSource = String(repeating: """
+namespace Acme.Module
+{
+    public sealed class Handler\(1) : IHandler
+    {
+        private readonly ILogger _log;
+        public int Retries { get; set; }
+        public void Handle(Request request)
+        {
+            var result = _log.Process(request);
+            if (result == null) throw new InvalidOperationException();
+        }
+    }
+}
+
+""", count: 8)
+let tTypes = Date()
+var typeTotal = 0
+for _ in 0..<2000 { typeTotal += TypeIndex.declarations(in: typeSource, spec: Languages.csharp).count }
+let typesMs = Date().timeIntervalSince(tTypes) * 1000
+print(String(format: "  разбор 2000 файлов на %d строк (один поток): %.0f мс",
+             typeSource.split(separator: "\n").count, typesMs))
+check(typeTotal == 2000 * 8, "в каждом файле найдено ровно 8 типов")
+check(typesMs < 5000, "2000 файлов разбираются быстрее 5 с даже в один поток")
+
+// ─────────────────────────────── ⇧⇧ ───────────────────────────────
+section("Двойной Shift")
+
+/// Прогоняет последовательность событий; возвращает, сколько раз сработало.
+/// `s` — нажат только Shift, `0` — всё отпущено, `k` — обычная клавиша,
+/// `c` — зажат ⌘ (с Shift или без). Время — в секундах.
+func doubleShift(_ events: [(String, Double)]) -> Int {
+    var detector = DoubleShiftDetector()
+    var fired = 0
+    for (event, time) in events {
+        switch event {
+        case "s": if detector.modifiersChanged(shiftOnly: true, none: false, at: time) { fired += 1 }
+        case "0": if detector.modifiersChanged(shiftOnly: false, none: true, at: time) { fired += 1 }
+        case "c": if detector.modifiersChanged(shiftOnly: false, none: false, at: time) { fired += 1 }
+        default:  detector.keyPressed()
+        }
+    }
+    return fired
+}
+check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28)]) == 1, "два быстрых нажатия -> срабатывает")
+check(doubleShift([("s", 0), ("0", 0.08)]) == 0, "одно нажатие -> нет")
+check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.9), ("0", 0.98)]) == 0, "медленно -> нет")
+check(doubleShift([("s", 0), ("0", 0.9), ("s", 1.0), ("0", 1.08)]) == 0, "долгое удержание -> нет")
+check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.8)]) == 0, "второе нажатие удержано -> нет")
+check(doubleShift([("s", 0), ("k", 0.05), ("0", 0.1), ("s", 0.2), ("0", 0.28)]) == 0,
+      "Shift+буква, потом Shift -> нет")
+check(doubleShift([("s", 0), ("0", 0.08), ("k", 0.1), ("s", 0.2), ("0", 0.28)]) == 0,
+      "буква между нажатиями -> нет")
+check(doubleShift([("s", 0), ("c", 0.05), ("0", 0.1), ("s", 0.2), ("0", 0.28)]) == 0,
+      "⌘⇧, потом Shift -> нет")
+check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28), ("s", 0.4), ("0", 0.48)]) == 1,
+      "три нажатия -> срабатывает один раз")
+check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28),
+                   ("s", 0.4), ("0", 0.48), ("s", 0.6), ("0", 0.68)]) == 2,
+      "четыре нажатия -> два раза")
+
 // ────────────────────────── Режимы палитры ──────────────────────────
 section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 4, "режимов палитры четыре")
+check(PaletteMode.allCases.count == 5, "режимов палитры пять")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
 }
 check(!PaletteMode.files.requiresLanguageServer, "поиск файлов не требует LSP")
 check(!PaletteMode.outline.requiresLanguageServer, "структура файла не требует LSP")
+check(!PaletteMode.classes.requiresLanguageServer, "поиск по классам не требует LSP")
 check(PaletteMode.symbols.requiresLanguageServer, "символы проекта требуют LSP")
 check(PaletteMode.references.requiresLanguageServer, "использования требуют LSP")
 
