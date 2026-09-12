@@ -7,6 +7,7 @@ import Foundation
 /// по режимам. Иначе забытая ветка всплывает только при сборке приложения.
 enum PaletteMode: Equatable, CaseIterable {
     case files          // ⌘P  — fuzzy-поиск по именам файлов
+    case classes        // ⇧⇧  — типы всего проекта, лексически, без LSP; следом файлы
     case outline        // ⌘⇧O — структура текущего файла, лексически, без LSP
     case symbols        // ⌘T  — символы проекта, через LSP
     case references     // ⌘R  — использования символа под курсором
@@ -14,6 +15,7 @@ enum PaletteMode: Equatable, CaseIterable {
     var placeholder: String {
         switch self {
         case .files:      return "Перейти к файлу…"
+        case .classes:    return "Класс, интерфейс, структура…"
         case .outline:    return "Метод, свойство, поле…"
         case .symbols:    return "Символ в проекте…"
         case .references: return "Использования"
@@ -23,6 +25,7 @@ enum PaletteMode: Equatable, CaseIterable {
     var icon: String {
         switch self {
         case .files:      return "magnifyingglass"
+        case .classes:    return "cube"
         case .outline:    return "list.bullet.indent"
         case .symbols:    return "number"
         case .references: return "arrow.triangle.branch"
@@ -32,8 +35,8 @@ enum PaletteMode: Equatable, CaseIterable {
     /// Нужен ли для этого режима языковой сервер.
     var requiresLanguageServer: Bool {
         switch self {
-        case .files, .outline:      return false
-        case .symbols, .references: return true
+        case .files, .classes, .outline: return false
+        case .symbols, .references:      return true
         }
     }
 }

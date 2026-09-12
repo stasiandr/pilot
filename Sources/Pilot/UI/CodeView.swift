@@ -258,6 +258,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         NotificationCenter.default.removeObserver(self)
     }
 
+    func focusText() {
+        view.window?.makeFirstResponder(textView)
+    }
+
     func textViewDidChangeSelection(_ notification: Notification) {
         if textView.updateCurrentLineHighlight() { ruler?.needsDisplay = true }
         if let model {
@@ -532,6 +536,7 @@ struct CodeView: NSViewControllerRepresentable {
     let fontSize: CGFloat
     let reveal: Workspace.RevealRequest?
     let occurrences: [NSRange]
+    let focusRequest: Int
     let onCaretChange: (Int) -> Void
     let onGoToDefinition: (Int) -> Void
 
@@ -581,6 +586,12 @@ struct CodeView: NSViewControllerRepresentable {
                 controller.reveal(range: range)
             }
         }
+
+        if focusRequest != context.coordinator.appliedFocus {
+            context.coordinator.appliedFocus = focusRequest
+            // Вьюха могла только что появиться и ещё не попасть в окно.
+            DispatchQueue.main.async { controller.focusText() }
+        }
     }
 
     /// Дешёвая подпись набора вхождений: сравнивать массивы целиком
@@ -600,5 +611,6 @@ struct CodeView: NSViewControllerRepresentable {
         var fontSize: CGFloat = 12.5
         var appliedReveal: Int = -1
         var occurrenceSignature: Int = 0
+        var appliedFocus: Int = 0
     }
 }

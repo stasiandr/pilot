@@ -115,7 +115,7 @@ struct JumpBar: View {
             }
         } label: {
             if let item = workspace.currentOutlineItem {
-                SegmentLabel(badge: item.kind, title: item.name)
+                SegmentLabel(badge: item.kind, keyword: item.keyword, title: item.name)
             } else {
                 SegmentLabel(title: document.outline.isEmpty ? "Нет структуры" : "Нет выделения",
                              dimmed: true)
@@ -139,23 +139,40 @@ struct JumpBar: View {
         Button("Открыть папку…") { workspace.promptForFolder() }
     }
 
+    /// Содержимое папки. Подпапки — подменю, как в Xcode, но только на один
+    /// уровень: SwiftUI строит меню целиком, и рекурсия по большому проекту
+    /// собирала бы тысячи пунктов ради одного клика.
     @ViewBuilder
     private func siblingsMenu(parent: String) -> some View {
-        let siblings = workspace.fileTree?.children(ofDirectory: parent) ?? []
-        ForEach(siblings.prefix(menuLimit), id: \.path) { node in
-            Button {
-                if node.isDirectory {
-                    workspace.revealFolder(node.path)
-                } else if let root = workspace.root {
-                    workspace.navigate(to: NavTarget(url: root.appendingPathComponent(node.path), range: nil))
+        let siblings = workspace.fileTree?.node(at: parent)?.children ?? []
+        ForEach(siblings.prefix(menuLimit), id: \.relPath) { node in
+            if node.isDirectory {
+                Menu {
+                    ForEach(node.children.prefix(menuLimit), id: \.relPath) { child in
+                        if child.isDirectory {
+                            Label(child.name, systemImage: Theme.folderIcon.symbol)
+                        } else {
+                            fileButton(child)
+                        }
+                    }
+                } label: {
+                    Label(node.name, systemImage: Theme.folderIcon.symbol)
                 }
-            } label: {
-                let icon = node.isDirectory ? Theme.folderIcon : Theme.fileIcon(forName: node.name)
-                Label(node.name, systemImage: icon.symbol)
+            } else {
+                fileButton(node)
             }
         }
         if siblings.count > menuLimit {
             Text("… и ещё \(siblings.count - menuLimit)")
+        }
+    }
+
+    private func fileButton(_ node: FileTree.Node) -> some View {
+        Button {
+            guard let root = workspace.root else { return }
+            workspace.navigate(to: NavTarget(url: root.appendingPathComponent(node.relPath), range: nil))
+        } label: {
+            Label(node.name, systemImage: Theme.fileIcon(forName: node.name).symbol)
         }
     }
 }
@@ -165,6 +182,7 @@ struct SegmentLabel: View {
     var symbol: String? = nil
     var color: NSColor = .secondaryLabelColor
     var badge: OutlineKind? = nil
+    var keyword: String? = nil
     let title: String
     var dimmed = false
 
@@ -172,7 +190,7 @@ struct SegmentLabel: View {
         HStack(spacing: 4) {
             Group {
                 if let badge {
-                    SymbolBadge(kind: badge, size: 14)
+                    SymbolBadge(kind: badge, keyword: keyword, size: 14)
                 } else if let symbol {
                     Image(systemName: symbol)
                         .symbolRenderingMode(.hierarchical)

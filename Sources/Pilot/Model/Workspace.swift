@@ -6,6 +6,11 @@ final class Workspace: ObservableObject {
     @Published private(set) var root: URL?
     @Published private(set) var isIndexing = false
     @Published private(set) var fileCount = 0
+    /// Индекс типов строится после индекса файлов и заметно дольше.
+    @Published private(set) var isTypeIndexing = false
+    @Published private(set) var typeCount = 0
+    /// Дерево папок для боковой панели. Строится из того же индекса, что и ⌘P.
+    @Published private(set) var fileTree: FileTree?
     @Published var query = "" { didSet { queryChanged() } }
     @Published private(set) var results: [SearchHit] = []
     @Published private(set) var items: [PaletteItem] = []
@@ -30,6 +35,11 @@ final class Workspace: ObservableObject {
         revealCounter += 1
         reveal = RevealRequest(seq: revealCounter, range: range)
     }
+    /// Просьба перевести фокус клавиатуры в текст; счётчик — по той же причине, что и у reveal.
+    @Published private(set) var editorFocusRequest = 0
+
+    func focusEditor() { editorFocusRequest += 1 }
+
     /// Позиция курсора в открытом документе — отсюда берутся запросы к LSP.
     @Published private(set) var caretOffset: Int = 0
     /// Вхождения идентификатора под курсором — подсвечиваются в тексте.
@@ -72,22 +82,15 @@ final class Workspace: ObservableObject {
     }
 
     @Published var navigatorTab: NavigatorTab = .project
-    @Published private(set) var navigatorRows: [FileTreeRow] = []
-    /// Растёт при каждой пересборке строк: по нему список понимает, что
-    /// перерисовываться пора, не сравнивая тысячи строк.
-    @Published private(set) var navigatorVersion = 0
-    @Published private(set) var navigatorSelection: String?
     /// Фильтр вкладки «Структура» — отдельный, чтобы не сбрасывать дерево.
     @Published var outlineFilter = ""
     @Published var navigatorFilter = "" {
         didSet { if navigatorFilter != oldValue { navigatorFilterChanged() } }
     }
+    /// Дерево только из файлов, подошедших под фильтр навигатора.
+    @Published private(set) var filteredTree: FileTree?
 
-    private(set) var fileTree: FileTreeNode?
-    private var filteredTree: FileTreeNode?
-    private var expandedFolders: Set<String> = [""]
-    private let treeQueue = DispatchQueue(label: "pilot.tree", qos: .userInitiated)
-    private let treeGeneration = AtomicCounter()
+    private let filterQueue = DispatchQueue(label: "pilot.filter", qos: .userInitiated)
     private let filterGeneration = AtomicCounter()
     /// Больше строк фильтр не показывает: дальше человек всё равно уточнит запрос.
     nonisolated static let navigatorFilterLimit = 2000
@@ -98,7 +101,11 @@ final class Workspace: ObservableObject {
     let lsp = LSPService()
 
     private var index: FileIndex?
+    private var typeIndex: TypeIndex?
     private let work = DispatchQueue(label: "pilot.index", qos: .userInitiated)
+    /// Отдельная очередь: на крупном проекте разбор всех исходников — секунды, и на `work`
+    /// он задержал бы и поиск файлов, и открытие файла.
+    private let typeWork = DispatchQueue(label: "pilot.types", qos: .utility)
     private let scanGeneration = AtomicCounter()
     private let searchGeneration = AtomicCounter()
     private let loadGeneration = AtomicCounter()
@@ -106,22 +113,54 @@ final class Workspace: ObservableObject {
     /// Полный список использований; поле ввода фильтрует его на месте.
     private var allReferences: [PaletteItem] = []
 
-    private let recentKey = "pilot.recentRoots"
+    private static let recentKey = "pilot.recentRoots"
 
-    var recentRoots: [URL] {
-        (UserDefaults.standard.array(forKey: recentKey) as? [String] ?? [])
+    /// Недавние проекты, свежие первыми. Папки, которых больше нет
+    /// на диске, отсеиваются при чтении — в список их не выводим.
+    @Published private(set) var recentRoots: [URL] = Workspace.loadRecentRoots()
+
+    private static func loadRecentRoots() -> [URL] {
+        let fm = FileManager.default
+        return (UserDefaults.standard.array(forKey: recentKey) as? [String] ?? [])
+            .filter { fm.fileExists(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
     }
 
     // MARK: - Открытие воркспейса
 
-    func openLastOrPrompt() {
-        if let last = recentRoots.first,
-           FileManager.default.fileExists(atPath: last.path) {
-            open(root: last)
+    /// Старт приложения. Путь из командной строки открывается сразу,
+    /// иначе остаётся стартовый экран с выбором из недавних проектов.
+    func start() {
+        openLaunchTarget()
+    }
+
+    /// Путь из командной строки: `Pilot /path/to/project` или `Pilot /path/File.cs`.
+    /// Для файла корнем проекта становится ближайший git-репозиторий над ним.
+    private func openLaunchTarget() {
+        // macOS может дописать свои аргументы вида `-NSFoo YES` — берём
+        // первый абсолютный путь, который существует на диске.
+        var isDirectory: ObjCBool = false
+        guard let path = CommandLine.arguments.dropFirst().first(where: {
+            $0.hasPrefix("/") && FileManager.default.fileExists(atPath: $0, isDirectory: &isDirectory)
+        }) else { return }
+
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        if isDirectory.boolValue {
+            open(root: url)
         } else {
-            promptForFolder()
+            open(root: Self.projectRoot(containing: url))
+            open(file: url)
         }
+    }
+
+    private static func projectRoot(containing file: URL) -> URL {
+        let fm = FileManager.default
+        var dir = file.deletingLastPathComponent()
+        while dir.path != "/" {
+            if fm.fileExists(atPath: dir.appendingPathComponent(".git").path) { return dir }
+            dir = dir.deletingLastPathComponent()
+        }
+        return file.deletingLastPathComponent()
     }
 
     func promptForFolder() {
@@ -143,156 +182,166 @@ final class Workspace: ObservableObject {
         query = ""
         results = []
         items = []
+        fileTree = nil
         history.removeAll()
         historyIndex = -1
         currentOutlineItem = nil
         branch = GitInfo.branch(at: url)
-        fileTree = nil
-        filteredTree = nil
-        expandedFolders = [""]
-        navigatorSelection = nil
         navigatorFilter = ""
-        _ = treeGeneration.bump()
-        rebuildNavigatorRows()
+        filteredTree = nil
         rememberRecent(url)
         lsp.workspaceChanged(to: url)
 
         let generation = scanGeneration.bump()
         isIndexing = true
+        typeIndex = nil
+        typeCount = 0
+        isTypeIndexing = true
+
+        typeWork.async { [weak self] in
+            guard let cached = IndexCache.loadTypes(root: url) else { return }
+            Task { @MainActor in
+                // Свежий индекс мог успеть раньше — тогда кэш уже не нужен.
+                guard let self, self.scanGeneration.isCurrent(generation),
+                      self.typeIndex == nil else { return }
+                self.adoptTypes(cached, indexing: true)
+            }
+        }
 
         work.async { [weak self] in
             guard let self else { return }
             // 1. Кэш делает повторное открытие проекта мгновенным.
-            if let cached = IndexCache.load(root: url) {
+            let cached = IndexCache.load(root: url)
+            if let cached {
+                let tree = FileTree.build(paths: cached.display)
                 Task { @MainActor in
                     guard self.scanGeneration.isCurrent(generation) else { return }
-                    self.adopt(cached, indexing: true)
+                    self.adopt(cached, tree: tree, indexing: true)
                 }
             }
             // 2. Всё равно пересканируем — кэш мог устареть.
             let counter = self.scanGeneration
             let fresh = FileIndex.build(root: url, shouldStop: { !counter.isCurrent(generation) })
+            guard counter.isCurrent(generation) else { return }
             IndexCache.save(fresh, root: url)
 
+            // Обычно кэш совпадает с диском один в один — тогда дерево
+            // не пересобираем, и панель не перерисовывается впустую.
+            let tree = cached?.display == fresh.display ? nil : FileTree.build(paths: fresh.display)
             Task { @MainActor in
                 guard self.scanGeneration.isCurrent(generation) else { return }
-                self.adopt(fresh, indexing: false)
+                self.adopt(fresh, tree: tree, indexing: false)
+                self.rebuildTypeIndex(files: fresh.display, root: url, generation: generation)
             }
         }
     }
 
-    private func adopt(_ newIndex: FileIndex, indexing: Bool) {
+    /// `tree == nil` — оставить текущее дерево: список файлов не изменился.
+    private func adopt(_ newIndex: FileIndex, tree: FileTree?, indexing: Bool) {
         index = newIndex
         fileCount = newIndex.count
         isIndexing = indexing
+        if let tree { fileTree = tree }
         runFileSearch()
-        buildTree(from: newIndex)
+        runClassSearch()
+        // Индекс сменился — отфильтрованное дерево собрано по старому.
+        if !navigatorFilter.isEmpty { navigatorFilterChanged() }
     }
 
-    // MARK: - Навигатор проекта
-
-    /// Дерево строится в своей очереди, чтобы не задерживать поиск ⌘P,
-    /// который живёт в `work`.
-    private func buildTree(from index: FileIndex) {
-        let generation = treeGeneration.bump()
-        let counter = treeGeneration
-        let rootName = index.root.lastPathComponent
-        treeQueue.async { [weak self] in
-            let tree = FileTreeNode.build(rootName: rootName, paths: index.display)
+    /// Типы разбираются по уже готовому списку файлов — второй раз
+    /// обходить диск незачем.
+    private func rebuildTypeIndex(files: [String], root url: URL, generation: Int) {
+        let counter = scanGeneration
+        typeWork.async { [weak self] in
+            guard let fresh = TypeIndex.build(root: url, files: files,
+                                              shouldStop: { !counter.isCurrent(generation) })
+            else { return }
+            IndexCache.saveTypes(fresh, root: url)
             Task { @MainActor in
                 guard let self, counter.isCurrent(generation) else { return }
-                self.fileTree = tree
-                self.rebuildNavigatorRows()
-                if !self.navigatorFilter.isEmpty { self.navigatorFilterChanged() }
+                self.adoptTypes(fresh, indexing: false)
             }
         }
     }
 
-    private func rebuildNavigatorRows() {
-        if !navigatorFilter.isEmpty {
-            navigatorRows = filteredTree?.flatten(expanded: [], expandAll: true) ?? []
-        } else {
-            navigatorRows = fileTree?.flatten(expanded: expandedFolders) ?? []
-        }
-        navigatorVersion += 1
+    private func adoptTypes(_ newIndex: TypeIndex, indexing: Bool) {
+        typeIndex = newIndex
+        typeCount = newIndex.count
+        isTypeIndexing = indexing
+        runClassSearch()
     }
 
-    func toggleFolder(_ path: String) {
-        guard navigatorFilter.isEmpty else { return }   // в фильтре раскрыто всё
-        if expandedFolders.contains(path) {
-            expandedFolders.remove(path)
-        } else {
-            expandedFolders.insert(path)
-        }
-        rebuildNavigatorRows()
+    /// Путь открытого файла относительно корня — чтобы найти его в дереве.
+    var openFilePath: String? {
+        guard let url = document?.url, let root, url.path.hasPrefix(root.path + "/") else { return nil }
+        return String(url.path.dropFirst(root.path.count + 1))
     }
 
-    func setFolder(_ path: String, expanded: Bool) {
-        guard navigatorFilter.isEmpty, expandedFolders.contains(path) != expanded else { return }
-        toggleFolder(path)
-    }
-
-    /// Клик по строке навигатора: файл открывается, папка раскрывается.
-    func selectInNavigator(_ path: String?) {
-        guard let path, let root else { return }
-        navigatorSelection = path
-        guard let row = navigatorRows.first(where: { $0.id == path }) else { return }
-        if row.node.isDirectory { return }
-        let url = root.appendingPathComponent(path)
-        guard document?.url != url else { return }
-        navigate(to: NavTarget(url: url, range: nil))
-    }
-
-    /// Открытый файл подсвечивается в дереве, а его папки раскрываются.
-    private func revealInNavigator(_ url: URL) {
-        guard let root, url.path.hasPrefix(root.path + "/") else { return }
-        let path = relativePath(for: url)
-        navigatorSelection = path
-        guard navigatorFilter.isEmpty else { return }
-        let missing = FileTreeNode.ancestors(of: path).filter { !expandedFolders.contains($0) }
-        if !missing.isEmpty {
-            expandedFolders.formUnion(missing)
-            rebuildNavigatorRows()
-        }
-    }
-
-    /// Показать папку в дереве — из меню jump bar.
-    func revealFolder(_ path: String) {
-        navigatorTab = .project
+    /// Назад на стартовый экран. Индексация и языковой сервер
+    /// старого проекта останавливаются.
+    func closeProject() {
+        // Новое поколение отменяет обход ФС и загрузку файла, что ещё идут.
+        _ = scanGeneration.bump()
+        _ = loadGeneration.bump()
+        lsp.workspaceChanged(to: nil)
+        root = nil
+        index = nil
+        fileTree = nil
+        document = nil
+        loadError = nil
+        isIndexing = false
+        fileCount = 0
+        isPaletteOpen = false
+        query = ""
+        results = []
+        items = []
+        occurrences = []
+        breadcrumb = ""
+        currentOutlineItem = nil
+        branch = nil
         navigatorFilter = ""
-        expandedFolders.formUnion(FileTreeNode.ancestors(of: path))
-        expandedFolders.insert(path)
-        navigatorSelection = path
-        rebuildNavigatorRows()
+        filteredTree = nil
+        history.removeAll()
+        historyIndex = -1
     }
 
+    // MARK: - Фильтр навигатора
+
+    /// Как фильтр навигатора Xcode: подстрока в имени файла. Под фильтр
+    /// собирается своё маленькое дерево — его панель показывает раскрытым.
     private func navigatorFilterChanged() {
         let needle = navigatorFilter.trimmingCharacters(in: .whitespaces)
         let generation = filterGeneration.bump()
         guard !needle.isEmpty, let index else {
             filteredTree = nil
-            rebuildNavigatorRows()
             return
         }
         let counter = filterGeneration
-        let rootName = index.root.lastPathComponent
-        treeQueue.async { [weak self] in
+        filterQueue.async { [weak self] in
             let ids = index.filter(name: needle, limit: Self.navigatorFilterLimit,
                                    shouldStop: { !counter.isCurrent(generation) })
-            let tree = FileTreeNode.build(rootName: rootName, paths: ids.map { index.relPath($0) })
+            let tree = FileTree.build(paths: ids.map { index.relPath($0) })
             Task { @MainActor in
                 guard let self, counter.isCurrent(generation) else { return }
                 self.filteredTree = tree
-                self.rebuildNavigatorRows()
             }
         }
     }
 
     private func rememberRecent(_ url: URL) {
-        var list = recentRoots.map(\.path).filter { $0 != url.path }
-        list.insert(url.path, at: 0)
+        var list = recentRoots.filter { $0.path != url.path }
+        list.insert(url, at: 0)
         if list.count > 10 { list.removeSubrange(10...) }
-        UserDefaults.standard.set(list, forKey: recentKey)
+        saveRecent(list)
+    }
+
+    func forgetRecent(_ url: URL) {
+        saveRecent(recentRoots.filter { $0.path != url.path })
+    }
+
+    private func saveRecent(_ list: [URL]) {
+        recentRoots = list
+        UserDefaults.standard.set(list.map(\.path), forKey: Self.recentKey)
     }
 
     // MARK: - Палитра
@@ -304,16 +353,24 @@ final class Workspace: ObservableObject {
         isPaletteOpen = true
         switch mode {
         case .files:      runFileSearch()
+        case .classes:    runClassSearch()
         case .symbols:    runSymbolSearch()
         case .outline:    buildOutlineItems()
         case .references: break   // наполняется через findReferences()
         }
     }
 
+    /// ⇧⇧. Повторное ⇧⇧ при уже открытом поиске не стирает набранное.
+    func openClassSearch() {
+        if isPaletteOpen && paletteMode == .classes { return }
+        openPalette(mode: .classes)
+    }
+
     private func queryChanged() {
         selection = 0
         switch paletteMode {
         case .files:      runFileSearch()
+        case .classes:    runClassSearch()
         case .symbols:    runSymbolSearch()
         case .references: filterReferences()
         case .outline:    buildOutlineItems()
@@ -493,6 +550,80 @@ final class Workspace: ObservableObject {
                         positions: hit.positions,
                         target: NavTarget(url: index.absoluteURL(hit.id), range: nil))
                 }
+                if self.selection >= self.items.count {
+                    self.selection = max(0, self.items.count - 1)
+                }
+            }
+        }
+    }
+
+    // MARK: - Поиск по классам
+    //
+    // В основном — типы проекта из лексического индекса. Под ними несколько
+    // файлов: если искомое оказалось не классом, а конфигом или README,
+    // не нужно переключаться на ⌘P. Пока индекс типов строится впервые,
+    // эти файлы — вообще всё, что есть.
+
+    private func runClassSearch() {
+        guard paletteMode == .classes else { return }
+        let generation = searchGeneration.bump()
+        let counter = searchGeneration
+        let q = query
+        guard !q.trimmingCharacters(in: .whitespaces).isEmpty else {
+            items = []
+            return
+        }
+        let types = typeIndex
+        let files = index
+
+        work.async { [weak self] in
+            let stop = { !counter.isCurrent(generation) }
+            let typeHits = types?.search(q, limit: 150, shouldStop: stop) ?? []
+            // Файл, где объявлен уже найденный тип, — повтор той же строки.
+            let typeFiles = Set(typeHits.lazy.compactMap { types?.relPath($0.id) })
+            var fileHits: [SearchHit] = []
+            if let files {
+                fileHits = Array(files.search(q, limit: 30, shouldStop: stop)
+                    .filter { !typeFiles.contains(files.relPath($0.id)) }
+                    .prefix(10))
+            }
+
+            Task { @MainActor in
+                guard let self, counter.isCurrent(generation), self.paletteMode == .classes else { return }
+                var built: [PaletteItem] = []
+                built.reserveCapacity(typeHits.count + fileHits.count)
+                if let types {
+                    for hit in typeHits {
+                        let declaration = types.declaration(hit.id)
+                        let path = types.relPath(hit.id)
+                        var secondary = path
+                        if let container = declaration.container, !container.isEmpty {
+                            secondary = "\(container) · \(path)"
+                        }
+                        built.append(PaletteItem(
+                            id: built.count,
+                            icon: TypeIndex.icon(forKeyword: declaration.keyword),
+                            primary: declaration.name,
+                            positions: hit.positions,
+                            secondary: secondary,
+                            trailing: declaration.keyword,
+                            target: types.target(hit.id)))
+                    }
+                }
+                if let files {
+                    for hit in fileHits {
+                        let path = files.relPath(hit.id)
+                        built.append(PaletteItem(
+                            id: built.count,
+                            icon: Self.icon(forPath: path),
+                            primary: path,
+                            nameOffset: files.nameOffset(hit.id),
+                            positions: hit.positions,
+                            trailing: "file",
+                            target: NavTarget(url: files.absoluteURL(hit.id), range: nil)))
+                    }
+                }
+                self.items = built
                 if self.selection >= self.items.count {
                     self.selection = max(0, self.items.count - 1)
                 }
@@ -711,7 +842,6 @@ final class Workspace: ObservableObject {
                     self.occurrenceWord = nil
                     self.breadcrumb = ""
                     self.currentOutlineItem = nil
-                    self.revealInNavigator(url)
                     self.requestReveal(reveal)
                     // Сервер поднимается здесь — лениво, при первом файле
                     // подходящего языка, а не при запуске приложения.
@@ -763,11 +893,11 @@ enum IndexCache {
         return dir
     }
 
-    private static func fileURL(root: URL) -> URL? {
+    private static func fileURL(root: URL, extension ext: String = "idx") -> URL? {
         guard let dir = directory else { return nil }
         var hash: UInt64 = 0xcbf29ce484222325
         for b in root.path.utf8 { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
-        return dir.appendingPathComponent(String(format: "%016llx.idx", hash))
+        return dir.appendingPathComponent(String(format: "%016llx.", hash) + ext)
     }
 
     static func save(_ index: FileIndex, root: URL) {
@@ -787,5 +917,19 @@ enum IndexCache {
             index.appendCached(rel: String(line))
         }
         return index.count > 0 ? index : nil
+    }
+
+    // Типы лежат рядом, в соседнем файле с тем же хэшем.
+
+    static func saveTypes(_ index: TypeIndex, root: URL) {
+        guard let url = fileURL(root: root, extension: "types") else { return }
+        try? index.serialized().data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
+    static func loadTypes(root: URL) -> TypeIndex? {
+        guard let url = fileURL(root: root, extension: "types"),
+              let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        return TypeIndex.deserialize(text, root: root)
     }
 }

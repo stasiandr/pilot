@@ -1,111 +1,106 @@
 import Foundation
 
-/// Дерево файлов для навигатора.
+/// Дерево папок для боковой панели.
 ///
-/// Строится из плоского списка путей индекса — в фоне, одним проходом.
-/// Дети каждой папки сортируются лениво, при первом раскрытии: на проекте
-/// в 100 000 файлов сортировать всё дерево заранее незачем, человек
-/// раскроет от силы пару десятков папок.
+/// Строится из уже готового индекса, а не отдельным обходом диска: так
+/// в дереве ровно те файлы, что находит ⌘P, с тем же `.gitignore`.
+/// Пустых папок в индексе нет — нет их и здесь.
 ///
-/// После передачи на главный поток дерево трогает только он (ленивая
-/// сортировка мутирует узел), отсюда @unchecked Sendable.
-final class FileTreeNode: @unchecked Sendable {
-    let name: String
-    /// Путь относительно корня; у корня — пустая строка. Он же id строки.
-    let path: String
-    let isDirectory: Bool
+/// Узлы — классы: NSOutlineView различает элементы по идентичности объекта.
+final class FileTree: @unchecked Sendable {
 
-    private var children: [FileTreeNode] = []
-    /// Только у папок и только для сборки: быстрый поиск подпапки по имени.
-    private var subdirectories: [String: FileTreeNode] = [:]
-    private var isSorted = false
+    final class Node: @unchecked Sendable {
+        let name: String
+        /// Путь от корня проекта; у корня — пустая строка.
+        let relPath: String
+        let isDirectory: Bool
+        /// Папки впереди, внутри групп — «естественный» порядок Finder'а:
+        /// `file2` раньше `file10`.
+        fileprivate(set) var children: [Node] = []
+        fileprivate(set) weak var parent: Node?
 
-    init(name: String, path: String, isDirectory: Bool) {
-        self.name = name
-        self.path = path
-        self.isDirectory = isDirectory
-    }
-
-    static func build<S: Sequence>(rootName: String, paths: S) -> FileTreeNode where S.Element == String {
-        let root = FileTreeNode(name: rootName, path: "", isDirectory: true)
-        for path in paths { root.insert(path) }
-        return root
-    }
-
-    private func insert(_ path: String) {
-        var node = self
-        var start = path.startIndex
-        while let slash = path[start...].firstIndex(of: "/") {
-            node = node.subdirectory(named: String(path[start..<slash]),
-                                     path: String(path[..<slash]))
-            start = path.index(after: slash)
+        fileprivate init(name: String, relPath: String, isDirectory: Bool, parent: Node?) {
+            self.name = name
+            self.relPath = relPath
+            self.isDirectory = isDirectory
+            self.parent = parent
         }
-        node.children.append(FileTreeNode(name: String(path[start...]), path: path, isDirectory: false))
-    }
 
-    private func subdirectory(named name: String, path: String) -> FileTreeNode {
-        if let existing = subdirectories[name] { return existing }
-        let dir = FileTreeNode(name: name, path: path, isDirectory: true)
-        subdirectories[name] = dir
-        children.append(dir)
-        return dir
-    }
-
-    /// Сначала папки, затем файлы; внутри — «человеческий» порядок,
-    /// как в Finder: file2 раньше file10.
-    var sortedChildren: [FileTreeNode] {
-        if !isSorted {
-            children.sort { a, b in
-                if a.isDirectory != b.isDirectory { return a.isDirectory }
-                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        /// Цепочка папок от корня (не включая его) до самого узла.
+        var ancestors: [Node] {
+            var chain: [Node] = []
+            var current = parent
+            while let node = current, node.parent != nil {
+                chain.append(node)
+                current = node.parent
             }
-            isSorted = true
+            return chain.reversed()
         }
-        return children
     }
 
-    /// Строки навигатора в порядке показа: сам узел и содержимое раскрытых
-    /// папок. `expandAll` — для отфильтрованного дерева, где видно всё.
-    func flatten(expanded: Set<String>, expandAll: Bool = false) -> [FileTreeRow] {
-        var rows: [FileTreeRow] = []
-        func visit(_ node: FileTreeNode, depth: Int) {
-            let isOpen = node.isDirectory && (expandAll || expanded.contains(node.path))
-            rows.append(FileTreeRow(node: node, depth: depth, isExpanded: isOpen))
-            guard isOpen else { return }
-            for child in node.sortedChildren { visit(child, depth: depth + 1) }
-        }
-        visit(self, depth: 0)
-        return rows
+    let root: Node
+    let fileCount: Int
+    /// Быстрый поиск узла по пути — чтобы подсветить в дереве открытый файл.
+    private let lookup: [String: Node]
+
+    private init(root: Node, fileCount: Int, lookup: [String: Node]) {
+        self.root = root
+        self.fileCount = fileCount
+        self.lookup = lookup
     }
 
-    /// Папки, которые надо раскрыть, чтобы файл стал виден:
-    /// "a/b/c.swift" → ["", "a", "a/b"].
-    static func ancestors(of path: String) -> [String] {
-        var result = [""]
-        var index = path.startIndex
-        while let slash = path[index...].firstIndex(of: "/") {
-            result.append(String(path[..<slash]))
-            index = path.index(after: slash)
-        }
-        return result
-    }
+    func node(at relPath: String) -> Node? { lookup[relPath] }
 
-    /// Непосредственное содержимое папки по пути — для меню jump bar.
-    func children(ofDirectory dirPath: String) -> [FileTreeNode] {
-        var node = self
-        if !dirPath.isEmpty {
-            for part in dirPath.split(separator: "/") {
-                guard let next = node.subdirectories[String(part)] else { return [] }
-                node = next
+    /// Пути — относительные, через `/`, как в `FileIndex.display`.
+    /// Синхронно; на 100 000 файлов — десятки миллисекунд, поэтому вызывать вне главного потока.
+    static func build(paths: [String]) -> FileTree {
+        let root = Node(name: "", relPath: "", isDirectory: true, parent: nil)
+        var lookup: [String: Node] = ["": root]
+        lookup.reserveCapacity(paths.count + paths.count / 4)
+        var fileCount = 0
+
+        for path in paths {
+            guard !path.isEmpty, lookup[path] == nil else { continue }
+
+            // Поднимаемся от файла к ближайшей уже существующей папке,
+            // затем создаём недостающие звенья сверху вниз.
+            var missing: [Substring] = []
+            var cursor = Substring(path)
+            var parent = root
+            while let slash = cursor.lastIndex(of: "/") {
+                cursor = cursor[..<slash]
+                if let existing = lookup[String(cursor)] {
+                    parent = existing
+                    break
+                }
+                missing.append(cursor)
             }
-        }
-        return node.sortedChildren
-    }
-}
+            for dirPath in missing.reversed() {
+                let name = dirPath.lastIndex(of: "/").map { dirPath[dirPath.index(after: $0)...] } ?? dirPath
+                let dir = Node(name: String(name), relPath: String(dirPath), isDirectory: true, parent: parent)
+                parent.children.append(dir)
+                lookup[dir.relPath] = dir
+                parent = dir
+            }
 
-struct FileTreeRow: Identifiable {
-    let node: FileTreeNode
-    let depth: Int
-    let isExpanded: Bool
-    var id: String { node.path }
+            let name = path.lastIndex(of: "/").map { path[path.index(after: $0)...] } ?? Substring(path)
+            let file = Node(name: String(name), relPath: path, isDirectory: false, parent: parent)
+            parent.children.append(file)
+            lookup[path] = file
+            fileCount += 1
+        }
+
+        sortRecursively(root)
+        return FileTree(root: root, fileCount: fileCount, lookup: lookup)
+    }
+
+    private static func sortRecursively(_ node: Node) {
+        node.children.sort { a, b in
+            if a.isDirectory != b.isDirectory { return a.isDirectory }
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
+        for child in node.children where child.isDirectory {
+            sortRecursively(child)
+        }
+    }
 }

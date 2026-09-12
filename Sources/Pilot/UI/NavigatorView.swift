@@ -15,27 +15,45 @@ struct NavigatorView: View {
             }
     }
 
-    @ViewBuilder
+    /// Дерево проекта не пересоздаётся при переключении вкладок — оно
+    /// только прячется: иначе раскрытые папки забывались бы.
     private var content: some View {
-        switch workspace.navigatorTab {
-        case .project:
-            if workspace.root == nil {
-                placeholder("Папка не открыта")
-            } else if workspace.navigatorRows.isEmpty {
-                placeholder(workspace.navigatorFilter.isEmpty ? "Индексация…" : "Ничего не найдено")
-            } else {
-                FileTreeList(rows: workspace.navigatorRows,
-                             version: workspace.navigatorVersion,
-                             selection: workspace.navigatorSelection,
-                             onSelect: { workspace.selectInNavigator($0) },
-                             onToggle: { workspace.toggleFolder($0) },
-                             onSetExpanded: { workspace.setFolder($0, expanded: $1) })
-                    .equatable()
+        ZStack {
+            projectTree
+                .opacity(workspace.navigatorTab == .project ? 1 : 0)
+                .allowsHitTesting(workspace.navigatorTab == .project)
+                .accessibilityHidden(workspace.navigatorTab != .project)
+            switch workspace.navigatorTab {
+            case .project: EmptyView()
+            case .outline: OutlineList(workspace: workspace)
+            case .recent:  RecentList(workspace: workspace)
             }
-        case .outline:
-            OutlineList(workspace: workspace)
-        case .recent:
-            RecentList(workspace: workspace)
+        }
+    }
+
+    @ViewBuilder
+    private var projectTree: some View {
+        if workspace.fileTree == nil {
+            placeholder(workspace.root == nil ? "Папка не открыта" : "Индексация…")
+        } else {
+            // Пока отфильтрованное дерево собирается, показываем полное,
+            // но не раскрываем его целиком — на 100 000 файлов это дорого.
+            let filtering = !workspace.navigatorFilter.isEmpty && workspace.filteredTree != nil
+            FileTreeView(tree: filtering ? workspace.filteredTree : workspace.fileTree,
+                         selectedPath: workspace.openFilePath,
+                         root: workspace.root,
+                         expandAll: filtering,
+                         onOpen: { relPath, focusEditor in
+                             guard let root = workspace.root else { return }
+                             workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),
+                                                              range: nil))
+                             if focusEditor { workspace.focusEditor() }
+                         })
+                .overlay {
+                    if filtering, workspace.filteredTree?.fileCount == 0 {
+                        placeholder("Ничего не найдено")
+                    }
+                }
         }
     }
 
@@ -117,110 +135,6 @@ struct NavigatorView: View {
     }
 }
 
-// MARK: - Дерево файлов
-
-/// Список отдельным Equatable-видом: воркспейс публикует изменения на каждое
-/// движение курсора, а сравнивать тысячи строк дерева на каждое — зря.
-/// Перерисовка — только когда сменилась версия строк или выделение.
-struct FileTreeList: View, Equatable {
-    let rows: [FileTreeRow]
-    let version: Int
-    let selection: String?
-    let onSelect: (String?) -> Void
-    let onToggle: (String) -> Void
-    let onSetExpanded: (String, Bool) -> Void
-
-    static func == (a: FileTreeList, b: FileTreeList) -> Bool {
-        a.version == b.version && a.selection == b.selection
-    }
-
-    var body: some View {
-        ScrollViewReader { proxy in
-            List(selection: Binding(get: { selection }, set: { onSelect($0) })) {
-                ForEach(rows) { row in
-                    FileTreeRowView(row: row, onToggle: onToggle)
-                        .tag(row.id)
-                        .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-                }
-            }
-            .listStyle(.sidebar)
-            .environment(\.sidebarRowSize, .small)
-            .onChange(of: selection) { _, new in
-                guard let new else { return }
-                proxy.scrollTo(new)
-            }
-            .onKeyPress(.leftArrow) { expand(false) }
-            .onKeyPress(.rightArrow) { expand(true) }
-        }
-    }
-
-    /// ← и → сворачивают и раскрывают выбранную папку, как в Finder.
-    private func expand(_ open: Bool) -> KeyPress.Result {
-        guard let selection, let row = rows.first(where: { $0.id == selection }),
-              row.node.isDirectory, row.isExpanded != open else { return .ignored }
-        onSetExpanded(selection, open)
-        return .handled
-    }
-}
-
-struct FileTreeRowView: View {
-    let row: FileTreeRow
-    let onToggle: (String) -> Void
-
-    var body: some View {
-        HStack(spacing: 5) {
-            disclosure
-            icon
-            Text(row.node.name)
-                .font(.system(size: 13, weight: row.depth == 0 ? .semibold : .regular))
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        .padding(.leading, CGFloat(max(0, row.depth - 1)) * 14)
-        .contentShape(Rectangle())
-        // simultaneous — чтобы одиночный клик выделял строку сразу,
-        // а не ждал, не окажется ли он двойным.
-        .simultaneousGesture(TapGesture(count: 2).onEnded {
-            if row.node.isDirectory { onToggle(row.id) }
-        })
-    }
-
-    @ViewBuilder
-    private var disclosure: some View {
-        if row.node.isDirectory {
-            Button { onToggle(row.id) } label: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.secondary)
-                    .rotationEffect(.degrees(row.isExpanded ? 90 : 0))
-                    .frame(width: 12, height: 16)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-        } else {
-            Color.clear.frame(width: 12, height: 16)
-        }
-    }
-
-    @ViewBuilder
-    private var icon: some View {
-        if row.depth == 0 {
-            // Корень проекта — синяя «папка-проект», как у Xcode.
-            Image(systemName: "folder.fill.badge.gearshape")
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(Color(nsColor: Theme.folderIcon.color))
-                .font(.system(size: 13))
-                .frame(width: 18)
-        } else {
-            let icon = row.node.isDirectory ? Theme.folderIcon : Theme.fileIcon(forName: row.node.name)
-            Image(systemName: icon.symbol)
-                .foregroundStyle(Color(nsColor: icon.color))
-                .font(.system(size: 12))
-                .frame(width: 18)
-        }
-    }
-}
-
 // MARK: - Структура файла
 
 struct OutlineList: View {
@@ -283,7 +197,7 @@ struct OutlineRowView: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            SymbolBadge(kind: item.kind)
+            SymbolBadge(kind: item.kind, keyword: item.keyword)
             Text(item.name)
                 .font(.system(size: 13))
                 .lineLimit(1)
@@ -295,12 +209,14 @@ struct OutlineRowView: View {
 /// Буква в цветном квадратике — символы в Xcode помечены так же.
 struct SymbolBadge: View {
     let kind: OutlineKind
+    var keyword: String? = nil
     var size: CGFloat = 16
 
     var body: some View {
-        let badge = Theme.badge(for: kind)
+        let badge = Theme.badge(for: kind, keyword: keyword)
         Text(badge.letter)
-            .font(.system(size: size * 0.62, weight: .bold, design: .rounded))
+            .font(.system(size: size * (badge.letter.count > 1 ? 0.5 : 0.62),
+                          weight: .bold, design: .rounded))
             .foregroundStyle(Color(nsColor: Theme.badgeText))
             .frame(width: size, height: size)
             .background(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)

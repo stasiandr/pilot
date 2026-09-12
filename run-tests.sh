@@ -1,5 +1,6 @@
 #!/bin/bash
-# Тесты алгоритмического ядра: индекс, fuzzy-поиск, .gitignore, лексер.
+# Тесты алгоритмического ядра: индекс файлов и типов, дерево файлов, fuzzy-поиск,
+# .gitignore, лексер, распознавание ⇧⇧.
 # AppKit здесь не нужен, поэтому они гоняются и на macOS, и на Linux.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -8,7 +9,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/Sources/coretests"
-cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Highlight/{Language,Lexer,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient}.swift "$TMP/Sources/coretests/"
 cp CoreTests/CoreTests.swift "$TMP/Sources/coretests/main.swift"

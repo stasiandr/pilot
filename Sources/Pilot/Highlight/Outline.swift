@@ -41,6 +41,9 @@ struct OutlineItem: Identifiable {
     var line: Int
     var depth: Int
     var container: String?
+    /// Ключевое слово, которым введено объявление: `class`, `struct`, `func`.
+    /// У методов C-подобных языков его нет.
+    var keyword: String? = nil
 }
 
 /// Как в этом языке опознаётся объявление.
@@ -109,7 +112,7 @@ enum OutlineBuilder {
             }
         }
 
-        func record(_ nameToken: Token, kind: OutlineKind, opensScope: Bool) {
+        func record(_ nameToken: Token, kind: OutlineKind, opensScope: Bool, keyword: String? = nil) {
             let name = text(nameToken)
             guard !name.isEmpty else { return }
             let line = model.line(containing: Int(nameToken.start))
@@ -122,7 +125,8 @@ enum OutlineBuilder {
                 range: NSRange(location: Int(nameToken.start), length: Int(nameToken.length)),
                 line: line,
                 depth: depth,
-                container: scopes.last?.name))
+                container: scopes.last?.name,
+                keyword: keyword))
 
             if opensScope { scopes.append((name, braceDepth)) }
         }
@@ -170,26 +174,51 @@ enum OutlineBuilder {
             let word = text(token)
 
             // --- объявления, вводимые ключевым словом ---
-            if let kind = spec.declarationKeywords[word] {
+            if var kind = spec.declarationKeywords[word] {
                 guard let nameIndex = nextMeaningful(after: i) else { i += 1; continue }
                 var nameToken = tokens[nameIndex]
+                var keyword = word
 
                 // Swift: `init` — само по себе имя; C#: `record class Foo`.
                 if kind == .initializer {
-                    record(token, kind: .initializer, opensScope: false)
+                    record(token, kind: .initializer, opensScope: false, keyword: word)
                     pendingBody = true
                     i += 1
                     continue
                 }
-                // Пропускаем вторичное ключевое слово: `record class Foo`, `open class Bar`
-                if nameToken.kind == .keyword, spec.declarationKeywords[text(nameToken)] != nil,
+                // Пропускаем вторичное ключевое слово: `record class Foo`, `enum class Bar`.
+                // Что объявлено, решает второе слово: Swift-овый `class func foo` —
+                // метод, а не класс `foo`, а `const enum Foo` в TS — тип.
+                // Если оба слова типовые, оставляем первое: оно точнее.
+                var nameAt = nameIndex
+                if nameToken.kind == .keyword, let secondary = spec.declarationKeywords[text(nameToken)],
                    let after = nextMeaningful(after: nameIndex) {
+                    if !(kind == .type && secondary == .type) {
+                        kind = secondary
+                        keyword = text(nameToken)
+                    }
                     nameToken = tokens[after]
+                    nameAt = after
                 }
                 guard isIdentifierLike(nameToken) else { i += 1; continue }
 
+                // `namespace Acme.Billing`, `package com.acme.billing` — имя целиком,
+                // а не только первый сегмент: лексер режет его по точкам.
+                if kind == .namespace {
+                    var j = nameAt
+                    while j + 2 < tokens.count {
+                        let dot = tokens[j + 1], part = tokens[j + 2]
+                        guard dot.length == 1, units[Int(dot.start)] == 0x2E,
+                              dot.start == tokens[j].start + tokens[j].length,
+                              part.start == dot.start + 1, isIdentifierLike(part) else { break }
+                        j += 2
+                    }
+                    let last = tokens[j]
+                    nameToken.length = last.start + last.length - nameToken.start
+                }
+
                 let opensScope = (kind == .type || kind == .namespace)
-                record(nameToken, kind: kind, opensScope: opensScope)
+                record(nameToken, kind: kind, opensScope: opensScope, keyword: keyword)
                 pendingBody = (kind == .method || kind == .function || kind == .property)
                 i += 1
                 continue

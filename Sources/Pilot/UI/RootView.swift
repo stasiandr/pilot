@@ -6,11 +6,14 @@ import AppKit
 /// активности посередине.
 struct RootView: View {
     @ObservedObject var workspace: Workspace
+    @State private var doubleShift: DoubleShiftMonitor?
+    /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
+    @AppStorage("pilot.showsSidebar") private var showsSidebar = true
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: columnVisibility) {
             NavigatorView(workspace: workspace)
-                .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 440)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 480)
         } detail: {
             detail
                 .toolbar { toolbar }
@@ -21,6 +24,17 @@ struct RootView: View {
             if workspace.isPaletteOpen { paletteOverlay }
         }
         .frame(minWidth: 860, minHeight: 520)
+        .onAppear {
+            doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
+        }
+    }
+
+    /// На стартовом экране навигатору показывать нечего — панель прячется,
+    /// но выбор пользователя не трогаем: откроется проект — вернётся.
+    private var columnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { showsSidebar && workspace.root != nil ? .all : .detailOnly },
+            set: { if workspace.root != nil { showsSidebar = $0 != .detailOnly } })
     }
 
     // MARK: - Редактор
@@ -47,10 +61,11 @@ struct RootView: View {
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
+                     focusRequest: workspace.editorFocusRequest,
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) })
         } else if workspace.root == nil {
-            welcome
+            StartView(workspace: workspace)
         } else {
             noEditor
         }
@@ -78,8 +93,9 @@ struct RootView: View {
                 .foregroundStyle(.tertiary)
             VStack(alignment: .leading, spacing: 8) {
                 shortcutHint(["⌘", "P"], "Перейти к файлу")
+                shortcutHint(["⇧", "⇧"], "Найти класс")
                 shortcutHint(["⌘", "⇧", "O"], "Структура файла")
-                shortcutHint(["⌘", "O"], "Открыть папку")
+                shortcutHint(["⌘", "⇧", "W"], "Закрыть проект")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -88,7 +104,7 @@ struct RootView: View {
     private func shortcutHint(_ keys: [String], _ title: String) -> some View {
         HStack(spacing: 10) {
             HStack(spacing: 3) {
-                ForEach(keys, id: \.self) { key in
+                ForEach(Array(keys.enumerated()), id: \.offset) { _, key in
                     Text(key)
                         .font(.system(size: 11, weight: .medium, design: .rounded))
                         .frame(minWidth: 20, minHeight: 20)
@@ -100,81 +116,6 @@ struct RootView: View {
             Text(title).font(.system(size: 12))
         }
         .foregroundStyle(.secondary)
-    }
-
-    // MARK: - Стартовый экран
-
-    /// По мотивам окна «Welcome to Xcode»: слева иконка и главное действие,
-    /// справа недавние проекты — всё на одной стеклянной панели.
-    private var welcome: some View {
-        HStack(spacing: 0) {
-            VStack(spacing: 20) {
-                appIcon
-                VStack(spacing: 5) {
-                    Text("Pilot").font(.system(size: 30, weight: .bold))
-                    Text("Мгновенный просмотрщик кода")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                }
-                Button {
-                    workspace.promptForFolder()
-                } label: {
-                    Label("Открыть папку…", systemImage: "folder")
-                        .frame(minWidth: 180)
-                }
-                .pilotGlassButton(prominent: true)
-                .controlSize(.large)
-                .keyboardShortcut("o", modifiers: .command)
-            }
-            .frame(maxWidth: .infinity)
-
-            if !workspace.recentRoots.isEmpty {
-                recentProjects
-            }
-        }
-        .padding(24)
-        .frame(width: workspace.recentRoots.isEmpty ? 380 : 700, height: 380)
-        .pilotGlass(cornerRadius: 30)
-        .shadow(color: .black.opacity(0.35), radius: 30, y: 14)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var appIcon: some View {
-        RoundedRectangle(cornerRadius: 22, style: .continuous)
-            .fill(LinearGradient(colors: [Color(red: 0.54, green: 0.68, blue: 0.96),
-                                          Color(red: 0.78, green: 0.63, blue: 0.96)],
-                                 startPoint: .topLeading, endPoint: .bottomTrailing))
-            .frame(width: 96, height: 96)
-            .overlay {
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 46, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(.white.opacity(0.35), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.3), radius: 12, y: 6)
-    }
-
-    private var recentProjects: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Недавние")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 10)
-                .padding(.bottom, 4)
-            ForEach(workspace.recentRoots.prefix(6), id: \.path) { url in
-                RecentProjectRow(url: url) { workspace.open(root: url) }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(10)
-        .frame(width: 300)
-        .frame(maxHeight: .infinity)
-        .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
-            .fill(Color.black.opacity(0.18)))
     }
 
     // MARK: - Тулбар
@@ -208,9 +149,11 @@ struct RootView: View {
     /// Как в Xcode: иконка ветки, под именем проекта — текущая ветка.
     private var titleView: some View {
         HStack(spacing: 8) {
-            Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.secondary)
+            if workspace.branch != nil {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
             VStack(alignment: .leading, spacing: 0) {
                 Text(workspace.root?.lastPathComponent ?? "Pilot")
                     .font(.system(size: 13, weight: .semibold))
@@ -374,43 +317,5 @@ struct ActivityView: View {
 
     private var divider: some View {
         Text("|").foregroundStyle(.quaternary)
-    }
-}
-
-// MARK: - Недавний проект на стартовом экране
-
-struct RecentProjectRow: View {
-    let url: URL
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 20))
-                    .foregroundStyle(Color(nsColor: Theme.folderIcon.color))
-                    .frame(width: 26)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(url.lastPathComponent)
-                        .font(.system(size: 13, weight: .semibold))
-                        .lineLimit(1)
-                    Text(url.deletingLastPathComponent().path
-                            .replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(hovering ? 0.08 : 0)))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
     }
 }

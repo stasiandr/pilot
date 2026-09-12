@@ -119,6 +119,24 @@ enum Theme {
         }
     }
 
+    /// У типов буква — по ключевому слову, как в Xcode: S — struct,
+    /// E — enum, Pr — протокол. Без ключевого слова — по виду объявления.
+    static func badge(for kind: OutlineKind, keyword: String?) -> (letter: String, color: NSColor) {
+        if kind == .type, let keyword {
+            switch keyword {
+            case "struct":            return ("S", Macchiato.mauve)
+            case "enum":              return ("E", Macchiato.mauve)
+            case "record":            return ("R", Macchiato.mauve)
+            case "protocol":          return ("Pr", Macchiato.lavender)
+            case "interface":         return ("I", Macchiato.lavender)
+            case "trait":             return ("T", Macchiato.lavender)
+            case "extension", "impl": return ("Ex", Macchiato.overlay2)
+            default: break
+            }
+        }
+        return badge(for: kind)
+    }
+
     static var badgeText: NSColor { Macchiato.crust }
 
     /// «1 файл», «3 файла», «7 055 файлов».
