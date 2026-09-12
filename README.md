@@ -10,9 +10,14 @@
 Нужны только Command Line Tools, Xcode-проект не требуется.
 
 ```
-./build.sh          # собирает Pilot.app
-open Pilot.app
+./run.sh                    # собрать и запустить с последним проектом
+./run.sh ~/code/project     # открыть папку
+./run.sh src/Program.cs     # открыть файл; корень — ближайший git-репозиторий
 ```
+
+`run.sh` собирает debug-версию и перезапускает уже открытый Pilot. Лог
+приложения пишется в `.build/pilot.log`. Release-сборка для замеров —
+`CONFIG=release ./run.sh`, просто собрать бандл — `./build.sh`.
 
 Для Liquid Glass нужен SDK macOS 26 (Xcode 26). На более старом Xcode
 проект тоже соберётся — стекло заменится штатным `NSVisualEffectView`.
