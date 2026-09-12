@@ -67,7 +67,10 @@ final class FileIndex: @unchecked Sendable {
 
     /// Рекурсивный обход. Синхронный — вызывающий обязан делать это вне главного потока.
     /// `shouldStop` позволяет прервать обход, если воркспейс сменился.
-    static func build(root: URL, shouldStop: @escaping () -> Bool) -> FileIndex {
+    /// `exclude` — правила проекта поверх `.gitignore`: например, `.meta` в Unity.
+    static func build(root: URL,
+                      exclude: ((_ relPath: String, _ isDirectory: Bool) -> Bool)? = nil,
+                      shouldStop: @escaping () -> Bool) -> FileIndex {
         let index = FileIndex(root: root)
         index.reserve(8192)
 
@@ -108,6 +111,7 @@ final class FileIndex: @unchecked Sendable {
                 let isDir = values?.isDirectory ?? false
 
                 if frame.ignore.isIgnored(relPath: rel, name: name, isDir: isDir) { continue }
+                if let exclude, exclude(rel, isDir) { continue }
 
                 if isDir {
                     // .gitignore самой подпапки действует только на её содержимое

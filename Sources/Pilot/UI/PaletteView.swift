@@ -45,7 +45,7 @@ struct PaletteView: View {
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            TextField(workspace.paletteMode.placeholder, text: $workspace.query)
+            TextField(placeholder, text: $workspace.query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 19, weight: .regular))
                 .focused($focused)
@@ -60,11 +60,17 @@ struct PaletteView: View {
         .padding(.vertical, 15)
     }
 
+    private var placeholder: String {
+        workspace.paletteMode == .assetUsages && !workspace.usagesTitle.isEmpty
+            ? "Где используется \(workspace.usagesTitle)"
+            : workspace.paletteMode.placeholder
+    }
+
     private var isIndexingForMode: Bool {
         switch workspace.paletteMode {
         case .files:   return workspace.isIndexing
         case .classes: return workspace.isIndexing || workspace.isTypeIndexing
-        case .outline, .symbols, .references: return false
+        case .outline, .symbols, .references, .assetUsages: return false
         }
     }
 
@@ -81,7 +87,7 @@ struct PaletteView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help("Типов в индексе")
-        case .symbols, .references, .outline:
+        case .symbols, .references, .outline, .assetUsages:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
                     .font(.system(size: 11, design: .monospaced))
@@ -122,6 +128,10 @@ struct PaletteView: View {
             return workspace.document == nil
                 ? "Сначала откройте файл"
                 : "В этом файле объявлений не найдено"
+        case .assetUsages:
+            return workspace.query.isEmpty
+                ? "На \(workspace.usagesTitle) не ссылается ни одна сцена, префаб или ассет"
+                : "Ничего не найдено"
         }
     }
 

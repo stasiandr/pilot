@@ -294,6 +294,13 @@ final class SyntaxModel: @unchecked Sendable {   // неизменяем пос�
                 var j = i
                 while j < n && (u[j] == 0x20 || u[j] == 0x09) { j += 1 }
                 if j < n && u[j] == 0x28 { kind = .function }
+                // `ключ: значение` в YAML — ключ красится как имя, а не как тип.
+                // Двоеточие вплотную и за ним пробел или конец строки:
+                // `http://` ключом не считается.
+                else if spec.keysBeforeColon && i < n && u[i] == 0x3A
+                            && (i + 1 == n || u[i + 1] == 0x20 || u[i + 1] == 0x0A || u[i + 1] == 0x0D) {
+                    kind = .function
+                }
                 else if spec.capitalizedIsType && c >= 0x41 && c <= 0x5A { kind = .type }
             }
             sink?.append(Token(start: Int32(start), length: Int32(i - start), kind: kind))

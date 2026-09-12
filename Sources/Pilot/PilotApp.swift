@@ -68,6 +68,13 @@ struct PilotApp: App {
                 }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(!workspace.lsp.isReady)
+                // Unity: ссылки на ассеты — это GUID, языковой сервер тут не нужен.
+                Button("Где используется ассет") { workspace.findAssetUsages() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!workspace.unity.isActive)
+                Button("Ассет ↔ .meta") { workspace.toggleMetaFile() }
+                    .keyboardShortcut("m", modifiers: [.command, .control])
+                    .disabled(!workspace.unity.isActive)
                 Divider()
                 Button("Назад") { workspace.goBack() }
                     .keyboardShortcut("[", modifiers: .command)

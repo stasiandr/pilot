@@ -2,6 +2,8 @@ import Foundation
 
 enum OutlineKind: UInt8 {
     case type, method, property, field, function, variable, namespace, initializer, enumCase
+    // Unity: объекты сцен и префабов, методы-сообщения движка, поля инспектора.
+    case gameObject, component, prefab, unityMessage, serializedField
 
     var icon: String {
         switch self {
@@ -14,6 +16,11 @@ enum OutlineKind: UInt8 {
         case .namespace:   return "shippingbox"
         case .initializer: return "wrench.and.screwdriver"
         case .enumCase:    return "list.number"
+        case .gameObject:      return "cube"
+        case .component:       return "puzzlepiece.extension"
+        case .prefab:          return "cube.transparent"
+        case .unityMessage:    return "bolt"
+        case .serializedField: return "slider.horizontal.3"
         }
     }
 
@@ -28,6 +35,11 @@ enum OutlineKind: UInt8 {
         case .namespace:   return "ns"
         case .initializer: return "init"
         case .enumCase:    return "case"
+        case .gameObject:      return "object"
+        case .component:       return "comp"
+        case .prefab:          return "prefab"
+        case .unityMessage:    return "unity"
+        case .serializedField: return "inspector"
         }
     }
 }

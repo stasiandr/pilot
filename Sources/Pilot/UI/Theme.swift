@@ -39,6 +39,12 @@ enum Theme {
 
     static var gutterTextCurrent: NSColor { Macchiato.lavender }
 
+    /// Unity: методы, которые вызывает движок, ссылки на ассеты по GUID
+    /// и ссылки, которым не нашлось ассета.
+    static var unityEvent: NSColor { Macchiato.teal }
+    static var assetLink: NSColor { Macchiato.sapphire }
+    static var brokenLink: NSColor { Macchiato.red }
+
     /// Иконки боковой панели: папки заметнее файлов, чтобы структура
     /// читалась с одного взгляда.
     static var sidebarFolder: NSColor { Macchiato.blue }
@@ -61,6 +67,9 @@ enum Theme {
         static let yellow    = rgb(0xEED49F)
         static let green     = rgb(0xA6DA95)
         static let sky       = rgb(0x91D7E3)
+        static let teal      = rgb(0x8BD5CA)
+        static let sapphire  = rgb(0x7DC4E4)
+        static let red       = rgb(0xED8796)
         static let blue      = rgb(0x8AADF4)
         static let lavender  = rgb(0xB7BDF8)
         static let text      = rgb(0xCAD3F5)

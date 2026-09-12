@@ -64,13 +64,19 @@ struct RootView: View {
     @ViewBuilder
     private var content: some View {
         if let error = workspace.loadError {
-            notice(icon: "exclamationmark.triangle", title: error)
+            // Текстуру или модель не прочитать как текст, но в Unity-проекте
+            // про неё всё равно есть что узнать.
+            notice(icon: "exclamationmark.triangle", title: error,
+                   hint: workspace.unity.isActive
+                       ? "⇧⌘R — где используется этот ассет  ·  ⌃⌘M — открыть его .meta" : nil)
         } else if workspace.document != nil {
             CodeView(document: workspace.document,
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
                      focusRequest: workspace.editorFocusRequest,
+                     decorator: workspace.unity.decorator(),
+                     decorationsVersion: workspace.unity.decorationsVersion,
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) })
         } else if workspace.root == nil {
@@ -81,7 +87,7 @@ struct RootView: View {
         }
     }
 
-    private func notice(icon: String, title: String) -> some View {
+    private func notice(icon: String, title: String, hint: String? = nil) -> some View {
         VStack(spacing: 12) {
             Image(systemName: icon)
                 .font(.system(size: 34, weight: .light))
@@ -90,6 +96,11 @@ struct RootView: View {
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            if let hint {
+                Text(hint)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -123,6 +134,16 @@ struct RootView: View {
 
             Spacer()
 
+            if let notice = workspace.notice {
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.circle").font(.system(size: 10))
+                    Text(notice).font(.system(size: 11)).lineLimit(1)
+                }
+                .foregroundStyle(.orange)
+                .transition(.opacity)
+            }
+
+            unityChip
             languageServerChip
 
             if workspace.isIndexing {
@@ -139,6 +160,35 @@ struct RootView: View {
         .frame(height: 26)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Divider().opacity(0.5) }
+    }
+
+    // MARK: - Unity
+
+    @ViewBuilder
+    private var unityChip: some View {
+        if let project = workspace.unity.project {
+            HStack(spacing: 5) {
+                if workspace.unity.isIndexingAssets {
+                    ProgressView().controlSize(.small).scaleEffect(0.55)
+                } else {
+                    Image(systemName: "cube.fill").font(.system(size: 9))
+                        .foregroundStyle(Color(nsColor: Theme.unityEvent))
+                }
+                Text("Unity \(project.editorVersion ?? "")")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .help(unityHelp)
+        }
+    }
+
+    private var unityHelp: String {
+        let assets = workspace.unity.assets.map { "Ассетов с GUID: \($0.count)." } ?? "Собираю GUID ассетов…"
+        return """
+            \(assets)
+            ⌘B или ⌘+клик по GUID — открыть ассет, по fileID — перейти к объекту.
+            ⇧⌘R — где используется открытый ассет. ⌃⌘M — ассет ↔ .meta.
+            .meta скрыты из поиска и дерева.
+            """
     }
 
     // MARK: - Состояние языкового сервера

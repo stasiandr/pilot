@@ -10,6 +10,10 @@ struct LoadedDocument: Sendable {
     let languageName: String
     /// Структура файла для навигации. Строится здесь же, в фоне.
     let outline: [OutlineItem]
+    /// Сцена, префаб или другой сериализованный ассет Unity — разобранный.
+    var unityFile: UnityYAMLFile? = nil
+    /// Растёт при повторном разборе того же файла — вьюхе пора перекрасить.
+    var revision = 0
 
     enum LoadError: Error, LocalizedError {
         case tooLarge(Int)
@@ -32,7 +36,7 @@ struct LoadedDocument: Sendable {
     /// любого исходника; такие файлы в репозитории почти всегда бинарные.
     static let maxBytes = 64 * 1024 * 1024
 
-    static func load(url: URL) throws -> LoadedDocument {
+    static func load(url: URL, unity: UnityContext? = nil) throws -> LoadedDocument {
         let data: Data
         do {
             data = try Data(contentsOf: url, options: .mappedIfSafe)
@@ -57,11 +61,38 @@ struct LoadedDocument: Sendable {
         let spec = Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
         let outline = OutlineBuilder.build(model: model)
+        let semantics = UnitySemantics.analyze(model: model, lexicalOutline: outline, context: unity)
         return LoadedDocument(url: url, text: text, model: model,
                               languageName: spec?.name ?? "Plain Text",
-                              outline: outline)
+                              outline: semantics?.outline ?? outline,
+                              unityFile: semantics?.serialized)
+    }
+
+    /// Тот же документ, заново осмысленный: индекс ассетов Unity
+    /// дособрался, и у скриптов в сцене появились имена.
+    func reanalyzed(unity: UnityContext?) -> LoadedDocument {
+        guard let semantics = UnitySemantics.analyze(
+            model: model, lexicalOutline: OutlineBuilder.build(model: model), context: unity) else { return self }
+        return LoadedDocument(url: url, text: text, model: model, languageName: languageName,
+                              outline: semantics.outline, unityFile: semantics.serialized,
+                              revision: revision + 1)
     }
 }
+
+// MARK: - Украшения поверх подсветки
+
+/// Смысловая разметка поверх лексической подсветки: ссылка на ассет,
+/// битая ссылка, метод-сообщение Unity. Считается, как и подсветка,
+/// только для видимых строк.
+struct TextDecoration {
+    var range: NSRange
+    var color: NSColor? = nil
+    var underline = false
+    var toolTip: String? = nil
+}
+
+/// Документ и видимый диапазон → украшения.
+typealias CodeDecorator = (LoadedDocument, NSRange) -> [TextDecoration]
 
 // MARK: - NSTextView с подсветкой только видимой области
 
@@ -110,6 +141,9 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     private var ruler: LineNumberRuler?
 
     private var model: SyntaxModel?
+    private var document: LoadedDocument?
+    /// Смысловые украшения; меняются вместе с `invalidateDecorations()`.
+    var decorator: CodeDecorator?
     private var fontSize: CGFloat = 12.5
     private var isApplying = false
     private var lastHighlighted: ClosedRange<Int>?
@@ -243,6 +277,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     func show(_ doc: LoadedDocument) {
         guard let storage = textView.textStorage else { return }
         model = doc.model
+        document = doc
         lastHighlighted = nil
 
         let font = Theme.editorFont(size: fontSize)
@@ -257,12 +292,34 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.scroll(NSPoint(x: 0, y: 0))
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
         ruler?.model = doc.model
+        ruler?.eventLines = Self.gutterMarkers(for: doc)
         ruler?.invalidateWidth()
         highlightVisible()
     }
 
+    /// Тот же файл, новый разбор (например, дособрался индекс ассетов):
+    /// текст и прокрутку не трогаем, только перекрашиваем.
+    func refresh(_ doc: LoadedDocument) {
+        document = doc
+        ruler?.eventLines = Self.gutterMarkers(for: doc)
+        ruler?.needsDisplay = true
+        invalidateDecorations()
+    }
+
+    func invalidateDecorations() {
+        lastHighlighted = nil
+        highlightVisible()
+    }
+
+    /// Значки в колонке номеров: методы, которые вызывает движок.
+    private static func gutterMarkers(for doc: LoadedDocument) -> Set<Int> {
+        Set(doc.outline.lazy.filter { $0.kind == .unityMessage }.map(\.line))
+    }
+
     func showEmpty() {
         model = nil
+        document = nil
+        ruler?.eventLines = []
         textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
         ruler?.model = nil
         ruler?.needsDisplay = true
@@ -327,6 +384,20 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             storage.addAttribute(.foregroundColor, value: Theme.color(t.kind), range: r)
         }
         storage.removeAttribute(.backgroundColor, range: range)
+        storage.removeAttribute(.underlineStyle, range: range)
+        storage.removeAttribute(.toolTip, range: range)
+        if let decorator, let document {
+            for d in decorator(document, range) {
+                guard d.range.length > 0, NSMaxRange(d.range) <= storage.length else { continue }
+                if let color = d.color { storage.addAttribute(.foregroundColor, value: color, range: d.range) }
+                if d.underline {
+                    storage.addAttribute(.underlineStyle,
+                                         value: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
+                                         range: d.range)
+                }
+                if let tip = d.toolTip { storage.addAttribute(.toolTip, value: tip, range: d.range) }
+            }
+        }
         for occurrence in occurrences {
             guard NSIntersectionRange(occurrence, range).length > 0,
                   NSMaxRange(occurrence) <= storage.length else { continue }
@@ -346,6 +417,14 @@ final class LineNumberRuler: NSRulerView {
     weak var textView: NSTextView?
     var model: SyntaxModel?
     var font: NSFont = Theme.editorFont(size: 11)
+    /// Строки со значком слева от номера — методы-сообщения Unity.
+    var eventLines: Set<Int> = []
+    private lazy var markerImage: NSImage? = {
+        let config = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
+            .applying(.init(paletteColors: [Theme.unityEvent]))
+        return NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "Сообщение Unity")?
+            .withSymbolConfiguration(config)
+    }()
 
     init(scrollView: NSScrollView, textView: NSTextView) {
         self.textView = textView
@@ -398,6 +477,11 @@ final class LineNumberRuler: NSRulerView {
             label.draw(at: NSPoint(x: ruleThickness - size.width - 8,
                                    y: y + (lineRect.height - size.height) / 2),
                        withAttributes: attrs)
+            if eventLines.contains(line), let image = markerImage {
+                let side = image.size
+                image.draw(in: NSRect(x: 4, y: y + (lineRect.height - side.height) / 2,
+                                      width: side.width, height: side.height))
+            }
             line += 1
         }
     }
@@ -411,6 +495,9 @@ struct CodeView: NSViewControllerRepresentable {
     let reveal: Workspace.RevealRequest?
     let occurrences: [NSRange]
     let focusRequest: Int
+    /// Смысловые украшения и их версия: сменилась — перекрашиваем.
+    var decorator: CodeDecorator? = nil
+    var decorationsVersion: Int = 0
     let onCaretChange: (Int) -> Void
     let onGoToDefinition: (Int) -> Void
 
@@ -424,13 +511,21 @@ struct CodeView: NSViewControllerRepresentable {
     func updateNSViewController(_ controller: CodeViewController, context: Context) {
         controller.onCaretChange = onCaretChange
         controller.onGoToDefinition = onGoToDefinition
+        controller.decorator = decorator
 
         var documentChanged = false
         if let document {
             if context.coordinator.shownURL != document.url {
                 context.coordinator.shownURL = document.url
+                context.coordinator.revision = document.revision
+                context.coordinator.decorationsVersion = decorationsVersion
                 controller.show(document)
                 documentChanged = true
+            } else if context.coordinator.revision != document.revision
+                        || context.coordinator.decorationsVersion != decorationsVersion {
+                context.coordinator.revision = document.revision
+                context.coordinator.decorationsVersion = decorationsVersion
+                controller.refresh(document)
             }
         } else if context.coordinator.shownURL != nil {
             context.coordinator.shownURL = nil
@@ -486,5 +581,7 @@ struct CodeView: NSViewControllerRepresentable {
         var appliedReveal: Int = -1
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
+        var revision = 0
+        var decorationsVersion = 0
     }
 }
