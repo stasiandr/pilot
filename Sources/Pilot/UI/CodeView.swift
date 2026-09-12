@@ -144,6 +144,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.font = font
         textView.backgroundColor = .clear
         textView.drawsBackground = false
+        textView.selectedTextAttributes = [.backgroundColor: Theme.selection]
         textView.textContainerInset = NSSize(width: 4, height: 10)
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true

@@ -72,6 +72,12 @@ struct PilotApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Палитра — Catppuccin Macchiato, тёмная; ставим до появления окна,
+        // чтобы не мигнуть светлым хромом.
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
