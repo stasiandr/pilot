@@ -265,7 +265,12 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         model = nil
         textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
         ruler?.model = nil
-        ruler?.needsDisplay = true
+        ruler?.setChanges([])
+    }
+
+    /// Отличия от HEAD — полосками в колонке номеров.
+    func setLineChanges(_ changes: [LineDiff.Change]) {
+        ruler?.setChanges(changes)
     }
 
     /// Вхождения красим не все сразу, а вместе с остальной подсветкой —
@@ -398,7 +403,66 @@ final class LineNumberRuler: NSRulerView {
             label.draw(at: NSPoint(x: ruleThickness - size.width - 8,
                                    y: y + (lineRect.height - size.height) / 2),
                        withAttributes: attrs)
+            if line < marks.count, marks[line] != 0 {
+                drawMark(marks[line], top: y, height: lineRect.height)
+            }
             line += 1
+        }
+    }
+
+    // MARK: Отличия от HEAD
+
+    /// Пометки по строкам, битами `Mark`. Плотный массив, а не список
+    /// блоков: при отрисовке — одно обращение по индексу на видимую строку.
+    private var marks: [UInt8] = []
+
+    private enum Mark {
+        static let added: UInt8 = 1
+        static let modified: UInt8 = 2
+        static let deletedAbove: UInt8 = 4
+        static let deletedBelow: UInt8 = 8   // удалено после последней строки
+    }
+
+    func setChanges(_ changes: [LineDiff.Change]) {
+        let count = model?.lineCount ?? 0
+        guard !changes.isEmpty, count > 0 else {
+            if !marks.isEmpty { marks = []; needsDisplay = true }
+            return
+        }
+        var fresh = [UInt8](repeating: 0, count: count)
+        for change in changes {
+            switch change.kind {
+            case .added, .modified:
+                let bit = change.kind == .added ? Mark.added : Mark.modified
+                for line in change.lines where line < count { fresh[line] |= bit }
+            case .deleted:
+                if change.lines.lowerBound < count {
+                    fresh[change.lines.lowerBound] |= Mark.deletedAbove
+                } else {
+                    fresh[count - 1] |= Mark.deletedBelow
+                }
+            }
+        }
+        marks = fresh
+        needsDisplay = true
+    }
+
+    /// Полоска вплотную к тексту, как в VS Code; удаление — треугольник
+    /// на стыке строк, между которыми что-то было.
+    private func drawMark(_ mark: UInt8, top: CGFloat, height: CGFloat) {
+        let x = ruleThickness - 4
+        if mark & (Mark.added | Mark.modified) != 0 {
+            (mark & Mark.added != 0 ? Theme.gitAdded : Theme.gitModified).setFill()
+            NSRect(x: x, y: top, width: 3, height: height).fill()
+        }
+        for (bit, y) in [(Mark.deletedAbove, top), (Mark.deletedBelow, top + height)] where mark & bit != 0 {
+            let wedge = NSBezierPath()
+            wedge.move(to: NSPoint(x: x - 1, y: y - 4))
+            wedge.line(to: NSPoint(x: x + 4, y: y))
+            wedge.line(to: NSPoint(x: x - 1, y: y + 4))
+            wedge.close()
+            Theme.gitDeleted.setFill()
+            wedge.fill()
         }
     }
 }
@@ -410,6 +474,7 @@ struct CodeView: NSViewControllerRepresentable {
     let fontSize: CGFloat
     let reveal: Workspace.RevealRequest?
     let occurrences: [NSRange]
+    let lineChanges: [LineDiff.Change]
     let focusRequest: Int
     let onCaretChange: (Int) -> Void
     let onGoToDefinition: (Int) -> Void
@@ -445,6 +510,12 @@ struct CodeView: NSViewControllerRepresentable {
         if documentChanged || context.coordinator.occurrenceSignature != occurrenceSignature {
             context.coordinator.occurrenceSignature = occurrenceSignature
             controller.setOccurrences(occurrences)
+        }
+
+        // Блоков изменений — единицы, сравнить массивы целиком дёшево.
+        if documentChanged || context.coordinator.lineChanges != lineChanges {
+            context.coordinator.lineChanges = lineChanges
+            controller.setLineChanges(lineChanges)
         }
 
         // Переход применяем один раз на запрос; порядковый номер нужен,
@@ -484,6 +555,7 @@ struct CodeView: NSViewControllerRepresentable {
         var shownURL: URL?
         var fontSize: CGFloat = 12.5
         var appliedReveal: Int = -1
+        var lineChanges: [LineDiff.Change] = []
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
     }

@@ -45,6 +45,7 @@ struct RootView: View {
             FileTreeView(tree: workspace.fileTree,
                          selectedPath: workspace.openFilePath,
                          root: workspace.root,
+                         gitFiles: workspace.git.changedFiles,
                          onOpen: { relPath, focusEditor in
                              guard let root = workspace.root else { return }
                              workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),
@@ -66,6 +67,7 @@ struct RootView: View {
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
+                     lineChanges: workspace.git.lineChanges,
                      focusRequest: workspace.editorFocusRequest,
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) })
@@ -119,7 +121,9 @@ struct RootView: View {
 
             Spacer()
 
+            blameLabel
             languageServerChip
+            branchChip
 
             if workspace.isIndexing {
                 HStack(spacing: 5) {
@@ -135,6 +139,103 @@ struct RootView: View {
         .frame(height: 26)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Divider().opacity(0.5) }
+    }
+
+    // MARK: - Git
+
+    /// Кто и когда последним трогал строку под курсором. Появляется, когда
+    /// blame досчитается; до тех пор места в строке не занимает.
+    @ViewBuilder
+    private var blameLabel: some View {
+        if let doc = workspace.document,
+           let commit = workspace.git.blame?.commit(atLine: doc.model.line(containing: workspace.caretOffset)) {
+            if commit.isUncommitted {
+                Text("Не закоммичено")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .help("Строка отличается от HEAD")
+            } else {
+                HStack(spacing: 6) {
+                    Text("\(commit.author), \(Self.ago(commit.time))")
+                        .foregroundStyle(.secondary)
+                        .layoutPriority(1)
+                    Text(commit.summary)
+                        .foregroundStyle(.tertiary)
+                        .truncationMode(.tail)
+                }
+                .font(.system(size: 11))
+                .lineLimit(1)
+                .frame(maxWidth: 420, alignment: .trailing)
+                .help("\(commit.shortSHA) · \(commit.author) · \(Self.fullDate(commit.time))\n\(commit.summary)")
+                .contextMenu {
+                    Button("Скопировать хэш коммита") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(commit.sha, forType: .string)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ветка. Клик — список изменённых файлов, как и ⌃⇧G.
+    @ViewBuilder
+    private var branchChip: some View {
+        if let status = workspace.git.status {
+            let changed = workspace.git.changedCount
+            Button { workspace.openPalette(mode: .changes) } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch").font(.system(size: 10))
+                    Text(status.headLabel).fontWeight(.medium)
+                    if status.ahead > 0 { Text("↑\(status.ahead)") }
+                    if status.behind > 0 { Text("↓\(status.behind)") }
+                    if changed > 0 {
+                        Text("±\(changed)").foregroundStyle(Color(nsColor: Theme.gitModified))
+                    }
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            .help(branchHelp(status, changed: changed))
+        }
+    }
+
+    private func branchHelp(_ status: GitStatus, changed: Int) -> String {
+        var lines: [String] = []
+        if let branch = status.branch {
+            lines.append("Ветка \(branch)" + (status.upstream.map { " → \($0)" } ?? ""))
+        } else {
+            lines.append("HEAD отсоединён: \(status.headLabel)")
+        }
+        if status.ahead > 0 || status.behind > 0 {
+            lines.append("Впереди на \(status.ahead), позади на \(status.behind) коммитов")
+        }
+        lines.append(changed > 0 ? "Изменено файлов: \(changed) — ⌃⇧G" : "Изменений нет")
+        return lines.joined(separator: "\n")
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+
+    private static let fullFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.dateStyle = .long
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private static func ago(_ date: Date?) -> String {
+        guard let date else { return "" }
+        return relativeFormatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    private static func fullDate(_ date: Date?) -> String {
+        date.map(fullFormatter.string(from:)) ?? ""
     }
 
     // MARK: - Состояние языкового сервера

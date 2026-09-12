@@ -54,6 +54,14 @@ struct PilotApp: App {
                 Button("Предыдущее вхождение") { workspace.jumpToOccurrence(-1) }
                     .keyboardShortcut(.upArrow, modifiers: .option)
                 Divider()
+                Button("Изменённые файлы…") { workspace.openPalette(mode: .changes) }
+                    .keyboardShortcut("g", modifiers: [.control, .shift])
+                    .disabled(workspace.git.repository == nil)
+                Button("Следующее изменение") { workspace.jumpToChange(1) }
+                    .keyboardShortcut(.downArrow, modifiers: [.control, .option])
+                Button("Предыдущее изменение") { workspace.jumpToChange(-1) }
+                    .keyboardShortcut(.upArrow, modifiers: [.control, .option])
+                Divider()
                 // Не требует LSP: если сервер не готов, работает лексический
                 // поиск объявления в пределах файла.
                 Button("Перейти к объявлению") {

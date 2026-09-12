@@ -67,7 +67,7 @@ struct PaletteView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help("Файлов в индексе")
-        case .symbols, .references, .outline:
+        case .symbols, .references, .outline, .changes:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
                     .font(.system(size: 11, design: .monospaced))
@@ -102,6 +102,9 @@ struct PaletteView: View {
             return workspace.document == nil
                 ? "Сначала откройте файл"
                 : "В этом файле объявлений не найдено"
+        case .changes:
+            if workspace.git.repository == nil { return "Проект не под git" }
+            return workspace.query.isEmpty ? "Изменений нет — всё закоммичено" : "Ничего не найдено"
         }
     }
 
