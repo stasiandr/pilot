@@ -43,6 +43,7 @@ struct NavigatorView: View {
                          selectedPath: workspace.openFilePath,
                          root: workspace.root,
                          expandAll: filtering,
+                         gitFiles: workspace.git.changedFiles,
                          onOpen: { relPath, focusEditor in
                              guard let root = workspace.root else { return }
                              workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),

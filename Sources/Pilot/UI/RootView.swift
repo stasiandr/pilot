@@ -62,6 +62,7 @@ struct RootView: View {
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
+                     lineChanges: workspace.git.lineChanges,
                      focusRequest: workspace.editorFocusRequest,
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) })
@@ -148,9 +149,12 @@ struct RootView: View {
     }
 
     /// Как в Xcode: иконка ветки, под именем проекта — текущая ветка.
+    /// Сначала она прочитана из HEAD при открытии, затем её сменяет живой
+    /// статус git — и после checkout в терминале заголовок обновится.
     private var titleView: some View {
-        HStack(spacing: 8) {
-            if workspace.branch != nil {
+        let branch = workspace.git.status?.headLabel ?? workspace.branch
+        return HStack(spacing: 8) {
+            if branch != nil {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
@@ -159,7 +163,7 @@ struct RootView: View {
                 Text(workspace.root?.lastPathComponent ?? "Pilot")
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
-                if let branch = workspace.branch {
+                if let branch {
                     Text(branch)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
@@ -170,6 +174,7 @@ struct RootView: View {
             .frame(maxWidth: 170, alignment: .leading)
         }
         .padding(.horizontal, 4)
+        .help(workspace.git.status.map { branchHelp($0, changed: workspace.git.changedCount) } ?? "")
     }
 
     // MARK: - Статусная строка
@@ -188,11 +193,14 @@ struct RootView: View {
 
                 Spacer()
 
+                blameLabel
+                changesChip
                 let position = doc.model.position(at: workspace.caretOffset)
                 Text("Строка: \(position.line + 1)   Столбец: \(position.character + 1)")
                     .monospacedDigit()
             } else {
                 Spacer()
+                changesChip
             }
         }
         .font(.system(size: 11))
@@ -203,6 +211,100 @@ struct RootView: View {
         .overlay(alignment: .top) {
             Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
         }
+    }
+
+    // MARK: - Git
+
+    /// Кто и когда последним трогал строку под курсором. Появляется, когда
+    /// blame досчитается; до тех пор места в строке не занимает.
+    @ViewBuilder
+    private var blameLabel: some View {
+        if let doc = workspace.document,
+           let commit = workspace.git.blame?.commit(atLine: doc.model.line(containing: workspace.caretOffset)) {
+            if commit.isUncommitted {
+                Text("Не закоммичено")
+                    .foregroundStyle(.tertiary)
+                    .help("Строка отличается от HEAD")
+            } else {
+                HStack(spacing: 6) {
+                    Text("\(commit.author), \(Self.ago(commit.time))")
+                        .layoutPriority(1)
+                    Text(commit.summary)
+                        .foregroundStyle(.tertiary)
+                        .truncationMode(.tail)
+                }
+                .lineLimit(1)
+                .frame(maxWidth: 420, alignment: .trailing)
+                .help("\(commit.shortSHA) · \(commit.author) · \(Self.fullDate(commit.time))\n\(commit.summary)")
+                .contextMenu {
+                    Button("Скопировать хэш коммита") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(commit.sha, forType: .string)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Сколько файлов изменено и насколько ветка разошлась с upstream.
+    /// Ветка сама — в заголовке окна; клик здесь — список изменений, как ⌃⇧G.
+    @ViewBuilder
+    private var changesChip: some View {
+        if let status = workspace.git.status {
+            let changed = workspace.git.changedCount
+            if changed > 0 || status.ahead > 0 || status.behind > 0 {
+                Button { workspace.openPalette(mode: .changes) } label: {
+                    HStack(spacing: 4) {
+                        if status.ahead > 0 { Text("↑\(status.ahead)") }
+                        if status.behind > 0 { Text("↓\(status.behind)") }
+                        if changed > 0 {
+                            Text("±\(changed)").foregroundStyle(Color(nsColor: Theme.gitModified))
+                        }
+                    }
+                    .monospacedDigit()
+                }
+                .buttonStyle(.plain)
+                .help(branchHelp(status, changed: changed))
+            }
+        }
+    }
+
+    private func branchHelp(_ status: GitStatus, changed: Int) -> String {
+        var lines: [String] = []
+        if let branch = status.branch {
+            lines.append("Ветка \(branch)" + (status.upstream.map { " → \($0)" } ?? ""))
+        } else {
+            lines.append("HEAD отсоединён: \(status.headLabel)")
+        }
+        if status.ahead > 0 || status.behind > 0 {
+            lines.append("Впереди на \(status.ahead), позади на \(status.behind) коммитов")
+        }
+        lines.append(changed > 0 ? "Изменено файлов: \(changed) — ⌃⇧G" : "Изменений нет")
+        return lines.joined(separator: "\n")
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+
+    private static let fullFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.dateStyle = .long
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private static func ago(_ date: Date?) -> String {
+        guard let date else { return "" }
+        return relativeFormatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    private static func fullDate(_ date: Date?) -> String {
+        date.map(fullFormatter.string(from:)) ?? ""
     }
 
     // MARK: - Оверлей палитры

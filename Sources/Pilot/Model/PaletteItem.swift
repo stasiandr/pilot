@@ -11,6 +11,7 @@ enum PaletteMode: Equatable, CaseIterable {
     case outline        // ⌘⇧O — структура текущего файла, лексически, без LSP
     case symbols        // ⌘T  — символы проекта, через LSP
     case references     // ⌘R  — использования символа под курсором
+    case changes        // ⌃⇧G — файлы, изменённые относительно HEAD
 
     var placeholder: String {
         switch self {
@@ -19,6 +20,7 @@ enum PaletteMode: Equatable, CaseIterable {
         case .outline:    return "Метод, свойство, поле…"
         case .symbols:    return "Символ в проекте…"
         case .references: return "Использования"
+        case .changes:    return "Изменённый файл…"
         }
     }
 
@@ -29,14 +31,15 @@ enum PaletteMode: Equatable, CaseIterable {
         case .outline:    return "list.bullet.indent"
         case .symbols:    return "number"
         case .references: return "arrow.triangle.branch"
+        case .changes:    return "plusminus"
         }
     }
 
     /// Нужен ли для этого режима языковой сервер.
     var requiresLanguageServer: Bool {
         switch self {
-        case .files, .classes, .outline: return false
-        case .symbols, .references:      return true
+        case .files, .classes, .outline, .changes: return false
+        case .symbols, .references:                return true
         }
     }
 }

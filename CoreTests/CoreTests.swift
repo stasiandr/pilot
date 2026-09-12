@@ -999,12 +999,205 @@ check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28),
       "четыре нажатия -> два раза")
 
 
+// ─────────────────────────── Git: диф строк ───────────────────────────
+section("Git: диф строк")
+
+func diff(_ old: String, _ new: String, maxEdits: Int = LineDiff.maxEdits) -> [LineDiff.Change] {
+    LineDiff.changes(old: old, new: new, maxEdits: maxEdits)
+}
+func ch(_ kind: LineDiff.Kind, _ lines: Range<Int>) -> LineDiff.Change {
+    LineDiff.Change(kind: kind, lines: lines)
+}
+
+check(diff("a\nb\nc\n", "a\nb\nc\n").isEmpty, "одинаковые тексты -> изменений нет")
+check(diff("a\nc\n", "a\nb\nc\n") == [ch(.added, 1..<2)], "вставка строки -> added")
+check(diff("a\nb\nc\n", "a\nc\n") == [ch(.deleted, 1..<1)], "удаление строки -> deleted перед строкой 1")
+check(diff("a\nb\nc\n", "a\nB\nc\n") == [ch(.modified, 1..<2)], "правка строки -> modified")
+check(diff("a\nb", "a") == [ch(.deleted, 1..<1)], "удаление последней строки -> deleted за концом")
+check(diff("", "x\ny\n") == [ch(.added, 0..<2)], "новый файл -> всё добавлено")
+check(diff("a\r\nb\r\n", "a\nb\n").isEmpty, "CRLF против LF изменением не считается")
+check(diff("1\n2\n3\n4\n5\n6\n7\n", "1\nX\n3\n4\n5\n7\nY\n")
+        == [ch(.modified, 1..<2), ch(.deleted, 5..<5), ch(.added, 6..<7)],
+      "несколько блоков разного вида (получено \(diff("1\n2\n3\n4\n5\n6\n7\n", "1\nX\n3\n4\n5\n7\nY\n")))")
+check(diff("a\nb\n", "a\nb\nc\nd\n") == [ch(.added, 2..<4)], "дописали в конец")
+check(diff("a\nb\nc\nd\n", "x\ny\n", maxEdits: 2) == [ch(.modified, 0..<2)],
+      "правок больше предела -> один блок на всё различающееся")
+
+// Оптимальность: неизменённые строки нового текста — общая подпоследовательность
+// со старым, и она наибольшая (сверяем с LCS динамикой на случайных текстах).
+func lcsLength(_ a: [String], _ b: [String]) -> Int {
+    var dp = [Int](repeating: 0, count: b.count + 1)
+    for x in a {
+        var prev = 0
+        for j in 0..<b.count {
+            let saved = dp[j + 1]
+            dp[j + 1] = x == b[j] ? prev + 1 : max(dp[j + 1], dp[j])
+            prev = saved
+        }
+    }
+    return dp[b.count]
+}
+var rng = SystemRandomNumberGenerator()
+var diffMismatches = 0
+for _ in 0..<400 {
+    let a = (0..<Int.random(in: 0...12, using: &rng)).map { _ in ["a", "b", "c"].randomElement(using: &rng)! }
+    let b = (0..<Int.random(in: 0...12, using: &rng)).map { _ in ["a", "b", "c"].randomElement(using: &rng)! }
+    let changes = diff(a.joined(separator: "\n"), b.joined(separator: "\n"))
+    var changed = Set<Int>()
+    for c in changes { changed.formUnion(c.lines) }
+    let kept = (0..<max(1, b.count)).filter { !changed.contains($0) }.map { b.isEmpty ? "" : b[$0] }
+    // kept должен быть подпоследовательностью a…
+    var it = (a.isEmpty ? [""] : a).makeIterator()
+    let isSubsequence = kept.allSatisfy { line in
+        while let next = it.next() { if next == line { return true } }
+        return false
+    }
+    // …и самой длинной из общих.
+    let best = lcsLength(a.isEmpty ? [""] : a, b.isEmpty ? [""] : b)
+    if !isSubsequence || kept.count != best { diffMismatches += 1 }
+}
+check(diffMismatches == 0, "на 400 случайных парах диф минимален и корректен (расхождений: \(diffMismatches))")
+
+let bigOld = (0..<100_000).map { "let value\($0) = compute(\($0))" }
+var bigNew = bigOld
+for i in stride(from: 5_000, to: 100_000, by: 10_000) { bigNew[i] = "// changed \(i)" }
+bigNew.insert("// inserted", at: 50_000)
+let tDiff = Date()
+let bigChanges = LineDiff.changes(old: bigOld.joined(separator: "\n"), new: bigNew.joined(separator: "\n"))
+let diffMs = Date().timeIntervalSince(tDiff) * 1000
+print(String(format: "  диф файла на 100k строк с 11 правками: %.0f мс", diffMs))
+check(bigChanges.count == 11, "в большом файле найдено 11 блоков (получено \(bigChanges.count))")
+check(diffMs < 1000, "диф файла на 100k строк быстрее 1 с")
+
+
+// ─────────────────────────── Git: разбор вывода ───────────────────────────
+section("Git: разбор вывода")
+
+let statusFixture = [
+    "# branch.oid 1234567890abcdef1234567890abcdef12345678",
+    "# branch.head main",
+    "# branch.upstream origin/main",
+    "# branch.ab +2 -1",
+    "1 .M N... 100644 100644 100644 aaa bbb src/App.swift",
+    "1 A. N... 000000 100644 100644 000 bbb src/New File.swift",
+    "1 D. N... 100644 000000 000000 aaa 000 old.txt",
+    "2 R. N... 100644 100644 100644 aaa bbb R100 docs/new.md", "docs/old.md",
+    "u UU N... 100644 100644 100644 100644 a b c conflict.cs",
+    "? notes/todo.txt",
+].joined(separator: "\0") + "\0"
+let parsedStatus = GitStatus.parse(Data(statusFixture.utf8))
+check(parsedStatus.head == "1234567890abcdef1234567890abcdef12345678", "хэш HEAD")
+check(parsedStatus.branch == "main" && parsedStatus.upstream == "origin/main", "ветка и upstream")
+check(parsedStatus.ahead == 2 && parsedStatus.behind == 1, "впереди на 2, позади на 1")
+check(parsedStatus.files["src/App.swift"] == .modified, "изменённый файл")
+check(parsedStatus.files["src/New File.swift"] == .added, "добавленный файл с пробелом в имени")
+check(parsedStatus.files["old.txt"] == .deleted, "удалённый файл")
+check(parsedStatus.files["docs/new.md"] == .renamed && parsedStatus.files["docs/old.md"] == nil,
+      "переименование: новый путь есть, старый не просочился отдельной записью")
+check(parsedStatus.files["conflict.cs"] == .conflicted, "конфликт слияния")
+check(parsedStatus.files["notes/todo.txt"] == .untracked, "неотслеживаемый файл")
+check(parsedStatus.files.count == 6, "файлов шесть (получено \(parsedStatus.files.count))")
+
+let detached = GitStatus.parse(Data("# branch.oid abcdef1234567\0# branch.head (detached)\0".utf8))
+check(detached.branch == nil && detached.headLabel == "abcdef1", "отсоединённый HEAD -> короткий хэш")
+let initial = GitStatus.parse(Data("# branch.oid (initial)\0# branch.head main\0".utf8))
+check(initial.head == nil && initial.branch == "main", "репозиторий без коммитов")
+
+let shaA = String(repeating: "a", count: 40)
+let shaZero = String(repeating: "0", count: 40)
+let blameFixture = """
+\(shaA) 1 1 2
+author Ada Lovelace
+author-mail <ada@example.com>
+author-time 1700000000
+author-tz +0000
+summary First commit
+filename main.swift
+\tlet a = 1
+\(shaA) 2 2
+\tlet b = 2
+\(shaZero) 3 3 1
+author External file (--contents)
+author-time 1800000000
+summary Version of main.swift from main.swift
+filename main.swift
+\tlet c = 3
+
+"""
+let blame = GitBlame.parse(Data(blameFixture.utf8), lineCount: 4)
+check(blame.commits.count == 2, "два коммита (получено \(blame.commits.count))")
+check(blame.commit(atLine: 0)?.author == "Ada Lovelace", "автор первой строки")
+check(blame.commit(atLine: 1)?.summary == "First commit", "вторая строка — тот же коммит, сведения не повторяются")
+check(blame.commit(atLine: 0)?.time == Date(timeIntervalSince1970: 1_700_000_000), "время коммита")
+check(blame.commit(atLine: 2)?.isUncommitted == true, "нулевой хэш -> не закоммичено")
+check(blame.commit(atLine: 3) == nil, "строка без сведений -> nil")
+check(blame.commit(atLine: 99) == nil, "строка за концом файла -> nil")
+
+
+// ─────────────────────────── Git: живой репозиторий ───────────────────────────
+section("Git: живой репозиторий")
+
+if Git.executable == nil {
+    print("  git не найден — пропускаю")
+} else {
+    let repo = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pilot-git-\(UUID().uuidString)")
+        .resolvingSymlinksInPath()
+    try? FileManager.default.createDirectory(at: repo.appendingPathComponent("src"), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: repo) }
+
+    // Глобальный конфиг пользователя (подпись коммитов, хуки) тесту не нужен.
+    let isolated = ["-c", "user.name=Pilot Test", "-c", "user.email=test@example.com",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+    func sh(_ args: [String]) { _ = Git.run(isolated + args, in: repo) }
+    func write(_ path: String, _ text: String) {
+        try? text.write(to: repo.appendingPathComponent(path), atomically: true, encoding: .utf8)
+    }
+
+    sh(["init", "-q", "--initial-branch=main"])
+    write("src/app.txt", "one\ntwo\nthree\n")
+    write(".gitignore", "*.log\n")
+    sh(["add", "."])
+    sh(["commit", "-q", "-m", "Initial"])
+
+    check(Git.repositoryRoot(for: repo.appendingPathComponent("src"))?.path == repo.path,
+          "корень репозитория находится из вложенной папки")
+
+    write("src/app.txt", "one\nTWO\nthree\nfour\n")
+    write("src/new.txt", "fresh\n")
+    write("debug.log", "noise\n")
+
+    let live = Git.status(in: repo)
+    check(live?.branch == "main" && live?.head?.count == 40, "status: ветка main и хэш HEAD")
+    check(live?.files["src/app.txt"] == .modified, "status: изменённый файл")
+    check(live?.files["src/new.txt"] == .untracked, "status: новый файл")
+    check(live?.files["debug.log"] == nil, "status: игнорируемый файл не попадает")
+
+    let edited = "one\nTWO\nthree\nfour\n"
+    let tracked = Git.lineChanges(text: edited, path: "src/app.txt", repository: repo)
+    check(tracked?.tracked == true, "файл в HEAD есть")
+    check(tracked?.changes == [ch(.modified, 1..<2), ch(.added, 3..<4)],
+          "полоски против HEAD (получено \(String(describing: tracked?.changes)))")
+
+    let fresh = Git.lineChanges(text: "fresh\n", path: "src/new.txt", repository: repo)
+    check(fresh?.tracked == false && fresh?.changes == [ch(.added, 0..<1)], "новый файл — весь добавлен")
+    let ignoredFile = Git.lineChanges(text: "noise\n", path: "debug.log", repository: repo)
+    check(ignoredFile?.tracked == false && ignoredFile?.changes.isEmpty == true, "игнорируемый файл — без полосок")
+
+    let liveBlame = Git.blame(text: edited, path: "src/app.txt", repository: repo, lineCount: 5)
+    check(liveBlame?.commit(atLine: 0)?.author == "Pilot Test", "blame: автор неизменённой строки")
+    check(liveBlame?.commit(atLine: 0)?.summary == "Initial", "blame: сообщение коммита")
+    check(liveBlame?.commit(atLine: 1)?.isUncommitted == true, "blame: изменённая строка не закоммичена")
+    check(liveBlame?.commit(atLine: 3)?.isUncommitted == true, "blame: дописанная строка не закоммичена")
+}
+
+
 // ────────────────────────── Режимы палитры ──────────────────────────
 section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 5, "режимов палитры пять")
+check(PaletteMode.allCases.count == 6, "режимов палитры шесть")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
@@ -1014,6 +1207,7 @@ check(!PaletteMode.outline.requiresLanguageServer, "структура файл�
 check(!PaletteMode.classes.requiresLanguageServer, "поиск по классам не требует LSP")
 check(PaletteMode.symbols.requiresLanguageServer, "символы проекта требуют LSP")
 check(PaletteMode.references.requiresLanguageServer, "использования требуют LSP")
+check(!PaletteMode.changes.requiresLanguageServer, "изменённые файлы не требуют LSP")
 
 // ────────────────────────── Фильтр навигатора ──────────────────────────
 section("Фильтр навигатора")

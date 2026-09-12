@@ -14,6 +14,8 @@ struct FileTreeView: NSViewRepresentable {
     let root: URL?
     /// Отфильтрованное дерево маленькое и показывается раскрытым целиком.
     var expandAll = false
+    /// Изменённые относительно HEAD файлы — подкрашиваются, как в VS Code.
+    var gitFiles: [String: GitFileState] = [:]
     let onOpen: (_ relPath: String, _ focusEditor: Bool) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -56,6 +58,7 @@ struct FileTreeView: NSViewRepresentable {
         coordinator.onOpen = onOpen
         coordinator.root = root
         coordinator.update(tree: tree, selectedPath: selectedPath, expandAll: expandAll)
+        coordinator.update(gitFiles: gitFiles)
     }
 
     // MARK: - Координатор
@@ -68,6 +71,10 @@ struct FileTreeView: NSViewRepresentable {
 
         private var tree: FileTree?
         private var shownSelection: String?
+        private var gitFiles: [String: GitFileState] = [:]
+        /// Папки, внутри которых что-то изменено, — чтобы изменение было
+        /// видно и в свёрнутом дереве.
+        private var gitFolders: [String: GitFileState] = [:]
         /// Раскрытые папки по путям, а не по узлам: при пересканировании
         /// дерево собирается заново, а раскрытое должно остаться раскрытым.
         private var expanded: Set<String> = []
@@ -102,6 +109,48 @@ struct FileTreeView: NSViewRepresentable {
                 shownSelection = selectedPath
                 reveal(selectedPath)
             }
+        }
+
+        /// Статус меняется редко (на возврате в приложение), а дерево может
+        /// быть огромным — перекрашиваем только уже созданные строки,
+        /// остальные получат цвет, когда до них доскроллят.
+        func update(gitFiles newFiles: [String: GitFileState]) {
+            guard newFiles != gitFiles, let outline else { return }
+            gitFiles = newFiles
+            gitFolders = Self.folderStates(newFiles)
+            outline.enumerateAvailableRowViews { rowView, row in
+                guard let node = outline.item(atRow: row) as? FileTree.Node,
+                      let cell = rowView.view(atColumn: 0) as? FileCell else { return }
+                cell.configure(with: node, git: self.gitState(of: node))
+            }
+        }
+
+        private func gitState(of node: FileTree.Node) -> GitFileState? {
+            node.isDirectory ? gitFolders[node.relPath] : gitFiles[node.relPath]
+        }
+
+        /// Цвет папки — по самому важному изменению внутри:
+        /// конфликт важнее правки, правка важнее новых файлов.
+        private static func folderStates(_ files: [String: GitFileState]) -> [String: GitFileState] {
+            func rank(_ state: GitFileState) -> Int {
+                switch state {
+                case .conflicted:        return 2
+                case .added, .untracked: return 0
+                default:                 return 1
+                }
+            }
+            var folders: [String: GitFileState] = [:]
+            for (path, state) in files {
+                let folderState: GitFileState = rank(state) == 0 ? .added : (rank(state) == 2 ? .conflicted : .modified)
+                var cursor = Substring(path)
+                while let slash = cursor.lastIndex(of: "/") {
+                    cursor = cursor[..<slash]
+                    let key = String(cursor)
+                    if let existing = folders[key], rank(existing) >= rank(folderState) { continue }
+                    folders[key] = folderState
+                }
+            }
+            return folders
         }
 
         private func restoreExpansion() {
@@ -247,7 +296,7 @@ struct FileTreeView: NSViewRepresentable {
         func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
             guard let node = item as? FileTree.Node else { return nil }
             let cell = outlineView.makeView(withIdentifier: FileCell.identifier, owner: nil) as? FileCell ?? FileCell()
-            cell.configure(with: node)
+            cell.configure(with: node, git: gitState(of: node))
             return cell
         }
 
@@ -257,7 +306,9 @@ struct FileTreeView: NSViewRepresentable {
 
         func outlineView(_ outlineView: NSOutlineView, toolTipFor cell: NSCell, rect: NSRectPointer,
                          tableColumn: NSTableColumn?, item: Any, mouseLocation: NSPoint) -> String {
-            (item as? FileTree.Node)?.relPath ?? ""
+            guard let node = item as? FileTree.Node else { return "" }
+            guard !node.isDirectory, let state = gitFiles[node.relPath] else { return node.relPath }
+            return "\(node.relPath) — \(state.label)"
         }
 
         func outlineViewItemDidExpand(_ notification: Notification) {
@@ -279,6 +330,8 @@ private final class FileCell: NSTableCellView {
 
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
+    /// Статус git справа: буква у файла (M, A, ?, U, R), точка у папки.
+    private let badge = NSTextField(labelWithString: "")
 
     init() {
         super.init(frame: .zero)
@@ -290,9 +343,14 @@ private final class FileCell: NSTableCellView {
         label.lineBreakMode = .byTruncatingMiddle
         label.font = .systemFont(ofSize: NSFont.systemFontSize)
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
+        badge.setContentCompressionResistancePriority(.required, for: .horizontal)
+        badge.setContentHuggingPriority(.required, for: .horizontal)
 
         addSubview(icon)
         addSubview(label)
+        addSubview(badge)
         imageView = icon
         textField = label
 
@@ -302,14 +360,16 @@ private final class FileCell: NSTableCellView {
             icon.widthAnchor.constraint(equalToConstant: 16),
             icon.heightAnchor.constraint(equalToConstant: 16),
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -4),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            badge.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            badge.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) не используется") }
 
-    func configure(with node: FileTree.Node) {
+    func configure(with node: FileTree.Node, git state: GitFileState?) {
         label.stringValue = node.name
         // Цветные иконки по типу файла, как в навигаторе Xcode.
         let style = node.isDirectory ? Theme.folderIcon : Theme.fileIcon(forName: node.name)
@@ -317,6 +377,32 @@ private final class FileCell: NSTableCellView {
         icon.image = NSImage(systemSymbolName: style.symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(config)
         icon.contentTintColor = style.color
+
+        // У папки вместо буквы точка: бледно-жёлтое имя на стекле сайдбара
+        // почти не отличить от белого, а изменение внутри видно и так.
+        if let state {
+            badge.stringValue = node.isDirectory ? "•" : state.letter
+        } else {
+            badge.stringValue = ""
+        }
+        gitColor = state.map(Theme.git)
+        applyGitColor()
+    }
+
+    /// Ячейки переиспользуются — цвет задаётся и у неизменённых, иначе
+    /// файл унаследует жёлтый от предыдущего хозяина ячейки.
+    private var gitColor: NSColor?
+
+    /// На синем фоне выделения цветной текст не читается — там белый.
+    /// Фон строки меняется при выделении и при смене фокуса окна.
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet { applyGitColor() }
+    }
+
+    private func applyGitColor() {
+        let color = backgroundStyle == .emphasized ? nil : gitColor
+        label.textColor = color ?? .labelColor
+        badge.textColor = color ?? .secondaryLabelColor
     }
 }
 

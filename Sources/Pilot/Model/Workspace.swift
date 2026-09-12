@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @MainActor
 final class Workspace: ObservableObject {
@@ -99,6 +100,17 @@ final class Workspace: ObservableObject {
     private var occurrenceWord: String?
 
     let lsp = LSPService()
+    let git = GitService()
+    private var gitObservation: AnyCancellable?
+
+    init() {
+        // Статус-строка и полоски у номеров строк читают git через workspace:
+        // его изменения должны перерисовывать то же, что и наши.
+        gitObservation = git.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        git.onStatusChange = { [weak self] in self?.gitStatusChanged() }
+    }
 
     private var index: FileIndex?
     private var typeIndex: TypeIndex?
@@ -154,13 +166,8 @@ final class Workspace: ObservableObject {
     }
 
     private static func projectRoot(containing file: URL) -> URL {
-        let fm = FileManager.default
-        var dir = file.deletingLastPathComponent()
-        while dir.path != "/" {
-            if fm.fileExists(atPath: dir.appendingPathComponent(".git").path) { return dir }
-            dir = dir.deletingLastPathComponent()
-        }
-        return file.deletingLastPathComponent()
+        let dir = file.deletingLastPathComponent()
+        return Git.repositoryRoot(for: dir) ?? dir
     }
 
     func promptForFolder() {
@@ -191,6 +198,7 @@ final class Workspace: ObservableObject {
         filteredTree = nil
         rememberRecent(url)
         lsp.workspaceChanged(to: url)
+        git.workspaceChanged(to: url)
 
         let generation = scanGeneration.bump()
         isIndexing = true
@@ -284,6 +292,7 @@ final class Workspace: ObservableObject {
         _ = scanGeneration.bump()
         _ = loadGeneration.bump()
         lsp.workspaceChanged(to: nil)
+        git.workspaceChanged(to: nil)
         root = nil
         index = nil
         fileTree = nil
@@ -356,6 +365,7 @@ final class Workspace: ObservableObject {
         case .classes:    runClassSearch()
         case .symbols:    runSymbolSearch()
         case .outline:    buildOutlineItems()
+        case .changes:    buildChangeItems()
         case .references: break   // наполняется через findReferences()
         }
     }
@@ -374,7 +384,69 @@ final class Workspace: ObservableObject {
         case .symbols:    runSymbolSearch()
         case .references: filterReferences()
         case .outline:    buildOutlineItems()
+        case .changes:    buildChangeItems()
         }
+    }
+
+    // MARK: - Git
+
+    /// Изменённые файлы проекта. Удалённые не показываем — открывать нечего.
+    /// Ранжирование и подсветка — те же, что у ⌘P: список прогоняется через
+    /// маленький FileIndex.
+    private func buildChangeItems() {
+        guard let root else { items = []; return }
+        let changed = git.changedFiles.filter { $0.value != .deleted }
+        let index = FileIndex(root: root)
+        for path in changed.keys.sorted() { index.appendCached(rel: path) }
+
+        let hits = index.search(query, limit: 500, shouldStop: { false })
+        items = hits.enumerated().map { position, hit in
+            let path = index.relPath(hit.id)
+            return PaletteItem(
+                id: position,
+                icon: Self.icon(forPath: path),
+                primary: path,
+                nameOffset: index.nameOffset(hit.id),
+                positions: hit.positions,
+                trailing: changed[path]?.letter,
+                target: NavTarget(url: index.absoluteURL(hit.id), range: nil))
+        }
+        if selection >= items.count { selection = max(0, items.count - 1) }
+    }
+
+    /// Вернулись в приложение, а список изменённых файлов стал другим —
+    /// буквы в открытой палитре должны это отразить.
+    private func gitStatusChanged() {
+        guard isPaletteOpen else { return }
+        switch paletteMode {
+        case .files:   runFileSearch()
+        case .changes: buildChangeItems()
+        case .classes, .outline, .symbols, .references: break
+        }
+    }
+
+    /// Следующий/предыдущий изменённый блок; по кругу, как и вхождения.
+    func jumpToChange(_ direction: Int) {
+        guard let document, !git.lineChanges.isEmpty else { return }
+        let changes = git.lineChanges
+        let line = document.model.line(containing: caretOffset)
+        let target: LineDiff.Change?
+        if direction > 0 {
+            target = changes.first { $0.lines.lowerBound > line } ?? changes.first
+        } else {
+            target = changes.last { $0.lines.lowerBound < line } ?? changes.last
+        }
+        guard let target else { return }
+        // Блок целиком выделяется и вспыхивает: видно, что именно поменялось.
+        // Удаление за последней строкой ставит курсор на неё же.
+        let model = document.model
+        let first = min(target.lines.lowerBound, model.lineCount - 1)
+        let last = min(max(first, target.lines.upperBound - 1), model.lineCount - 1)
+        let start = LSPPosition(line: first, character: 0)
+        let end = target.lines.isEmpty
+            ? start
+            : LSPPosition(line: last, character: model.lineRange(last).count)
+        requestReveal(LSPRange(start: start, end: end))
     }
 
     // MARK: - Структура текущего файла
@@ -548,6 +620,7 @@ final class Workspace: ObservableObject {
                         primary: path,
                         nameOffset: index.nameOffset(hit.id),
                         positions: hit.positions,
+                        trailing: self.git.changedFiles[path]?.letter,
                         target: NavTarget(url: index.absoluteURL(hit.id), range: nil))
                 }
                 if self.selection >= self.items.count {
@@ -846,9 +919,11 @@ final class Workspace: ObservableObject {
                     // Сервер поднимается здесь — лениво, при первом файле
                     // подходящего языка, а не при запуске приложения.
                     self.lsp.documentOpened(doc)
+                    self.git.documentOpened(doc)
                 case .failure(let error):
                     self.document = nil
                     self.loadError = error.localizedDescription
+                    self.git.documentOpened(nil)
                 }
             }
         }

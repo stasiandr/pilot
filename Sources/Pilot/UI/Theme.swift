@@ -150,6 +150,24 @@ enum Theme {
         return "\(n.formatted()) \(word)"
     }
 
+    /// Git: полоски у номеров строк и имена файлов в дереве. Привычные
+    /// роли: добавлено зелёным, изменено жёлтым, удалено красным.
+    static var gitAdded: NSColor { Macchiato.green }
+    static var gitModified: NSColor { Macchiato.yellow }
+    static var gitDeleted: NSColor { Macchiato.red }
+    static var gitRenamed: NSColor { Macchiato.sky }
+    static var gitConflicted: NSColor { Macchiato.peach }
+
+    static func git(_ state: GitFileState) -> NSColor {
+        switch state {
+        case .added, .untracked: return gitAdded
+        case .modified:          return gitModified
+        case .deleted:           return gitDeleted
+        case .renamed:           return gitRenamed
+        case .conflicted:        return gitConflicted
+        }
+    }
+
     /// Шрифт редактора: Hack Nerd Font Mono, если установлен, иначе системный моноширинный.
     static func editorFont(size: CGFloat) -> NSFont {
         if let f = NSFont(name: "HackNFM-Regular", size: size) { return f }
@@ -163,8 +181,8 @@ enum Theme {
         static let rosewater = rgb(0xF4DBD6)
         static let flamingo  = rgb(0xF0C6C6)
         static let pink      = rgb(0xF5BDE6)
-        static let mauve     = rgb(0xC6A0F6)
         static let red       = rgb(0xED8796)
+        static let mauve     = rgb(0xC6A0F6)
         static let peach     = rgb(0xF5A97F)
         static let yellow    = rgb(0xEED49F)
         static let green     = rgb(0xA6DA95)
