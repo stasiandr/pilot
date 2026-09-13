@@ -39,37 +39,46 @@ struct LoadedDocument: Sendable {
     static let maxBytes = 64 * 1024 * 1024
 
     static func load(url: URL) throws -> LoadedDocument {
-        let data: Data
-        do {
-            data = try Data(contentsOf: url, options: .mappedIfSafe)
-        } catch {
-            throw LoadError.unreadable(error.localizedDescription)
-        }
-        return try make(url: url, data: data, revision: nil)
+        make(url: url, text: try readText(url: url, maxBytes: maxBytes), revision: nil)
     }
 
+    /// Файл из коммита — для ревью MR: те же проверки, что и с диска.
     static func make(url: URL, data: Data, revision: String?) throws -> LoadedDocument {
-        if data.count > maxBytes { throw LoadError.tooLarge(data.count) }
+        make(url: url, text: try decodeText(data, maxBytes: maxBytes), revision: revision)
+    }
 
-        // Эвристика бинарности: NUL в первых 8 КБ.
-        let probe = data.prefix(8192)
-        if probe.contains(0) { throw LoadError.binary }
-
-        let text: String
-        if let s = String(data: data, encoding: .utf8) {
-            text = s
-        } else if let s = String(data: data, encoding: .isoLatin1) {
-            text = s   // фолбэк, чтобы не падать на legacy-кодировках
-        } else {
-            throw LoadError.binary
-        }
-
+    private static func make(url: URL, text: String, revision: String?) -> LoadedDocument {
         let spec = Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
         let outline = OutlineBuilder.build(model: model)
         return LoadedDocument(url: url, text: text, model: model,
                               languageName: spec?.name ?? "Plain Text",
                               outline: outline, revision: revision)
+    }
+
+    /// Текст файла с теми же проверками, что и при открытии: размер,
+    /// бинарность, кодировка. Нужен и предпросмотру в палитре.
+    static func readText(url: URL, maxBytes: Int) throws -> String {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: .mappedIfSafe)
+        } catch {
+            throw LoadError.unreadable(error.localizedDescription)
+        }
+        return try decodeText(data, maxBytes: maxBytes)
+    }
+
+    private static func decodeText(_ data: Data, maxBytes: Int) throws -> String {
+        if data.count > maxBytes { throw LoadError.tooLarge(data.count) }
+
+        // Эвристика бинарности: NUL в первых 8 КБ.
+        let probe = data.prefix(8192)
+        if probe.contains(0) { throw LoadError.binary }
+
+        if let s = String(data: data, encoding: .utf8) { return s }
+        // фолбэк, чтобы не падать на legacy-кодировках
+        if let s = String(data: data, encoding: .isoLatin1) { return s }
+        throw LoadError.binary
     }
 }
 

@@ -183,6 +183,16 @@ final class TypeIndex: @unchecked Sendable {   // неизменяем посл�
         return index
     }
 
+    /// Из уже разобранных объявлений — их отдаёт индекс символов, и второй
+    /// разбор всего проекта ради одних типов не нужен.
+    static func make(root: URL, entries: [(path: String, declarations: [TypeDeclaration])]) -> TypeIndex {
+        let index = TypeIndex(root: root)
+        for entry in entries where !entry.declarations.isEmpty {
+            index.append(path: entry.path, entry.declarations)
+        }
+        return index
+    }
+
     // MARK: - Поиск
 
     /// До `limit` лучших типов. Пустой запрос ничего не находит: список

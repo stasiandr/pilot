@@ -47,7 +47,7 @@ struct PilotApp: App {
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                 Button("Символ в проекте…") { workspace.openPalette(mode: .symbols) }
                     .keyboardShortcut("t", modifiers: .command)
-                    .disabled(!workspace.lsp.isReady)
+                    .disabled(!workspace.canSearchSymbols)
                 Divider()
                 Button("Следующее объявление") { workspace.jumpToMember(1) }
                     .keyboardShortcut(.downArrow, modifiers: .control)
@@ -85,8 +85,8 @@ struct PilotApp: App {
                     .keyboardShortcut(.upArrow, modifiers: [.command, .option])
                     .disabled(workspace.review.active == nil)
                 Divider()
-                // Не требует LSP: если сервер не готов, работает лексический
-                // поиск объявления в пределах файла.
+                // Не требует LSP: пока сервер не готов, отвечает быстрый
+                // навигатор по индексу объявлений проекта.
                 Button("Перейти к объявлению") {
                     workspace.goToDefinition(at: workspace.caretOffset)
                 }
@@ -95,7 +95,7 @@ struct PilotApp: App {
                     workspace.findReferences(at: workspace.caretOffset)
                 }
                 .keyboardShortcut("r", modifiers: .command)
-                .disabled(!workspace.lsp.isReady)
+                .disabled(workspace.document == nil)
                 Divider()
                 Button("Назад") { workspace.goBack() }
                     .keyboardShortcut("[", modifiers: .command)

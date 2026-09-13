@@ -901,6 +901,67 @@ print(String(format: "  разбор 2000 файлов на %d строк (од�
 check(typeTotal == 2000 * 8, "в каждом файле найдено ровно 8 типов")
 check(typesMs < 5000, "2000 файлов разбираются быстрее 5 с даже в один поток")
 
+// ──────────────────────── Предпросмотр в палитре ────────────────────────
+section("Предпросмотр")
+
+// большой файл: цель в середине, фрагмент — окно вокруг неё
+let previewSource = (0..<500).map { i in
+    i == 250 ? "public sealed class Target : Base { // цель" : "    var line\(i) = \"text\"; /* c */"
+}.joined(separator: "\n")
+let previewModel = SyntaxModel(text: previewSource, spec: Languages.csharp)
+let focusRange = LSPRange(start: LSPPosition(line: 250, character: 20), end: LSPPosition(line: 250, character: 26))
+let focused = FilePreview.make(model: previewModel, range: focusRange)
+check(focused.focusLine == 250, "строка цели запомнена")
+check(focused.lineCount == 500, "известно число строк файла")
+check(focused.lines.first?.number == 250 - FilePreview.linesBefore, "фрагмент начинается выше цели")
+check(focused.lines.last?.number == 250 + FilePreview.linesAfter, "фрагмент заканчивается ниже цели")
+if let line = focused.lines.first(where: { $0.number == 250 }) {
+    check(line.text == "public sealed class Target : Base { // цель", "текст строки собран из отрезков без потерь")
+    check(line.segments.filter(\.focused).map(\.text) == ["Target"],
+          "подсвечено ровно имя цели (получено \(line.segments.filter(\.focused).map(\.text)))")
+    check(line.segments.first?.kind == .keyword && line.segments.first?.text == "public",
+          "ключевое слово — отдельным отрезком с видом keyword")
+    check(line.segments.last?.kind == .comment, "комментарий в конце строки распознан")
+}
+check(focused.lines.filter { $0.segments.contains(where: \.focused) }.count == 1,
+      "подсветка цели только в одной строке")
+check(focused.lines.first { $0.number == 100 + 150 - 1 }?.segments.contains { $0.kind == .string } == true,
+      "строковые литералы в соседних строках раскрашены")
+
+// без цели — начало файла
+let top = FilePreview.make(model: previewModel, range: nil)
+check(top.focusLine == nil && top.lines.first?.number == 0, "без цели показывается начало файла")
+check(top.lines.count == FilePreview.linesBefore + FilePreview.linesAfter + 1, "без цели — полное окно строк")
+
+// цель у самого начала и у самого конца — окно подрезается границами файла
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 2, character: 0),
+                                                           end: LSPPosition(line: 2, character: 1))).lines.first?.number == 0,
+      "окно не уходит выше первой строки")
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 499, character: 0),
+                                                           end: LSPPosition(line: 499, character: 1))).lines.last?.number == 499,
+      "окно не уходит ниже последней строки")
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 9999, character: 0),
+                                                           end: LSPPosition(line: 9999, character: 1))).focusLine == 499,
+      "цель за концом файла прижимается к последней строке")
+
+// табуляции, CRLF, длинные строки, многострочный комментарий, файл без языка
+let tabbed = FilePreview.make(model: SyntaxModel(text: "\tint x;\r\nnext", spec: Languages.csharp), range: nil)
+check(tabbed.lines.first?.text == "    int x;", "табуляция раскрыта в пробелы, \\r\\n отрезан (получено \(tabbed.lines.first?.text ?? "nil"))")
+let longLine = FilePreview.make(model: SyntaxModel(text: String(repeating: "a", count: 5000), spec: nil), range: nil)
+check(longLine.lines.first.map { $0.text.count } == FilePreview.maxLineLength + 2, "длинная строка обрезана с многоточием")
+let block = FilePreview.make(model: SyntaxModel(text: "/* начало\nпродолжение */ int x;", spec: Languages.csharp), range: nil)
+check(block.lines.last?.segments.first?.kind == .comment && block.lines.last?.segments.first?.text == "продолжение */",
+      "многострочный комментарий раскрашен и во второй строке")
+let plain = FilePreview.make(model: SyntaxModel(text: "просто текст", spec: nil), range: nil)
+check(plain.lines.first?.segments == [FilePreview.Segment(text: "просто текст", kind: .plain, focused: false)],
+      "файл без языка — одним простым отрезком")
+
+let tPreview = Date()
+for _ in 0..<200 { _ = FilePreview.make(model: bigModel, range: focusRange) }
+let previewMs = Date().timeIntervalSince(tPreview) * 1000 / 200
+print(String(format: "  фрагмент для предпросмотра в файле на 200k строк: %.2f мс", previewMs))
+check(previewMs < 20, "фрагмент строится быстрее 20 мс даже в огромном файле")
+
 // ─────────────────────────────── ⇧⇧ ───────────────────────────────
 section("Двойной Shift")
 
@@ -1258,17 +1319,11 @@ section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 6, "режимов палитры шесть")
+check(PaletteMode.allCases.count == 7, "режимов палитры семь")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
 }
-check(!PaletteMode.files.requiresLanguageServer, "поиск файлов не требует LSP")
-check(!PaletteMode.outline.requiresLanguageServer, "структура файла не требует LSP")
-check(!PaletteMode.classes.requiresLanguageServer, "поиск по классам не требует LSP")
-check(PaletteMode.symbols.requiresLanguageServer, "символы проекта требуют LSP")
-check(PaletteMode.references.requiresLanguageServer, "использования требуют LSP")
-check(!PaletteMode.changes.requiresLanguageServer, "изменённые файлы не требуют LSP")
 
 // ────────────────────────── Фильтр навигатора ──────────────────────────
 section("Фильтр навигатора")
@@ -1288,6 +1343,332 @@ check(GitInfo.parse(head: "ref: refs/heads/main\n") == "main", "ветка из 
 check(GitInfo.parse(head: "ref: refs/heads/claude/feature-x") == "claude/feature-x", "ветка со слешем")
 check(GitInfo.parse(head: "29970deadb287d5457bc98c3dcc0b28c522c90c3\n") == "29970de", "отсоединённый HEAD — короткий хэш")
 check(GitInfo.parse(head: "") == nil, "пустой HEAD")
+
+// ─────────────────────── Структура: типы в объявлениях ───────────────────────
+section("Структура: типы в объявлениях")
+
+let declSource = """
+namespace Game
+{
+    public class Stash<T> : Base<T>, IStash where T : struct
+    {
+        [SerializeField] private Foo _foo;
+        private readonly List<Player> _players = new();
+        public static World Default { get; }
+        public ref T Get(int entity) => ref _items[entity];
+        public Stash<U> Other<U>() where U : struct => null;
+        private int[] _numbers;
+        public event Action<int> Changed;
+        public delegate void Handler<TArg>(TArg value);
+        public enum Mode { Idle, Run = 2, Jump }
+        Dictionary<string, List<int>> Map() { return null; }
+    }
+}
+"""
+let declItems = OutlineBuilder.build(model: SyntaxModel(text: declSource, spec: Languages.csharp))
+func declNamed(_ n: String) -> OutlineItem? { declItems.first { $0.name == n } }
+check(declNamed("Stash")?.genericParams == ["T"], "параметры дженерика типа (получено \(declNamed("Stash")?.genericParams ?? []))")
+check(declNamed("Stash")?.bases == ["Base<T>", "IStash"], "базовые типы без where (получено \(declNamed("Stash")?.bases ?? []))")
+check(declNamed("_foo")?.typeText == "Foo", "атрибут не прилипает к типу поля (получено \(declNamed("_foo")?.typeText ?? "nil"))")
+check(declNamed("_players")?.typeText == "List<Player>", "дженерик-тип поля (получено \(declNamed("_players")?.typeText ?? "nil"))")
+check(declNamed("Default")?.typeText == "World", "тип свойства, static не входит (получено \(declNamed("Default")?.typeText ?? "nil"))")
+check(declNamed("Get")?.typeText == "T", "возвращаемый тип `ref T` → T (получено \(declNamed("Get")?.typeText ?? "nil"))")
+check(declNamed("Other")?.kind == .method, "дженерик-метод `Other<U>()` попал в структуру")
+check(declNamed("Other")?.typeText == "Stash<U>", "его возвращаемый тип (получено \(declNamed("Other")?.typeText ?? "nil"))")
+check(declNamed("_numbers")?.typeText == "int[]", "массив (получено \(declNamed("_numbers")?.typeText ?? "nil"))")
+check(declNamed("Changed")?.kind == .field && declNamed("Changed")?.typeText == "Action<int>",
+      "у event имя — последнее слово, тип — перед ним (получено \(declNamed("Changed").map { "\($0.name): \($0.typeText ?? "nil")" } ?? "nil"))")
+check(declNamed("Action") == nil, "тип события не записан как имя")
+check(declNamed("Handler")?.kind == .method, "делегат-дженерик назван по имени, а не по типу")
+check(["Idle", "Run", "Jump"].allSatisfy { n in declNamed(n)?.kind == .enumCase && declNamed(n)?.container == "Mode" },
+      "значения enum с контейнером (получено \(declItems.filter { $0.kind == .enumCase }.map(\.name)))")
+check(declNamed("Map")?.typeText == "Dictionary<string,List<int>>", "вложенные дженерики (получено \(declNamed("Map")?.typeText ?? "nil"))")
+check(declNamed("2") == nil && declNamed("entity") == nil, "значения и параметры не объявления")
+
+// ─────────────────────────── Быстрый навигатор ───────────────────────────
+section("Быстрый навигатор")
+
+let navRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-nav-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: navRoot)
+let playerSystemSource = """
+using Game.Components;
+using Game.Ecs;
+using Vec = Game.Components.Health;
+
+namespace Game.Systems
+{
+    public sealed class PlayerSystem : BaseSystem
+    {
+        private Stash<Health> _health;
+        private readonly List<Player> _players = new();
+        private Vec _alias;
+        public Player Leader { get; private set; }
+
+        public override void OnAwake()
+        {
+            _health = World.GetStash<Health>();
+            ref var health = ref _health.Get(0);
+            health.Damage(1);
+            var player = new Player();
+            player.Move(2);
+            Leader.Move(3);
+            foreach (var p in _players) { p.Move(4); }
+            Log("Damage");
+            var world = World.Default;
+            world.GetStash<Health>();
+            Helper.Run();
+            this.Log("x");
+            // Damage в комментарии
+            var unknown = Something();
+            unknown.Damage(5);
+            _health.Get(1).Current = 0;
+            health.value = 1;
+        }
+        public enum Mode { Idle, Run = 2 }
+        void SetMode() { var m = Mode.Run; }
+    }
+    public class Player
+    {
+        public void Move(int dx) { }
+    }
+    public static class Helper { public static void Run() { } }
+}
+"""
+let damageSystemSource = """
+using Game.Components;
+using Game.Ecs;
+namespace Game.Systems
+{
+    [IncludeStash(typeof(Health))]
+    [IncludeStash(typeof(Game.Components.Health), "_hp")]
+    public partial class DamageSystem
+    {
+        private Filter _filter;
+        void OnUpdate()
+        {
+            foreach (var entity in _filter) { _health.Get(entity.Id).Damage(1); _hp.Has(entity.Id); }
+        }
+    }
+}
+"""
+let navFiles: [String: String] = [
+    "Assets/Game/Health.cs": """
+        using System;
+        namespace Game.Components
+        {
+            public struct Health
+            {
+                public int Current;
+                public float value;
+                public int Max { get; set; }
+                public void Damage(int amount) { Current -= amount; }
+            }
+        }
+        """,
+    "Assets/Game/Stash.cs": """
+        namespace Game.Ecs
+        {
+            public class Stash<T> where T : struct
+            {
+                public ref T Get(int entity) => ref _items[entity];
+                public bool Has(int entity) => true;
+                private T[] _items;
+            }
+            public class Filter
+            {
+                public Enumerator GetEnumerator() => default;
+                public struct Enumerator { public Entity Current => default; }
+            }
+            public struct Entity { public int Id; }
+            public class World
+            {
+                public Stash<T> GetStash<T>() where T : struct => null;
+                public static World Default { get; }
+            }
+        }
+        """,
+    "Assets/Game/BaseSystem.cs": """
+        namespace Game.Systems
+        {
+            public abstract class BaseSystem
+            {
+                protected World World;
+                public virtual void OnAwake() { }
+                protected void Log(string message) { }
+            }
+        }
+        """,
+    "Assets/Game/PlayerSystem.cs": playerSystemSource,
+    "Other/Player.cs": "namespace Other { public class Player { public void Move(int dx) { } } }",
+    "Assets/Game/DamageSystem.cs": damageSystemSource,
+    "Docs/readme.md": "Damage Damage Damage",
+]
+for (path, text) in navFiles {
+    let url = navRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? text.write(to: url, atomically: true, encoding: .utf8)
+}
+let symbols = SymbolIndex.build(root: navRoot, files: Array(navFiles.keys), shouldStop: { false })
+check(symbols != nil, "индекс символов построен")
+let symbolIndex = symbols ?? SymbolIndex(root: navRoot)
+check(symbolIndex.files.contains { $0.path == "Assets/Game/PlayerSystem.cs" && $0.usings == ["Game.Components", "Game.Ecs"]
+                                   && $0.aliases["Vec"] == "Game.Components.Health" && $0.namespaces == ["Game.Systems"] },
+      "using, псевдонимы и namespace файла")
+check(!symbolIndex.files.contains { $0.path.hasSuffix(".md") }, "Markdown не индексируется")
+
+let playerModel = SyntaxModel(text: playerSystemSource, spec: Languages.csharp)
+let navDocument = NavDocument(url: navRoot.appendingPathComponent("Assets/Game/PlayerSystem.cs"),
+                              relPath: "Assets/Game/PlayerSystem.cs", model: playerModel,
+                              outline: OutlineBuilder.build(model: playerModel))
+let navigator = LocalNavigator(index: symbolIndex, document: navDocument)
+
+/// ⌘B на слове `word` в n-м вхождении `context` внутри PlayerSystem.cs.
+func jump(_ context: String, _ word: String, occurrence: Int = 0) -> LocalNavigator.Answer {
+    let text = playerSystemSource as NSString
+    var searchFrom = 0
+    var found = NSRange(location: NSNotFound, length: 0)
+    for _ in 0...occurrence {
+        found = text.range(of: context, options: [], range: NSRange(location: searchFrom, length: text.length - searchFrom))
+        guard found.location != NSNotFound else { return .none }
+        searchFrom = found.location + found.length
+    }
+    let inner = (context as NSString).range(of: word)
+    return navigator.definition(at: found.location + inner.location)
+}
+func landed(_ answer: LocalNavigator.Answer) -> String {
+    guard let first = answer.declarations.first else { return "ничего" }
+    return "\(first.container ?? "-").\(first.name) в \(first.path)\(answer.isExact ? "" : " (кандидатов \(answer.declarations.count))")"
+}
+func expect(_ answer: LocalNavigator.Answer, _ name: String, in path: String, container: String? = nil, _ label: String) {
+    let first = answer.declarations.first
+    check(answer.isExact && first?.name == name && first?.path == path && (container == nil || first?.container == container),
+          "\(label) (получено: \(landed(answer)))")
+}
+
+expect(jump("health.Damage(1)", "Damage"), "Damage", in: "Assets/Game/Health.cs", container: "Health",
+       "ref var из Stash<Health>.Get → T подставлен → Health.Damage")
+expect(jump("player.Move(2)", "Move"), "Move", in: "Assets/Game/PlayerSystem.cs", container: "Player",
+       "var = new Player → Player из своего namespace, а не Other.Player")
+expect(jump("Leader.Move(3)", "Move"), "Move", in: "Assets/Game/PlayerSystem.cs",
+       "тип свойства → его метод")
+expect(jump("p.Move(4)", "Move"), "Move", in: "Assets/Game/PlayerSystem.cs",
+       "foreach по List<Player> → элемент Player")
+expect(jump("World.GetStash<Health>()", "GetStash"), "GetStash", in: "Assets/Game/Stash.cs", container: "World",
+       "поле World из базового класса → World.GetStash")
+expect(jump("world.GetStash<Health>()", "GetStash"), "GetStash", in: "Assets/Game/Stash.cs",
+       "var = World.Default (static-свойство через поле базового класса) → World")
+expect(jump("Helper.Run()", "Run"), "Run", in: "Assets/Game/PlayerSystem.cs", container: "Helper",
+       "статический вызов через имя типа")
+expect(jump("this.Log(\"x\")", "Log"), "Log", in: "Assets/Game/BaseSystem.cs",
+       "this. → метод базового класса")
+expect(jump("Log(\"Damage\")", "Log"), "Log", in: "Assets/Game/BaseSystem.cs",
+       "голый вызов → член базового класса")
+expect(jump("Mode.Run", "Run"), "Run", in: "Assets/Game/PlayerSystem.cs", container: "Mode",
+       "значение вложенного enum")
+expect(jump("new Player()", "Player"), "Player", in: "Assets/Game/PlayerSystem.cs",
+       "тип после new — ближайший по namespace")
+expect(jump("private Vec _alias", "Vec"), "Health", in: "Assets/Game/Health.cs",
+       "псевдоним using")
+expect(jump("player.Move(2)", "player"), "player", in: "Assets/Game/PlayerSystem.cs",
+       "локальная переменная")
+expect(jump("_health.Get(1).Current", "Current"), "Current", in: "Assets/Game/Health.cs",
+       "поле результата дженерик-метода")
+expect(jump("health.value", "value"), "value", in: "Assets/Game/Health.cs",
+       "поле с именем-контекстным словом `value`")
+let fallbackAnswer = jump("unknown.Damage(5)", "Damage")
+check(fallbackAnswer.declarations.first?.name == "Damage" && fallbackAnswer.declarations.count == 1
+        && fallbackAnswer.isExact,
+      "тип неизвестен, но объявление с таким именем одно — прыгаем (получено: \(landed(fallbackAnswer)))")
+check(jump("Log(\"Damage\")", "Damage").declarations.isEmpty, "слово в строке — не идентификатор")
+check(jump("// Damage в комментарии", "Damage").declarations.isEmpty, "слово в комментарии — не идентификатор")
+check(jump("public void Move", "Move").declarations.isEmpty, "на самом объявлении прыгать некуда")
+
+let moveCandidates = LocalNavigator(index: symbolIndex, document: NavDocument(
+    url: navRoot.appendingPathComponent("x.cs"), relPath: "x.cs",
+    model: SyntaxModel(text: "class X { void F(dynamic d) { d.Move(1); } }", spec: Languages.csharp),
+    outline: OutlineBuilder.build(model: SyntaxModel(text: "class X { void F(dynamic d) { d.Move(1); } }", spec: Languages.csharp))))
+    .definition(at: ("class X { void F(dynamic d) { d.Move(1); } }" as NSString).range(of: "Move").location)
+check(!moveCandidates.isExact && moveCandidates.declarations.count == 2,
+      "тип неизвестен, одноимённых два — список выбора (получено: \(landed(moveCandidates)))")
+
+// Morpeh: поля от [IncludeStash] и foreach по Filter
+let damageModel = SyntaxModel(text: damageSystemSource, spec: Languages.csharp)
+let damageNavigator = LocalNavigator(index: symbolIndex, document: NavDocument(
+    url: navRoot.appendingPathComponent("Assets/Game/DamageSystem.cs"), relPath: "Assets/Game/DamageSystem.cs",
+    model: damageModel, outline: OutlineBuilder.build(model: damageModel)))
+func jumpDamage(_ context: String, _ word: String) -> LocalNavigator.Answer {
+    let at = (damageSystemSource as NSString).range(of: context)
+    guard at.location != NSNotFound else { return .none }
+    return damageNavigator.definition(at: at.location + (context as NSString).range(of: word).location)
+}
+expect(jumpDamage("_health.Get(entity.Id).Damage(1)", "Damage"), "Damage", in: "Assets/Game/Health.cs",
+       "[IncludeStash] даёт поле _health: Stash<Health> → Get → Health.Damage")
+expect(jumpDamage("_health.Get(entity.Id)", "_health"), "_health", in: "Assets/Game/DamageSystem.cs",
+       "само поле ведёт к атрибуту")
+expect(jumpDamage("_hp.Has(entity.Id)", "Has"), "Has", in: "Assets/Game/Stash.cs",
+       "явное имя поля из второго аргумента")
+expect(jumpDamage("_health.Get(entity.Id)", "Id"), "Id", in: "Assets/Game/Stash.cs", container: "Entity",
+       "foreach по Filter → GetEnumerator().Current → Entity")
+let stashFields = symbolIndex.symbols.filter { $0.name.hasPrefix("_h") && $0.container == "DamageSystem" }
+check(stashFields.map(\.name).sorted() == ["_health", "_hp"] && stashFields.allSatisfy { $0.typeText == "Stash<Health>" },
+      "в индексе два поля стэшей (получено \(stashFields.map { "\($0.name): \($0.typeText ?? "nil")" }))")
+
+let noIndex = LocalNavigator(index: nil, document: navDocument)
+check(noIndex.definition(at: (playerSystemSource as NSString).range(of: "Leader.Move").location).declarations.first?.name == "Leader",
+      "без индекса — хотя бы структура самого файла")
+
+// ⌘R: по тексту проекта, без строк и комментариев, только тот же язык
+let damageOffset = (playerSystemSource as NSString).range(of: "health.Damage").location + 7
+let damageRefs = navigator.references(at: damageOffset, root: navRoot, files: Array(navFiles.keys), shouldStop: { false })
+check(damageRefs.count == 4, "Damage: объявление и три вызова, без строки, комментария и .md (получено \(damageRefs.map { "\($0.path):\($0.line)" }))")
+check(damageRefs.first?.path == "Assets/Game/PlayerSystem.cs", "текущий файл — первым")
+let localRefs = navigator.references(at: (playerSystemSource as NSString).range(of: "player.Move").location,
+                                     root: navRoot, files: Array(navFiles.keys), shouldStop: { false })
+check(localRefs.count == 2 && localRefs.allSatisfy { $0.path == "Assets/Game/PlayerSystem.cs" },
+      "локальная переменная — только в своём файле (получено \(localRefs.count))")
+check(LocalNavigator.containsWord(Data("a Damage b".utf8), Array("Damage".utf8)), "слово целиком найдено")
+check(!LocalNavigator.containsWord(Data("TakeDamage".utf8), Array("Damage".utf8)), "часть слова не считается")
+
+// ⌘T
+func findSymbols(_ q: String) -> [String] {
+    symbolIndex.search(q, limit: 20, shouldStop: { false }).map { "\(symbolIndex[$0.id].container ?? "-").\(symbolIndex[$0.id].name)" }
+}
+check(findSymbols("PlaSys").first == "Game.Systems.PlayerSystem", "⌘T: аббревиатура типа (получено \(findSymbols("PlaSys")))")
+check(Set(findSymbols("Move").prefix(2)) == ["Player.Move"], "⌘T: оба Move (получено \(findSymbols("Move")))")
+check(findSymbols("world.getstash").first == "World.GetStash", "⌘T: запрос с точкой — по контейнеру")
+check(findSymbols("").isEmpty, "⌘T: пустой запрос — пусто")
+
+// индекс типов для ⇧⇧ — из того же разбора
+let derivedTypes = TypeIndex.make(root: navRoot, entries: symbolIndex.typeEntries())
+let derivedNames = (0..<derivedTypes.count).map { derivedTypes.declaration(Int32($0)).name }.sorted()
+check(derivedNames == ["BaseSystem", "DamageSystem", "Entity", "Enumerator", "Filter", "Health", "Helper", "Mode",
+                      "Player", "Player", "PlayerSystem", "Stash", "World"],
+      "типы для ⇧⇧ из индекса символов (получено \(derivedNames))")
+
+// кэш
+let symbolRoundTrip = SymbolIndex.deserialize(symbolIndex.serialized(), root: navRoot)
+check(symbolRoundTrip?.symbols == symbolIndex.symbols && symbolRoundTrip?.files == symbolIndex.files,
+      "кэш символов: туда и обратно без потерь")
+check(symbolRoundTrip?.typesByName["Player"]?.count == 2, "после загрузки из кэша таблицы построены")
+check(SymbolIndex.deserialize("pilot-types 1\nF\tx", root: navRoot) == nil, "чужой формат кэша отвергается")
+try? FileManager.default.removeItem(at: navRoot)
+
+// производительность: разбор, как на крупном проекте, но в памяти
+let perfSource = String(repeating: """
+    public sealed class System0 : BaseSystem
+    {
+        private Stash<Health> _health;
+        public override void OnUpdate(float dt) { var h = _health.Get(0); h.Damage(1); }
+    }
+
+    """, count: 2000)
+let tExtract = Date()
+let perfExtract = SymbolIndex.extract(text: perfSource, spec: Languages.csharp, path: "perf.cs")
+let extractMs = Date().timeIntervalSince(tExtract) * 1000
+print(String(format: "  объявления из файла на %d строк: %.0f мс, найдено %d", 10_000, extractMs, perfExtract.1.count))
+check(perfExtract.1.count == 6000, "в синтетике по три объявления на класс (получено \(perfExtract.1.count))")
+check(extractMs < 400, "разбор 10 000 строк быстрее 400 мс")
 
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
