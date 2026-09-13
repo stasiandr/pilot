@@ -1636,7 +1636,8 @@ final class Workspace: ObservableObject {
                       buffer.model.version == snapshot.version else { return }
                 self.objectWillChange.send()
                 buffer.setSemantics(outline: semantics?.outline ?? outline,
-                                    unityFile: semantics?.serialized, version: snapshot.version)
+                                    unityFile: semantics?.serialized, hierarchy: semantics?.hierarchy,
+                                    version: snapshot.version)
                 self.updateBreadcrumb()
             }
         }
@@ -1748,6 +1749,15 @@ final class Workspace: ObservableObject {
         navigate(to: NavTarget(url: document.url, range: LSPRange(
             start: document.model.position(at: range.location),
             end: document.model.position(at: NSMaxRange(range)))))
+    }
+
+    /// GameObject или вложенный префаб под курсором — его строка выделена
+    /// в иерархии под файлом в дереве проекта.
+    var unityHierarchySelection: Int64? {
+        guard let document, let file = document.unityFile, let hierarchy = document.unityHierarchy,
+              let index = file.objectIndex(containing: caretOffset),
+              let node = hierarchy.node(forObjectAt: index, in: file) else { return nil }
+        return hierarchy.nodes[node].fileID
     }
 
     /// Открыть ассет по GUID — ссылка в инспекторе.

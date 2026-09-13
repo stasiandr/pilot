@@ -15,7 +15,7 @@ cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,LS
 cp Sources/Pilot/Git/{LineDiff,GitParsing,Git,MergeConflicts}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Nav/{SymbolIndex,LocalNavigator}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/GitLab/{GitLabRemote,GitLabModels,UnifiedDiff}.swift "$TMP/Sources/coretests/"
-cp Sources/Pilot/Unity/{UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Unity/{UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector,UnityHierarchy}.swift "$TMP/Sources/coretests/"
 cp CoreTests/CoreTests.swift "$TMP/Sources/coretests/main.swift"
 
 cat > "$TMP/Package.swift" <<'MANIFEST'

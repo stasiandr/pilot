@@ -73,6 +73,11 @@ enum Theme {
 
     static var folderIcon: Icon { Icon(symbol: "folder.fill", color: Macchiato.blue) }
 
+    /// Иерархия сцены и префаба в дереве — как в окне Hierarchy у Unity:
+    /// GameObject — серый кубик, вложенный префаб — кубик цвета префаба.
+    static var gameObjectIcon: Icon { Icon(symbol: "cube", color: Macchiato.subtext0) }
+    static var prefabInstanceIcon: Icon { Icon(symbol: "cube.fill", color: Macchiato.sapphire) }
+
     /// Иконки по типу файла. Как в навигаторе Xcode — цветные, но цвета
     /// взяты из той же Macchiato, чтобы хром не спорил с подсветкой.
     static func fileIcon(forName name: String) -> Icon {

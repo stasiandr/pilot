@@ -7,6 +7,10 @@ import AppKit
 /// файлов строки создаются только для видимого), даёт штатную клавиатуру
 /// (стрелки, ← → сворачивают и разворачивают, набор имени прыгает к файлу)
 /// и позволяет программно раскрыть путь до открытого файла.
+///
+/// У открытой сцены или префаба под файлом раскрывается его иерархия —
+/// как окно Hierarchy в Unity. Клик по объекту ставит на него курсор,
+/// и инспектор показывает его компоненты.
 struct FileTreeView: NSViewRepresentable {
     let tree: FileTree?
     /// Открытый файл — подсвечивается в дереве, папки до него раскрываются.
@@ -16,7 +20,15 @@ struct FileTreeView: NSViewRepresentable {
     var expandAll = false
     /// Изменённые относительно HEAD файлы — подкрашиваются, как в VS Code.
     var gitFiles: [String: GitFileState] = [:]
+    /// Показывать ли у сцен и префабов иерархию: только в Unity-проекте
+    /// и не под фильтром — там дерево раскрыто целиком.
+    var showsHierarchy = false
+    /// Иерархия открытого файла (`selectedPath`).
+    var hierarchy: UnityHierarchy? = nil
+    /// GameObject или вложенный префаб под курсором.
+    var selectedObject: Int64? = nil
     let onOpen: (_ relPath: String, _ focusEditor: Bool) -> Void
+    var onSelectObject: (_ fileID: Int64, _ focusEditor: Bool) -> Void = { _, _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -41,6 +53,7 @@ struct FileTreeView: NSViewRepresentable {
         outline.delegate = coordinator
         outline.target = coordinator
         outline.action = #selector(Coordinator.rowClicked(_:))
+        outline.doubleAction = #selector(Coordinator.rowDoubleClicked(_:))
         outline.onReturn = { [weak coordinator] in coordinator?.openSelected() }
         outline.menu = coordinator.makeContextMenu()
 
@@ -56,8 +69,11 @@ struct FileTreeView: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         let coordinator = context.coordinator
         coordinator.onOpen = onOpen
+        coordinator.onSelectObject = onSelectObject
         coordinator.root = root
-        coordinator.update(tree: tree, selectedPath: selectedPath, expandAll: expandAll)
+        coordinator.update(tree: tree, selectedPath: selectedPath, expandAll: expandAll,
+                           hierarchy: showsHierarchy ? hierarchy : nil, selectedObject: selectedObject,
+                           showsHierarchy: showsHierarchy)
         coordinator.update(gitFiles: gitFiles)
     }
 
@@ -67,10 +83,16 @@ struct FileTreeView: NSViewRepresentable {
     final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate {
         weak var outline: NSOutlineView?
         var onOpen: ((String, Bool) -> Void)?
+        var onSelectObject: ((Int64, Bool) -> Void)?
         var root: URL?
 
         private var tree: FileTree?
         private var shownSelection: String?
+        private var shownObject: Int64?
+        /// Файл открыт из дерева и ещё грузится. Пока открыт прежний, дерево
+        /// обновляется с его путём — возвращать на него выделение не надо,
+        /// иначе оно прыгает: новый файл, старый, снова новый.
+        private var pendingOpen: (path: String, previous: String?)?
         private var gitFiles: [String: GitFileState] = [:]
         /// Папки, внутри которых что-то изменено, — чтобы изменение было
         /// видно и в свёрнутом дереве.
@@ -81,13 +103,36 @@ struct FileTreeView: NSViewRepresentable {
         /// Раскрытие, которое делаем мы сами, не должно попадать в `expanded`
         /// как пользовательское — иначе переоткрытие проекта раскроет всё подряд.
         private var isRestoring = false
+        /// Выделение ставим мы сами — это не выбор объекта пользователем.
+        private var isSelecting = false
 
-        func update(tree newTree: FileTree?, selectedPath: String?, expandAll: Bool) {
+        // Иерархия сцены или префаба — ветка под его файлом.
+        private var showsHierarchy = false
+        private var hierarchy: UnityHierarchy?
+        /// Под каким файлом она висит.
+        private var hierarchyPath: String?
+        /// Строки иерархии, по одной на узел. Объекты переживают перечитывание
+        /// файла после правки — иначе NSOutlineView забыл бы, что раскрыто.
+        private var hierarchyItems: [HierarchyItem] = []
+        /// Сцены и префабы, чью иерархию свернули руками: сами не раскрываем.
+        private var collapsedHierarchies: Set<String> = []
+        /// Раскрытые GameObject'ы по файлам: вернулся в префаб — всё как было.
+        private var expandedObjects: [String: Set<Int64>] = [:]
+
+        func update(tree newTree: FileTree?, selectedPath: String?, expandAll: Bool,
+                    hierarchy newHierarchy: UnityHierarchy?, selectedObject: Int64?, showsHierarchy: Bool) {
             guard let outline else { return }
+
+            if showsHierarchy != self.showsHierarchy {
+                self.showsHierarchy = showsHierarchy
+                // У каждого файла сцены меняется, есть ли у него стрелка.
+                if newTree === tree { outline.reloadData(); restoreExpansion() }
+            }
 
             // Сравнение по идентичности: дерево меняется целиком и редко,
             // а update вызывается на каждое движение курсора.
-            if newTree !== tree {
+            let treeChanged = newTree !== tree
+            if treeChanged {
                 // nil приходит только при смене проекта; пересканирование
                 // того же проекта подменяет дерево сразу, минуя nil.
                 if newTree == nil { expanded.removeAll() }
@@ -105,9 +150,26 @@ struct FileTreeView: NSViewRepresentable {
                 shownSelection = nil
             }
 
-            if selectedPath != shownSelection {
+            let hierarchyPath = newHierarchy != nil && selectedPath.map(Self.hasHierarchy) == true ? selectedPath : nil
+            if treeChanged || newHierarchy !== hierarchy || hierarchyPath != self.hierarchyPath {
+                let sameFile = !treeChanged && hierarchyPath == self.hierarchyPath
+                adopt(newHierarchy, at: hierarchyPath, treeChanged: treeChanged)
+                // Файл перечитали после правки: строки пересоздались, а с ними
+                // пропало выделение. Ставим его обратно, не дёргая прокрутку —
+                // если только из дерева уже не открывают другой файл.
+                if sameFile, pendingOpen == nil {
+                    select(path: selectedPath, object: selectedObject, scroll: false)
+                }
+            }
+
+            if let pending = pendingOpen {
+                if selectedPath == pending.previous, shownSelection == pending.path { return }
+                pendingOpen = nil
+            }
+            if selectedPath != shownSelection || selectedObject != shownObject {
                 shownSelection = selectedPath
-                reveal(selectedPath)
+                shownObject = selectedObject
+                select(path: selectedPath, object: selectedObject, scroll: true)
             }
         }
 
@@ -170,8 +232,12 @@ struct FileTreeView: NSViewRepresentable {
             expanded = alive
         }
 
-        private func reveal(_ path: String?) {
+        /// Выделить строку открытого файла, а если под курсором объект его
+        /// иерархии и она раскрыта — строку объекта.
+        private func select(path: String?, object: Int64?, scroll: Bool) {
             guard let outline else { return }
+            isSelecting = true
+            defer { isSelecting = false }
             guard let path, let node = tree?.node(at: path) else {
                 outline.deselectAll(nil)
                 return
@@ -179,9 +245,23 @@ struct FileTreeView: NSViewRepresentable {
             for folder in node.ancestors where !outline.isItemExpanded(folder) {
                 outline.expandItem(folder)
             }
-            let row = outline.row(forItem: node)
+            var target: Any = node
+            if let object, path == hierarchyPath, let hierarchy, outline.isItemExpanded(node),
+               let index = hierarchy.node(forFileID: object) {
+                // Как Unity: выделенный объект виден, его предки раскрыты.
+                for ancestor in hierarchy.ancestors(of: index) {
+                    let item = hierarchyItems[ancestor]
+                    if !outline.isItemExpanded(item) {
+                        outline.expandItem(item)
+                        expandedObjects[path, default: []].insert(item.fileID)
+                    }
+                }
+                target = hierarchyItems[index]
+            }
+            let row = outline.row(forItem: target)
             guard row >= 0 else { return }
             outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            guard scroll else { return }
 
             // scrollRowToVisible прижал бы строку к краю; если она за экраном,
             // ставим её посередине, чтобы было видно соседей по папке.
@@ -192,27 +272,136 @@ struct FileTreeView: NSViewRepresentable {
             outline.scrollToVisible(rowRect.insetBy(dx: 0, dy: -margin))
         }
 
+        // MARK: Иерархия
+
+        static func hasHierarchy(_ name: String) -> Bool {
+            name.hasSuffix(".prefab") || name.hasSuffix(".unity")
+        }
+
+        /// Новая иерархия: другой файл открыли или этот перечитали после правки.
+        private func adopt(_ newHierarchy: UnityHierarchy?, at path: String?, treeChanged: Bool) {
+            guard let outline else { return }
+            isRestoring = true
+            defer { isRestoring = false }
+
+            // Ветку прежнего файла сворачиваем, пока её строки ещё на месте:
+            // NSOutlineView спросит у источника данных детей, которых сейчас не станет.
+            let oldPath = hierarchyPath
+            let oldNode = treeChanged ? nil : oldPath.flatMap { tree?.node(at: $0) }
+            if let oldNode, oldPath != path {
+                outline.collapseItem(oldNode)
+            }
+
+            let reused = path == oldPath
+                ? Dictionary(hierarchyItems.map { ($0.fileID, $0) }, uniquingKeysWith: { a, _ in a }) : [:]
+            hierarchyItems = newHierarchy.map { hierarchy in
+                hierarchy.nodes.enumerated().map { index, node in
+                    let item = reused[node.fileID] ?? HierarchyItem(fileID: node.fileID)
+                    item.index = index
+                    item.name = node.name
+                    item.isPrefab = node.isPrefab
+                    item.isActive = node.isActive
+                    return item
+                }
+            } ?? []
+            hierarchy = newHierarchy
+            hierarchyPath = path
+
+            if let oldNode, oldPath != path { outline.reloadItem(oldNode, reloadChildren: true) }
+            guard let path, let fileNode = tree?.node(at: path) else { return }
+            outline.reloadItem(fileNode, reloadChildren: true)
+
+            // Открыли сцену или префаб — сразу видно, что внутри.
+            if !collapsedHierarchies.contains(path) {
+                for folder in fileNode.ancestors where !outline.isItemExpanded(folder) {
+                    outline.expandItem(folder)
+                }
+                outline.expandItem(fileNode)
+            }
+            guard outline.isItemExpanded(fileNode), let hierarchy else { return }
+
+            // У префаба один корень — он раскрыт, как в режиме префаба Unity.
+            // У сцены корней много, раскрываем только то, что раскрывали руками.
+            let saved = expandedObjects[path] ?? (path.hasSuffix(".prefab")
+                ? Set(hierarchy.roots.map { hierarchy.nodes[$0].fileID }) : [])
+            expandedObjects[path] = saved
+            func expand(_ nodes: [Int]) {
+                for node in nodes where saved.contains(hierarchy.nodes[node].fileID) {
+                    outline.expandItem(hierarchyItems[node])
+                    expand(hierarchy.nodes[node].children)
+                }
+            }
+            expand(hierarchy.roots)
+        }
+
+        /// Строки удалённых объектов NSOutlineView может ещё держать до перечитывания ветки.
+        private func node(of item: HierarchyItem) -> UnityHierarchy.Node? {
+            guard let hierarchy, item.index < hierarchyItems.count, hierarchyItems[item.index] === item else { return nil }
+            return hierarchy.nodes[item.index]
+        }
+
+        private func hierarchyChildren(of item: Any?) -> [Int]? {
+            if let item = item as? HierarchyItem { return node(of: item)?.children ?? [] }
+            if let node = item as? FileTree.Node, !node.isDirectory, node.relPath == hierarchyPath {
+                return hierarchy?.roots
+            }
+            return nil
+        }
+
+        /// `Canvas/Panel/Button` — как для `transform.Find`.
+        private func hierarchyPath(of item: HierarchyItem) -> String {
+            guard let hierarchy, node(of: item) != nil else { return item.name }
+            return (hierarchy.ancestors(of: item.index) + [item.index])
+                .map { hierarchy.nodes[$0].name }.joined(separator: "/")
+        }
+
         // MARK: Действия
 
+        /// Клик по папке раскрывает её — стрелочка слишком мелкая мишень.
+        /// Файл по клику только выделяется: открывается двойным кликом.
+        /// Объект иерархии клик выбирает — инспектор сразу на нём.
         @objc func rowClicked(_ sender: NSOutlineView) {
             let row = sender.clickedRow
-            guard row >= 0, let node = sender.item(atRow: row) as? FileTree.Node else { return }
-            if node.isDirectory {
-                // Клик по папке раскрывает её — стрелочка слишком мелкая мишень.
-                if sender.isItemExpanded(node) {
-                    sender.animator().collapseItem(node)
-                } else {
-                    sender.animator().expandItem(node)
-                }
-            } else {
-                open(node, focusEditor: false)
+            guard row >= 0 else { return }
+            if let item = sender.item(atRow: row) as? HierarchyItem {
+                select(item, focusEditor: false)
+                return
             }
+            guard let node = sender.item(atRow: row) as? FileTree.Node, node.isDirectory else { return }
+            if sender.isItemExpanded(node) {
+                sender.animator().collapseItem(node)
+            } else {
+                sender.animator().expandItem(node)
+            }
+        }
+
+        /// Двойной клик по файлу открывает его и уводит в текст, как Return.
+        /// Папку первый клик уже раскрыл — второй её не трогает. Объект
+        /// иерархии первый клик выбрал — второй его раскрывает.
+        @objc func rowDoubleClicked(_ sender: NSOutlineView) {
+            let row = sender.clickedRow
+            guard row >= 0 else { return }
+            if let item = sender.item(atRow: row) as? HierarchyItem {
+                guard sender.isExpandable(item) else { return }
+                if sender.isItemExpanded(item) {
+                    sender.animator().collapseItem(item)
+                } else {
+                    sender.animator().expandItem(item)
+                }
+                return
+            }
+            guard let node = sender.item(atRow: row) as? FileTree.Node, !node.isDirectory else { return }
+            open(node, focusEditor: true)
         }
 
         /// Return: папку раскрыть, файл открыть и уйти в текст.
         func openSelected() {
-            guard let outline, outline.selectedRow >= 0,
-                  let node = outline.item(atRow: outline.selectedRow) as? FileTree.Node else { return }
+            guard let outline, outline.selectedRow >= 0 else { return }
+            if let item = outline.item(atRow: outline.selectedRow) as? HierarchyItem {
+                select(item, focusEditor: true)
+                return
+            }
+            guard let node = outline.item(atRow: outline.selectedRow) as? FileTree.Node else { return }
             if node.isDirectory {
                 if outline.isItemExpanded(node) { outline.collapseItem(node) } else { outline.expandItem(node) }
             } else {
@@ -223,8 +412,28 @@ struct FileTreeView: NSViewRepresentable {
         private func open(_ node: FileTree.Node, focusEditor: Bool) {
             // Отмечаем заранее: когда документ загрузится, дерево уже
             // выделило эту строку и прыгать никуда не должно.
+            if node.relPath != shownSelection {
+                pendingOpen = (node.relPath, shownSelection)
+            }
             shownSelection = node.relPath
+            shownObject = nil
             onOpen?(node.relPath, focusEditor)
+        }
+
+        private func select(_ item: HierarchyItem, focusEditor: Bool) {
+            // Курсор встанет на объект, и дерево не должно никуда прыгать.
+            shownSelection = hierarchyPath
+            shownObject = item.fileID
+            onSelectObject?(item.fileID, focusEditor)
+        }
+
+        /// Стрелки по иерархии ведут за собой инспектор, как в Unity.
+        /// По файлам — нет: открытие файла дороже, для него есть Return.
+        func outlineViewSelectionDidChange(_ notification: Notification) {
+            guard !isSelecting, let outline, outline.window?.firstResponder === outline,
+                  NSApp.currentEvent?.type == .keyDown, outline.selectedRow >= 0,
+                  let item = outline.item(atRow: outline.selectedRow) as? HierarchyItem else { return }
+            select(item, focusEditor: false)
         }
 
         // MARK: Контекстное меню
@@ -237,8 +446,16 @@ struct FileTreeView: NSViewRepresentable {
 
         func menuNeedsUpdate(_ menu: NSMenu) {
             menu.removeAllItems()
-            guard let outline, outline.clickedRow >= 0,
-                  let node = outline.item(atRow: outline.clickedRow) as? FileTree.Node else { return }
+            guard let outline, outline.clickedRow >= 0 else { return }
+            if let item = outline.item(atRow: outline.clickedRow) as? HierarchyItem {
+                let copy = NSMenuItem(title: "Скопировать путь в иерархии", action: #selector(copyHierarchyPath(_:)),
+                                      keyEquivalent: "")
+                copy.target = self
+                copy.representedObject = item
+                menu.addItem(copy)
+                return
+            }
+            guard let node = outline.item(atRow: outline.clickedRow) as? FileTree.Node else { return }
 
             let reveal = NSMenuItem(title: "Показать в Finder", action: #selector(revealInFinder(_:)), keyEquivalent: "")
             let copyRel = NSMenuItem(title: "Скопировать путь", action: #selector(copyPath(_:)), keyEquivalent: "")
@@ -273,18 +490,31 @@ struct FileTreeView: NSViewRepresentable {
             NSPasteboard.general.setString(url.path, forType: .string)
         }
 
+        @objc private func copyHierarchyPath(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? HierarchyItem else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(hierarchyPath(of: item), forType: .string)
+        }
+
         // MARK: Источник данных
 
         func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-            node(item)?.children.count ?? 0
+            if let children = hierarchyChildren(of: item) { return children.count }
+            guard let node = node(item), node.isDirectory else { return 0 }
+            return node.children.count
         }
 
         func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-            node(item)!.children[index]
+            if let children = hierarchyChildren(of: item) { return hierarchyItems[children[index]] }
+            return node(item)!.children[index]
         }
 
+        /// У сцен и префабов стрелка есть, даже пока они не открыты:
+        /// раскрыть — значит открыть файл, иерархия подтянется следом.
         func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
-            (item as? FileTree.Node)?.isDirectory ?? false
+            if let item = item as? HierarchyItem { return !(node(of: item)?.children.isEmpty ?? true) }
+            guard let node = item as? FileTree.Node else { return false }
+            return node.isDirectory || (showsHierarchy && Self.hasHierarchy(node.name))
         }
 
         private func node(_ item: Any?) -> FileTree.Node? {
@@ -294,31 +524,59 @@ struct FileTreeView: NSViewRepresentable {
         // MARK: Строки
 
         func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
-            guard let node = item as? FileTree.Node else { return nil }
             let cell = outlineView.makeView(withIdentifier: FileCell.identifier, owner: nil) as? FileCell ?? FileCell()
+            if let item = item as? HierarchyItem {
+                cell.configure(with: item)
+                return cell
+            }
+            guard let node = item as? FileTree.Node else { return nil }
             cell.configure(with: node, git: gitState(of: node))
             return cell
         }
 
         func outlineView(_ outlineView: NSOutlineView, typeSelectStringFor tableColumn: NSTableColumn?, item: Any) -> String? {
-            (item as? FileTree.Node)?.name
+            (item as? FileTree.Node)?.name ?? (item as? HierarchyItem)?.name
         }
 
         func outlineView(_ outlineView: NSOutlineView, toolTipFor cell: NSCell, rect: NSRectPointer,
                          tableColumn: NSTableColumn?, item: Any, mouseLocation: NSPoint) -> String {
+            if let item = item as? HierarchyItem {
+                let path = hierarchyPath(of: item)
+                return item.isPrefab ? "\(path) — вложенный префаб" : path
+            }
             guard let node = item as? FileTree.Node else { return "" }
             guard !node.isDirectory, let state = gitFiles[node.relPath] else { return node.relPath }
             return "\(node.relPath) — \(state.label)"
         }
 
         func outlineViewItemDidExpand(_ notification: Notification) {
-            guard !isRestoring, let node = notification.userInfo?["NSObject"] as? FileTree.Node else { return }
-            expanded.insert(node.relPath)
+            guard !isRestoring else { return }
+            let object = notification.userInfo?["NSObject"]
+            if let item = object as? HierarchyItem, let path = hierarchyPath {
+                expandedObjects[path, default: []].insert(item.fileID)
+            } else if let node = object as? FileTree.Node {
+                if node.isDirectory {
+                    expanded.insert(node.relPath)
+                } else {
+                    collapsedHierarchies.remove(node.relPath)
+                    // Раскрыли неоткрытую сцену — открываем, иерархия придёт с разбором.
+                    if node.relPath != hierarchyPath { open(node, focusEditor: false) }
+                }
+            }
         }
 
         func outlineViewItemDidCollapse(_ notification: Notification) {
-            guard !isRestoring, let node = notification.userInfo?["NSObject"] as? FileTree.Node else { return }
-            expanded.remove(node.relPath)
+            guard !isRestoring else { return }
+            let object = notification.userInfo?["NSObject"]
+            if let item = object as? HierarchyItem, let path = hierarchyPath {
+                expandedObjects[path]?.remove(item.fileID)
+            } else if let node = object as? FileTree.Node {
+                if node.isDirectory {
+                    expanded.remove(node.relPath)
+                } else {
+                    collapsedHierarchies.insert(node.relPath)
+                }
+            }
         }
     }
 }
@@ -371,6 +629,7 @@ private final class FileCell: NSTableCellView {
 
     func configure(with node: FileTree.Node, git state: GitFileState?) {
         label.stringValue = node.name
+        icon.alphaValue = 1
         // Цветные иконки по типу файла, как в навигаторе Xcode.
         let style = node.isDirectory ? Theme.folderIcon : Theme.fileIcon(forName: node.name)
         let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
@@ -386,12 +645,30 @@ private final class FileCell: NSTableCellView {
             badge.stringValue = ""
         }
         gitColor = state.map(Theme.git)
+        dimmed = false
+        applyGitColor()
+    }
+
+    /// Объект иерархии сцены или префаба. Выключенный — бледный, как в Unity.
+    func configure(with item: HierarchyItem) {
+        label.stringValue = item.name
+        let style = item.isPrefab ? Theme.prefabInstanceIcon : Theme.gameObjectIcon
+        let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+        icon.image = NSImage(systemSymbolName: style.symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+        icon.contentTintColor = style.color
+        icon.alphaValue = item.isActive ? 1 : 0.45
+        badge.stringValue = ""
+        gitColor = nil
+        dimmed = !item.isActive
         applyGitColor()
     }
 
     /// Ячейки переиспользуются — цвет задаётся и у неизменённых, иначе
     /// файл унаследует жёлтый от предыдущего хозяина ячейки.
     private var gitColor: NSColor?
+    /// Выключенный GameObject.
+    private var dimmed = false
 
     /// На синем фоне выделения цветной текст не читается — там белый.
     /// Фон строки меняется при выделении и при смене фокуса окна.
@@ -400,8 +677,9 @@ private final class FileCell: NSTableCellView {
     }
 
     private func applyGitColor() {
-        let color = backgroundStyle == .emphasized ? nil : gitColor
-        label.textColor = color ?? .labelColor
+        let emphasized = backgroundStyle == .emphasized
+        let color = emphasized ? nil : gitColor
+        label.textColor = color ?? (dimmed && !emphasized ? .tertiaryLabelColor : .labelColor)
         badge.textColor = color ?? .secondaryLabelColor
     }
 }
@@ -410,6 +688,30 @@ private final class FileCell: NSTableCellView {
 
 private final class FileOutlineView: NSOutlineView {
     var onReturn: (() -> Void)?
+
+    /// Штатная стрелка — мишень в десяток точек. Ловим клик на всю высоту
+    /// строки и с запасом по бокам: от отступа уровня до начала иконки.
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = row(at: point)
+        if row >= 0, let item = item(atRow: row), isExpandable(item) {
+            let arrow = frameOfOutlineCell(atRow: row)
+            let rowRect = rect(ofRow: row)
+            let target = NSRect(x: arrow.minX - 6, y: rowRect.minY,
+                                width: arrow.width + 10, height: rowRect.height)
+            if !arrow.isEmpty, target.contains(point) {
+                // ⌥ — раскрыть или свернуть всё вложенное, как у штатной стрелки.
+                let recursive = event.modifierFlags.contains(.option)
+                if isItemExpanded(item) {
+                    animator().collapseItem(item, collapseChildren: recursive)
+                } else {
+                    animator().expandItem(item, expandChildren: recursive)
+                }
+                return
+            }
+        }
+        super.mouseDown(with: event)
+    }
 
     override func keyDown(with event: NSEvent) {
         // 36 — Return, 76 — Enter на цифровом блоке.
@@ -425,5 +727,22 @@ private final class FileOutlineView: NSOutlineView {
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         return row(at: point) >= 0 ? super.menu(for: event) : nil
+    }
+}
+
+// MARK: - Строка иерархии
+
+/// GameObject или вложенный префаб в ветке сцены. Объект, а не структура:
+/// NSOutlineView помнит раскрытое и выделенное по идентичности строки.
+final class HierarchyItem: NSObject {
+    let fileID: Int64
+    /// Узел в текущей `UnityHierarchy`.
+    var index = 0
+    var name = ""
+    var isPrefab = false
+    var isActive = true
+
+    init(fileID: Int64) {
+        self.fileID = fileID
     }
 }

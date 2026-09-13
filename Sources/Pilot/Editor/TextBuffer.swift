@@ -80,9 +80,11 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
 
     /// Структура и разбор Unity вместе с версией модели, по которой они
     /// построены: пока текст её не догнал, позициям разбора не верим.
-    func setSemantics(outline: [OutlineItem], unityFile: UnityYAMLFile?, version: Int) {
+    func setSemantics(outline: [OutlineItem], unityFile: UnityYAMLFile?, hierarchy: UnityHierarchy?,
+                      version: Int) {
         document.outline = outline
         document.unityFile = unityFile
+        document.unityHierarchy = hierarchy
         document.semanticsVersion = version
     }
 
