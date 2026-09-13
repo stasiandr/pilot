@@ -1,0 +1,8 @@
+{
+  "name": "dev.local.pilot.ide",
+  "version": "0.1.0",
+  "displayName": "Pilot Editor",
+  "description": "Pilot как внешний редактор скриптов: файлы из Unity открываются в запущенном Pilot на нужной строке. Файлы решения генерирует пакет Rider.",
+  "unity": "2021.3",
+  "dependencies": {}
+}

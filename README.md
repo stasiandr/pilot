@@ -369,6 +369,32 @@ Unity.
 помечены как `inspector`. Узнаются по имени и атрибуту — как их и находит сам
 Unity, — а не по наследованию от `MonoBehaviour`.
 
+**Внешний редактор скриптов.** Двойной клик по скрипту или по ошибке в
+консоли Unity открывает файл в Pilot на нужной строке, «Assets → Open C#
+Project» — сам проект. Для этого в Unity-проект добавляется пакет из
+`UnityPackage/` — в `Packages/manifest.json`:
+
+```
+"dev.local.pilot.ide": "file:/путь/к/pilot/UnityPackage"
+```
+
+и в Preferences → External Tools → External Script Editor выбирается Pilot.
+Пакет отдаёт файл адресом `pilot://open?file=…&line=…&column=…&project=…`
+через `open -a`: запущенный Pilot получает его Apple Event'ом без
+перезапуска, незапущенный — сразу после старта. Файл из другого проекта
+переключает Pilot на тот проект; корнем становится папка Unity-проекта.
+
+`.sln` и `.csproj` генерирует пакет Rider (`com.unity.ide.rider`), Pilot
+только передаёт ему вызовы Unity: Rider-пакет делает это, даже когда текущий
+редактор не Rider, а под выбором редактора в Preferences остаются его
+настройки и «Regenerate project files». Пакет Visual Studio так не умеет.
+Без Rider-пакета Unity файлы проекта не обновляет, и языковой сервер не
+видит новые скрипты. Выбор редактора в Unity общий для всех проектов на
+машине: в проекте без пакета Unity запустит Pilot как обычное приложение —
+без строки и без обновления `.csproj`.
+
+Из Finder и `open -a Pilot File.cs` файлы тоже приходят в уже открытое окно.
+
 ## Языковой сервер (C#)
 
 Семантика C# — это Roslyn, а Roslyn грузит solution и строит индекс

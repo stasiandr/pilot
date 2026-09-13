@@ -16,5 +16,13 @@
     <key>NSHighResolutionCapable</key>      <true/>
     <key>LSApplicationCategoryType</key>    <string>public.app-category.developer-tools</string>
     <key>NSSupportsAutomaticTermination</key> <true/>
+    <!-- pilot://open?file=…&line=…&project=… — так файл открывает Unity. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>      <string>dev.local.pilot.open</string>
+            <key>CFBundleURLSchemes</key>   <array><string>pilot</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>

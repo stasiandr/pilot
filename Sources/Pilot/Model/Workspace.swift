@@ -284,6 +284,26 @@ final class Workspace: ObservableObject {
         }
     }
 
+    /// Файл или проект, присланный снаружи: Unity, Finder, `open -a Pilot`.
+    /// Файл из другого проекта переключает на тот проект.
+    func open(_ request: OpenRequest) {
+        var isDirectory: ObjCBool = false
+        if let path = request.path,
+           !FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory) { return }
+        let file = isDirectory.boolValue ? nil : request.path
+        guard let desired = request.project ?? (file.map(Self.projectRoot(containing:)) ?? request.path)
+        else { return }
+
+        if !OpenRequest.staysInRoot(root, file: file, desired: desired, repository: Git.repositoryRoot(for:)) {
+            open(root: desired)
+            // Не дали закрыть проект с несохранёнными правками — остаёмся.
+            guard root == desired else { return }
+        }
+        if let file {
+            navigate(to: NavTarget(url: file, range: request.range))
+        }
+    }
+
     private static func projectRoot(containing file: URL) -> URL {
         let dir = file.deletingLastPathComponent()
         return Git.repositoryRoot(for: dir) ?? dir

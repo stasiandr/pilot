@@ -3140,6 +3140,51 @@ let shortName = Tabs.shortened(longName)
 check(shortName.count == 36 && shortName.hasPrefix("VeryLong") && shortName.hasSuffix("Player.g.cs") && shortName.contains("…"),
       "длинное имя — многоточие посередине, конец с расширением цел (получено \(shortName))")
 
+// ─────────────────────── Открытие снаружи ───────────────────────
+section("OpenRequest")
+let unityRequest = OpenRequest(url: URL(string:
+    "pilot://open?project=%2FUsers%2Fme%2FMy%20Game&file=%2FUsers%2Fme%2FMy%20Game%2FAssets%2FA%2BB.cs&line=12&column=5")!)
+check(unityRequest?.path?.path == "/Users/me/My Game/Assets/A+B.cs", "pilot://: путь с пробелом и + раскодирован")
+check(unityRequest?.project?.path == "/Users/me/My Game", "pilot://: проект")
+check(unityRequest?.range == LSPRange(start: LSPPosition(line: 11, character: 4), end: LSPPosition(line: 11, character: 4)),
+      "строка и столбец с единицы -> LSP с нуля")
+let noPlace = OpenRequest(url: URL(string: "pilot://open?file=/p/A.cs&line=-1&column=0")!)
+check(noPlace?.line == nil && noPlace?.column == nil && noPlace?.range == nil, "-1 и 0 от Unity — место неизвестно")
+let lineOnly = OpenRequest(url: URL(string: "pilot://open?file=/p/A.cs&line=3")!)
+check(lineOnly?.range?.start == LSPPosition(line: 2, character: 0), "без столбца — начало строки")
+check(OpenRequest(url: URL(string: "pilot://open?project=/p")!)?.path == nil, "только проект — «Open C# Project»")
+check(OpenRequest(url: URL(string: "pilot://open?file=relative/A.cs")!) == nil, "относительный путь не принимается")
+check(OpenRequest(url: URL(string: "pilot://other?file=/p/A.cs")!) == nil, "неизвестная команда")
+check(OpenRequest(url: URL(string: "https://open?file=/p/A.cs")!) == nil, "чужая схема")
+check(OpenRequest(url: URL(fileURLWithPath: "/p/./src/../A.cs"))?.path?.path == "/p/A.cs", "file:// от Finder")
+
+func openRepoOf(_ url: URL) -> URL? {
+    // Основной репозиторий /repo, внутри — worktree со своим .git.
+    url.path.hasPrefix("/repo/.claude/worktrees/wt") ? URL(fileURLWithPath: "/repo/.claude/worktrees/wt")
+        : url.path.hasPrefix("/repo") ? URL(fileURLWithPath: "/repo") : nil
+}
+let openRepo = URL(fileURLWithPath: "/repo")
+let worktree = URL(fileURLWithPath: "/repo/.claude/worktrees/wt")
+check(OpenRequest.staysInRoot(openRepo, file: URL(fileURLWithPath: "/repo/Assets/A.cs"), desired: openRepo, repository: openRepoOf),
+      "файл открытого проекта — без переключения")
+check(OpenRequest.staysInRoot(openRepo, file: URL(fileURLWithPath: "/repo/client/Assets/A.cs"),
+                              desired: URL(fileURLWithPath: "/repo/client"), repository: openRepoOf),
+      "Unity-проект в подпапке открытого репозитория — без переключения")
+check(!OpenRequest.staysInRoot(openRepo, file: URL(fileURLWithPath: "/repo/.claude/worktrees/wt/Assets/A.cs"),
+                               desired: worktree, repository: openRepoOf),
+      "файл worktree внутри открытого репозитория — переключиться на worktree")
+check(!OpenRequest.staysInRoot(openRepo, file: URL(fileURLWithPath: "/other/A.cs"),
+                               desired: URL(fileURLWithPath: "/other"), repository: openRepoOf),
+      "файл другого проекта — переключиться")
+check(!OpenRequest.staysInRoot(URL(fileURLWithPath: "/rep"), file: URL(fileURLWithPath: "/repo/A.cs"),
+                               desired: openRepo, repository: openRepoOf),
+      "/rep — не родитель /repo")
+check(!OpenRequest.staysInRoot(nil, file: URL(fileURLWithPath: "/repo/A.cs"), desired: openRepo, repository: openRepoOf),
+      "стартовый экран — открыть проект")
+check(OpenRequest.staysInRoot(openRepo, file: nil, desired: openRepo, repository: openRepoOf), "проект уже открыт")
+check(!OpenRequest.staysInRoot(openRepo, file: nil, desired: URL(fileURLWithPath: "/repo/client"), repository: openRepoOf),
+      "просили открыть проект-подпапку — открываем её")
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

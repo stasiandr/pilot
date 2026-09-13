@@ -24,11 +24,10 @@ struct PilotApp: App {
         Window("Pilot", id: "main") {
             RootView(workspace: workspace)
                 .task {
-                    delegate.workspace = workspace
                     // Путь из командной строки открываем после первого кадра:
                     // окно должно появиться мгновенно, а индексация идёт фоном.
                     // Без пути остаётся стартовый экран с выбором проекта.
-                    workspace.start()
+                    delegate.attach(workspace)
                 }
                 .animation(.easeOut(duration: 0.14), value: workspace.isPaletteOpen)
         }
@@ -236,6 +235,59 @@ struct PilotApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Чтобы при выходе спросить про несохранённые правки.
     weak var workspace: Workspace?
+    /// Файлы и `pilot://`, пришедшие раньше первого кадра: Unity запускает
+    /// Pilot сразу с файлом, и событие обгоняет окно.
+    private var pendingRequests: [OpenRequest] = []
+
+    /// Окно готово. Присланное снаружи важнее командной строки: без него
+    /// открывается путь из аргументов или остаётся стартовый экран.
+    @MainActor
+    func attach(_ workspace: Workspace) {
+        self.workspace = workspace
+        if pendingRequests.isEmpty {
+            workspace.start()
+        } else {
+            pendingRequests.forEach(workspace.open)
+            pendingRequests = []
+        }
+    }
+
+    /// Finder, `open -a Pilot File.cs` и `pilot://open?…` из Unity —
+    /// в уже запущенный экземпляр, без перезапуска. Apple Events ловим сами:
+    /// `application(_:open:)` файлы не получает — их перехватывает SwiftUI.
+    private func installOpenHandlers() {
+        let events = NSAppleEventManager.shared()
+        events.setEventHandler(self, andSelector: #selector(handleOpen(_:reply:)),
+                               forEventClass: AEEventClass(kCoreEventClass), andEventID: AEEventID(kAEOpenDocuments))
+        events.setEventHandler(self, andSelector: #selector(handleOpen(_:reply:)),
+                               forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
+
+    /// odoc несёт список файлов, GURL — одну строку с адресом. Строку
+    /// в файл не приводим: AppKit сделал бы из `pilot://…` путь к файлу.
+    @MainActor @objc private func handleOpen(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        guard let direct = event.paramDescriptor(forKeyword: keyDirectObject) else { return }
+        if event.eventID == AEEventID(kAEGetURL) {
+            receive(direct.stringValue.flatMap(URL.init(string:)).map { [$0] } ?? [])
+            return
+        }
+        let items = direct.numberOfItems > 0 ? (1...direct.numberOfItems).compactMap { direct.atIndex($0) } : [direct]
+        receive(items.compactMap(\.fileURLValue))
+    }
+
+    @MainActor
+    private func receive(_ urls: [URL]) {
+        let requests = urls.compactMap(OpenRequest.init(url:))
+        guard let workspace else {
+            pendingRequests += requests
+            return
+        }
+        requests.forEach(workspace.open)
+        for window in NSApp.windows where window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -246,6 +298,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Палитра — Catppuccin Macchiato, тёмная; ставим до появления окна,
         // чтобы не мигнуть светлым хромом.
         NSApp.appearance = NSAppearance(named: .darkAqua)
+        // До конца запуска: событие, с которым Pilot запустили, приходит сразу после.
+        installOpenHandlers()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
