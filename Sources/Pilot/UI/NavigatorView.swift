@@ -6,6 +6,7 @@ import AppKit
 /// стеклянной панелью.
 struct NavigatorView: View {
     @ObservedObject var workspace: Workspace
+    @AppStorage("pilot.showsInspector") private var showsInspector = true
 
     var body: some View {
         content
@@ -46,10 +47,19 @@ struct NavigatorView: View {
                          root: workspace.root,
                          expandAll: filtering,
                          gitFiles: workspace.git.changedFiles,
+                         showsHierarchy: workspace.unity.isActive && !filtering,
+                         hierarchy: workspace.document?.unityHierarchy,
+                         selectedObject: workspace.unityHierarchySelection,
                          onOpen: { relPath, focusEditor in
                              guard let root = workspace.root else { return }
                              workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),
                                                               range: nil))
+                             if focusEditor { workspace.focusEditor() }
+                         },
+                         onSelectObject: { fileID, focusEditor in
+                             // Выбрали объект — значит, будут его править: нужен инспектор.
+                             showsInspector = true
+                             workspace.revealUnityObject(fileID: fileID)
                              if focusEditor { workspace.focusEditor() }
                          })
                 .overlay {
