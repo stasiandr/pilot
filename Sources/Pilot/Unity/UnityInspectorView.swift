@@ -22,24 +22,29 @@ struct UnityInspectorView: View {
                let content = UnityInspector.content(file: file, model: document.model,
                                                     caret: workspace.caretOffset,
                                                     resolve: { workspace.unity.assets?.displayName(for: $0) }) {
+                // Текст правили, а разбор ещё не догнал: позиции полей
+                // устарели, писать по ним нельзя. Это доли секунды.
+                // Версия файла из мерж-реквеста — только для чтения.
+                // Переключатель отладки ничего не пишет — он доступен всегда.
+                let locked = !document.isSemanticsFresh || document.revision != nil
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
-                        header(content, file: file)
+                        HStack(alignment: .top, spacing: 6) {
+                            header(content, file: file)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .disabled(locked)
+                            if !document.isSemanticsFresh {
+                                ProgressView().controlSize(.mini)
+                            }
+                            debugToggle
+                        }
                         ForEach(Array(content.sections.enumerated()), id: \.element.id) { index, section in
                             sectionView(section, focused: index == content.focusedSection,
                                         file: file, document: document)
                         }
+                        .disabled(locked)
                     }
                     .padding(12)
-                }
-                // Текст правили, а разбор ещё не догнал: позиции полей
-                // устарели, писать по ним нельзя. Это доли секунды.
-                // Версия файла из мерж-реквеста — только для чтения.
-                .disabled(!document.isSemanticsFresh || document.revision != nil)
-                .overlay(alignment: .topTrailing) {
-                    if !document.isSemanticsFresh {
-                        ProgressView().controlSize(.mini).padding(6)
-                    }
                 }
             } else {
                 VStack(spacing: 8) {
@@ -53,17 +58,23 @@ struct UnityInspectorView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .toolbar {
-            ToolbarItem {
-                Button { debug.toggle() } label: {
-                    Image(systemName: debug ? "ladybug.fill" : "ladybug")
-                }
-                .help("Отладка: показать служебные поля, как Debug-инспектор Unity")
-            }
-        }
     }
 
     // MARK: - Шапка
+
+    /// Жучок в углу инспектора, как Debug-режим в Unity: видны служебные поля.
+    private var debugToggle: some View {
+        Button { debug.toggle() } label: {
+            Image(systemName: debug ? "ladybug.fill" : "ladybug")
+                .font(.system(size: 12))
+                .foregroundStyle(debug ? AnyShapeStyle(Color(nsColor: Theme.unityEvent)) : AnyShapeStyle(.secondary))
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Отладка")
+        .help("Отладка: показать служебные поля, как Debug-инспектор Unity")
+    }
 
     @ViewBuilder
     private func header(_ content: UnityInspectorContent, file: UnityYAMLFile) -> some View {
