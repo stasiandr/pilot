@@ -3158,6 +3158,31 @@ check(OpenRequest(url: URL(string: "pilot://other?file=/p/A.cs")!) == nil, "не
 check(OpenRequest(url: URL(string: "https://open?file=/p/A.cs")!) == nil, "чужая схема")
 check(OpenRequest(url: URL(fileURLWithPath: "/p/./src/../A.cs"))?.path?.path == "/p/A.cs", "file:// от Finder")
 
+// Командная строка — так Pilot запускает Unity: `$(ProjectPath) $(File):$(Line):$(Column)`.
+let disk: [String: Bool] = ["/g": true, "/g/Assets/A.cs": false, "/g/Assets/b:c.cs": false, "/g/Assets/7:8": false]
+func launch(_ args: String...) -> OpenRequest? {
+    OpenRequest(arguments: ["/Applications/Pilot.app/Contents/MacOS/Pilot"] + args) { disk[$0] }
+}
+let fromUnity = launch("/g", "/g/Assets/A.cs:12:5")
+check(fromUnity?.project?.path == "/g" && fromUnity?.path?.path == "/g/Assets/A.cs"
+      && fromUnity?.line == 12 && fromUnity?.column == 5, "Unity: проект, файл, строка, столбец")
+check(launch("/g/Assets/A.cs:12")?.line == 12 && launch("/g/Assets/A.cs:12")?.column == nil, "только строка")
+let noLine = launch("/g", "/g/Assets/A.cs:0:0")
+check(noLine?.path?.path == "/g/Assets/A.cs" && noLine?.line == nil, "двойной клик по скрипту: 0:0 — без места")
+let openProject = launch("/g", ":0:0")
+check(openProject?.project?.path == "/g" && openProject?.path == nil, "Open C# Project: пустой $(File) — только проект")
+check(launch("/g/Assets/b:c.cs:3")?.path?.path == "/g/Assets/b:c.cs", "двоеточие в имени файла")
+check(launch("/g/Assets/7:8")?.path?.path == "/g/Assets/7:8" && launch("/g/Assets/7:8")?.line == nil,
+      "файл, похожий на file:line, существует — берём как есть")
+check(launch("-NSDocumentRevisionsDebugMode", "YES", "/g/Assets/A.cs")?.path?.path == "/g/Assets/A.cs",
+      "аргументы macOS пропускаются")
+check(launch("/nope/A.cs:3") == nil && launch() == nil, "несуществующий путь и пустая строка")
+
+let roundTrip = OpenRequest(url: OpenRequest(path: URL(fileURLWithPath: "/My Game/a&b=c+d#e.cs"), line: 7, column: 2,
+                                             project: URL(fileURLWithPath: "/My Game")).url)
+check(roundTrip?.path?.path == "/My Game/a&b=c+d#e.cs" && roundTrip?.line == 7 && roundTrip?.column == 2
+      && roundTrip?.project?.path == "/My Game", "pilot:// туда и обратно: пробел, &, =, +, #")
+
 func openRepoOf(_ url: URL) -> URL? {
     // Основной репозиторий /repo, внутри — worktree со своим .git.
     url.path.hasPrefix("/repo/.claude/worktrees/wt") ? URL(fileURLWithPath: "/repo/.claude/worktrees/wt")

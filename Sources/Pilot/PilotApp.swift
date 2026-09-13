@@ -9,6 +9,9 @@ enum PilotMain {
         if let socket = LSPDaemon.socketArgument(CommandLine.arguments) {
             LSPDaemon.run(socketPath: socket)
         }
+        if let request = OpenRequest.launch, LaunchForwarding.forward(request) {
+            exit(0)
+        }
         PilotApp.main()
     }
 }
@@ -235,25 +238,22 @@ struct PilotApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Чтобы при выходе спросить про несохранённые правки.
     weak var workspace: Workspace?
-    /// Файлы и `pilot://`, пришедшие раньше первого кадра: Unity запускает
-    /// Pilot сразу с файлом, и событие обгоняет окно.
+    /// Файлы и `pilot://`, пришедшие раньше первого кадра: `open -a Pilot File.cs`
+    /// запускает Pilot сразу с файлом, и событие обгоняет окно.
     private var pendingRequests: [OpenRequest] = []
 
-    /// Окно готово. Присланное снаружи важнее командной строки: без него
-    /// открывается путь из аргументов или остаётся стартовый экран.
+    /// Окно готово: путь из командной строки, затем присланное снаружи.
+    /// Без того и другого остаётся стартовый экран.
     @MainActor
     func attach(_ workspace: Workspace) {
         self.workspace = workspace
-        if pendingRequests.isEmpty {
-            workspace.start()
-        } else {
-            pendingRequests.forEach(workspace.open)
-            pendingRequests = []
-        }
+        workspace.start()
+        pendingRequests.forEach(workspace.open)
+        pendingRequests = []
     }
 
-    /// Finder, `open -a Pilot File.cs` и `pilot://open?…` из Unity —
-    /// в уже запущенный экземпляр, без перезапуска. Apple Events ловим сами:
+    /// Finder, `open -a Pilot File.cs` и `pilot://open?…` от второго процесса
+    /// (LaunchForwarding) — в уже открытое окно. Apple Events ловим сами:
     /// `application(_:open:)` файлы не получает — их перехватывает SwiftUI.
     private func installOpenHandlers() {
         let events = NSAppleEventManager.shared()

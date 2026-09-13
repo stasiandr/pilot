@@ -283,30 +283,13 @@ final class Workspace: ObservableObject {
     /// Старт приложения. Путь из командной строки открывается сразу,
     /// иначе остаётся стартовый экран с выбором из недавних проектов.
     func start() {
-        openLaunchTarget()
+        if let request = OpenRequest.launch { open(request) }
     }
 
-    /// Путь из командной строки: `Pilot /path/to/project` или `Pilot /path/File.cs`.
-    /// Для файла корнем проекта становится ближайший git-репозиторий над ним.
-    private func openLaunchTarget() {
-        // macOS может дописать свои аргументы вида `-NSFoo YES` — берём
-        // первый абсолютный путь, который существует на диске.
-        var isDirectory: ObjCBool = false
-        guard let path = CommandLine.arguments.dropFirst().first(where: {
-            $0.hasPrefix("/") && FileManager.default.fileExists(atPath: $0, isDirectory: &isDirectory)
-        }) else { return }
-
-        let url = URL(fileURLWithPath: path).standardizedFileURL
-        if isDirectory.boolValue {
-            open(root: url)
-        } else {
-            open(root: Self.projectRoot(containing: url))
-            open(file: url)
-        }
-    }
-
-    /// Файл или проект, присланный снаружи: Unity, Finder, `open -a Pilot`.
-    /// Файл из другого проекта переключает на тот проект.
+    /// Файл или проект из командной строки или присланный снаружи: Unity,
+    /// Finder, `open -a Pilot`. Для файла без проекта корнем становится
+    /// ближайший git-репозиторий над ним; файл из другого проекта
+    /// переключает на тот проект.
     func open(_ request: OpenRequest) {
         var isDirectory: ObjCBool = false
         if let path = request.path,

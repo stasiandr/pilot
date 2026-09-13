@@ -16,7 +16,8 @@
     <key>NSHighResolutionCapable</key>      <true/>
     <key>LSApplicationCategoryType</key>    <string>public.app-category.developer-tools</string>
     <key>NSSupportsAutomaticTermination</key> <true/>
-    <!-- pilot://open?file=…&line=…&project=… — так файл открывает Unity. -->
+    <!-- pilot://open?file=…&line=…&project=… — так второй процесс передаёт
+         файл уже запущенному Pilot (LaunchForwarding). -->
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
