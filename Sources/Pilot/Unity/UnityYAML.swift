@@ -35,6 +35,14 @@ struct UnityObject: Sendable {
     var modifiedName: String?
     /// `Сборка::Пространство.Класс` — Unity 6 пишет его у MonoBehaviour.
     var editorClassIdentifier: String?
+    /// `m_Children` у Transform и `m_Roots` у SceneRoots — порядок детей
+    /// в окне Hierarchy. Порядок в файле с ним не совпадает.
+    var children: [Int64]?
+    /// `m_RootOrder` — место корня сцены до Unity 2022, где ещё нет SceneRoots.
+    /// У вложенного префаба — из его переопределений.
+    var rootOrder: Int?
+    /// `m_IsActive: 0` — выключенный GameObject.
+    var isInactive = false
 
     var isGameObject: Bool { classID == 1 }
     var isPrefabInstance: Bool { classID == 1001 }
@@ -247,7 +255,11 @@ final class UnityYAMLFile: @unchecked Sendable {   // неизменяем по�
         var objects: [UnityObject] = []
         var current: UnityObject?
         var expectTypeName = false
-        var nameModificationPending = false
+        /// Переопределение вложенного префаба, чьё `value:` ждём строкой ниже.
+        enum PendingModification { case none, name, rootOrder }
+        var pending = PendingModification.none
+        /// Идут элементы `m_Children:` / `m_Roots:`.
+        var collectingChildren = false
         var lineNumber = 0
         var i = 0
 
@@ -266,7 +278,8 @@ final class UnityYAMLFile: @unchecked Sendable {   // неизменяем по�
                 if let done = current { objects.append(done) }
                 current = parseHeader(u, lineStart, end, line: lineNumber)
                 expectTypeName = current != nil
-                nameModificationPending = false
+                pending = .none
+                collectingChildren = false
                 continue
             }
             guard current != nil else { continue }
@@ -287,18 +300,38 @@ final class UnityYAMLFile: @unchecked Sendable {   // неизменяем по�
             while lineStart + indent < end && u[lineStart + indent] == 0x20 { indent += 1 }
             let k = lineStart + indent
 
-            if nameModificationPending {
-                nameModificationPending = false
-                if indent == 6, hasPrefix(u, k, end, "value: "), current!.modifiedName == nil {
+            if pending != .none {
+                defer { pending = .none }
+                guard indent == 6, hasPrefix(u, k, end, "value: ") else { continue }
+                if pending == .name, current!.modifiedName == nil {
                     let value = scalar(u, k + 7, end)
                     if !value.isEmpty { current!.modifiedName = value }
+                } else if pending == .rootOrder, current!.rootOrder == nil {
+                    current!.rootOrder = signedInteger(u, k + 7, end).map { Int($0.value) }
                 }
                 continue
             }
 
+            if collectingChildren {
+                // Элементы списка стоят на том же отступе, что и его ключ.
+                if indent == 2, hasPrefix(u, k, end, "- ") {
+                    if let id = reference(u, k, end)?.fileID { current!.children!.append(id) }
+                    continue
+                }
+                collectingChildren = false
+            }
+
             switch indent {
             case 2:
-                if hasPrefix(u, k, end, "m_Name: ") || (end - k == 7 && hasPrefix(u, k, end, "m_Name:")) {
+                if hasPrefix(u, k, end, "m_Children:") || hasPrefix(u, k, end, "m_Roots:") {
+                    current!.children = []
+                    // `m_Children: []` — детей нет, элементов не будет.
+                    collectingChildren = u[end - 1] != 0x5D   // ]
+                } else if hasPrefix(u, k, end, "m_RootOrder: ") {
+                    current!.rootOrder = signedInteger(u, k + 13, end).map { Int($0.value) }
+                } else if hasPrefix(u, k, end, "m_IsActive: ") {
+                    current!.isInactive = k + 12 < end && u[k + 12] == 0x30   // 0
+                } else if hasPrefix(u, k, end, "m_Name: ") || (end - k == 7 && hasPrefix(u, k, end, "m_Name:")) {
                     let valueStart = min(k + 8, end)
                     let value = scalar(u, valueStart, end)
                     if !value.isEmpty {
@@ -326,7 +359,9 @@ final class UnityYAMLFile: @unchecked Sendable {   // неизменяем по�
                 }
             case 6:
                 if end - k == 20, hasPrefix(u, k, end, "propertyPath: m_Name") {
-                    nameModificationPending = true
+                    pending = .name
+                } else if end - k == 25, hasPrefix(u, k, end, "propertyPath: m_RootOrder") {
+                    pending = .rootOrder
                 }
             default:
                 break

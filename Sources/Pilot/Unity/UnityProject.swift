@@ -156,6 +156,8 @@ enum UnitySemantics {
         var outline: [OutlineItem]
         /// Разобранный сериализованный файл — для переходов по ссылкам.
         var serialized: UnityYAMLFile?
+        /// Иерархия сцены или префаба — ветка под файлом в дереве проекта.
+        var hierarchy: UnityHierarchy? = nil
     }
 
     static func isSerializedAsset(_ spec: LanguageSpec?) -> Bool {
@@ -169,7 +171,9 @@ enum UnitySemantics {
             // Формат узнаётся по содержимому, а не по расширению: `.asset`
             // бывает и бинарным, а в `.meta` объектов нет вовсе.
             guard let file = UnityYAMLFile.parse(model.units) else { return nil }
-            return Result(outline: file.outline(resolve: { context?.assetName($0) }), serialized: file)
+            let resolve: UnityYAMLFile.Resolver = { context?.assetName($0) }
+            return Result(outline: file.outline(resolve: resolve), serialized: file,
+                          hierarchy: UnityHierarchy.build(file: file, resolve: resolve))
         }
         if context != nil, model.spec?.name == Languages.csharp.name {
             return Result(outline: UnityCSharp.annotate(lexicalOutline, units: model.units),

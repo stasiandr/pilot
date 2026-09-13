@@ -22,14 +22,16 @@ final class Workspace: ObservableObject {
     @Published var query = "" { didSet { queryChanged() } }
     @Published private(set) var results: [SearchHit] = []
     @Published private(set) var items: [PaletteItem] = []
-    /// Открытый в редакторе файл: текст, история правок, синтаксическая модель.
+    /// Открытые вкладки, слева направо. У каждой свой буфер: текст, история
+    /// отмены, выделение и прокрутка — ушёл на другую и вернулся, всё на месте.
+    @Published private(set) var tabs: [TextBuffer] = []
+    /// Активная вкладка — файл в редакторе. nil — пустой редактор или
+    /// файл, который не открылся как текст.
     @Published private(set) var buffer: TextBuffer?
     /// Открытый документ. Модель в нём та же, что правит редактор.
     var document: LoadedDocument? { buffer?.document }
-    /// Файлы с несохранёнными правками. Живут в памяти, пока смотрим другие:
-    /// вернулся — правки и история отмены на месте.
-    private var unsaved: [URL: TextBuffer] = [:]
     @Published private(set) var unsavedCount = 0
+    private var activationCounter = 0
     @Published private(set) var loadError: String?
     @Published var selection: Int = 0
     /// Закрылась палитра — фокус возвращается в текст: иначе он остаётся
@@ -58,6 +60,10 @@ final class Workspace: ObservableObject {
     @Published private(set) var editorFocusRequest = 0
 
     func focusEditor() { editorFocusRequest += 1 }
+    /// То же для поля фильтра внизу навигатора.
+    @Published private(set) var navigatorFilterFocusRequest = 0
+
+    func focusNavigatorFilter() { navigatorFilterFocusRequest += 1 }
 
     /// ⌘F и соседи — панель поиска над редактором. Идут запросом, а не
     /// через цепочку ответчиков: фокус может быть в дереве файлов,
@@ -314,6 +320,7 @@ final class Workspace: ObservableObject {
         review.workspaceChanged(to: url)
         unity.workspaceChanged(to: url)
         requestedFile = nil
+        restoreTabs(root: url)
         let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
 
         let generation = scanGeneration.bump()
@@ -1162,25 +1169,33 @@ final class Workspace: ObservableObject {
     /// Переход с записью в историю. Без истории go-to-definition —
     /// ловушка: провалился и не вернёшься.
     func navigate(to target: NavTarget) {
-        if let document {
-            let current = NavTarget(
-                url: document.url,
-                range: LSPRange(start: document.model.position(at: caretOffset),
-                                end: document.model.position(at: caretOffset)))
-            if historyIndex < 0 {
-                history = [current]
-                historyIndex = 0
-            } else if history[historyIndex].url != current.url
-                        || history[historyIndex].range?.start != current.range?.start {
-                history[historyIndex] = current
-            }
+        rememberPosition()
+        appendHistory(target)
+        jump(to: target)
+    }
+
+    /// Текущая запись истории — там, где курсор сейчас: вернёмся именно сюда.
+    private func rememberPosition() {
+        guard let document else { return }
+        let current = NavTarget(
+            url: document.url,
+            range: LSPRange(start: document.model.position(at: caretOffset),
+                            end: document.model.position(at: caretOffset)))
+        if historyIndex < 0 {
+            history = [current]
+            historyIndex = 0
+        } else if history[historyIndex].url != current.url
+                    || history[historyIndex].range?.start != current.range?.start {
+            history[historyIndex] = current
         }
+    }
+
+    private func appendHistory(_ target: NavTarget) {
         if historyIndex < history.count - 1 {
             history.removeSubrange((historyIndex + 1)...)
         }
         history.append(target)
         historyIndex = history.count - 1
-        jump(to: target)
     }
 
     func goBack() {
@@ -1195,10 +1210,12 @@ final class Workspace: ObservableObject {
         jump(to: history[historyIndex])
     }
 
+    /// Переход без диапазона — «открыть файл»: уже открытый остаётся,
+    /// где был, а не прыгает в начало.
     private func jump(to target: NavTarget) {
         isPaletteOpen = false
         if document?.url == target.url {
-            requestReveal(target.range)
+            if let range = target.range { requestReveal(range) }
         } else {
             open(file: target.url, reveal: target.range)
         }
@@ -1214,20 +1231,20 @@ final class Workspace: ObservableObject {
     /// Чтение и разбор уходят в фон: на файле в сотни тысяч строк первый
     /// проход лексера занимает сотни миллисекунд, и делать это на главном
     /// потоке — значит подвесить интерфейс.
+    ///
+    /// Файл, уже открытый во вкладке, не перечитывается: переходим на неё,
+    /// а там правки, ⌘Z, выделение и прокрутка.
     func open(file url: URL, reveal: LSPRange? = nil) {
         isPaletteOpen = false
-        loadError = nil
         requestedFile = url
         let generation = loadGeneration.bump()
-        let counter = loadGeneration
-        let unityContext = unity.context
-
-        // Несохранённый буфер важнее файла на диске: там правки и ⌘Z.
-        if let cached = unsaved[url] {
-            let caret = cached.model.position(at: cached.lastCaret)
-            activate(cached, reveal: reveal ?? LSPRange(start: caret, end: caret))
+        if let tab = tab(for: url, revision: nil) {
+            activate(tab, reveal: reveal)
             return
         }
+        loadError = nil
+        let counter = loadGeneration
+        let unityContext = unity.context
 
         work.async { [weak self] in
             guard let self else { return }
@@ -1239,11 +1256,17 @@ final class Workspace: ObservableObject {
         }
     }
 
-    /// Файл в версии MR: текст берётся из коммита, а не с диска.
+    /// Файл в версии MR: текст берётся из коммита, а не с диска. Файлы MR
+    /// обычно проходят подряд (⌥⌘↓), поэтому следующий занимает вкладку
+    /// предыдущего, а не открывает новую.
     func open(reviewFile file: ReviewFile, reveal: LSPRange? = nil) {
         isPaletteOpen = false
-        loadError = nil
         let generation = loadGeneration.bump()
+        if let tab = reviewTab(for: file) {
+            activate(tab, reveal: reveal)
+            return
+        }
+        loadError = nil
         let counter = loadGeneration
 
         Task { [weak self] in
@@ -1255,14 +1278,32 @@ final class Workspace: ObservableObject {
                 result = .failure(error)
             }
             guard counter.isCurrent(generation) else { return }
-            self.present(result, reveal: reveal)
+            self.present(result, reveal: reveal, replacingReviewTab: true)
         }
     }
 
-    private func present(_ result: Result<LoadedDocument, Error>, reveal: LSPRange?) {
+    private func present(_ result: Result<LoadedDocument, Error>, reveal: LSPRange?,
+                         replacingReviewTab: Bool = false) {
         switch result {
         case .success(let doc):
-            activate(TextBuffer(document: doc, fontSize: fontSize), reveal: reveal)
+            // Пока файл читался, его могли открыть другим путём.
+            if let existing = tab(for: doc.url, revision: doc.revision) {
+                activate(existing, reveal: reveal)
+                return
+            }
+            let buffer = TextBuffer(document: doc, fontSize: fontSize)
+            if replacingReviewTab, let current = self.buffer, current.isReadOnly,
+               let index = tabs.firstIndex(where: { $0 === current }) {
+                // Версия из MR правок не знает — терять при замене нечего.
+                discard(current)
+                tabs.insert(buffer, at: index)
+            } else {
+                let active = self.buffer.flatMap { current in tabs.firstIndex { $0 === current } }
+                tabs.insert(buffer, at: Tabs.insertionIndex(active: active, count: tabs.count))
+            }
+            adopt(buffer)
+            activate(buffer, reveal: reveal)
+            trimTabs()
         case .failure(let error):
             setBuffer(nil)
             loadError = error.localizedDescription
@@ -1270,50 +1311,303 @@ final class Workspace: ObservableObject {
         }
     }
 
-    // MARK: - Буферы и правки
+    // MARK: - Вкладки
 
-    private func activate(_ buffer: TextBuffer, reveal: LSPRange?) {
-        setBuffer(buffer)
+    /// Вкладка рабочей копии (`revision == nil`) или версии файла из MR.
+    func tab(for url: URL, revision: String?) -> TextBuffer? {
+        let path = url.standardizedFileURL.path
+        return tabs.first { $0.document.revision == revision && $0.url.standardizedFileURL.path == path }
+    }
+
+    /// Буфер стал вкладкой: его правки и «грязность» теперь касаются нас.
+    private func adopt(_ buffer: TextBuffer) {
+        buffer.onEdit = { [weak self] buffer, range, text in self?.bufferEdited(buffer, range: range, text: text) }
+        buffer.onDirtyChange = { [weak self] buffer in self?.dirtyChanged(buffer) }
+    }
+
+    /// Клик по вкладке. Переход записывается в историю, как и любой другой:
+    /// ⌘[ вернёт на прежнюю вкладку.
+    func selectTab(_ tab: TextBuffer) {
+        guard tab !== buffer else { return }
+        isPaletteOpen = false
+        _ = loadGeneration.bump()
+        rememberPosition()
+        // Историю ведут по пути: версию из MR она открыла бы рабочей копией.
+        if !tab.isReadOnly { appendHistory(NavTarget(url: tab.url, range: nil)) }
+        requestedFile = tab.url
+        activate(tab, reveal: nil)
+    }
+
+    /// ⇧⌘] и ⇧⌘[ — соседняя вкладка, по кругу.
+    func selectAdjacentTab(_ direction: Int) {
+        guard !tabs.isEmpty else { return }
+        guard let current = buffer, let index = tabs.firstIndex(where: { $0 === current }) else {
+            selectTab(direction > 0 ? tabs[0] : tabs[tabs.count - 1])
+            return
+        }
+        selectTab(tabs[(index + direction + tabs.count) % tabs.count])
+    }
+
+    /// Вкладки от недавней к давней.
+    var recentTabs: [TextBuffer] {
+        Tabs.recentOrder(lastActivated: tabs.map(\.lastActivated)).map { tabs[$0] }
+    }
+
+    /// Пункт меню «⌃Tab»: на вкладку, где был перед этой.
+    func selectPreviousRecentTab() {
+        guard let previous = recentTabs.first(where: { $0 !== buffer }) else { return }
+        selectTab(previous)
+    }
+
+    // ⌃Tab: пока держат ⌃, вкладки только показываются — порядок недавних
+    // не меняется, иначе второй Tab вернул бы на первую. Выбор фиксируется,
+    // когда ⌃ отпустили.
+
+    func beginTabSwitch() -> [TextBuffer] {
+        rememberPosition()
+        return recentTabs
+    }
+
+    func showTabWhileSwitching(_ tab: TextBuffer) {
+        guard tabs.contains(where: { $0 === tab }) else { return }
+        isPaletteOpen = false
+        _ = loadGeneration.bump()
+        activate(tab, reveal: nil, remember: false)
+    }
+
+    func endTabSwitch(startedAt start: TextBuffer?) {
+        guard let current = buffer, current !== start else { return }
+        activationCounter += 1
+        current.lastActivated = activationCounter
+        if !current.isReadOnly { appendHistory(NavTarget(url: current.url, range: nil)) }
+        persistTabs()
+    }
+
+    func moveTab(_ tab: TextBuffer, to target: TextBuffer) {
+        guard tab !== target, let from = tabs.firstIndex(where: { $0 === tab }),
+              let to = tabs.firstIndex(where: { $0 === target }) else { return }
+        tabs.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        persistTabs()
+    }
+
+    /// ⌘W. Если вместо текста — сообщение «файл не открыть», убирает его.
+    func closeActiveTab() {
+        if let buffer {
+            closeTabs([buffer])
+        } else if loadError != nil {
+            loadError = nil
+            if let next = recentTabs.first { activate(next, reveal: nil) }
+        }
+    }
+
+    func closeTab(_ tab: TextBuffer) { closeTabs([tab]) }
+
+    /// ⌥⌘W — все, кроме этой (по умолчанию — активной).
+    func closeOtherTabs(_ keep: TextBuffer? = nil) {
+        guard let keep = keep ?? buffer else { return }
+        closeTabs(tabs.filter { $0 !== keep })
+    }
+
+    func closeTabsToTheRight(of tab: TextBuffer) {
+        guard let index = tabs.firstIndex(where: { $0 === tab }) else { return }
+        closeTabs(Array(tabs[(index + 1)...]))
+    }
+
+    /// Несохранённое без спроса не закрывается. После активной открывается
+    /// та, где были перед ней: ⌘B, прочитал, ⌘W — и ты там, откуда пришёл.
+    func closeTabs(_ closing: [TextBuffer]) {
+        guard !closing.isEmpty, confirmUnsavedChanges(in: closing) else { return }
+        let wasActive = buffer.map { current in closing.contains { $0 === current } } ?? false
+        for tab in closing { discard(tab) }
+        updateUnsavedCount()
+        if wasActive {
+            _ = loadGeneration.bump()
+            if let next = recentTabs.first {
+                activate(next, reveal: nil)
+            } else {
+                showNoEditor()
+            }
+        }
+        persistTabs()
+    }
+
+    /// Вкладка уходит из памяти вместе с правками — спрашивать надо до этого.
+    private func discard(_ tab: TextBuffer) {
+        tabs.removeAll { $0 === tab }
+        tab.onEdit = nil
+        tab.onDirtyChange = nil
+        if !tab.isReadOnly { lsp.documentClosed(tab.url) }
+    }
+
+    /// Сверх лимита закрываются вкладки, где дольше всех не были.
+    /// Несохранённые не трогаем, даже если их больше лимита.
+    private func trimTabs() {
+        guard tabs.count > Tabs.limit else { return }
+        while tabs.count > Tabs.limit {
+            let active = buffer.flatMap { current in tabs.firstIndex { $0 === current } }
+            guard let victim = Tabs.evictionIndex(lastActivated: tabs.map(\.lastActivated),
+                                                  dirty: tabs.map(\.isDirty), active: active)
+            else { break }
+            discard(tabs[victim])
+        }
+        persistTabs()
+    }
+
+    private func showNoEditor() {
+        setBuffer(nil)
         loadError = nil
         caretOffset = 0
         occurrences = []
         occurrenceWord = nil
         breadcrumb = ""
         currentOutlineItem = nil
-        requestReveal(reveal)
-        if buffer.isReadOnly {
-            // Версия из MR: полоски и треды даёт ревью, а не HEAD. Серверу
-            // её не показываем — у него на руках рабочая копия того же файла.
-            git.documentOpened(nil)
-        } else {
-            // Сервер поднимается здесь — лениво, при первом файле
-            // подходящего языка, а не при запуске приложения.
-            lsp.documentOpened(buffer.document)
-            git.documentOpened(buffer.document)
-        }
+        git.documentOpened(nil)
     }
 
-    /// Смена открытого буфера. Уходящий остаётся в памяти, только если
-    /// в нём есть несохранённые правки.
-    private func setBuffer(_ new: TextBuffer?) {
-        if let old = buffer, old !== new {
-            old.lastCaret = caretOffset
-            if !old.isDirty, !old.isReadOnly {
-                unsaved[old.url] = nil
-                lsp.documentClosed(old.url)
+    // MARK: - Буферы и правки
+
+    /// `remember: false` — показать, не меняя порядок недавних (⌃Tab).
+    private func activate(_ buffer: TextBuffer, reveal: LSPRange?, remember: Bool = true) {
+        if remember {
+            activationCounter += 1
+            buffer.lastActivated = activationCounter
+        }
+        loadError = nil
+        if buffer !== self.buffer {
+            // Курсор — там, где его оставили; редактор восстановит его сам,
+            // и совпадение значений не даст ему опубликовать смену посреди
+            // обновления вьюхи.
+            caretOffset = buffer.lastCaret
+            setBuffer(buffer)
+            occurrences = []
+            occurrenceWord = nil
+            updateBreadcrumb()
+            scheduleOccurrences()
+            // Правили и ушли, не дождавшись разбора, — разберём сейчас.
+            if !buffer.document.isSemanticsFresh { rebuildOutline(buffer) }
+            if buffer.isReadOnly {
+                // Версия из MR: полоски и треды даёт ревью, а не HEAD. Серверу
+                // её не показываем — у него на руках рабочая копия того же файла.
+                git.documentOpened(nil)
+            } else {
+                // Сервер поднимается здесь — лениво, при первом файле
+                // подходящего языка, а не при запуске приложения. Повторное
+                // открытие того же документа сервер не заметит.
+                lsp.documentOpened(buffer.document)
+                git.documentOpened(buffer.document)
             }
         }
+        if let reveal { requestReveal(reveal) }
+        if remember { persistTabs() }
+    }
+
+    private func setBuffer(_ new: TextBuffer?) {
         buffer = new
         updateConflicts()
-        guard let new else { return }
-        new.onEdit = { [weak self] buffer, range, text in self?.bufferEdited(buffer, range: range, text: text) }
-        new.onDirtyChange = { [weak self] buffer in self?.dirtyChanged(buffer) }
     }
 
     private func dropAllBuffers() {
+        _ = restoreGeneration.bump()
+        isRestoringTabs = false
+        for tab in tabs where !tab.isReadOnly { lsp.documentClosed(tab.url) }
+        tabs = []
         setBuffer(nil)
-        unsaved.removeAll()
         updateUnsavedCount()
+    }
+
+    // MARK: - Вкладки между запусками
+    //
+    // Открытые файлы помнятся для каждого проекта: вернулся к нему — те же
+    // вкладки, та же активная. Несохранённые правки на диск не пишутся —
+    // перед закрытием Pilot про них спрашивает.
+
+    private static let tabsKey = "pilot.openTabs"
+    private let restoreGeneration = AtomicCounter()
+    private let restoreQueue = DispatchQueue(label: "pilot.tabs", qos: .userInitiated)
+    /// Пока вкладки проекта дочитываются, список не сохраняем: иначе
+    /// сохранился бы недочитанный.
+    private var isRestoringTabs = false
+    private var persistedTabs: [String: Any]?
+
+    private func persistTabs() {
+        guard let root, !isRestoringTabs else { return }
+        let files = tabs.filter { !$0.isReadOnly }.map(\.url.path)
+        let active = buffer.flatMap { $0.isReadOnly ? nil : $0.url.path } ?? ""
+        let entry: [String: Any] = ["files": files, "active": active]
+        if let persistedTabs, persistedTabs["files"] as? [String] == files,
+           persistedTabs["active"] as? String == active { return }
+        persistedTabs = entry
+
+        var all = UserDefaults.standard.dictionary(forKey: Self.tabsKey) ?? [:]
+        all[root.path] = entry
+        // Проекты, выпавшие из недавних, не копим.
+        let keep = Set(recentRoots.map(\.path)).union([root.path])
+        all = all.filter { keep.contains($0.key) }
+        UserDefaults.standard.set(all, forKey: Self.tabsKey)
+    }
+
+    /// Сначала читается активная — она показывается сразу, — затем
+    /// остальные встают по местам, не отнимая фокус.
+    private func restoreTabs(root: URL) {
+        persistedTabs = nil
+        isRestoringTabs = false
+        guard let entry = UserDefaults.standard.dictionary(forKey: Self.tabsKey)?[root.path] as? [String: Any],
+              let files = entry["files"] as? [String], !files.isEmpty else { return }
+        persistedTabs = entry
+        let active = entry["active"] as? String
+        let urls = files.map { URL(fileURLWithPath: $0) }
+        let activeURL = urls.first { $0.path == active }
+
+        let restore = restoreGeneration.bump()
+        let restoreCounter = restoreGeneration
+        let load = loadGeneration.bump()
+        let loadCounter = loadGeneration
+        let unityContext = unity.context
+        isRestoringTabs = true
+
+        // Не на `work`: там сейчас встанет обход проекта, а ⌘P важнее вкладок.
+        restoreQueue.async { [weak self] in
+            var documents: [URL: LoadedDocument] = [:]
+            let ordered = (activeURL.map { [$0] } ?? []) + urls.filter { $0 != activeURL }
+            for url in ordered {
+                guard restoreCounter.isCurrent(restore) else { return }
+                guard let document = try? LoadedDocument.load(url: url, unity: unityContext) else { continue }
+                documents[url] = document
+                if url == activeURL {
+                    Task { @MainActor in
+                        guard let self, restoreCounter.isCurrent(restore) else { return }
+                        self.adoptRestored([url], documents: [url: document],
+                                           activate: loadCounter.isCurrent(load) ? url : nil)
+                    }
+                }
+            }
+            Task { @MainActor in
+                guard let self, restoreCounter.isCurrent(restore) else { return }
+                self.adoptRestored(urls, documents: documents, activate: nil)
+                self.isRestoringTabs = false
+                self.persistTabs()
+            }
+        }
+    }
+
+    /// Прочитанные вкладки — в сохранённом порядке, впереди открытых за это
+    /// время. Уже открытый файл второй раз не открывается.
+    private func adoptRestored(_ urls: [URL], documents: [URL: LoadedDocument], activate url: URL?) {
+        var restored: [TextBuffer] = []
+        for url in urls {
+            if let existing = tab(for: url, revision: nil) {
+                restored.append(existing)
+            } else if let document = documents[url] {
+                let buffer = TextBuffer(document: document, fontSize: fontSize)
+                adopt(buffer)
+                restored.append(buffer)
+            }
+        }
+        tabs = restored + tabs.filter { tab in !restored.contains { $0 === tab } }
+        if let url, let active = tab(for: url, revision: nil) {
+            requestedFile = url
+            activate(active, reveal: nil)
+        }
     }
 
     private var outlineTask: Task<Void, Never>?
@@ -1366,7 +1660,8 @@ final class Workspace: ObservableObject {
                       buffer.model.version == snapshot.version else { return }
                 self.objectWillChange.send()
                 buffer.setSemantics(outline: semantics?.outline ?? outline,
-                                    unityFile: semantics?.serialized, version: snapshot.version)
+                                    unityFile: semantics?.serialized, hierarchy: semantics?.hierarchy,
+                                    version: snapshot.version)
                 self.updateBreadcrumb()
             }
         }
@@ -1377,6 +1672,8 @@ final class Workspace: ObservableObject {
     /// Индекс GUID дособрался: у скриптов в открытой сцене появились имена.
     /// Разбираем файл заново, не трогая ни текст, ни прокрутку.
     private func unityAssetsReady() {
+        // Фоновые вкладки переразберутся, когда на них вернутся.
+        for tab in tabs where tab !== buffer { tab.invalidateSemantics() }
         guard let buffer else { return }
         rebuildOutline(buffer)
     }
@@ -1478,6 +1775,15 @@ final class Workspace: ObservableObject {
             end: document.model.position(at: NSMaxRange(range)))))
     }
 
+    /// GameObject или вложенный префаб под курсором — его строка выделена
+    /// в иерархии под файлом в дереве проекта.
+    var unityHierarchySelection: Int64? {
+        guard let document, let file = document.unityFile, let hierarchy = document.unityHierarchy,
+              let index = file.objectIndex(containing: caretOffset),
+              let node = hierarchy.node(forObjectAt: index, in: file) else { return nil }
+        return hierarchy.nodes[node].fileID
+    }
+
     /// Открыть ассет по GUID — ссылка в инспекторе.
     func openUnityAsset(guid: UnityGUID, fileID: Int64? = nil) {
         Task { [weak self] in
@@ -1501,12 +1807,13 @@ final class Workspace: ObservableObject {
     }
 
     private func dirtyChanged(_ buffer: TextBuffer) {
-        unsaved[buffer.url] = buffer.isDirty ? buffer : nil
+        // Точка на вкладке — у любой, не только у активной.
+        objectWillChange.send()
         updateUnsavedCount()
     }
 
     private func updateUnsavedCount() {
-        let count = unsaved.values.filter(\.isDirty).count
+        let count = tabs.filter(\.isDirty).count
         if unsavedCount != count { unsavedCount = count }
         // Точка в красной кнопке окна — как у любого документа в macOS.
         for window in NSApp.windows where !(window is NSPanel) {
@@ -1516,8 +1823,6 @@ final class Workspace: ObservableObject {
 
     var isCurrentDirty: Bool { buffer?.isDirty == true }
 
-    func isUnsaved(_ url: URL) -> Bool { unsaved[url]?.isDirty == true }
-
     // MARK: - Сохранение
 
     func save() {
@@ -1526,7 +1831,7 @@ final class Workspace: ObservableObject {
     }
 
     func saveAll() {
-        for buffer in unsaved.values where buffer.isDirty { save(buffer) }
+        for buffer in tabs where buffer.isDirty { save(buffer) }
     }
 
     @discardableResult
@@ -1550,7 +1855,12 @@ final class Workspace: ObservableObject {
     /// Перед сменой проекта и выходом. true — можно продолжать: всё
     /// сохранено или правки решили выбросить.
     func confirmUnsavedChanges() -> Bool {
-        let dirty = unsaved.values.filter(\.isDirty).sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
+        confirmUnsavedChanges(in: tabs)
+    }
+
+    /// То же перед закрытием вкладок — только про те, что закрываются.
+    private func confirmUnsavedChanges(in buffers: [TextBuffer]) -> Bool {
+        let dirty = buffers.filter(\.isDirty).sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
         guard !dirty.isEmpty else { return true }
 
         let alert = NSAlert()
@@ -1571,8 +1881,8 @@ final class Workspace: ObservableObject {
         case .alertFirstButtonReturn:
             return dirty.allSatisfy { save($0) }
         case .alertThirdButtonReturn:
-            for buffer in dirty { unsaved[buffer.url] = nil }
-            updateUnsavedCount()
+            // Буферы с правками выбросит тот, кто спрашивал: закрытие вкладок
+            // или смена проекта. При выходе — вместе с процессом.
             return true
         default:
             return false

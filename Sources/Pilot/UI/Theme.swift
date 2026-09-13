@@ -57,6 +57,10 @@ enum Theme {
 
     static var separator: NSColor { Macchiato.surface0 }
 
+    /// Вкладки: активная — плашкой, под курсором — её тенью.
+    static var tabActive: NSColor { Macchiato.surface0 }
+    static var tabHover: NSColor { Macchiato.surface0.withAlphaComponent(0.45) }
+
     /// Молния быстрого индекса в статус-строке: пока навигация идёт по нему.
     static var fastIndex: NSColor { Macchiato.yellow }
 
@@ -68,6 +72,11 @@ enum Theme {
     }
 
     static var folderIcon: Icon { Icon(symbol: "folder.fill", color: Macchiato.blue) }
+
+    /// Иерархия сцены и префаба в дереве — как в окне Hierarchy у Unity:
+    /// GameObject — серый кубик, вложенный префаб — кубик цвета префаба.
+    static var gameObjectIcon: Icon { Icon(symbol: "cube", color: Macchiato.subtext0) }
+    static var prefabInstanceIcon: Icon { Icon(symbol: "cube.fill", color: Macchiato.sapphire) }
 
     /// Иконки по типу файла. Как в навигаторе Xcode — цветные, но цвета
     /// взяты из той же Macchiato, чтобы хром не спорил с подсветкой.
@@ -226,6 +235,8 @@ enum Theme {
     /// Открытый тред ревью — значок у строки. Голубой не спорит ни с одной
     /// из полосок диффа.
     static var reviewThread: NSColor { Macchiato.sky }
+    /// Слитый MR в результатах поиска — лиловым, как принято в GitHub и GitLab.
+    static var reviewMerged: NSColor { Macchiato.mauve }
     /// Конфликт слияния: текущее (HEAD) — зелёным, входящее — синим,
     /// общий предок — серым, строки маркеров — персиковым, как буква U.
     static var conflictCurrent: NSColor { Macchiato.green.withAlphaComponent(0.10) }

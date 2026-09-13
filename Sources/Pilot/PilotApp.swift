@@ -65,6 +65,14 @@ struct PilotApp: App {
                     .disabled(workspace.root == nil)
             }
             CommandGroup(replacing: .saveItem) {
+                // ⌘W закрывает вкладку, а не окно — как в Xcode и браузерах.
+                Button("Закрыть вкладку") { workspace.closeActiveTab() }
+                    .keyboardShortcut("w", modifiers: .command)
+                    .disabled(workspace.buffer == nil && workspace.loadError == nil)
+                Button("Закрыть другие вкладки") { workspace.closeOtherTabs() }
+                    .keyboardShortcut("w", modifiers: [.command, .option])
+                    .disabled(workspace.buffer == nil || workspace.tabs.count < 2)
+                Divider()
                 Button("Сохранить") { workspace.save() }
                     .keyboardShortcut("s", modifiers: .command)
                     .disabled(!workspace.isCurrentDirty)
@@ -130,7 +138,7 @@ struct PilotApp: App {
                 Button("Предыдущее изменение") { workspace.jumpToChange(-1) }
                     .keyboardShortcut(.upArrow, modifiers: [.control, .option])
                 Divider()
-                Button("Ревью мерж-реквестов") { workspace.navigatorTab = .review }
+                Button("Ревью мерж-реквестов") { workspace.showReviews() }
                     .keyboardShortcut("r", modifiers: [.command, .option])
                     .disabled(workspace.root == nil)
                 Button("Комментировать строку…") { workspace.commentOnCaretLine() }
@@ -194,6 +202,17 @@ struct PilotApp: App {
                 Button("Вперёд") { workspace.goForward() }
                     .keyboardShortcut("]", modifiers: .command)
                     .disabled(!workspace.canGoForward)
+                Divider()
+                Button("Следующая вкладка") { workspace.selectAdjacentTab(1) }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                    .disabled(workspace.tabs.count < 2)
+                Button("Предыдущая вкладка") { workspace.selectAdjacentTab(-1) }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                    .disabled(workspace.tabs.count < 2)
+                // ⌃Tab ловит TabSwitchMonitor: с зажатым ⌃ он ходит дальше
+                // по недавним, а меню так не умеет. Здесь — подпись и клик.
+                Button("Недавняя вкладка  ⌃Tab") { workspace.selectPreviousRecentTab() }
+                    .disabled(workspace.tabs.count < 2)
                 Divider()
                 Button("Крупнее") { workspace.fontSize += 1 }
                     .keyboardShortcut("=", modifiers: .command)   // ⌘+ без Shift

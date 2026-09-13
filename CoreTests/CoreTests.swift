@@ -1850,6 +1850,57 @@ let approvals = try? GitLabJSON.decoder.decode(GLApprovals.self, from: Data(appr
 check(approvals?.isApproved(by: GLUser(id: 8, username: "stas", name: "Stas")) == true, "апрув от меня виден")
 check(approvals?.isApproved(by: GLUser(id: 9, username: "bob", name: "Bob")) == false, "чужой апрув — не мой")
 
+// ────────────────────────── Поиск MR ──────────────────────────
+section("GitLab: поиск MR")
+
+func testMR(_ iid: Int, _ title: String, author: String = "ada", reviewer: String? = nil,
+            branch: String = "feature", labels: [String]? = nil) -> GLMergeRequest {
+    GLMergeRequest(id: 1000 + iid, iid: iid, title: title, description: nil, state: "opened", draft: nil,
+                   author: GLUser(id: author.count, username: author, name: author.capitalized),
+                   reviewers: reviewer.map { [GLUser(id: 99, username: $0, name: "Ревьюер")] }, assignees: nil,
+                   sourceBranch: branch, targetBranch: "develop", webUrl: "", sha: nil, updatedAt: nil,
+                   userNotesCount: nil, diffRefs: nil, hasConflicts: nil, labels: labels)
+}
+let searchList = [
+    testMR(10, "Починить загрузку ассетов", branch: "fix/asset-loading"),
+    testMR(11, "Ёлка в меню", author: "bob", reviewer: "stas", labels: ["UI"]),
+    testMR(12, "Рефакторинг сцены", branch: "loading-screen"),
+    testMR(123, "Новый HUD"),
+    testMR(7, "HUD: поправить отступы PROJ-123"),
+]
+func found(_ query: String) -> [Int] { MergeRequestSearch(query).filter(searchList).map(\.iid) }
+
+check(found("") == [10, 11, 12, 123, 7], "пустой запрос — весь список в исходном порядке")
+check(found("загрузку") == [10], "слово из заголовка")
+check(found("ЗАГРУЗКУ ассетов") == [10], "регистр не важен, все слова должны найтись")
+check(found("загрузку сцены").isEmpty, "слова — через И")
+check(found("елка") == [11], "ё и е не различаются")
+check(found("loading") == [10, 12], "по ветке-источнику (получено \(found("loading")))")
+check(found("develop").isEmpty, "целевая ветка не ищется — иначе нашлось бы всё")
+check(found("ui") == [11], "по метке")
+check(found("@st") == [11], "@логин — ревьюер по началу логина")
+check(found("@bob") == [11] && found("@ob").isEmpty, "@логин — автор, только с начала")
+check(found("bob") == [11], "имя автора без @")
+check(found("!123") == [123], "!номер — только этот MR, не PROJ-123 в заголовке")
+check(found("#12") == [12], "#номер — так же")
+check(found("123") == [123, 7], "число: сначала MR с таким номером, потом совпадения в тексте (получено \(found("123")))")
+check(found("hud") == [123, 7], "совпадения в заголовке — в исходном порядке")
+check(found("hud ada") == [123, 7], "слово не из заголовка тоже подходит")
+check(found("загрузку ada") == [10], "смесь заголовка и автора")
+
+let fixSearch = MergeRequestSearch("fix @ada !12 Загрузка")
+check(fixSearch.apiSearch == "fix Загрузка" && fixSearch.apiAuthor == "ada",
+      "в API — слова как ввели, @логин отдельно, !номер не уходит (получено «\(fixSearch.apiSearch)»)")
+check(MergeRequestSearch("!42").iid == 42 && MergeRequestSearch("42").iid == 42, "номер из !42 и 42")
+check(MergeRequestSearch("42 fix").iid == nil, "номер — только когда запрос из одного числа")
+check(!MergeRequestSearch("a").wantsServer && MergeRequestSearch("ab").wantsServer, "GitLab — от двух букв")
+check(MergeRequestSearch("!7").wantsServer && MergeRequestSearch("@x").wantsServer, "номер и автор — сразу")
+check(MergeRequestSearch("   ").isEmpty, "пробелы — пустой запрос")
+
+let labeledJSON = #"{"id": 2, "iid": 5, "title": "t", "state": "merged", "author": {"id": 1, "username": "a", "name": "A"}, "source_branch": "s", "target_branch": "t", "web_url": "", "labels": ["bug", "UI"]}"#
+let labeledMR = try? GitLabJSON.decoder.decode(GLMergeRequest.self, from: Data(labeledJSON.utf8))
+check(labeledMR?.labels == ["bug", "UI"] && labeledMR?.isOpen == false, "MR: метки и состояние")
+
 
 // ────────────────────────── Режимы палитры ──────────────────────────
 section("Режимы палитры")
@@ -2150,6 +2201,146 @@ print(String(format: "  сцена на %d строк: разбор и стру�
 check(bigFile?.objects.count == 50_000, "большая сцена: все 50 000 объектов")
 check(bigOutline.count == 50_000, "большая сцена: структура на все объекты")
 check(parseMs < 1500, "сцена на 50k объектов разбирается быстрее 1.5 с (получено \(Int(parseMs)) мс)")
+
+section("Unity / иерархия")
+
+if let scene, let hierarchy = UnityHierarchy.build(file: scene, resolve: { _ in nil }) {
+    func names(_ nodes: [Int]) -> [String] { nodes.map { hierarchy.nodes[$0].name } }
+    func node(_ fileID: Int64) -> Int? { hierarchy.node(forFileID: fileID) }
+    check(names(hierarchy.roots) == ["Canvas"], "корень сцены (получено \(names(hierarchy.roots)))")
+    if let canvas = node(100), let button = node(200), let icon = node(300), let badge = node(400) {
+        check(names(hierarchy.nodes[canvas].children) == ["Play Button"], "дети Canvas")
+        check(names(hierarchy.nodes[button].children) == ["Icon"], "вложенный префаб — ребёнок своего родителя")
+        check(hierarchy.nodes[icon].isPrefab && !hierarchy.nodes[button].isPrefab, "вложенный префаб помечен")
+        check(names(hierarchy.nodes[icon].children) == ["Badge"], "добавленное во вложенный префаб — под ним")
+        check(names(hierarchy.ancestors(of: badge)) == ["Canvas", "Play Button", "Icon"], "предки от корня")
+        check(hierarchy.node(forObjectAt: scene.index(ofFileID: 202)!, in: scene) == button,
+              "компонент ведёт к своему GameObject'у")
+        check(hierarchy.node(forObjectAt: scene.index(ofFileID: -301)!, in: scene) == icon,
+              "заглушка ведёт к вложенному префабу")
+        check(hierarchy.node(forObjectAt: scene.index(ofFileID: 101)!, in: scene) == canvas,
+              "Transform ведёт к своему GameObject'у")
+    } else {
+        check(false, "все объекты сцены есть в иерархии")
+    }
+} else {
+    check(false, "иерархия сцены строится")
+}
+
+// Порядок детей — по m_Children, а не по файлу; заглушка вложенного префаба
+// стоит в m_Children, как у Unity. `m_Children: []` не глотает следующие ключи.
+let orderedPrefab = """
+--- !u!1 &1
+GameObject:
+  m_Name: Root
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Children:
+  - {fileID: 22}
+  - {fileID: -40}
+  - {fileID: 12}
+  m_Father: {fileID: 0}
+--- !u!1 &11
+GameObject:
+  m_Name: Second
+  m_IsActive: 0
+--- !u!4 &12
+Transform:
+  m_GameObject: {fileID: 11}
+  m_Children: []
+  m_Father: {fileID: 2}
+--- !u!1 &21
+GameObject:
+  m_Name: First
+  m_IsActive: 1
+--- !u!4 &22
+Transform:
+  m_GameObject: {fileID: 21}
+  m_Children: []
+  m_Father: {fileID: 2}
+--- !u!1001 &30
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 2}
+  m_SourcePrefab: {fileID: 100100000, guid: \(buttonPrefabGUID), type: 3}
+--- !u!4 &-40 stripped
+Transform:
+  m_PrefabInstance: {fileID: 30}
+"""
+let orderedFile = UnityYAMLFile.parse(SyntaxModel(text: orderedPrefab, spec: Languages.unityYAML).units)!
+check(orderedFile.object(2)?.children == [22, -40, 12], "m_Children разобран (получено \(orderedFile.object(2)?.children ?? []))")
+check(orderedFile.object(12)?.children == [] && orderedFile.object(12)?.father == 2, "m_Children: [] — и m_Father после него")
+check(orderedFile.object(11)?.isInactive == true && orderedFile.object(21)?.isInactive == false, "m_IsActive")
+if let h = UnityHierarchy.build(file: orderedFile, resolve: { $0.description == buttonPrefabGUID ? "Button" : nil }) {
+    let root = h.roots.first!
+    let kids = h.nodes[root].children.map { h.nodes[$0].name }
+    check(kids == ["First", "Button", "Second"], "дети в порядке m_Children (получено \(kids))")
+    check(h.nodes[h.node(forFileID: 11)!].isActive == false, "выключенный GameObject")
+}
+
+// Корни сцены: SceneRoots (Unity 2022+) и m_RootOrder (раньше).
+func rootNames(_ text: String) -> [String] {
+    guard let file = UnityYAMLFile.parse(SyntaxModel(text: text, spec: Languages.unityYAML).units),
+          let h = UnityHierarchy.build(file: file, resolve: { _ in nil }) else { return [] }
+    return h.roots.map { h.nodes[$0].name }
+}
+func rootObject(_ go: Int, _ name: String, order: Int? = nil) -> String {
+    """
+    --- !u!1 &\(go)
+    GameObject:
+      m_Name: \(name)
+    --- !u!4 &\(go + 1)
+    Transform:
+      m_GameObject: {fileID: \(go)}
+      m_Children: []
+      m_Father: {fileID: 0}
+    \(order.map { "  m_RootOrder: \($0)\n" } ?? "")
+    """
+}
+let prefabRoot = """
+--- !u!1001 &90
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 1, guid: \(buttonPrefabGUID), type: 3}
+      propertyPath: m_Name
+      value: Enemy
+      objectReference: {fileID: 0}
+    - target: {fileID: 2, guid: \(buttonPrefabGUID), type: 3}
+      propertyPath: m_RootOrder
+      value: 1
+      objectReference: {fileID: 0}
+
+"""
+check(rootNames(rootObject(10, "Camera") + rootObject(20, "Light") + prefabRoot + """
+--- !u!1660057539 &9223372036854775807
+SceneRoots:
+  m_ObjectHideFlags: 0
+  m_Roots:
+  - {fileID: 21}
+  - {fileID: 90}
+  - {fileID: 11}
+""") == ["Light", "Enemy", "Camera"], "корни — по SceneRoots, вложенный префаб в нём своим fileID")
+check(rootNames(rootObject(10, "Camera", order: 2) + rootObject(20, "Light", order: 0) + prefabRoot)
+      == ["Light", "Enemy", "Camera"], "без SceneRoots корни — по m_RootOrder, у префаба — из переопределений")
+check(rootNames(rootObject(10, "Camera") + rootObject(20, "Light")) == ["Camera", "Light"],
+      "без порядка — как в файле")
+let settingsAsset = "--- !u!114 &11400000\nMonoBehaviour:\n  m_Name: Settings\n  speed: 5\n"
+check(UnityHierarchy.build(file: UnityYAMLFile.parse(SyntaxModel(text: settingsAsset, spec: Languages.unityYAML).units)!,
+                           resolve: { _ in nil }) == nil,
+      "у ScriptableObject иерархии нет")
+
+// Большая сцена: 12 500 GameObject'ов, по десять детей у каждого.
+if let bigFile {
+    let t = Date()
+    let bigHierarchy = UnityHierarchy.build(file: bigFile, resolve: { assetIndex.displayName(for: $0) })
+    let ms = Date().timeIntervalSince(t) * 1000
+    print(String(format: "  иерархия сцены на 12 500 объектов: %.0f мс", ms))
+    check(bigHierarchy?.nodes.count == 12_500 && bigHierarchy?.roots.count == 1, "большая сцена: все узлы, один корень")
+    check(ms < 300, "иерархия большой сцены быстрее 300 мс (получено \(Int(ms)) мс)")
+}
 
 section("Unity / C#")
 
@@ -2914,6 +3105,40 @@ let extractMs = Date().timeIntervalSince(tExtract) * 1000
 print(String(format: "  объявления из файла на %d строк: %.0f мс, найдено %d", 10_000, extractMs, perfExtract.1.count))
 check(perfExtract.1.count == 6000, "в синтетике по три объявления на класс (получено \(perfExtract.1.count))")
 check(extractMs < 400, "разбор 10 000 строк быстрее 400 мс")
+
+// ─────────────────────────── Вкладки ───────────────────────────
+section("Вкладки")
+check(Tabs.insertionIndex(active: 1, count: 4) == 2, "новая вкладка — сразу за активной")
+check(Tabs.insertionIndex(active: 3, count: 4) == 4, "за последней — в конец")
+check(Tabs.insertionIndex(active: nil, count: 4) == 4, "без активной — в конец")
+check(Tabs.insertionIndex(active: nil, count: 0) == 0, "первая вкладка")
+
+// давняя, без правок и не активная
+check(Tabs.evictionIndex(lastActivated: [5, 1, 3, 9], dirty: [false, false, false, false], active: 3) == 1,
+      "закрывается та, где дольше всех не были")
+check(Tabs.evictionIndex(lastActivated: [5, 1, 3, 9], dirty: [false, true, false, false], active: 3) == 2,
+      "несохранённая не закрывается")
+check(Tabs.evictionIndex(lastActivated: [1, 5], dirty: [false, false], active: 0) == 1,
+      "активная не закрывается, даже самая давняя")
+check(Tabs.evictionIndex(lastActivated: [1, 5], dirty: [true, true], active: nil) == nil,
+      "все с правками — закрывать некого")
+
+check(Tabs.recentOrder(lastActivated: [3, 7, 1, 5]) == [1, 3, 0, 2], "⌃Tab: от недавней к давней")
+
+let tabDetails = Tabs.details(forPaths: ["Assets/Scripts/Enemy/Health.cs", "Assets/Scripts/Player/Health.cs",
+                                         "Assets/Scripts/Player/Move.cs", "README.md"])
+check(tabDetails == ["Enemy", "Player", nil, nil], "одноимённые различаются ближайшей папкой (получено \(tabDetails))")
+let deepDetails = Tabs.details(forPaths: ["a/x/Editor/Config.cs", "b/x/Editor/Config.cs", "Config.cs"])
+check(deepDetails == ["a/x/Editor", "b/x/Editor", nil],
+      "папок берётся столько, сколько нужно, чтобы различить (получено \(deepDetails))")
+let sameDetails = Tabs.details(forPaths: ["src/App.swift", "src/App.swift"])
+check(sameDetails == ["src", "src"], "одинаковые пути (файл и его версия из MR) — подпись есть, различит значок")
+
+check(Tabs.shortened("Short.cs") == "Short.cs", "короткое имя не сокращается")
+let longName = "VeryLongGeneratedSerializationContractForPlayer.g.cs"
+let shortName = Tabs.shortened(longName)
+check(shortName.count == 36 && shortName.hasPrefix("VeryLong") && shortName.hasSuffix("Player.g.cs") && shortName.contains("…"),
+      "длинное имя — многоточие посередине, конец с расширением цел (получено \(shortName))")
 
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")

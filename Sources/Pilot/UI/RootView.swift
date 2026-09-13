@@ -7,6 +7,7 @@ import AppKit
 struct RootView: View {
     @ObservedObject var workspace: Workspace
     @State private var doubleShift: DoubleShiftMonitor?
+    @State private var tabSwitch: TabSwitchMonitor?
     @State private var paletteSpace: CGSize = .zero
     /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
@@ -33,6 +34,7 @@ struct RootView: View {
         .frame(minWidth: 860, minHeight: 520)
         .onAppear {
             doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
+            tabSwitch = TabSwitchMonitor(workspace: workspace)
         }
     }
 
@@ -57,6 +59,9 @@ struct RootView: View {
 
     private var detail: some View {
         VStack(spacing: 0) {
+            if workspace.root != nil, !workspace.tabs.isEmpty {
+                TabBar(workspace: workspace)
+            }
             if workspace.root != nil {
                 JumpBar(workspace: workspace)
             }
