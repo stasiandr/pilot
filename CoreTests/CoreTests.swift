@@ -2915,6 +2915,40 @@ print(String(format: "  объявления из файла на %d строк:
 check(perfExtract.1.count == 6000, "в синтетике по три объявления на класс (получено \(perfExtract.1.count))")
 check(extractMs < 400, "разбор 10 000 строк быстрее 400 мс")
 
+// ─────────────────────────── Вкладки ───────────────────────────
+section("Вкладки")
+check(Tabs.insertionIndex(active: 1, count: 4) == 2, "новая вкладка — сразу за активной")
+check(Tabs.insertionIndex(active: 3, count: 4) == 4, "за последней — в конец")
+check(Tabs.insertionIndex(active: nil, count: 4) == 4, "без активной — в конец")
+check(Tabs.insertionIndex(active: nil, count: 0) == 0, "первая вкладка")
+
+// давняя, без правок и не активная
+check(Tabs.evictionIndex(lastActivated: [5, 1, 3, 9], dirty: [false, false, false, false], active: 3) == 1,
+      "закрывается та, где дольше всех не были")
+check(Tabs.evictionIndex(lastActivated: [5, 1, 3, 9], dirty: [false, true, false, false], active: 3) == 2,
+      "несохранённая не закрывается")
+check(Tabs.evictionIndex(lastActivated: [1, 5], dirty: [false, false], active: 0) == 1,
+      "активная не закрывается, даже самая давняя")
+check(Tabs.evictionIndex(lastActivated: [1, 5], dirty: [true, true], active: nil) == nil,
+      "все с правками — закрывать некого")
+
+check(Tabs.recentOrder(lastActivated: [3, 7, 1, 5]) == [1, 3, 0, 2], "⌃Tab: от недавней к давней")
+
+let tabDetails = Tabs.details(forPaths: ["Assets/Scripts/Enemy/Health.cs", "Assets/Scripts/Player/Health.cs",
+                                         "Assets/Scripts/Player/Move.cs", "README.md"])
+check(tabDetails == ["Enemy", "Player", nil, nil], "одноимённые различаются ближайшей папкой (получено \(tabDetails))")
+let deepDetails = Tabs.details(forPaths: ["a/x/Editor/Config.cs", "b/x/Editor/Config.cs", "Config.cs"])
+check(deepDetails == ["a/x/Editor", "b/x/Editor", nil],
+      "папок берётся столько, сколько нужно, чтобы различить (получено \(deepDetails))")
+let sameDetails = Tabs.details(forPaths: ["src/App.swift", "src/App.swift"])
+check(sameDetails == ["src", "src"], "одинаковые пути (файл и его версия из MR) — подпись есть, различит значок")
+
+check(Tabs.shortened("Short.cs") == "Short.cs", "короткое имя не сокращается")
+let longName = "VeryLongGeneratedSerializationContractForPlayer.g.cs"
+let shortName = Tabs.shortened(longName)
+check(shortName.count == 36 && shortName.hasPrefix("VeryLong") && shortName.hasSuffix("Player.g.cs") && shortName.contains("…"),
+      "длинное имя — многоточие посередине, конец с расширением цел (получено \(shortName))")
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

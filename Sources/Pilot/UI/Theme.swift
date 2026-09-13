@@ -57,6 +57,10 @@ enum Theme {
 
     static var separator: NSColor { Macchiato.surface0 }
 
+    /// Вкладки: активная — плашкой, под курсором — её тенью.
+    static var tabActive: NSColor { Macchiato.surface0 }
+    static var tabHover: NSColor { Macchiato.surface0.withAlphaComponent(0.45) }
+
     /// Молния быстрого индекса в статус-строке: пока навигация идёт по нему.
     static var fastIndex: NSColor { Macchiato.yellow }
 
