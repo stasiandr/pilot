@@ -43,26 +43,7 @@ struct LoadedDocument: Sendable {
     static let maxBytes = 64 * 1024 * 1024
 
     static func load(url: URL, unity: UnityContext? = nil) throws -> LoadedDocument {
-        let data: Data
-        do {
-            data = try Data(contentsOf: url, options: .mappedIfSafe)
-        } catch {
-            throw LoadError.unreadable(error.localizedDescription)
-        }
-        if data.count > maxBytes { throw LoadError.tooLarge(data.count) }
-
-        // Эвристика бинарности: NUL в первых 8 КБ.
-        let probe = data.prefix(8192)
-        if probe.contains(0) { throw LoadError.binary }
-
-        let text: String
-        if let s = String(data: data, encoding: .utf8) {
-            text = s
-        } else if let s = String(data: data, encoding: .isoLatin1) {
-            text = s   // фолбэк, чтобы не падать на legacy-кодировках
-        } else {
-            throw LoadError.binary
-        }
+        let text = try readText(url: url, maxBytes: maxBytes)
         var document = make(url: url, text: text, unity: unity)
         document.modificationDate = modificationDate(of: url)
         return document
@@ -93,6 +74,27 @@ struct LoadedDocument: Sendable {
                               outline: semantics.outline, unityFile: semantics.serialized,
                               revision: revision + 1, edition: edition,
                               modificationDate: modificationDate)
+    }
+
+    /// Текст файла с теми же проверками, что и при открытии: размер,
+    /// бинарность, кодировка. Нужен и предпросмотру в палитре.
+    static func readText(url: URL, maxBytes: Int) throws -> String {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: .mappedIfSafe)
+        } catch {
+            throw LoadError.unreadable(error.localizedDescription)
+        }
+        if data.count > maxBytes { throw LoadError.tooLarge(data.count) }
+
+        // Эвристика бинарности: NUL в первых 8 КБ.
+        let probe = data.prefix(8192)
+        if probe.contains(0) { throw LoadError.binary }
+
+        if let s = String(data: data, encoding: .utf8) { return s }
+        // фолбэк, чтобы не падать на legacy-кодировках
+        if let s = String(data: data, encoding: .isoLatin1) { return s }
+        throw LoadError.binary
     }
 }
 
@@ -137,6 +139,70 @@ final class CodeTextView: NSTextView {
         }
     }
 
+    // MARK: Текущая строка
+
+    /// Где полоса текущей строки нарисована сейчас — чтобы при смене строки
+    /// перерисовать только две полосы, а не весь экран.
+    private var currentLineRect: NSRect?
+
+    /// Полоса под строкой с курсором на всю ширину, как в Xcode.
+    /// При выделении через несколько строк не рисуется — там она только мешает.
+    func lineHighlightRect() -> NSRect? {
+        guard let layout = layoutManager, let storage = textStorage else { return nil }
+        let selection = selectedRange()
+        let text = storage.string as NSString
+        // Длинное выделение почти наверняка многострочное, а искать в нём
+        // перевод строки на каждой отрисовке — лишняя работа.
+        if selection.length > 4096 { return nil }
+        if selection.length > 0,
+           text.rangeOfCharacter(from: .newlines, options: [], range: selection).location != NSNotFound {
+            return nil
+        }
+
+        var rect: NSRect
+        let atEnd = selection.location >= storage.length
+        if storage.length == 0 || (atEnd && text.character(at: storage.length - 1) == 0x0A) {
+            // Курсор на пустой последней строке — у неё свой «лишний» фрагмент.
+            rect = layout.extraLineFragmentRect
+            if rect.isEmpty { return nil }
+        } else {
+            let glyph = layout.glyphIndexForCharacter(at: min(selection.location, storage.length - 1))
+            rect = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        }
+        rect.origin.x = 0
+        rect.origin.y += textContainerOrigin.y
+        rect.size.width = max(bounds.width, visibleRect.maxX)
+        return rect
+    }
+
+    /// Возвращает true, если полоса появилась или исчезла — тогда
+    /// перерисовать надо и гаттер.
+    @discardableResult
+    func updateCurrentLineHighlight() -> Bool {
+        let new = lineHighlightRect()
+        guard new != currentLineRect else { return false }
+        if let old = currentLineRect { setNeedsDisplay(old) }
+        if let new { setNeedsDisplay(new) }
+        let toggled = (new == nil) != (currentLineRect == nil)
+        currentLineRect = new
+        return toggled
+    }
+
+    /// Именно draw, а не drawBackground: при drawsBackground = false
+    /// AppKit drawBackground не зовёт. Полоса рисуется до текста — под ним.
+    ///
+    /// Прямоугольник считаем здесь же, а не берём сохранённый: раскладка
+    /// ленивая, и посчитанная заранее позиция строки бывает лишь оценкой,
+    /// которая уезжает, когда строки выше раскладываются по-настоящему.
+    override func draw(_ dirtyRect: NSRect) {
+        currentLineRect = lineHighlightRect()
+        if let line = currentLineRect, line.intersects(dirtyRect) {
+            Theme.currentLine.setFill()
+            line.intersection(dirtyRect).intersection(bounds).fill()
+        }
+        super.draw(dirtyRect)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Не перехватываем Cmd+P и Cmd+F — их обрабатывает окно.
         if event.modifierFlags.contains(.command) {
@@ -147,13 +213,29 @@ final class CodeTextView: NSTextView {
     }
 }
 
+/// На macOS 26 NSScrollView кладёт клип-вью под вертикальную линейку —
+/// она «плавает» над текстом, и начало строк прячется за гаттером.
+/// Возвращаем классическую раскладку: текст начинается справа от линейки.
+final class CodeScrollView: NSScrollView {
+    override func tile() {
+        super.tile()
+        guard rulersVisible, let ruler = verticalRulerView else { return }
+        let edge = ruler.frame.maxX
+        var clip = contentView.frame
+        guard clip.minX < edge else { return }
+        clip.size.width -= edge - clip.minX
+        clip.origin.x = edge
+        contentView.frame = clip
+    }
+}
+
 final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     /// Курсор поехал — обновляем позицию, от неё зависят все запросы к LSP.
     var onCaretChange: ((Int) -> Void)?
     /// ⌘+клик по символу.
     var onGoToDefinition: ((Int) -> Void)?
-    private let scrollView = NSScrollView()
+    private let scrollView = CodeScrollView()
     private var textView: CodeTextView!
     private var ruler: LineNumberRuler?
 
@@ -234,6 +316,11 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
+        if textView.updateCurrentLineHighlight() { ruler?.needsDisplay = true }
+        if let model {
+            ruler?.currentLine = model.line(containing: min(textView.selectedRange().location,
+                                                            max(0, model.units.count - 1)))
+        }
         onCaretChange?(textView.selectedRange().location)
     }
 
@@ -253,19 +340,28 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     /// scrollRangeToVisible прижимает строку к краю окна; для перехода
     /// удобнее видеть её примерно на трети экрана сверху.
+    ///
+    /// Раскладка ленивая, и позиция далёкой строки до раскладки — лишь
+    /// оценка: прокрутишь по ней, строки выше разложатся по-настоящему,
+    /// и на экране окажется совсем другое место. Поэтому уточняем:
+    /// прокрутили, разложили видимое, пересчитали — пара итераций сходится.
     private func scrollCentering(_ range: NSRange) {
         guard let layout = textView.layoutManager, let container = textView.textContainer else {
             textView.scrollRangeToVisible(range)
             return
         }
         let glyphRange = layout.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
-        var rect = layout.boundingRect(forGlyphRange: glyphRange, in: container)
-        rect.origin.y += textView.textContainerInset.height
-
-        let visibleHeight = scrollView.contentView.bounds.height
-        let targetY = max(0, rect.midY - visibleHeight / 3)
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
+        let clip = scrollView.contentView
+        for _ in 0..<4 {
+            layout.ensureLayout(forGlyphRange: glyphRange)
+            var rect = layout.boundingRect(forGlyphRange: glyphRange, in: container)
+            rect.origin.y += textView.textContainerInset.height
+            let targetY = max(0, rect.midY - clip.bounds.height / 3)
+            if abs(clip.bounds.origin.y - targetY) < 1 { break }
+            clip.scroll(to: NSPoint(x: 0, y: targetY))
+            scrollView.reflectScrolledClipView(clip)
+            layout.ensureLayout(forBoundingRect: clip.bounds, in: container)
+        }
         highlightVisible()
     }
 
@@ -310,8 +406,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
         ruler?.model = doc.model
         ruler?.eventLines = Self.gutterMarkers(for: doc)
+        ruler?.currentLine = 0
         ruler?.invalidateWidth()
         highlightVisible()
+        textView.updateCurrentLineHighlight()
     }
 
     /// Тот же файл, новый текст — правка из инспектора. Прокрутку и
@@ -368,7 +466,12 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         ruler?.eventLines = []
         textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
         ruler?.model = nil
-        ruler?.needsDisplay = true
+        ruler?.setChanges([])
+    }
+
+    /// Отличия от HEAD — полосками в колонке номеров.
+    func setLineChanges(_ changes: [LineDiff.Change]) {
+        ruler?.setChanges(changes)
     }
 
     /// Вхождения красим не все сразу, а вместе с остальной подсветкой —
@@ -389,6 +492,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         ruler?.font = font
         ruler?.invalidateWidth()
         highlightVisible()
+        textView.updateCurrentLineHighlight()
     }
 
     /// Красит только те строки, что попали в видимую область (+ запас).
@@ -471,6 +575,10 @@ final class LineNumberRuler: NSRulerView {
         return NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "Сообщение Unity")?
             .withSymbolConfiguration(config)
     }()
+    /// Строка с курсором: её номер ярче, а полоса продолжается в гаттер.
+    var currentLine = 0 {
+        didSet { if currentLine != oldValue { needsDisplay = true } }
+    }
 
     init(scrollView: NSScrollView, textView: NSTextView) {
         self.textView = textView
@@ -485,6 +593,19 @@ final class LineNumberRuler: NSRulerView {
         let digits = max(3, String(model?.lineCount ?? 0).count)
         ruleThickness = CGFloat(digits) * 8.0 + 20
         needsDisplay = true
+    }
+
+    /// Фон — как у редактора, без системной разделительной линии:
+    /// у Xcode гаттер и текст на одной подложке.
+    ///
+    /// Заливаем строго свои границы: с macOS 14 виды по умолчанию не
+    /// обрезаются по bounds, и dirtyRect бывает шире линейки — залив его
+    /// целиком, гаттер закрасил бы и текст, и соседние SwiftUI-виды.
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = dirtyRect.intersection(bounds)
+        Theme.editorBackground.setFill()
+        rect.fill()
+        drawHashMarksAndLabels(in: rect)
     }
 
     override func drawHashMarksAndLabels(in rect: NSRect) {
@@ -507,6 +628,12 @@ final class LineNumberRuler: NSRulerView {
             .font: font,
             .foregroundColor: Theme.gutterText,
         ]
+        let currentAttrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: Theme.gutterTextCurrent,
+        ]
+        // Полоса текущей строки та же, что в тексте, — продолжаем её в гаттер.
+        let highlight = (textView as? CodeTextView)?.lineHighlightRect()
 
         var line = firstLine
         while line < model.lineCount {
@@ -518,17 +645,82 @@ final class LineNumberRuler: NSRulerView {
             let lineRect = layout.lineFragmentRect(forGlyphAt: glyphIdx, effectiveRange: &effective)
 
             let y = origin.y + inset + lineRect.minY
+            let isCurrent = line == currentLine
+            if isCurrent, highlight != nil {
+                Theme.currentLine.setFill()
+                NSRect(x: 0, y: y, width: ruleThickness, height: lineRect.height).fill()
+            }
             let label = String(line + 1) as NSString
-            let size = label.size(withAttributes: attrs)
+            let labelAttrs = isCurrent ? currentAttrs : attrs
+            let size = label.size(withAttributes: labelAttrs)
             label.draw(at: NSPoint(x: ruleThickness - size.width - 8,
                                    y: y + (lineRect.height - size.height) / 2),
-                       withAttributes: attrs)
+                       withAttributes: labelAttrs)
             if eventLines.contains(line), let image = markerImage {
                 let side = image.size
                 image.draw(in: NSRect(x: 4, y: y + (lineRect.height - side.height) / 2,
                                       width: side.width, height: side.height))
             }
+            if line < marks.count, marks[line] != 0 {
+                drawMark(marks[line], top: y, height: lineRect.height)
+            }
             line += 1
+        }
+    }
+
+    // MARK: Отличия от HEAD
+
+    /// Пометки по строкам, битами `Mark`. Плотный массив, а не список
+    /// блоков: при отрисовке — одно обращение по индексу на видимую строку.
+    private var marks: [UInt8] = []
+
+    private enum Mark {
+        static let added: UInt8 = 1
+        static let modified: UInt8 = 2
+        static let deletedAbove: UInt8 = 4
+        static let deletedBelow: UInt8 = 8   // удалено после последней строки
+    }
+
+    func setChanges(_ changes: [LineDiff.Change]) {
+        let count = model?.lineCount ?? 0
+        guard !changes.isEmpty, count > 0 else {
+            if !marks.isEmpty { marks = []; needsDisplay = true }
+            return
+        }
+        var fresh = [UInt8](repeating: 0, count: count)
+        for change in changes {
+            switch change.kind {
+            case .added, .modified:
+                let bit = change.kind == .added ? Mark.added : Mark.modified
+                for line in change.lines where line < count { fresh[line] |= bit }
+            case .deleted:
+                if change.lines.lowerBound < count {
+                    fresh[change.lines.lowerBound] |= Mark.deletedAbove
+                } else {
+                    fresh[count - 1] |= Mark.deletedBelow
+                }
+            }
+        }
+        marks = fresh
+        needsDisplay = true
+    }
+
+    /// Полоска вплотную к тексту, как в VS Code; удаление — треугольник
+    /// на стыке строк, между которыми что-то было.
+    private func drawMark(_ mark: UInt8, top: CGFloat, height: CGFloat) {
+        let x = ruleThickness - 4
+        if mark & (Mark.added | Mark.modified) != 0 {
+            (mark & Mark.added != 0 ? Theme.gitAdded : Theme.gitModified).setFill()
+            NSRect(x: x, y: top, width: 3, height: height).fill()
+        }
+        for (bit, y) in [(Mark.deletedAbove, top), (Mark.deletedBelow, top + height)] where mark & bit != 0 {
+            let wedge = NSBezierPath()
+            wedge.move(to: NSPoint(x: x - 1, y: y - 4))
+            wedge.line(to: NSPoint(x: x + 4, y: y))
+            wedge.line(to: NSPoint(x: x - 1, y: y + 4))
+            wedge.close()
+            Theme.gitDeleted.setFill()
+            wedge.fill()
         }
     }
 }
@@ -540,6 +732,7 @@ struct CodeView: NSViewControllerRepresentable {
     let fontSize: CGFloat
     let reveal: Workspace.RevealRequest?
     let occurrences: [NSRange]
+    let lineChanges: [LineDiff.Change]
     let focusRequest: Int
     /// Смысловые украшения и их версия: сменилась — перекрашиваем.
     var decorator: CodeDecorator? = nil
@@ -595,6 +788,12 @@ struct CodeView: NSViewControllerRepresentable {
             controller.setOccurrences(occurrences)
         }
 
+        // Блоков изменений — единицы, сравнить массивы целиком дёшево.
+        if documentChanged || context.coordinator.lineChanges != lineChanges {
+            context.coordinator.lineChanges = lineChanges
+            controller.setLineChanges(lineChanges)
+        }
+
         // Переход применяем один раз на запрос; порядковый номер нужен,
         // чтобы повторный прыжок в то же место тоже сработал.
         if let reveal, let document, reveal.seq != context.coordinator.appliedReveal {
@@ -632,6 +831,7 @@ struct CodeView: NSViewControllerRepresentable {
         var shownURL: URL?
         var fontSize: CGFloat = 12.5
         var appliedReveal: Int = -1
+        var lineChanges: [LineDiff.Change] = []
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
         var revision = 0

@@ -56,6 +56,14 @@ struct OutlineItem: Identifiable {
     /// Ключевое слово, которым введено объявление: `class`, `struct`, `func`.
     /// У методов C-подобных языков его нет.
     var keyword: String? = nil
+    /// Тип, как он написан в объявлении: у поля и свойства — их тип, у метода —
+    /// возвращаемый. Пока только для C-подобных языков: по нему быстрый
+    /// навигатор понимает, куда ведёт `a.b`, не дожидаясь языкового сервера.
+    var typeText: String? = nil
+    /// У типов: базовый класс и интерфейсы из `: Base, IFoo`.
+    var bases: [String] = []
+    /// У типов: параметры-дженерики, `Stash<T>` → `["T"]`.
+    var genericParams: [String] = []
 }
 
 /// Как в этом языке опознаётся объявление.
@@ -98,6 +106,10 @@ enum OutlineBuilder {
         /// «внутри тела» сразу: у `=> выражения` и у методов интерфейса
         /// фигурных скобок нет вовсе, и флаг тогда не сбросится никогда.
         var pendingBody = false
+        /// Только что объявлен C#-овый enum: следующая `{` открывает список значений.
+        var pendingEnum = false
+        /// Глубина скобок, на которой открылось тело enum.
+        var enumDepth: Int? = nil
 
         let units = model.units
 
@@ -120,11 +132,13 @@ enum OutlineBuilder {
         func isIdentifierLike(_ token: Token) -> Bool {
             switch token.kind {
             case .plain, .type, .function, .constant: return true
+            case .keyword: return spec.contextualKeywords.contains(text(token))
             default: return false
             }
         }
 
-        func record(_ nameToken: Token, kind: OutlineKind, opensScope: Bool, keyword: String? = nil) {
+        func record(_ nameToken: Token, kind: OutlineKind, opensScope: Bool, keyword: String? = nil,
+                    typeText: String? = nil, bases: [String] = [], genericParams: [String] = []) {
             let name = text(nameToken)
             guard !name.isEmpty else { return }
             let line = model.line(containing: Int(nameToken.start))
@@ -138,9 +152,18 @@ enum OutlineBuilder {
                 line: line,
                 depth: depth,
                 container: scopes.last?.name,
-                keyword: keyword))
+                keyword: keyword,
+                typeText: typeText,
+                bases: bases,
+                genericParams: genericParams))
 
             if opensScope { scopes.append((name, braceDepth)) }
+        }
+
+        /// Тип слева от имени — для C-подобных языков, где он пишется перед именем.
+        func declaredType(before index: Int) -> String? {
+            guard spec.outline == .cFamily else { return nil }
+            return typeTextBefore(tokens: tokens, index: index, units: units, spec: spec)
         }
 
         var i = 0
@@ -152,7 +175,9 @@ enum OutlineBuilder {
                 let ch = units[Int(token.start)]
                 if ch == 0x7B {              // {
                     if pendingBody, bodyDepth == nil { bodyDepth = braceDepth }
+                    if pendingEnum, enumDepth == nil { enumDepth = braceDepth }
                     pendingBody = false
+                    pendingEnum = false
                     braceDepth += 1
                     i += 1
                     continue
@@ -161,6 +186,7 @@ enum OutlineBuilder {
                     pendingBody = false
                     braceDepth -= 1
                     if let body = bodyDepth, braceDepth <= body { bodyDepth = nil }
+                    if let e = enumDepth, braceDepth <= e { enumDepth = nil }
                     while let last = scopes.last, last.depth >= braceDepth { scopes.removeLast() }
                     i += 1
                     continue
@@ -181,6 +207,18 @@ enum OutlineBuilder {
                 continue
             default:
                 break
+            }
+
+            // Тело C#-енума: `{ Red, Green = 2 }`. Значение — идентификатор
+            // сразу после `{` или `,`; всё остальное здесь — выражения значений.
+            if let e = enumDepth, braceDepth == e + 1 {
+                if isIdentifierLike(token), let previous = previousMeaningful(tokens, before: i),
+                   previous.length == 1,
+                   units[Int(previous.start)] == 0x7B || units[Int(previous.start)] == 0x2C {
+                    record(token, kind: .enumCase, opensScope: false)
+                }
+                i += 1
+                continue
             }
 
             let word = text(token)
@@ -214,6 +252,17 @@ enum OutlineBuilder {
                 }
                 guard isIdentifierLike(nameToken) else { i += 1; continue }
 
+                // C#: `event Action<int> Changed;`, `delegate void Handler(int x);` —
+                // сразу за ключевым словом идёт тип, а имя стоит последним.
+                if spec.outline == .cFamily, word == "event" || word == "delegate",
+                   let (nameIndex, typeText) = trailingName(tokens: tokens, from: nameAt, units: units) {
+                    record(tokens[nameIndex], kind: kind, opensScope: false, keyword: keyword,
+                           typeText: typeText)
+                    pendingBody = false
+                    i = nameIndex + 1
+                    continue
+                }
+
                 // `namespace Acme.Billing`, `package com.acme.billing` — имя целиком,
                 // а не только первый сегмент: лексер режет его по точкам.
                 if kind == .namespace {
@@ -230,18 +279,27 @@ enum OutlineBuilder {
                 }
 
                 let opensScope = (kind == .type || kind == .namespace)
-                record(nameToken, kind: kind, opensScope: opensScope, keyword: keyword)
+                if kind == .type {
+                    let header = typeHeader(tokens: tokens, after: nameAt, units: units)
+                    record(nameToken, kind: kind, opensScope: opensScope, keyword: keyword,
+                           bases: header.bases, genericParams: header.genericParams)
+                    pendingEnum = spec.outline == .cFamily && keyword == "enum"
+                } else {
+                    record(nameToken, kind: kind, opensScope: opensScope, keyword: keyword)
+                }
                 pendingBody = (kind == .method || kind == .function || kind == .property)
                 i += 1
                 continue
             }
 
             // --- C-подобные: метод без вводного слова ---
-            if spec.outline == .cFamily, parenDepth == 0, token.kind == .function {
+            // `Get<T>(` лексер не помечает вызовом: между именем и скобкой дженерик.
+            if spec.outline == .cFamily, parenDepth == 0,
+               token.kind == .function || (isIdentifierLike(token) && isGenericCallShape(tokens: tokens, at: i, units: units)) {
                 let isDeclaration = looksLikeDeclaration(tokens: tokens, at: i,
                                                          units: units, spec: spec)
                 if isDeclaration {
-                    record(token, kind: .method, opensScope: false)
+                    record(token, kind: .method, opensScope: false, typeText: declaredType(before: i))
                 }
                 pendingBody = isDeclaration
                 i += 1
@@ -260,19 +318,19 @@ enum OutlineBuilder {
                 let followerChar = follower.length == 1 ? units[Int(follower.start)] : 0
 
                 if followerChar == 0x7B {                       // {
-                    record(token, kind: .property, opensScope: false)
+                    record(token, kind: .property, opensScope: false, typeText: declaredType(before: i))
                     pendingBody = true
                     i += 1
                     continue
                 }
                 if isArrow(tokens: tokens, at: next, units: units) {
-                    record(token, kind: .property, opensScope: false)
+                    record(token, kind: .property, opensScope: false, typeText: declaredType(before: i))
                     pendingBody = false        // тело-выражение, скобок не будет
                     i += 1
                     continue
                 }
                 if followerChar == 0x3B {                       // ;
-                    record(token, kind: .field, opensScope: false)
+                    record(token, kind: .field, opensScope: false, typeText: declaredType(before: i))
                     pendingBody = false
                     i += 1
                     continue
@@ -282,7 +340,7 @@ enum OutlineBuilder {
                     let after = tokens[next + 1]
                     let afterChar = after.length == 1 ? units[Int(after.start)] : 0
                     if afterChar != 0x3D && afterChar != 0x3E {
-                        record(token, kind: .field, opensScope: false)
+                        record(token, kind: .field, opensScope: false, typeText: declaredType(before: i))
                         pendingBody = false
                         i += 1
                         continue
@@ -294,6 +352,179 @@ enum OutlineBuilder {
         }
 
         return items
+    }
+
+    // MARK: - Типы в объявлениях
+
+    private static func tokenText(_ token: Token, _ units: [UInt16]) -> String {
+        String(decoding: units[Int(token.start)..<Int(token.start + token.length)], as: UTF16.self)
+    }
+
+    private static func char(_ token: Token, _ units: [UInt16]) -> UInt16 {
+        token.length == 1 ? units[Int(token.start)] : 0
+    }
+
+    private static func previousMeaningful(_ tokens: [Token], before index: Int) -> Token? {
+        var j = index - 1
+        while j >= 0 {
+            switch tokens[j].kind {
+            case .comment, .docComment, .attribute, .preprocessor: j -= 1
+            default: return tokens[j]
+            }
+        }
+        return nil
+    }
+
+    /// `Имя<…>(` — объявление или вызов дженерик-метода.
+    private static func isGenericCallShape(tokens: [Token], at index: Int, units: [UInt16]) -> Bool {
+        var j = index + 1
+        guard j < tokens.count, char(tokens[j], units) == 0x3C else { return false }   // <
+        var depth = 0
+        while j < tokens.count {
+            let c = char(tokens[j], units)
+            if c == 0x3C { depth += 1 }
+            else if c == 0x3E { depth -= 1; if depth == 0 { break } }
+            else if c == 0x3B || c == 0x7B || c == 0x7D || c == 0x28 || c == 0x3D { return false }
+            j += 1
+        }
+        return j + 1 < tokens.count && char(tokens[j + 1], units) == 0x28
+    }
+
+    /// Тип, написанный перед именем: `List<Foo>`, `int[]`, `Acme.Bar?`.
+    /// Идём влево, пока встречаются части типа; модификатор или `;` — граница.
+    static func typeTextBefore(tokens: [Token], index: Int, units: [UInt16], spec: LanguageSpec) -> String? {
+        var parts: [String] = []
+        var angle = 0
+        var j = index - 1
+        var lastWasWord = false
+        /// Имя типа уже встретилось: левее него `[` `]` — это атрибут, а не массив.
+        var sawWord = false
+        while j >= 0 {
+            let t = tokens[j]
+            switch t.kind {
+            case .comment, .docComment, .attribute, .preprocessor:
+                j -= 1
+                continue
+            default:
+                break
+            }
+            let c = char(t, units)
+            if c == 0x3E { angle += 1; parts.append(">"); lastWasWord = false }           // >
+            else if c == 0x3C {                                                          // <
+                guard angle > 0 else { break }
+                angle -= 1; parts.append("<"); lastWasWord = false
+            }
+            else if c == 0x2C { guard angle > 0 else { break }; parts.append(","); lastWasWord = false }
+            else if c == 0x2E || c == 0x3F || c == 0x5B || c == 0x5D {                   // . ? [ ]
+                if (c == 0x5B || c == 0x5D) && sawWord && angle == 0 { break }
+                parts.append(String(UnicodeScalar(UInt8(c)))); lastWasWord = false
+            }
+            else if t.kind == .plain || t.kind == .type || t.kind == .function
+                        || (t.kind == .keyword && spec.typeKeywords.contains(tokenText(t, units))) {
+                // Два слова подряд вне дженерика — левое уже не часть типа.
+                if lastWasWord && angle == 0 { break }
+                parts.append(tokenText(t, units)); lastWasWord = true
+                if angle == 0 { sawWord = true }
+            }
+            else { break }
+            j -= 1
+        }
+        guard angle == 0, !parts.isEmpty else { return nil }
+        let text = parts.reversed().joined()
+        guard let first = text.unicodeScalars.first, first != "." && first != "?" else { return nil }
+        return text
+    }
+
+    /// Имя в конце объявления, где тип идёт первым: `event Action<int> Changed;`,
+    /// `delegate void Handler<T>(T x);`. Возвращает индекс имени и тип перед ним.
+    private static func trailingName(tokens: [Token], from start: Int, units: [UInt16]) -> (Int, String?)? {
+        var angle = 0
+        var j = start
+        while j < tokens.count {
+            let c = char(tokens[j], units)
+            if c == 0x3C { angle += 1 }
+            else if c == 0x3E { angle -= 1 }
+            else if angle == 0 && (c == 0x3B || c == 0x28 || c == 0x7B || c == 0x3D || c == 0x2C) { break }
+            j += 1
+        }
+        guard j < tokens.count else { return nil }
+        // Перед `(` у дженерик-делегата стоит `<T>` — имя левее него.
+        var nameIndex = j - 1
+        if nameIndex >= 0, char(tokens[nameIndex], units) == 0x3E {
+            var depth = 0
+            while nameIndex >= start {
+                let c = char(tokens[nameIndex], units)
+                if c == 0x3E { depth += 1 } else if c == 0x3C { depth -= 1; if depth == 0 { break } }
+                nameIndex -= 1
+            }
+            nameIndex -= 1
+        }
+        guard nameIndex > start else { return nil }
+        let token = tokens[nameIndex]
+        guard token.kind == .plain || token.kind == .type || token.kind == .function else { return nil }
+        let typeText = (start..<nameIndex).map { tokenText(tokens[$0], units) }.joined()
+        return (nameIndex, typeText.isEmpty ? nil : typeText)
+    }
+
+    /// Шапка типа после имени: `<T, U>` и `: Base, IFoo` (или `extends`/`implements`).
+    private static func typeHeader(tokens: [Token], after nameIndex: Int,
+                                   units: [UInt16]) -> (genericParams: [String], bases: [String]) {
+        var generics: [String] = []
+        var bases: [String] = []
+        var j = nameIndex + 1
+
+        func skipTrivia() {
+            while j < tokens.count, tokens[j].kind == .comment || tokens[j].kind == .docComment { j += 1 }
+        }
+
+        skipTrivia()
+        if j < tokens.count, char(tokens[j], units) == 0x3C {            // <T, U>
+            var depth = 0
+            while j < tokens.count {
+                let t = tokens[j], c = char(t, units)
+                if c == 0x3C { depth += 1 }
+                else if c == 0x3E { depth -= 1; if depth == 0 { j += 1; break } }
+                else if depth == 1, t.kind == .plain || t.kind == .type {
+                    let word = tokenText(t, units)
+                    if word != "in" && word != "out" { generics.append(word) }
+                }
+                j += 1
+            }
+        }
+        skipTrivia()
+        if j < tokens.count, char(tokens[j], units) == 0x28 {            // record Foo(int X)
+            var depth = 0
+            while j < tokens.count {
+                let c = char(tokens[j], units)
+                if c == 0x28 { depth += 1 } else if c == 0x29 { depth -= 1; if depth == 0 { j += 1; break } }
+                j += 1
+            }
+        }
+        skipTrivia()
+        guard j < tokens.count else { return (generics, bases) }
+        let opener = tokenText(tokens[j], units)
+        guard opener == ":" || opener == "extends" || opener == "implements" else { return (generics, bases) }
+        j += 1
+
+        var current = ""
+        var angle = 0
+        var parens = 0
+        while j < tokens.count {
+            let t = tokens[j], c = char(t, units)
+            let word = tokenText(t, units)
+            if angle == 0 && parens == 0 && (c == 0x7B || c == 0x3B || word == "where") { break }
+            if c == 0x28 { parens += 1 }                                  // Kotlin: Base()
+            else if c == 0x29 { parens -= 1 }
+            else if parens > 0 { }
+            else if c == 0x3C { angle += 1; current += "<" }
+            else if c == 0x3E { angle -= 1; current += ">" }
+            else if c == 0x2C && angle == 0 { if !current.isEmpty { bases.append(current) }; current = "" }
+            else if word == "implements" || word == "extends" { if !current.isEmpty { bases.append(current) }; current = "" }
+            else if t.kind != .comment && t.kind != .docComment { current += word }
+            j += 1
+        }
+        if !current.isEmpty { bases.append(current) }
+        return (generics, bases)
     }
 
     /// Стоит ли на этой позиции `=>`. Лексер выдаёт стрелку двумя токенами.

@@ -45,10 +45,164 @@ enum Theme {
     static var assetLink: NSColor { Macchiato.sapphire }
     static var brokenLink: NSColor { Macchiato.red }
 
-    /// Иконки боковой панели: папки заметнее файлов, чтобы структура
-    /// читалась с одного взгляда.
-    static var sidebarFolder: NSColor { Macchiato.blue }
-    static var sidebarFile: NSColor { Macchiato.overlay2 }
+    /// Полоса под строкой с курсором — как в Xcode, едва заметная.
+    static var currentLine: NSColor { Macchiato.surface0.withAlphaComponent(0.55) }
+
+    /// Фон хрома вокруг редактора: чуть темнее самого текста, чтобы
+    /// стеклянный сайдбар и тулбар читались отдельными слоями.
+    static var chromeBackground: NSColor { Macchiato.mantle }
+
+    static var separator: NSColor { Macchiato.surface0 }
+
+    /// Молния быстрого индекса в статус-строке: пока навигация идёт по нему.
+    static var fastIndex: NSColor { Macchiato.yellow }
+
+    // MARK: - Иконки файлов
+
+    struct Icon {
+        let symbol: String
+        let color: NSColor
+    }
+
+    static var folderIcon: Icon { Icon(symbol: "folder.fill", color: Macchiato.blue) }
+
+    /// Иконки по типу файла. Как в навигаторе Xcode — цветные, но цвета
+    /// взяты из той же Macchiato, чтобы хром не спорил с подсветкой.
+    static func fileIcon(forName name: String) -> Icon {
+        switch name {
+        case "Package.swift":           return Icon(symbol: "shippingbox.fill", color: Macchiato.peach)
+        case "Dockerfile":              return Icon(symbol: "shippingbox", color: Macchiato.sapphire)
+        case "Makefile", "CMakeLists.txt": return Icon(symbol: "hammer", color: Macchiato.subtext0)
+        default: break
+        }
+        let ext = (name as NSString).pathExtension.lowercased()
+        if let unity = unityIcon(forExtension: ext) { return unity }
+        switch ext {
+        case "swift":                   return Icon(symbol: "swift", color: Macchiato.peach)
+        case "cs", "csx":               return Icon(symbol: "number.square", color: Macchiato.mauve)
+        case "c":                       return Icon(symbol: "c.square", color: Macchiato.blue)
+        case "cpp", "cc", "cxx":        return Icon(symbol: "c.square", color: Macchiato.sapphire)
+        case "h", "hpp", "hh", "hxx":   return Icon(symbol: "h.square", color: Macchiato.red)
+        case "m", "mm":                 return Icon(symbol: "m.square", color: Macchiato.peach)
+        case "js", "mjs", "cjs", "jsx": return Icon(symbol: "curlybraces.square", color: Macchiato.yellow)
+        case "ts", "tsx", "mts":        return Icon(symbol: "curlybraces.square", color: Macchiato.blue)
+        case "py", "pyi":               return Icon(symbol: "p.square", color: Macchiato.blue)
+        case "rs":                      return Icon(symbol: "r.square", color: Macchiato.peach)
+        case "go":                      return Icon(symbol: "g.square", color: Macchiato.sky)
+        case "java":                    return Icon(symbol: "j.square", color: Macchiato.red)
+        case "kt", "kts":               return Icon(symbol: "k.square", color: Macchiato.mauve)
+        case "rb":                      return Icon(symbol: "r.square", color: Macchiato.red)
+        case "php":                     return Icon(symbol: "p.square", color: Macchiato.lavender)
+        case "json":                    return Icon(symbol: "curlybraces", color: Macchiato.yellow)
+        case "xml", "plist", "csproj", "sln", "props", "targets", "xaml", "storyboard", "xib":
+                                        return Icon(symbol: "chevron.left.forwardslash.chevron.right", color: Macchiato.teal)
+        case "html", "htm":             return Icon(symbol: "chevron.left.forwardslash.chevron.right", color: Macchiato.peach)
+        case "css", "scss", "sass", "less": return Icon(symbol: "paintbrush", color: Macchiato.blue)
+        case "yaml", "yml", "toml", "ini", "cfg", "conf", "editorconfig":
+                                        return Icon(symbol: "gearshape", color: Macchiato.subtext0)
+        case "md", "markdown", "rst":   return Icon(symbol: "doc.richtext", color: Macchiato.lavender)
+        case "txt", "log":              return Icon(symbol: "doc.text", color: Macchiato.subtext0)
+        case "sh", "bash", "zsh", "fish", "command": return Icon(symbol: "terminal", color: Macchiato.green)
+        case "sql":                     return Icon(symbol: "cylinder", color: Macchiato.yellow)
+        case "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "icns", "heic", "tiff":
+                                        return Icon(symbol: "photo", color: Macchiato.teal)
+        case "pdf":                     return Icon(symbol: "doc.richtext", color: Macchiato.red)
+        case "lock", "resolved":        return Icon(symbol: "lock", color: Macchiato.overlay2)
+        default:                        return Icon(symbol: "doc", color: Macchiato.overlay2)
+        }
+    }
+
+    /// Unity-ассеты: сцены, префабы, материалы, шейдеры… Цвета — по роли,
+    /// как в окне Project у Unity: сцены и префабы заметнее остального.
+    private static func unityIcon(forExtension ext: String) -> Icon? {
+        guard let symbol = UnitySemantics.icon(forExtension: ext) else { return nil }
+        let color: NSColor
+        switch ext {
+        case "unity":                           color = Macchiato.lavender
+        case "prefab":                          color = Macchiato.sapphire
+        case "mat", "physicmaterial", "physicsmaterial2d": color = Macchiato.pink
+        case "shader", "hlsl", "cginc", "compute", "shadergraph", "shadersubgraph", "glsl", "vfx":
+                                                color = Macchiato.mauve
+        case "anim", "controller", "overridecontroller", "playable": color = Macchiato.peach
+        case "asset", "preset", "lighting":     color = Macchiato.teal
+        case "fbx", "obj", "blend", "dae", "3ds", "max": color = Macchiato.sky
+        case "wav", "mp3", "ogg", "aif", "aiff", "flac": color = Macchiato.green
+        default:                                color = Macchiato.subtext0
+        }
+        return Icon(symbol: symbol, color: color)
+    }
+
+    // MARK: - Бейджи символов
+
+    /// Буква в цветном квадратике — как у символов в Xcode.
+    /// Текст на бейдже тёмный: пастельные цвета Macchiato с белым не читаются.
+    static func badge(for kind: OutlineKind) -> (letter: String, color: NSColor) {
+        switch kind {
+        case .type:        return ("C", Macchiato.mauve)
+        case .method:      return ("M", Macchiato.blue)
+        case .function:    return ("F", Macchiato.green)
+        case .property:    return ("P", Macchiato.teal)
+        case .field:       return ("V", Macchiato.sky)
+        case .variable:    return ("V", Macchiato.sky)
+        case .namespace:   return ("N", Macchiato.flamingo)
+        case .initializer: return ("I", Macchiato.peach)
+        case .enumCase:    return ("E", Macchiato.yellow)
+        case .gameObject:      return ("GO", Macchiato.sapphire)
+        case .component:       return ("C", Macchiato.teal)
+        case .prefab:          return ("Pf", Macchiato.lavender)
+        case .unityMessage:    return ("U", Macchiato.teal)
+        case .serializedField: return ("SF", Macchiato.sky)
+        }
+    }
+
+    /// У типов буква — по ключевому слову, как в Xcode: S — struct,
+    /// E — enum, Pr — протокол. Без ключевого слова — по виду объявления.
+    static func badge(for kind: OutlineKind, keyword: String?) -> (letter: String, color: NSColor) {
+        if kind == .type, let keyword {
+            switch keyword {
+            case "struct":            return ("S", Macchiato.mauve)
+            case "enum":              return ("E", Macchiato.mauve)
+            case "record":            return ("R", Macchiato.mauve)
+            case "protocol":          return ("Pr", Macchiato.lavender)
+            case "interface":         return ("I", Macchiato.lavender)
+            case "trait":             return ("T", Macchiato.lavender)
+            case "extension", "impl": return ("Ex", Macchiato.overlay2)
+            default: break
+            }
+        }
+        return badge(for: kind)
+    }
+
+    static var badgeText: NSColor { Macchiato.crust }
+
+    /// «1 файл», «3 файла», «7 055 файлов».
+    static func count(_ n: Int, _ one: String, _ few: String, _ many: String) -> String {
+        let mod100 = n % 100, mod10 = n % 10
+        let word: String
+        if (11...14).contains(mod100) { word = many }
+        else if mod10 == 1 { word = one }
+        else if (2...4).contains(mod10) { word = few }
+        else { word = many }
+        return "\(n.formatted()) \(word)"
+    }
+
+    /// Git: полоски у номеров строк и имена файлов в дереве. Привычные
+    /// роли: добавлено зелёным, изменено жёлтым, удалено красным.
+    static var gitAdded: NSColor { Macchiato.green }
+    static var gitModified: NSColor { Macchiato.yellow }
+    static var gitDeleted: NSColor { Macchiato.red }
+    static var gitRenamed: NSColor { Macchiato.sky }
+    static var gitConflicted: NSColor { Macchiato.peach }
+
+    static func git(_ state: GitFileState) -> NSColor {
+        switch state {
+        case .added, .untracked: return gitAdded
+        case .modified:          return gitModified
+        case .deleted:           return gitDeleted
+        case .renamed:           return gitRenamed
+        case .conflicted:        return gitConflicted
+        }
+    }
 
     /// Шрифт редактора: Hack Nerd Font Mono, если установлен, иначе системный моноширинный.
     static func editorFont(size: CGFloat) -> NSFont {
@@ -61,22 +215,26 @@ enum Theme {
     /// https://catppuccin.com/palette — flavor Macchiato.
     private enum Macchiato {
         static let rosewater = rgb(0xF4DBD6)
+        static let flamingo  = rgb(0xF0C6C6)
         static let pink      = rgb(0xF5BDE6)
+        static let red       = rgb(0xED8796)
         static let mauve     = rgb(0xC6A0F6)
         static let peach     = rgb(0xF5A97F)
         static let yellow    = rgb(0xEED49F)
         static let green     = rgb(0xA6DA95)
-        static let sky       = rgb(0x91D7E3)
         static let teal      = rgb(0x8BD5CA)
+        static let sky       = rgb(0x91D7E3)
         static let sapphire  = rgb(0x7DC4E4)
-        static let red       = rgb(0xED8796)
         static let blue      = rgb(0x8AADF4)
         static let lavender  = rgb(0xB7BDF8)
         static let text      = rgb(0xCAD3F5)
         static let subtext0  = rgb(0xA5ADCB)
         static let overlay2  = rgb(0x939AB7)
         static let surface1  = rgb(0x494D64)
+        static let surface0  = rgb(0x363A4F)
         static let base      = rgb(0x24273A)
+        static let mantle    = rgb(0x1E2030)
+        static let crust     = rgb(0x181926)
     }
 
     private static func rgb(_ hex: Int) -> NSColor {

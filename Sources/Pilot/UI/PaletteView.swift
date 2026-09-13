@@ -4,10 +4,17 @@ import AppKit
 /// Палитра. Один компонент на все режимы: файлы (⌘P), классы (⇧⇧),
 /// структура файла (⌘⇧O), символы (⌘T), использования (⌘R) — отличаются
 /// только источником строк.
+///
+/// Рядом с результатами — предпросмотр выбранной строки. В широком окне
+/// он справа от списка, в узком — под ним.
 struct PaletteView: View {
     @ObservedObject var workspace: Workspace
+    /// Сколько места под палитрой: от этого зависит, куда встанет предпросмотр.
+    var available: CGSize = .zero
     @FocusState private var focused: Bool
     @State private var keyMonitor: Any?
+    @StateObject private var preview = PreviewLoader()
+    @AppStorage("pilot.palettePreview") private var previewEnabled = true
 
     var body: some View {
         PilotGlassGroup(spacing: 14) {
@@ -15,12 +22,12 @@ struct PaletteView: View {
                 queryField
                 if !workspace.items.isEmpty {
                     Divider().opacity(0.35)
-                    resultList
+                    results
                 } else if shouldShowEmptyState {
                     emptyState
                 }
             }
-            .frame(width: 660)
+            .frame(width: paletteWidth)
             .pilotGlass(cornerRadius: 20)
             .overlay(
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -28,8 +35,65 @@ struct PaletteView: View {
             )
             .shadow(color: .black.opacity(0.30), radius: 40, y: 18)
         }
-        .onAppear { focused = true; installKeyMonitor() }
+        .onAppear { focused = true; installKeyMonitor(); refreshPreview() }
         .onDisappear { removeKeyMonitor() }
+        .onChange(of: selectedTarget) { _, _ in refreshPreview() }
+        .onChange(of: previewEnabled) { _, _ in refreshPreview() }
+    }
+
+    // MARK: - Раскладка
+
+    private var showsPreview: Bool { previewEnabled && !workspace.items.isEmpty }
+
+    /// Предпросмотр справа, если окно позволяет; иначе — под списком.
+    private var isWide: Bool { available.width == 0 || available.width >= 1060 }
+
+    private var paletteWidth: CGFloat {
+        guard showsPreview else { return 660 }
+        let room = available.width == 0 ? 1240 : available.width - 64
+        return max(620, min(isWide ? 1240 : 760, room))
+    }
+
+    /// Высота под результаты и предпросмотр: сверху палитру подпирает
+    /// отступ от тулбара и поле ввода, снизу нужен воздух.
+    private var bodyHeight: CGFloat {
+        let room = available.height == 0 ? 460 : available.height - 60 - 56 - 40
+        return max(260, min(460, room))
+    }
+
+    @ViewBuilder
+    private var results: some View {
+        if !showsPreview {
+            resultList(height: resultListHeight)
+        } else if isWide {
+            HStack(spacing: 0) {
+                resultList(height: bodyHeight)
+                    .frame(width: min(520, max(400, paletteWidth * 0.42)))
+                Divider().opacity(0.35)
+                previewPane
+            }
+            .frame(height: bodyHeight)
+        } else {
+            let listHeight = min(resultListHeight, bodyHeight * 0.42)
+            resultList(height: listHeight)
+            Divider().opacity(0.35)
+            previewPane.frame(height: bodyHeight - listHeight)
+        }
+    }
+
+    private var previewPane: some View {
+        PalettePreview(loader: preview, root: workspace.root,
+                       onOpen: { workspace.activateSelection() })
+    }
+
+    private var selectedTarget: NavTarget? {
+        guard workspace.items.indices.contains(workspace.selection) else { return nil }
+        return workspace.items[workspace.selection].target
+    }
+
+    private func refreshPreview() {
+        guard previewEnabled else { return }
+        preview.show(selectedTarget, document: workspace.document)
     }
 
     private var shouldShowEmptyState: Bool {
@@ -55,6 +119,13 @@ struct PaletteView: View {
                 ProgressView().controlSize(.small).scaleEffect(0.8)
             }
             counter
+            Button { previewEnabled.toggle() } label: {
+                Image(systemName: "sidebar.right")
+                    .font(.system(size: 13))
+                    .foregroundStyle(previewEnabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
+            }
+            .buttonStyle(.plain)
+            .help(previewEnabled ? "Скрыть предпросмотр" : "Показать предпросмотр")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 15)
@@ -70,7 +141,8 @@ struct PaletteView: View {
         switch workspace.paletteMode {
         case .files:   return workspace.isIndexing
         case .classes: return workspace.isIndexing || workspace.isTypeIndexing
-        case .outline, .symbols, .references, .assetUsages: return false
+        case .symbols: return workspace.symbolIndex == nil && !workspace.lsp.isReady
+        case .outline, .references, .declarations, .changes, .assetUsages: return false
         }
     }
 
@@ -87,7 +159,7 @@ struct PaletteView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help("Типов в индексе")
-        case .symbols, .references, .outline, .assetUsages:
+        case .symbols, .references, .declarations, .outline, .changes, .assetUsages:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
                     .font(.system(size: 11, design: .monospaced))
@@ -119,15 +191,22 @@ struct PaletteView: View {
             }
             return "Начните вводить имя класса — можно заглавными: USvc → UserService"
         case .symbols:
-            if !workspace.lsp.isReady { return lspNotReadyMessage }
-            return workspace.query.isEmpty ? "Начните вводить имя символа" : "Ничего не найдено"
+            if !workspace.canSearchSymbols { return "Собираю символы проекта…" }
+            if !workspace.query.isEmpty { return "Ничего не найдено" }
+            return workspace.lsp.isReady
+                ? "Начните вводить имя символа"
+                : "Начните вводить имя символа — пока \(workspace.lsp.serverName ?? "языковой сервер") греется, ищу по быстрому индексу"
         case .references:
-            if !workspace.lsp.isReady { return lspNotReadyMessage }
             return "Использований не найдено"
+        case .declarations:
+            return "Ничего не найдено"
         case .outline:
             return workspace.document == nil
                 ? "Сначала откройте файл"
                 : "В этом файле объявлений не найдено"
+        case .changes:
+            if workspace.git.repository == nil { return "Проект не под git" }
+            return workspace.query.isEmpty ? "Изменений нет — всё закоммичено" : "Ничего не найдено"
         case .assetUsages:
             return workspace.query.isEmpty
                 ? "На \(workspace.usagesTitle) не ссылается ни одна сцена, префаб или ассет"
@@ -135,18 +214,9 @@ struct PaletteView: View {
         }
     }
 
-    private var lspNotReadyMessage: String {
-        switch workspace.lsp.state {
-        case .stopped:            return "Языковой сервер не запущен — откройте файл .cs"
-        case .starting(let what): return "Языковой сервер ещё греется: \(what)"
-        case .failed(let why):    return "Языковой сервер не поднялся: \(why)"
-        case .ready:              return "Ничего не найдено"
-        }
-    }
-
     // MARK: - Результаты
 
-    private var resultList: some View {
+    private func resultList(height: CGFloat) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 1) {
@@ -163,11 +233,19 @@ struct PaletteView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 8)
             }
-            .frame(maxHeight: 420)
+            .frame(height: height)
             .onChange(of: workspace.selection) { _, new in
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(new, anchor: .center) }
             }
         }
+    }
+
+    /// ScrollView сам по себе занимает всю предложенную высоту, и с одним
+    /// результатом стеклянная панель висела бы полупустой. Поэтому высоту
+    /// считаем по строкам: однострочная ~29 pt, с подписью ~43 pt.
+    private var resultListHeight: CGFloat {
+        let rowHeight: CGFloat = workspace.items.first?.secondary?.isEmpty == false ? 43 : 29
+        return min(420, CGFloat(workspace.items.count) * rowHeight + 16)
     }
 
     // MARK: - Клавиатура
@@ -214,7 +292,7 @@ struct PaletteRow: View {
         HStack(spacing: 10) {
             Image(systemName: item.icon)
                 .font(.system(size: 13))
-                .foregroundStyle(isSelected ? .primary : .secondary)
+                .foregroundStyle(iconStyle)
                 .frame(width: 17)
 
             VStack(alignment: .leading, spacing: 1) {
@@ -227,7 +305,9 @@ struct PaletteRow: View {
                         .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.75))
                                                     : AnyShapeStyle(.tertiary))
                         .lineLimit(1)
-                        .truncationMode(.head)
+                        // «Контейнер · путь/к/Файлу.cs»: важны оба конца,
+                        // поэтому режем середину, а не начало.
+                        .truncationMode(.middle)
                 }
             }
 
@@ -249,6 +329,14 @@ struct PaletteRow: View {
             }
         }
         .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+    }
+
+    /// Файлы — цветной иконкой, как в навигаторе; остальное приглушённо.
+    private var iconStyle: AnyShapeStyle {
+        if isSelected { return AnyShapeStyle(.primary) }
+        let file = Theme.fileIcon(forName: (item.primary as NSString).lastPathComponent)
+        if file.symbol == item.icon { return AnyShapeStyle(Color(nsColor: file.color)) }
+        return AnyShapeStyle(.secondary)
     }
 
     /// Собираем строку отрезками: совпавшие символы выделены,

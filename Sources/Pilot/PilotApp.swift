@@ -2,9 +2,21 @@ import SwiftUI
 import AppKit
 
 @main
+enum PilotMain {
+    static func main() {
+        // Тот же исполняемый файл работает и демоном языковых серверов —
+        // тогда никакого интерфейса, только сокет (см. LSPDaemon).
+        if let socket = LSPDaemon.socketArgument(CommandLine.arguments) {
+            LSPDaemon.run(socketPath: socket)
+        }
+        PilotApp.main()
+    }
+}
+
 struct PilotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var workspace = Workspace()
+    @AppStorage(Experimental.lspDaemonKey) private var lspDaemon = false
     @AppStorage("pilot.showsInspector") private var showsInspector = true
 
     var body: some Scene {
@@ -18,10 +30,24 @@ struct PilotApp: App {
                 }
                 .animation(.easeOut(duration: 0.14), value: workspace.isPaletteOpen)
         }
-        .windowToolbarStyle(.unified(showsTitle: true))
+        // Заголовок рисуем сами — с веткой git, как в Xcode.
+        .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1100, height: 720)
         .commands {
             SidebarCommands()   // «Показать/скрыть боковую панель», ⌃⌘S
+            CommandGroup(after: .appSettings) {
+                Menu("Экспериментальное") {
+                    // Перезапуск — прямо в сеттере: onChange в меню команд
+                    // срабатывает ненадёжно. @AppStorage пишет в UserDefaults
+                    // синхронно, и LSPService уже видит новое значение.
+                    Toggle("Держать языковые серверы между запусками", isOn: Binding(
+                        get: { lspDaemon },
+                        set: {
+                            lspDaemon = $0
+                            workspace.lsp.daemonSettingChanged(reopening: workspace.document)
+                        }))
+                }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Открыть папку…") { workspace.promptForFolder() }
                     .keyboardShortcut("o", modifiers: .command)
@@ -47,7 +73,7 @@ struct PilotApp: App {
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                 Button("Символ в проекте…") { workspace.openPalette(mode: .symbols) }
                     .keyboardShortcut("t", modifiers: .command)
-                    .disabled(!workspace.lsp.isReady)
+                    .disabled(!workspace.canSearchSymbols)
                 Divider()
                 Button("Следующее объявление") { workspace.jumpToMember(1) }
                     .keyboardShortcut(.downArrow, modifiers: .control)
@@ -58,8 +84,16 @@ struct PilotApp: App {
                 Button("Предыдущее вхождение") { workspace.jumpToOccurrence(-1) }
                     .keyboardShortcut(.upArrow, modifiers: .option)
                 Divider()
-                // Не требует LSP: если сервер не готов, работает лексический
-                // поиск объявления в пределах файла.
+                Button("Изменённые файлы…") { workspace.openPalette(mode: .changes) }
+                    .keyboardShortcut("g", modifiers: [.control, .shift])
+                    .disabled(workspace.git.repository == nil)
+                Button("Следующее изменение") { workspace.jumpToChange(1) }
+                    .keyboardShortcut(.downArrow, modifiers: [.control, .option])
+                Button("Предыдущее изменение") { workspace.jumpToChange(-1) }
+                    .keyboardShortcut(.upArrow, modifiers: [.control, .option])
+                Divider()
+                // Не требует LSP: пока сервер не готов, отвечает быстрый
+                // навигатор по индексу объявлений проекта.
                 Button("Перейти к объявлению") {
                     workspace.goToDefinition(at: workspace.caretOffset)
                 }
@@ -68,7 +102,7 @@ struct PilotApp: App {
                     workspace.findReferences(at: workspace.caretOffset)
                 }
                 .keyboardShortcut("r", modifiers: .command)
-                .disabled(!workspace.lsp.isReady)
+                .disabled(workspace.document == nil)
                 // Unity: ссылки на ассеты — это GUID, языковой сервер тут не нужен.
                 Button("Где используется ассет") { workspace.findAssetUsages() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])

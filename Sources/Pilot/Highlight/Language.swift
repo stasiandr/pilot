@@ -36,6 +36,9 @@ struct LanguageSpec {
     var declarationKeywords: [String: OutlineKind] = [:]
     /// Модификаторы: встретив их слева от имени, считаем, что это объявление.
     var modifierKeywords: Set<String> = []
+    /// Контекстные ключевые слова: подсвечиваются как ключевые, но могут быть
+    /// и обычным именем — `public Color value;`, `var get = …`.
+    var contextualKeywords: Set<String> = []
     /// Блоки задаются отступом, а не скобками (Python).
     var indentBased = false
     /// `ключ:` красится как имя (YAML).
@@ -129,6 +132,8 @@ enum Languages {
         l.modifierKeywords = ["public","private","protected","internal","static","abstract",
             "virtual","override","sealed","async","extern","unsafe","partial","readonly",
             "const","new","required","file"]
+        l.contextualKeywords = ["value","get","set","init","var","partial","record","required","scoped",
+            "with","and","or","not","when","where","yield","async","await","global","nameof","file"]
         return l
     }()
 

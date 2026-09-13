@@ -10,13 +10,33 @@ struct ServerConfig {
     var environment: [String: String] = [:]
     /// Произвольный JSON в `initializationOptions`.
     var initializationOptions: [String: Any]? = nil
+    /// Ответы на `workspace/configuration`: секция -> значение. На всё,
+    /// чего здесь нет, отвечаем null — сервер берёт своё значение по умолчанию.
+    var settings: [String: Any] = [:]
     /// Roslyn после initialize ждёт нестандартное `solution/open`,
     /// иначе молча не отдаёт ни одного символа.
     var opensSolution = false
+    /// Уведомление, которым сервер сообщает, что проекты загружены. До него
+    /// initialize уже прошёл, но семантики ещё нет: запросы вернут пустоту.
+    var projectsLoadedNotification: String? = nil
+    /// Подстрока в `window/logMessage`, которой сервер отмечает загрузку
+    /// одного проекта. По ней считается прогресс «проекты 57 из 134».
+    var projectLoadedMessage: String? = nil
     /// Человекочитаемое имя для статус-строки.
     var displayName: String
 
     /// Абсолютный путь к исполняемому файлу, если он вообще есть в системе.
+    /// Ответ на `workspace/configuration`: по значению на каждый запрошенный
+    /// элемент, в том же порядке: так требует протокол. Roslyn спрашивает
+    /// за раз десятки секций, и ответ из одного null ему не подходит.
+    func configurationResponse(_ params: Any?) -> [Any] {
+        let items = (params as? [String: Any])?["items"] as? [[String: Any]] ?? []
+        return items.map { item in
+            guard let section = item["section"] as? String else { return NSNull() }
+            return settings[section] ?? NSNull()
+        }
+    }
+
     func resolvedExecutable() -> String? {
         guard let first = command.first else { return nil }
         if first.contains("/") {
@@ -59,6 +79,13 @@ enum ServerRegistry {
         return nil
     }
 
+    /// Сервер, которому нужен solution, — если solution в корне есть и такой
+    /// сервер установлен. Его стоит поднимать сразу при открытии проекта.
+    static func solutionServer(root: URL) -> ServerConfig? {
+        guard findSolution(root: root) != nil else { return nil }
+        return all(root: root).first { $0.opensSolution && $0.resolvedExecutable() != nil }
+    }
+
     static func all(root: URL) -> [ServerConfig] {
         userDefined() + builtIn(root: root)
     }
@@ -75,12 +102,18 @@ enum ServerRegistry {
                 id: "roslyn",
                 languageId: "csharp",
                 fileExtensions: ["cs", "csx"],
+                // Information, а не Warning: только на этом уровне Roslyn пишет
+                // «Successfully completed load of X.csproj», по которым
+                // считается прогресс загрузки. Это пара сотен строк за запуск.
                 command: [roslyn,
-                          "--logLevel=Warning",
+                          "--logLevel=Information",
                           "--extensionLogDirectory=\(NSTemporaryDirectory())pilot-roslyn",
                           "--stdio"],
                 environment: DotnetRuntime.environment(forAppHost: roslyn),
+                settings: roslynSettings,
                 opensSolution: true,
+                projectsLoadedNotification: "workspace/projectInitializationComplete",
+                projectLoadedMessage: "Successfully completed load of",
                 displayName: "Roslyn"))
         }
 
@@ -104,6 +137,22 @@ enum ServerRegistry {
         return list
     }
 
+    /// Настройки Roslyn под читателя кода. Секции — ровно те, что сервер сам
+    /// запрашивает через `workspace/configuration`.
+    static let roslynSettings: [String: Any] = [
+        // Главное. По умолчанию Roslyn гоняет NuGet restore для каждого
+        // проекта, где видит неразрешённые зависимости, — по очереди, по
+        // полсекунды на проект. На Unity-проекте из 134 csproj это минута из
+        // полутора, и всё впустую: в сгенерированных Unity проектах нет
+        // PackageReference, восстанавливать там нечего.
+        "projects.dotnet_enable_automatic_restore": false,
+        // Диагностики Pilot не показывает — незачем их и считать.
+        "csharp|background_analysis.dotnet_analyzer_diagnostics_scope": "none",
+        "csharp|background_analysis.dotnet_compiler_diagnostics_scope": "none",
+        // ⌘T ищет по коду проекта, а не по UnityEngine.dll и прочим сборкам.
+        "csharp|symbol_search.dotnet_search_reference_assemblies": false,
+    ]
+
     private static func solutionArguments(root: URL, executable: String) -> [String] {
         if let sln = findSolution(root: root) {
             return [executable, "-s", sln.path]
@@ -121,6 +170,24 @@ enum ServerRegistry {
         if let sln = entries.first(where: { $0.pathExtension == "sln" }) { return sln }
         if let slnx = entries.first(where: { $0.pathExtension == "slnx" }) { return slnx }
         return entries.first { $0.pathExtension == "csproj" }
+    }
+
+    /// Сколько C#-проектов перечислено в .sln/.slnx; для одиночного .csproj — один.
+    /// nil, если файл не прочитался.
+    static func projectCount(solution: URL) -> Int? {
+        if solution.pathExtension == "csproj" { return 1 }
+        guard let text = try? String(contentsOf: solution, encoding: .utf8) else { return nil }
+        return projectCount(solutionText: text, isXML: solution.pathExtension == "slnx")
+    }
+
+    /// .sln: `Project("{guid}") = "Name", "Path\Name.csproj", "{guid}"`.
+    /// .slnx: `<Project Path="Path/Name.csproj" />`. Папки решения тоже
+    /// записаны как Project, поэтому считаем только строки с .csproj.
+    static func projectCount(solutionText text: String, isXML: Bool) -> Int {
+        let opener = isXML ? "<Project " : "Project("
+        return text.split(whereSeparator: \.isNewline).filter { line in
+            line.trimmingCharacters(in: .whitespaces).hasPrefix(opener) && line.contains(".csproj\"")
+        }.count
     }
 
     /// Roslyn обычно приезжает вместе с расширением C# для VS Code,
@@ -165,21 +232,49 @@ enum ServerRegistry {
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let servers = root["servers"] as? [[String: Any]] else { return [] }
 
-        return servers.compactMap { dict in
-            guard let id = dict["id"] as? String,
-                  let command = dict["command"] as? [String], !command.isEmpty,
-                  let extensions = dict["extensions"] as? [String] else { return nil }
+        return servers.compactMap(ServerConfig.init(json:))
+    }
+}
 
-            return ServerConfig(
-                id: id,
-                languageId: dict["languageId"] as? String ?? "plaintext",
-                fileExtensions: Set(extensions.map { $0.lowercased() }),
-                command: command,
-                environment: dict["env"] as? [String: String] ?? [:],
-                initializationOptions: dict["initializationOptions"] as? [String: Any],
-                opensSolution: dict["opensSolution"] as? Bool ?? false,
-                displayName: dict["displayName"] as? String ?? id)
-        }
+// MARK: - JSON
+//
+// Тот же формат, что в servers.json. По нему же конфигурация уходит демону:
+// сервер он поднимает ровно такой, какой описал Pilot.
+
+extension ServerConfig {
+    init?(json dict: [String: Any]) {
+        guard let id = dict["id"] as? String,
+              let command = dict["command"] as? [String], !command.isEmpty,
+              let extensions = dict["extensions"] as? [String] else { return nil }
+        self.init(
+            id: id,
+            languageId: dict["languageId"] as? String ?? "plaintext",
+            fileExtensions: Set(extensions.map { $0.lowercased() }),
+            command: command,
+            environment: dict["env"] as? [String: String] ?? [:],
+            initializationOptions: dict["initializationOptions"] as? [String: Any],
+            settings: dict["settings"] as? [String: Any] ?? [:],
+            opensSolution: dict["opensSolution"] as? Bool ?? false,
+            projectsLoadedNotification: dict["projectsLoadedNotification"] as? String,
+            projectLoadedMessage: dict["projectLoadedMessage"] as? String,
+            displayName: dict["displayName"] as? String ?? id)
+    }
+
+    var json: [String: Any] {
+        var dict: [String: Any] = [
+            "id": id,
+            "languageId": languageId,
+            "extensions": fileExtensions.sorted(),
+            "command": command,
+            "env": environment,
+            "settings": settings,
+            "opensSolution": opensSolution,
+            "displayName": displayName,
+        ]
+        if let initializationOptions { dict["initializationOptions"] = initializationOptions }
+        if let projectsLoadedNotification { dict["projectsLoadedNotification"] = projectsLoadedNotification }
+        if let projectLoadedMessage { dict["projectLoadedMessage"] = projectLoadedMessage }
+        return dict
     }
 }
 
@@ -193,12 +288,26 @@ enum DotnetRuntime {
 
     /// Окружение для запуска apphost: DOTNET_ROOT с подходящим рантаймом
     /// и его `dotnet` первым в PATH — чтобы и загрузчик проектов Roslyn
-    /// (MSBuild) взял тот же SDK, а не системный.
+    /// (MSBuild) взял тот же SDK, а не системный. Mono из PATH убран.
     static func environment(forAppHost appHost: String) -> [String: String] {
+        let path = pathWithoutMono(ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin")
         let required = requiredMajor(forAppHost: appHost) ?? 0
-        guard let root = findRoot(minimumMajor: required) else { return [:] }
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+        guard let root = findRoot(minimumMajor: required) else { return ["PATH": path] }
         return ["DOTNET_ROOT": root, "PATH": "\(root):\(path)"]
+    }
+
+    /// PATH без папок, где лежит `mono`.
+    ///
+    /// Старые, не-SDK csproj — а Unity генерирует именно такие — Roslyn
+    /// загружает через Mono, если находит его в PATH, и через .NET, если нет.
+    /// Результат одинаковый, скорость — нет: Unity-проект из 134 csproj
+    /// грузится 23 с через Mono и 8 с через .NET. Pilot, запущенный из
+    /// терминала, наследует PATH оболочки, а установщик Mono кладёт его туда.
+    static func pathWithoutMono(_ path: String) -> String {
+        let fm = FileManager.default
+        return path.split(separator: ":", omittingEmptySubsequences: true)
+            .filter { !fm.isExecutableFile(atPath: "\($0)/mono") }
+            .joined(separator: ":")
     }
 
     /// Мажорная версия Microsoft.NETCore.App из `<app>.runtimeconfig.json`.

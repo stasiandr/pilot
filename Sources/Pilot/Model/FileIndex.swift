@@ -1,5 +1,56 @@
 import Foundation
 
+/// Содержимое папки через readdir: имя и тип приходят одной записью —
+/// без URL на каждый файл и без отдельного stat.
+enum DirectoryReader {
+    struct Entry {
+        let name: String
+        let isDirectory: Bool
+    }
+
+    /// Файлы и папки без скрытых и без симлинков (по ним не ходим), плюс
+    /// есть ли в папке свой .gitignore. nil — папку не открыть.
+    static func read(_ path: String) -> (entries: [Entry], hasGitignore: Bool)? {
+        guard let dir = opendir(path) else { return nil }
+        defer { closedir(dir) }
+
+        var entries: [Entry] = []
+        var hasGitignore = false
+        while let record = readdir(dir) {
+            let name = withUnsafePointer(to: &record.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(to: CChar.self,
+                                          capacity: MemoryLayout.size(ofValue: record.pointee.d_name)) {
+                    String(cString: $0)
+                }
+            }
+            if name.utf8.first == 0x2E {                 // скрытые, а заодно «.» и «..»
+                if name == ".gitignore" { hasGitignore = true }
+                continue
+            }
+            var type = Int(record.pointee.d_type)
+            if type == typeUnknown {
+                // Не всякая ФС заполняет d_type — тогда спрашиваем явно.
+                var info = stat()
+                guard lstat(path + "/" + name, &info) == 0 else { continue }
+                switch Int(info.st_mode) & 0o170000 {
+                case 0o040000: type = typeDirectory
+                case 0o100000: type = typeRegular
+                default: continue
+                }
+            }
+            switch type {
+            case typeDirectory: entries.append(Entry(name: name, isDirectory: true))
+            case typeRegular:   entries.append(Entry(name: name, isDirectory: false))
+            default: continue                            // симлинки, сокеты, устройства
+            }
+        }
+        return (entries, hasGitignore)
+    }
+
+    // Значения d_type одинаковы на macOS и Linux.
+    private static let typeUnknown = 0, typeDirectory = 4, typeRegular = 8
+}
+
 struct SearchHit: Identifiable {
     let id: Int32            // индекс записи в FileIndex
     let score: Int
@@ -25,6 +76,13 @@ final class FileIndex: @unchecked Sendable {
 
     init(root: URL) { self.root = root }
 
+    /// Индекс из готового списка относительных путей — от git.
+    convenience init(root: URL, paths: [String]) {
+        self.init(root: root)
+        reserve(paths.count)
+        for path in paths { append(rel: path) }
+    }
+
     var count: Int { entries.count }
 
     func relPath(_ i: Int32) -> String { display[Int(i)] }
@@ -46,7 +104,10 @@ final class FileIndex: @unchecked Sendable {
         let utf8 = Array(rel.utf8)
         let start = bytes.count
         var lastSlash = -1
-        bytes.reserveCapacity(bytes.count + utf8.count)
+        // Никакого reserveCapacity на каждую запись: он выделяет ровно
+        // запрошенное и ломает геометрический рост — буфер копировался бы
+        // целиком чуть ли не на каждом пути, и на 272 000 файлов это полторы
+        // секунды вместо десятков миллисекунд.
         for (k, b) in utf8.enumerated() {
             if b == 0x2F { lastSlash = k }
             bytes.append((b >= 0x41 && b <= 0x5A) ? b + 32 : b)
@@ -65,65 +126,149 @@ final class FileIndex: @unchecked Sendable {
 
     // MARK: - Сканирование
 
+    /// Список файлов проекта. В git-репозитории его даёт git — это на порядки
+    /// быстрее обхода; иначе обходим диск сами.
+    ///
+    /// `early` получает индекс из одних отслеживаемых файлов, как только git
+    /// их отдал (десятые доли секунды), — до того, как он найдёт новые.
+    /// `exclude` — правила проекта поверх `.gitignore`: например, `.meta` в Unity.
+    /// Синхронный — вызывать вне главного потока.
+    static func scan(root: URL, exclude: Exclusion? = nil, shouldStop: @escaping () -> Bool,
+                     early: ((FileIndex) -> Void)? = nil) -> FileIndex {
+        // Пустой ответ бывает, когда открыта папка, которую git игнорирует
+        // или ещё не видел: тогда он ничего о ней не знает, и обходим сами.
+        if let tracked = GitFiles.tracked(root: root), !tracked.isEmpty, !shouldStop() {
+            let trackedPaths = filtered(tracked, exclude)
+            early?(FileIndex(root: root, paths: trackedPaths))
+            let complete = shouldStop() ? nil : GitFiles.complete(root: root, tracked: tracked)
+            return FileIndex(root: root, paths: complete.map { filtered($0, exclude) } ?? trackedPaths)
+        }
+        return build(root: root, exclude: exclude, shouldStop: shouldStop)
+    }
+
+    /// Правило исключения: путь от корня и папка ли это.
+    typealias Exclusion = (_ relPath: String, _ isDirectory: Bool) -> Bool
+
+    /// Список от git — плоский, папок в нём нет: исключённая папка
+    /// отсекается по любому из предков файла.
+    static func filtered(_ paths: [String], _ exclude: Exclusion?) -> [String] {
+        guard let exclude else { return paths }
+        return paths.filter { path in
+            if exclude(path, false) { return false }
+            var slash = path.firstIndex(of: "/")
+            while let s = slash {
+                if exclude(String(path[..<s]), true) { return false }
+                slash = path[path.index(after: s)...].firstIndex(of: "/")
+            }
+            return true
+        }
+    }
+
     /// Рекурсивный обход. Синхронный — вызывающий обязан делать это вне главного потока.
     /// `shouldStop` позволяет прервать обход, если воркспейс сменился.
-    /// `exclude` — правила проекта поверх `.gitignore`: например, `.meta` в Unity.
-    static func build(root: URL,
-                      exclude: ((_ relPath: String, _ isDirectory: Bool) -> Bool)? = nil,
-                      shouldStop: @escaping () -> Bool) -> FileIndex {
+    ///
+    /// Обход в ширину, по уровням: все папки одного уровня читаются
+    /// параллельно, а результаты складываются в порядке папок — индекс
+    /// получается тот же, что при последовательном обходе.
+    static func build(root: URL, exclude: Exclusion? = nil, shouldStop: @escaping () -> Bool) -> FileIndex {
         let index = FileIndex(root: root)
         index.reserve(8192)
 
-        let fm = FileManager.default
-        let hasRootIgnore = fm.fileExists(atPath: root.appendingPathComponent(".gitignore").path)
+        let rootPath = root.path
+        let hasRootIgnore = FileManager.default.fileExists(atPath: rootPath + "/.gitignore")
 
-        struct Frame {
-            let url: URL
-            let rel: String
-            let ignore: IgnoreMatcher   // цепочка слоёв, действующая на содержимое url
+        // Каждый фрейм несёт цепочку .gitignore своих предков, поэтому правила
+        // родителей корректно наследуются вглубь. Свой .gitignore папка
+        // добавляет сама, когда её читают: есть ли он, видно из листинга.
+        var level = [WalkFrame(rel: "", inherited: IgnoreMatcher(layers: [], useSoftSkip: !hasRootIgnore))]
+
+        while !level.isEmpty && !shouldStop() {
+            let frames = level
+            var listings = [WalkListing](repeating: WalkListing(), count: frames.count)
+            listings.withUnsafeMutableBufferPointer { out in
+                // Каждая итерация пишет только в свою ячейку.
+                DispatchQueue.concurrentPerform(iterations: frames.count) { i in
+                    out[i] = walk(frames[i], rootPath: rootPath, exclude: exclude)
+                }
+            }
+            level = []
+            for listing in listings {
+                for rel in listing.files { index.append(rel: rel) }
+                level += listing.dirs
+            }
         }
+        return index
+    }
 
-        let rootMatcher = IgnoreMatcher(layers: [], useSoftSkip: !hasRootIgnore)
-            .adding(IgnoreLayer.load(at: root, base: ""))
+    private struct WalkFrame {
+        let rel: String
+        let inherited: IgnoreMatcher   // слои .gitignore предков, без своего
+    }
 
-        // Обход в ширину: каждый фрейм несёт свою цепочку .gitignore,
-        // поэтому правила родителей корректно наследуются вглубь.
-        var queue: [Frame] = [Frame(url: root, rel: "", ignore: rootMatcher)]
-        var head = 0
+    private struct WalkListing {
+        var files: [String] = []
+        var dirs: [WalkFrame] = []
+    }
 
-        while head < queue.count {
-            if shouldStop() { break }
-            let frame = queue[head]
-            head += 1
+    private static func walk(_ frame: WalkFrame, rootPath: String, exclude: Exclusion?) -> WalkListing {
+        let dirPath = frame.rel.isEmpty ? rootPath : rootPath + "/" + frame.rel
+        var listing = WalkListing()
+        guard let contents = DirectoryReader.read(dirPath) else { return listing }
 
-            guard let children = try? fm.contentsOfDirectory(
-                at: frame.url,
-                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
+        // .gitignore папки действует только на её содержимое.
+        let ignore = contents.hasGitignore
+            ? frame.inherited.adding(IgnoreLayer.load(path: dirPath + "/.gitignore", base: frame.rel))
+            : frame.inherited
 
-            for child in children {
-                let name = child.lastPathComponent
-                let rel = frame.rel.isEmpty ? name : frame.rel + "/" + name
+        for entry in contents.entries {
+            let rel = frame.rel.isEmpty ? entry.name : frame.rel + "/" + entry.name
+            if ignore.isIgnored(relPath: rel, name: entry.name, isDir: entry.isDirectory) { continue }
+            if let exclude, exclude(rel, entry.isDirectory) { continue }
+            if entry.isDirectory {
+                listing.dirs.append(WalkFrame(rel: rel, inherited: ignore))
+            } else {
+                listing.files.append(rel)
+            }
+        }
+        return listing
+    }
 
-                let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                if values?.isSymbolicLink == true { continue }   // не ходим по симлинкам
-                let isDir = values?.isDirectory ?? false
+    // MARK: - Фильтр навигатора
 
-                if frame.ignore.isIgnored(relPath: rel, name: name, isDir: isDir) { continue }
-                if let exclude, exclude(rel, isDir) { continue }
+    /// Файлы, в имени которых есть подстрока, — без fuzzy и без учёта
+    /// регистра, как фильтр навигатора в Xcode. Бежит по тому же буферу,
+    /// что и поиск, без аллокаций на файл. Порядок — порядок индекса.
+    func filter(name needle: String, limit: Int, shouldStop: () -> Bool) -> [Int32] {
+        let pattern = needle.utf8.map { ($0 >= 0x41 && $0 <= 0x5A) ? $0 + 32 : $0 }
+        guard !pattern.isEmpty else { return [] }
 
-                if isDir {
-                    // .gitignore самой подпапки действует только на её содержимое
-                    let childIgnore = frame.ignore.adding(IgnoreLayer.load(at: child, base: rel))
-                    queue.append(Frame(url: child, rel: rel, ignore: childIgnore))
-                } else {
-                    index.append(rel: rel)
+        var found: [Int32] = []
+        bytes.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            pattern.withUnsafeBufferPointer { pat in
+                let first = pat[0]
+                let count = pat.count
+                for i in 0..<entries.count {
+                    if i & 0x3FF == 0 && shouldStop() { return }
+                    let e = entries[i]
+                    let end = Int(e.start + e.length)
+                    var p = Int(e.nameStart)
+                    let last = end - count
+                    while p <= last {
+                        if base[p] == first {
+                            var k = 1
+                            while k < count && base[p + k] == pat[k] { k += 1 }
+                            if k == count { break }
+                        }
+                        p += 1
+                    }
+                    guard p <= last else { continue }
+                    found.append(Int32(i))
+                    if found.count >= limit { return }
                 }
             }
         }
-
-        return index
+        return found
     }
 
     // MARK: - Поиск

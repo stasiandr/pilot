@@ -44,6 +44,49 @@ let nested = IgnoreMatcher(
     useSoftSkip: false)
 check(nested.isIgnored(relPath: "sub/a.log", name: "a.log", isDir: false), "nested layer applies in subtree")
 check(!nested.isIgnored(relPath: "other/a.log", name: "a.log", isDir: false), "nested layer skips other subtree")
+// база-префикс, но не папка: sub2 не лежит внутри sub
+check(!nested.isIgnored(relPath: "sub2/a.log", name: "a.log", isDir: false), "nested layer: sub2 is not inside sub")
+
+// Быстрые пути матчера: точное имя, окончание, обязательный литерал.
+func literal(_ p: String) -> String { String(decoding: IgnoreRule.longestLiteral(Array(p.utf8)), as: UTF8.self) }
+check(literal("[Aa]ssets/StreamingAssets/**/*.bank") == "ssets/StreamingAssets/", "литерал: класс и ** пропущены")
+check(literal("**/.idea/**/workspace.xml") == "workspace.xml", "литерал: слеш после ** не обязателен")
+check(literal("*.[oa]") == ".", "литерал: до класса")
+check(literal("x[]ab]cd") == "cd", "литерал: `]` сразу после `[` — часть класса")
+func kind(_ line: String) -> String {
+    switch IgnoreRule(line: line)!.kind {
+    case .literal: return "literal"
+    case .suffix: return "suffix"
+    case .glob: return "glob"
+    }
+}
+check(kind("Thumbs.db") == "literal" && kind("/Assets/link.xml") == "literal", "без спецсимволов -> literal")
+check(kind("*.csproj") == "suffix", "*.csproj -> suffix")
+check(kind("/*.csproj") == "glob", "якорный *.csproj — не суффикс: * не проходит через /")
+check(kind("[Bb]in/") == "glob", "класс -> glob")
+
+// Главная проверка: быстрые пути отвечают ровно как полный глоб.
+let patterns = ["Thumbs.db", "*.csproj", "*.pidb.meta", "[Bb]in", "**/.idea/**/workspace.xml",
+                "[Aa]ssets/StreamingAssets/**/*.bank", "[Aa]ssets/**/*.meta", "src/*.ts", "a?c",
+                "**/obj", "*", "*.[oa]", "build_ios*", "Assets/eWolf/Thumbs.db.meta", "**"]
+let texts = ["Thumbs.db", "x.csproj", "a/x.csproj", ".csproj", "x.pidb.meta", "bin", "Bin", "cabin",
+             ".idea/workspace.xml", "a/.idea/b/workspace.xml", "workspace.xml",
+             "Assets/StreamingAssets/x/y.bank", "assets/StreamingAssets/y.bank", "Assets/StreamingAssets.bank",
+             "Assets/a/b/c.meta", "Assets/c.meta", "src/a.ts", "src/a/b.ts", "abc", "a/c", "obj", "x/y/obj",
+             "x.o", "x.c", "build_ios_1", "Assets/eWolf/Thumbs.db.meta", "", "Папка/файл.cs"]
+var mismatches: [String] = []
+for p in patterns {
+    for anchored in ["", "/"] {
+        let rule = IgnoreRule(line: anchored + p)!
+        for t in texts {
+            let fast = Array(t.utf8).withUnsafeBufferPointer { rule.matches($0) }
+            if fast != Glob.match(pattern: rule.pattern, text: Array(t.utf8)) {
+                mismatches.append("\(anchored)\(p) ~ \(t)")
+            }
+        }
+    }
+}
+check(mismatches.isEmpty, "быстрые пути совпадают с глобом (расхождения: \(mismatches))")
 
 // ──────────────────────────── Fuzzy ────────────────────────────
 section("Fuzzy")
@@ -286,6 +329,257 @@ do {
           "неполное тело не выдаётся")
 }
 
+// ────────────────────────── LSP: таймауты и отмена ──────────────────────────
+section("LSP / таймауты")
+
+/// Результат запроса из фоновой задачи: семафор даёт happens-before.
+final class RequestOutcome: @unchecked Sendable { var text = "не завершился" }
+
+/// Запускает запрос в отдельной задаче и ждёт его не дольше `limit` секунд.
+/// nil — запрос так и не завершился.
+func runRequest(_ client: LSPClient, timeout: TimeInterval, cancelAfter: TimeInterval? = nil,
+                limit: TimeInterval = 3) -> String? {
+    let done = DispatchSemaphore(value: 0)
+    let outcome = RequestOutcome()
+    let task = Task.detached {
+        do {
+            let result = try await client.request("pilot/ping", [:], timeout: timeout)
+            outcome.text = result is NSNull ? "ответ" : "ответ \(result)"
+        } catch {
+            outcome.text = "\(error)"
+        }
+        done.signal()
+    }
+    if let cancelAfter {
+        Thread.sleep(forTimeInterval: cancelAfter)
+        task.cancel()
+    }
+    return done.wait(timeout: .now() + limit) == .success ? outcome.text : nil
+}
+
+func testServer(_ command: [String]) -> LSPClient {
+    let config = ServerConfig(id: "test", languageId: "plaintext", fileExtensions: [],
+                              command: command, displayName: "test")
+    let client = LSPClient(config: config, root: URL(fileURLWithPath: NSTemporaryDirectory()))
+    try? client.start()
+    return client
+}
+
+do {
+    // `cat` — эхо: наш запрос возвращается как «запрос от сервера», клиент
+    // на него отвечает, а эхо ответа закрывает исходный запрос.
+    let echo = testServer(["/bin/cat"])
+    check(runRequest(echo, timeout: 2) == "ответ", "эхо-сервер: запрос получает ответ")
+    echo.stop()
+
+    // Сервер, который молчит. Запрос обязан упасть по таймауту, а не повиснуть:
+    // вызывающий иначе никогда не узнает, что ответа не будет.
+    let silent = testServer(["/bin/sleep", "30"])
+    let t0 = Date()
+    let timedOut = runRequest(silent, timeout: 0.2)
+    check(timedOut?.contains("timeout") == true,
+          "молчащий сервер: запрос завершается таймаутом (получено: \(timedOut ?? "повис"))")
+    check(Date().timeIntervalSince(t0) < 1.5, "таймаут срабатывает вовремя")
+
+    // Отмена задачи снимает запрос сразу, не дожидаясь таймаута.
+    let t1 = Date()
+    let cancelled = runRequest(silent, timeout: 30, cancelAfter: 0.1)
+    check(cancelled != nil, "отменённый запрос завершается (получено: \(cancelled ?? "повис"))")
+    check(Date().timeIntervalSince(t1) < 1.5, "отмена не ждёт таймаута")
+    silent.stop()
+}
+
+// ────────────────────────── LSP: демон ──────────────────────────
+section("LSP / демон")
+
+/// Ждёт условия, не дольше `timeout` секунд.
+func eventually(_ timeout: TimeInterval = 3, _ condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    return condition()
+}
+
+final class ResultBox<T>: @unchecked Sendable { var value: Result<T, Error>? }
+
+/// Асинхронный вызов из синхронного кода тестов. nil — не дождались.
+func blocking<T>(_ body: @escaping @Sendable () async throws -> T) -> Result<T, Error>? {
+    let done = DispatchSemaphore(value: 0)
+    let box = ResultBox<T>()
+    Task.detached {
+        do { box.value = .success(try await body()) } catch { box.value = .failure(error) }
+        done.signal()
+    }
+    return done.wait(timeout: .now() + 5) == .success ? box.value : nil
+}
+
+/// Уведомления, которые клиент получил через демона.
+final class Heard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var methods: [String] = []
+    func add(_ method: String) { lock.lock(); methods.append(method); lock.unlock() }
+    func count(_ method: String) -> Int { lock.lock(); defer { lock.unlock() }; return methods.filter { $0 == method }.count }
+}
+
+do {
+    signal(SIGPIPE, SIG_IGN)
+    let tmp = NSTemporaryDirectory()
+    // `cat` вместо Roslyn: он возвращает всё, что ему пишут, поэтому через
+    // эхо видно, что именно демон переслал серверу и сколько раз.
+    let catConfig = ServerConfig(id: "cat", languageId: "plaintext", fileExtensions: ["txt"],
+                                 command: ["/bin/cat"], displayName: "cat")
+    let rootA = URL(fileURLWithPath: tmp + "pilot-daemon-a")
+    let rootB = URL(fileURLWithPath: tmp + "pilot-daemon-b")
+    for root in [rootA, rootB] {
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    final class Exited: @unchecked Sendable { var value = false }
+    var sockets: [String] = []
+
+    func makeDaemon(_ policy: LSPDaemon.Policy, build: String = "b1",
+                    executable: String? = nil) -> (LSPDaemon, String, Exited) {
+        let socket = tmp + "pilot-test-\(UUID().uuidString.prefix(8)).sock"
+        sockets.append(socket)
+        let daemon = LSPDaemon(socketPath: socket, build: build, executablePath: executable, policy: policy)
+        let exited = Exited()
+        daemon.onExit = { exited.value = true }
+        try? daemon.start()
+        return (daemon, socket, exited)
+    }
+
+    func client(_ socket: String, root: URL, heard: Heard? = nil) -> LSPClient? {
+        guard let fd = UnixSocket.connectTo(socket) else { return nil }
+        let c = LSPClient(config: catConfig, root: root)
+        if let heard { c.onNotification = { method, _ in heard.add(method) } }
+        c.connect(daemonSocket: fd)
+        return c
+    }
+
+    var quiet = LSPDaemon.Policy()
+    quiet.sweepInterval = 3600
+    quiet.exitWhenEmptyAfter = 3600
+
+    // Два клиента, один сервер.
+    var keepAll = quiet
+    keepAll.keepIfLoadTookAtLeast = 0
+    let (daemon, socket, _) = makeDaemon(keepAll)
+    let heardA = Heard(), heardB = Heard()
+    let a = client(socket, root: rootA, heard: heardA)!
+    let attachA = blocking { try await a.attach(build: "b1") }
+    check((try? attachA?.get()) == false, "первый клиент запускает сервер")
+    check((try? blocking { try await a.initialize() }?.get()) != nil, "initialize через демона")
+    let b = client(socket, root: rootA, heard: heardB)!
+    check((try? blocking { try await b.attach(build: "b1") }?.get()) == true,
+          "второй клиент того же проекта получает работающий сервер")
+    check((try? blocking { try await b.initialize() }?.get()) != nil, "второй initialize — из сохранённого")
+    check(daemon.snapshot().servers == 1, "сервер один на двоих")
+
+    let ping = blocking { try await b.request("pilot/ping", [:], timeout: 2) }
+    check((try? ping?.get()) is NSNull, "запрос проходит через демона к серверу и обратно")
+
+    // Общий документ открывается на сервере один раз и закрывается последним.
+    let doc = rootA.appendingPathComponent("a.txt")
+    a.didOpen(url: doc, languageId: "plaintext", text: "x")
+    b.didOpen(url: doc, languageId: "plaintext", text: "x")
+    check(eventually { heardA.count("textDocument/didOpen") == 1 }, "didOpen дошёл до сервера")
+    Thread.sleep(forTimeInterval: 0.2)
+    check(heardB.count("textDocument/didOpen") == 1, "второй didOpen того же файла сервер не получил")
+    a.stop()
+    check(eventually { daemon.snapshot().connections == 1 }, "отключение клиента демон заметил")
+    Thread.sleep(forTimeInterval: 0.2)
+    check(heardB.count("textDocument/didClose") == 0, "файл ещё открыт у второго — didClose нет")
+    b.didClose(url: doc)
+    check(eventually { heardB.count("textDocument/didClose") == 1 }, "последний закрывший — didClose дошёл")
+
+    // Клиентов нет, а дорогой (по политике) сервер остаётся.
+    b.stop()
+    check(eventually { daemon.snapshot().connections == 0 }, "все клиенты отключились")
+    check(daemon.snapshot().servers == 1, "дорогой сервер пережил уход клиентов")
+    let c = client(socket, root: rootA)!
+    check((try? blocking { try await c.attach(build: "b1") }?.get()) == true, "новый клиент застаёт его живым")
+    c.stop()
+
+    // Лимит серверов без клиентов: лишний — самый давний — уходит.
+    let d = client(socket, root: rootB)!
+    _ = blocking { try await d.attach(build: "b1") }
+    _ = blocking { try await d.initialize() }
+    check(daemon.snapshot().servers == 2, "второй проект — второй сервер")
+    d.stop()
+    check(eventually { daemon.snapshot().connections == 0 }, "и этот клиент ушёл")
+    // Лимит проверяем на копии политики: подменить её у живого демона нельзя.
+    var one = keepAll
+    one.maxIdleServers = 1
+    let (limited, limitedSocket, _) = makeDaemon(one)
+    for root in [rootA, rootB] {
+        let e = client(limitedSocket, root: root)!
+        _ = blocking { try await e.attach(build: "b1") }
+        _ = blocking { try await e.initialize() }
+        e.stop()
+    }
+    check(eventually { limited.snapshot().servers == 1 }, "без клиентов держим не больше одного — по политике")
+
+    // Дешёвый сервер (cat поднимается мгновенно) после ухода клиента не держим.
+    let (cheap, cheapSocket, _) = makeDaemon(quiet)
+    let f = client(cheapSocket, root: rootA)!
+    _ = blocking { try await f.attach(build: "b1") }
+    _ = blocking { try await f.initialize() }
+    f.stop()
+    check(eventually { cheap.snapshot().servers == 0 }, "быстро поднимающийся сервер останавливается сразу")
+
+    // Сборки не совпали. Исполняемый файл демона не менялся — устарел клиент.
+    let exe = tmp + "pilot-fake-exe-\(UUID().uuidString.prefix(8))"
+    FileManager.default.createFile(atPath: exe, contents: Data())
+    let (fresh, freshSocket, freshExited) = makeDaemon(quiet, build: LSPDaemon.buildID(executable: exe), executable: exe)
+    let old = client(freshSocket, root: rootA)!
+    if case .failure(RPCError.serverError(let code, _))? = blocking({ try await old.attach(build: "old") }) {
+        check(code == LSPDaemon.staleClientCode, "старый клиент получает отказ, демон остаётся")
+    } else {
+        check(false, "старый клиент получает отказ, демон остаётся")
+    }
+    check(!freshExited.value && fresh.snapshot().connections >= 0, "свежий демон не уходит из-за старого клиента")
+    old.stop()
+    // Файл демона пересобрали — устарел сам демон: отказывает и уходит.
+    Thread.sleep(forTimeInterval: 0.01)
+    try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: exe)
+    let fresher = client(freshSocket, root: rootA)!
+    let staleExit = Heard()
+    fresher.onExit = { _ in staleExit.add("exit") }
+    if case .failure(RPCError.serverError(let code, _))? = blocking({ try await fresher.attach(build: "new") }) {
+        check(code == LSPDaemon.staleDaemonCode, "пересобранный Pilot: демон сообщает, что устарел")
+    } else {
+        check(false, "пересобранный Pilot: демон сообщает, что устарел")
+    }
+    check(eventually { freshExited.value }, "устаревший демон уходит сам")
+    check(eventually { staleExit.count("exit") == 1 }, "клиент видит, что демон закрыл соединение")
+    check(UnixSocket.connectTo(freshSocket) == nil, "сокет устаревшего демона убран")
+    try? FileManager.default.removeItem(atPath: exe)
+
+    // Демона выключили в настройках: Pilot просит его уйти.
+    let (quitting, quitSocket, quitExited) = makeDaemon(quiet)
+    LSPDaemon.requestQuit(socketPath: quitSocket)
+    check(eventually { quitExited.value }, "по pilot/quit демон уходит")
+    LSPDaemon.requestQuit(socketPath: quitSocket)   // демона уже нет — просто ничего
+    _ = daemon; _ = limited; _ = cheap; _ = quitting
+    for socket in sockets { unlink(socket) }
+    for root in [rootA, rootB] { try? FileManager.default.removeItem(at: root) }
+}
+
+do {
+    var config = ServerConfig(id: "x", languageId: "csharp", fileExtensions: ["cs", "csx"],
+                              command: ["/bin/x", "--stdio"], displayName: "X")
+    config.settings = ["a.b": false]
+    config.opensSolution = true
+    config.projectsLoadedNotification = "done"
+    let back = ServerConfig(json: config.json)
+    check(back?.command == config.command && back?.fileExtensions == config.fileExtensions
+          && back?.settings["a.b"] as? Bool == false && back?.opensSolution == true
+          && back?.projectsLoadedNotification == "done",
+          "конфигурация сервера переживает JSON — так она уходит демону")
+}
+
 // ────────────────────────── LSP: разбор ответов ──────────────────────────
 section("LSP / разбор")
 
@@ -319,6 +613,53 @@ let syms = LSPSymbol.parse(json("[{\"name\":\"Foo\",\"kind\":5,\"containerName\"
 check(syms.count == 1 && syms[0].name == "Foo", "symbol: имя разобрано")
 check(syms[0].kindLabel == "class", "symbol: вид -> class")
 check(syms[0].range?.start.line == 2, "symbol: диапазон разобран")
+
+do {
+    var config = ServerConfig(id: "t", languageId: "csharp", fileExtensions: [], command: ["x"],
+                              displayName: "t")
+    config.settings = ServerRegistry.roslynSettings
+    let request = json("{\"items\":[{\"section\":\"csharp|inlay_hints.csharp_enable_inlay_hints_for_types\"},{\"section\":\"projects.dotnet_enable_automatic_restore\"},{\"scopeUri\":\"file:///a\"}]}")
+    let answer = config.configurationResponse(request)
+    check(answer.count == 3, "configuration: по ответу на каждый запрошенный элемент")
+    check(answer[0] is NSNull, "configuration: неизвестная секция -> null")
+    check(answer[1] as? Bool == false, "configuration: автоматический restore выключен")
+    check(answer[2] is NSNull, "configuration: элемент без секции -> null")
+    check(config.configurationResponse(nil).isEmpty, "configuration: без параметров -> пустой массив")
+}
+
+do {
+    // Папка с исполняемым `mono` выпадает из PATH, остальные — в том же порядке.
+    let fm = FileManager.default
+    let monoDir = NSTemporaryDirectory() + "pilot-mono-\(UUID().uuidString)"
+    try? fm.createDirectory(atPath: monoDir, withIntermediateDirectories: true)
+    fm.createFile(atPath: monoDir + "/mono", contents: Data("#!/bin/sh\n".utf8),
+                  attributes: [.posixPermissions: 0o755])
+    let stripped = DotnetRuntime.pathWithoutMono("/usr/bin:\(monoDir):/bin")
+    check(stripped == "/usr/bin:/bin", "PATH без Mono (получено \(stripped))")
+    check(DotnetRuntime.pathWithoutMono("/usr/bin:/bin") == "/usr/bin:/bin", "PATH без Mono не меняется")
+    try? fm.removeItem(atPath: monoDir)
+}
+
+let slnText = """
+Microsoft Visual Studio Solution File, Format Version 11.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Assembly-CSharp", "Assembly-CSharp.csproj", "{4DF3AB5E}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Folder", "Folder", "{0000}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UI", "Sub\\UI.csproj", "{1111}"
+EndProject
+"""
+check(ServerRegistry.projectCount(solutionText: slnText, isXML: false) == 2,
+      "sln: считаются проекты, но не папки решения")
+let slnxText = """
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/App/App.csproj" />
+    <Project Path="src/Lib/Lib.csproj" />
+  </Folder>
+</Solution>
+"""
+check(ServerRegistry.projectCount(solutionText: slnxText, isXML: true) == 2, "slnx: два проекта")
 
 let capsBool = ServerCapabilities.parse(json("{\"capabilities\":{\"definitionProvider\":true,\"hoverProvider\":false}}"))
 check(capsBool.definition && !capsBool.hover, "capabilities: булев вид")
@@ -757,6 +1098,91 @@ check(bigTree.root.children.count == 1 && bigTree.node(at: "src")?.children.coun
       "большое дерево: src и 200 модулей в нём")
 check(treeMs < 1500, "дерево из 100k файлов строится быстрее 1.5 с (получено \(Int(treeMs)) мс)")
 
+// ─────────────────────────── Файлы от git ───────────────────────────
+section("Файлы от git")
+
+check(GitFiles.split(Data("a.cs\0dir/b.cs\0".utf8)) == ["a.cs", "dir/b.cs"], "split: пути через NUL")
+check(GitFiles.split(Data("a.cs\0b.cs".utf8)) == ["a.cs", "b.cs"], "split: последний путь без NUL")
+check(GitFiles.split(Data()).isEmpty, "split: пусто -> пусто")
+check(GitFiles.split(Data(".gitignore\0src/.idea/x.xml\0src/a.cs\0a.b/c.cs\0x/.cs\0".utf8)) == ["src/a.cs", "a.b/c.cs"],
+      "split: скрытые файлы и папки отсеиваются, точка внутри имени — нет")
+check(GitFiles.split(Data("vendor/lib/\0Папка/файл.cs\0".utf8)) == ["Папка/файл.cs"],
+      "split: вложенный репозиторий (слеш на конце) отсеивается, не-ASCII цел")
+
+if let git = GitFiles.executable {
+    // Изолируемся от настроек пользователя: его глобальный excludesFile
+    // или подпись коммитов не должны влиять на тест.
+    setenv("GIT_CONFIG_GLOBAL", "/dev/null", 1)
+    setenv("GIT_CONFIG_NOSYSTEM", "1", 1)
+
+    let fm = FileManager.default
+    let repo = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("pilot-git-\(UUID().uuidString)")
+    func write(_ rel: String) {
+        let url = repo.appendingPathComponent(rel)
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data("x".utf8).write(to: url)
+    }
+    func runGit(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: git)
+        p.arguments = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + args
+        p.currentDirectoryURL = repo
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+    }
+
+    for rel in ["src/App.cs", "src/Old.cs", "README.md", ".hidden/secret.cs", "bin/out.dll"] { write(rel) }
+    try? Data("bin/\n".utf8).write(to: repo.appendingPathComponent(".gitignore"))
+    runGit(["init", "-q"])
+    runGit(["add", "."])
+    runGit(["commit", "-q", "-m", "init"])
+    write("notes.txt")                                                   // новый, не игнорируется
+    write("Папка с пробелом/файл.cs")                                   // пробелы и не-ASCII
+    write("bin/new.dll")                                                 // новый, но игнорируется
+    write(".hidden/new.cs")                                              // новый, но скрытый
+
+    let tracked = GitFiles.tracked(root: repo) ?? []
+    check(Set(tracked) == ["src/App.cs", "src/Old.cs", "README.md"],
+          "tracked: отслеживаемые без скрытых (получено \(tracked.sorted()))")
+    let all = Set(GitFiles.complete(root: repo, tracked: tracked) ?? [])
+    check(all == ["src/App.cs", "src/Old.cs", "README.md", "notes.txt", "Папка с пробелом/файл.cs"],
+          "complete: плюс новые, без игнорируемых и скрытых (получено \(all.sorted()))")
+
+    // Главное: от git или обходом — индекс один и тот же.
+    let viaGit = FileIndex.scan(root: repo, shouldStop: { false })
+    let viaWalk = FileIndex.build(root: repo, shouldStop: { false })
+    check(Set(viaGit.display) == Set(viaWalk.display),
+          "git и обход диска дают одинаковый набор (git: \(viaGit.display.sorted()), обход: \(viaWalk.display.sorted()))")
+
+    var earlyCount = -1
+    _ = FileIndex.scan(root: repo, shouldStop: { false }, early: { earlyCount = $0.count })
+    check(earlyCount == 3, "early: сначала приходят отслеживаемые файлы (получено \(earlyCount))")
+
+    // Удалён с диска, но не закоммичен: осознанно остаётся в списке —
+    // проверка стоила бы lstat на каждый файл проекта.
+    try? fm.removeItem(at: repo.appendingPathComponent("src/Old.cs"))
+    check(GitFiles.tracked(root: repo)?.contains("src/Old.cs") == true,
+          "удалённый, но не закоммиченный файл остаётся в списке")
+
+    let sub = FileIndex.scan(root: repo.appendingPathComponent("src"), shouldStop: { false })
+    check(sub.display == ["App.cs", "Old.cs"], "подпапка репозитория: пути относительно неё (получено \(sub.display))")
+
+    let plain = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pilot-plain-\(UUID().uuidString)")
+    try? fm.createDirectory(at: plain, withIntermediateDirectories: true)
+    try? Data("x".utf8).write(to: plain.appendingPathComponent("a.cs"))
+    check(GitFiles.tracked(root: plain) == nil, "не репозиторий -> nil")
+    check(FileIndex.scan(root: plain, shouldStop: { false }).display == ["a.cs"],
+          "не репозиторий -> обход диска")
+
+    try? fm.removeItem(at: repo)
+    try? fm.removeItem(at: plain)
+} else {
+    print("  git не найден — проверки со списком файлов от git пропущены")
+}
+
 // ─────────────────────────── Индекс типов ───────────────────────────
 section("Индекс типов")
 
@@ -901,6 +1327,67 @@ print(String(format: "  разбор 2000 файлов на %d строк (од�
 check(typeTotal == 2000 * 8, "в каждом файле найдено ровно 8 типов")
 check(typesMs < 5000, "2000 файлов разбираются быстрее 5 с даже в один поток")
 
+// ──────────────────────── Предпросмотр в палитре ────────────────────────
+section("Предпросмотр")
+
+// большой файл: цель в середине, фрагмент — окно вокруг неё
+let previewSource = (0..<500).map { i in
+    i == 250 ? "public sealed class Target : Base { // цель" : "    var line\(i) = \"text\"; /* c */"
+}.joined(separator: "\n")
+let previewModel = SyntaxModel(text: previewSource, spec: Languages.csharp)
+let focusRange = LSPRange(start: LSPPosition(line: 250, character: 20), end: LSPPosition(line: 250, character: 26))
+let focused = FilePreview.make(model: previewModel, range: focusRange)
+check(focused.focusLine == 250, "строка цели запомнена")
+check(focused.lineCount == 500, "известно число строк файла")
+check(focused.lines.first?.number == 250 - FilePreview.linesBefore, "фрагмент начинается выше цели")
+check(focused.lines.last?.number == 250 + FilePreview.linesAfter, "фрагмент заканчивается ниже цели")
+if let line = focused.lines.first(where: { $0.number == 250 }) {
+    check(line.text == "public sealed class Target : Base { // цель", "текст строки собран из отрезков без потерь")
+    check(line.segments.filter(\.focused).map(\.text) == ["Target"],
+          "подсвечено ровно имя цели (получено \(line.segments.filter(\.focused).map(\.text)))")
+    check(line.segments.first?.kind == .keyword && line.segments.first?.text == "public",
+          "ключевое слово — отдельным отрезком с видом keyword")
+    check(line.segments.last?.kind == .comment, "комментарий в конце строки распознан")
+}
+check(focused.lines.filter { $0.segments.contains(where: \.focused) }.count == 1,
+      "подсветка цели только в одной строке")
+check(focused.lines.first { $0.number == 100 + 150 - 1 }?.segments.contains { $0.kind == .string } == true,
+      "строковые литералы в соседних строках раскрашены")
+
+// без цели — начало файла
+let top = FilePreview.make(model: previewModel, range: nil)
+check(top.focusLine == nil && top.lines.first?.number == 0, "без цели показывается начало файла")
+check(top.lines.count == FilePreview.linesBefore + FilePreview.linesAfter + 1, "без цели — полное окно строк")
+
+// цель у самого начала и у самого конца — окно подрезается границами файла
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 2, character: 0),
+                                                           end: LSPPosition(line: 2, character: 1))).lines.first?.number == 0,
+      "окно не уходит выше первой строки")
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 499, character: 0),
+                                                           end: LSPPosition(line: 499, character: 1))).lines.last?.number == 499,
+      "окно не уходит ниже последней строки")
+check(FilePreview.make(model: previewModel, range: LSPRange(start: LSPPosition(line: 9999, character: 0),
+                                                           end: LSPPosition(line: 9999, character: 1))).focusLine == 499,
+      "цель за концом файла прижимается к последней строке")
+
+// табуляции, CRLF, длинные строки, многострочный комментарий, файл без языка
+let tabbed = FilePreview.make(model: SyntaxModel(text: "\tint x;\r\nnext", spec: Languages.csharp), range: nil)
+check(tabbed.lines.first?.text == "    int x;", "табуляция раскрыта в пробелы, \\r\\n отрезан (получено \(tabbed.lines.first?.text ?? "nil"))")
+let longLine = FilePreview.make(model: SyntaxModel(text: String(repeating: "a", count: 5000), spec: nil), range: nil)
+check(longLine.lines.first.map { $0.text.count } == FilePreview.maxLineLength + 2, "длинная строка обрезана с многоточием")
+let block = FilePreview.make(model: SyntaxModel(text: "/* начало\nпродолжение */ int x;", spec: Languages.csharp), range: nil)
+check(block.lines.last?.segments.first?.kind == .comment && block.lines.last?.segments.first?.text == "продолжение */",
+      "многострочный комментарий раскрашен и во второй строке")
+let plain = FilePreview.make(model: SyntaxModel(text: "просто текст", spec: nil), range: nil)
+check(plain.lines.first?.segments == [FilePreview.Segment(text: "просто текст", kind: .plain, focused: false)],
+      "файл без языка — одним простым отрезком")
+
+let tPreview = Date()
+for _ in 0..<200 { _ = FilePreview.make(model: bigModel, range: focusRange) }
+let previewMs = Date().timeIntervalSince(tPreview) * 1000 / 200
+print(String(format: "  фрагмент для предпросмотра в файле на 200k строк: %.2f мс", previewMs))
+check(previewMs < 20, "фрагмент строится быстрее 20 мс даже в огромном файле")
+
 // ─────────────────────────────── ⇧⇧ ───────────────────────────────
 section("Двойной Shift")
 
@@ -938,22 +1425,209 @@ check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28),
       "четыре нажатия -> два раза")
 
 
+// ─────────────────────────── Git: диф строк ───────────────────────────
+section("Git: диф строк")
+
+func diff(_ old: String, _ new: String, maxEdits: Int = LineDiff.maxEdits) -> [LineDiff.Change] {
+    LineDiff.changes(old: old, new: new, maxEdits: maxEdits)
+}
+func ch(_ kind: LineDiff.Kind, _ lines: Range<Int>) -> LineDiff.Change {
+    LineDiff.Change(kind: kind, lines: lines)
+}
+
+check(diff("a\nb\nc\n", "a\nb\nc\n").isEmpty, "одинаковые тексты -> изменений нет")
+check(diff("a\nc\n", "a\nb\nc\n") == [ch(.added, 1..<2)], "вставка строки -> added")
+check(diff("a\nb\nc\n", "a\nc\n") == [ch(.deleted, 1..<1)], "удаление строки -> deleted перед строкой 1")
+check(diff("a\nb\nc\n", "a\nB\nc\n") == [ch(.modified, 1..<2)], "правка строки -> modified")
+check(diff("a\nb", "a") == [ch(.deleted, 1..<1)], "удаление последней строки -> deleted за концом")
+check(diff("", "x\ny\n") == [ch(.added, 0..<2)], "новый файл -> всё добавлено")
+check(diff("a\r\nb\r\n", "a\nb\n").isEmpty, "CRLF против LF изменением не считается")
+check(diff("1\n2\n3\n4\n5\n6\n7\n", "1\nX\n3\n4\n5\n7\nY\n")
+        == [ch(.modified, 1..<2), ch(.deleted, 5..<5), ch(.added, 6..<7)],
+      "несколько блоков разного вида (получено \(diff("1\n2\n3\n4\n5\n6\n7\n", "1\nX\n3\n4\n5\n7\nY\n")))")
+check(diff("a\nb\n", "a\nb\nc\nd\n") == [ch(.added, 2..<4)], "дописали в конец")
+check(diff("a\nb\nc\nd\n", "x\ny\n", maxEdits: 2) == [ch(.modified, 0..<2)],
+      "правок больше предела -> один блок на всё различающееся")
+
+// Оптимальность: неизменённые строки нового текста — общая подпоследовательность
+// со старым, и она наибольшая (сверяем с LCS динамикой на случайных текстах).
+func lcsLength(_ a: [String], _ b: [String]) -> Int {
+    var dp = [Int](repeating: 0, count: b.count + 1)
+    for x in a {
+        var prev = 0
+        for j in 0..<b.count {
+            let saved = dp[j + 1]
+            dp[j + 1] = x == b[j] ? prev + 1 : max(dp[j + 1], dp[j])
+            prev = saved
+        }
+    }
+    return dp[b.count]
+}
+var rng = SystemRandomNumberGenerator()
+var diffMismatches = 0
+for _ in 0..<400 {
+    let a = (0..<Int.random(in: 0...12, using: &rng)).map { _ in ["a", "b", "c"].randomElement(using: &rng)! }
+    let b = (0..<Int.random(in: 0...12, using: &rng)).map { _ in ["a", "b", "c"].randomElement(using: &rng)! }
+    let changes = diff(a.joined(separator: "\n"), b.joined(separator: "\n"))
+    var changed = Set<Int>()
+    for c in changes { changed.formUnion(c.lines) }
+    let kept = (0..<max(1, b.count)).filter { !changed.contains($0) }.map { b.isEmpty ? "" : b[$0] }
+    // kept должен быть подпоследовательностью a…
+    var it = (a.isEmpty ? [""] : a).makeIterator()
+    let isSubsequence = kept.allSatisfy { line in
+        while let next = it.next() { if next == line { return true } }
+        return false
+    }
+    // …и самой длинной из общих.
+    let best = lcsLength(a.isEmpty ? [""] : a, b.isEmpty ? [""] : b)
+    if !isSubsequence || kept.count != best { diffMismatches += 1 }
+}
+check(diffMismatches == 0, "на 400 случайных парах диф минимален и корректен (расхождений: \(diffMismatches))")
+
+let bigOld = (0..<100_000).map { "let value\($0) = compute(\($0))" }
+var bigNew = bigOld
+for i in stride(from: 5_000, to: 100_000, by: 10_000) { bigNew[i] = "// changed \(i)" }
+bigNew.insert("// inserted", at: 50_000)
+let tDiff = Date()
+let bigChanges = LineDiff.changes(old: bigOld.joined(separator: "\n"), new: bigNew.joined(separator: "\n"))
+let diffMs = Date().timeIntervalSince(tDiff) * 1000
+print(String(format: "  диф файла на 100k строк с 11 правками: %.0f мс", diffMs))
+check(bigChanges.count == 11, "в большом файле найдено 11 блоков (получено \(bigChanges.count))")
+check(diffMs < 1000, "диф файла на 100k строк быстрее 1 с")
+
+
+// ─────────────────────────── Git: разбор вывода ───────────────────────────
+section("Git: разбор вывода")
+
+let statusFixture = [
+    "# branch.oid 1234567890abcdef1234567890abcdef12345678",
+    "# branch.head main",
+    "# branch.upstream origin/main",
+    "# branch.ab +2 -1",
+    "1 .M N... 100644 100644 100644 aaa bbb src/App.swift",
+    "1 A. N... 000000 100644 100644 000 bbb src/New File.swift",
+    "1 D. N... 100644 000000 000000 aaa 000 old.txt",
+    "2 R. N... 100644 100644 100644 aaa bbb R100 docs/new.md", "docs/old.md",
+    "u UU N... 100644 100644 100644 100644 a b c conflict.cs",
+    "? notes/todo.txt",
+].joined(separator: "\0") + "\0"
+let parsedStatus = GitStatus.parse(Data(statusFixture.utf8))
+check(parsedStatus.head == "1234567890abcdef1234567890abcdef12345678", "хэш HEAD")
+check(parsedStatus.branch == "main" && parsedStatus.upstream == "origin/main", "ветка и upstream")
+check(parsedStatus.ahead == 2 && parsedStatus.behind == 1, "впереди на 2, позади на 1")
+check(parsedStatus.files["src/App.swift"] == .modified, "изменённый файл")
+check(parsedStatus.files["src/New File.swift"] == .added, "добавленный файл с пробелом в имени")
+check(parsedStatus.files["old.txt"] == .deleted, "удалённый файл")
+check(parsedStatus.files["docs/new.md"] == .renamed && parsedStatus.files["docs/old.md"] == nil,
+      "переименование: новый путь есть, старый не просочился отдельной записью")
+check(parsedStatus.files["conflict.cs"] == .conflicted, "конфликт слияния")
+check(parsedStatus.files["notes/todo.txt"] == .untracked, "неотслеживаемый файл")
+check(parsedStatus.files.count == 6, "файлов шесть (получено \(parsedStatus.files.count))")
+
+let detached = GitStatus.parse(Data("# branch.oid abcdef1234567\0# branch.head (detached)\0".utf8))
+check(detached.branch == nil && detached.headLabel == "abcdef1", "отсоединённый HEAD -> короткий хэш")
+let initial = GitStatus.parse(Data("# branch.oid (initial)\0# branch.head main\0".utf8))
+check(initial.head == nil && initial.branch == "main", "репозиторий без коммитов")
+
+let shaA = String(repeating: "a", count: 40)
+let shaZero = String(repeating: "0", count: 40)
+let blameFixture = """
+\(shaA) 1 1 2
+author Ada Lovelace
+author-mail <ada@example.com>
+author-time 1700000000
+author-tz +0000
+summary First commit
+filename main.swift
+\tlet a = 1
+\(shaA) 2 2
+\tlet b = 2
+\(shaZero) 3 3 1
+author External file (--contents)
+author-time 1800000000
+summary Version of main.swift from main.swift
+filename main.swift
+\tlet c = 3
+
+"""
+let blame = GitBlame.parse(Data(blameFixture.utf8), lineCount: 4)
+check(blame.commits.count == 2, "два коммита (получено \(blame.commits.count))")
+check(blame.commit(atLine: 0)?.author == "Ada Lovelace", "автор первой строки")
+check(blame.commit(atLine: 1)?.summary == "First commit", "вторая строка — тот же коммит, сведения не повторяются")
+check(blame.commit(atLine: 0)?.time == Date(timeIntervalSince1970: 1_700_000_000), "время коммита")
+check(blame.commit(atLine: 2)?.isUncommitted == true, "нулевой хэш -> не закоммичено")
+check(blame.commit(atLine: 3) == nil, "строка без сведений -> nil")
+check(blame.commit(atLine: 99) == nil, "строка за концом файла -> nil")
+
+
+// ─────────────────────────── Git: живой репозиторий ───────────────────────────
+section("Git: живой репозиторий")
+
+if Git.executable == nil {
+    print("  git не найден — пропускаю")
+} else {
+    let repo = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pilot-git-\(UUID().uuidString)")
+        .resolvingSymlinksInPath()
+    try? FileManager.default.createDirectory(at: repo.appendingPathComponent("src"), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: repo) }
+
+    // Глобальный конфиг пользователя (подпись коммитов, хуки) тесту не нужен.
+    let isolated = ["-c", "user.name=Pilot Test", "-c", "user.email=test@example.com",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+    func sh(_ args: [String]) { _ = Git.run(isolated + args, in: repo) }
+    func write(_ path: String, _ text: String) {
+        try? text.write(to: repo.appendingPathComponent(path), atomically: true, encoding: .utf8)
+    }
+
+    sh(["init", "-q", "--initial-branch=main"])
+    write("src/app.txt", "one\ntwo\nthree\n")
+    write(".gitignore", "*.log\n")
+    sh(["add", "."])
+    sh(["commit", "-q", "-m", "Initial"])
+
+    check(Git.repositoryRoot(for: repo.appendingPathComponent("src"))?.path == repo.path,
+          "корень репозитория находится из вложенной папки")
+
+    write("src/app.txt", "one\nTWO\nthree\nfour\n")
+    write("src/new.txt", "fresh\n")
+    write("debug.log", "noise\n")
+
+    let live = Git.status(in: repo)
+    check(live?.branch == "main" && live?.head?.count == 40, "status: ветка main и хэш HEAD")
+    check(live?.files["src/app.txt"] == .modified, "status: изменённый файл")
+    check(live?.files["src/new.txt"] == .untracked, "status: новый файл")
+    check(live?.files["debug.log"] == nil, "status: игнорируемый файл не попадает")
+
+    let edited = "one\nTWO\nthree\nfour\n"
+    let tracked = Git.lineChanges(text: edited, path: "src/app.txt", repository: repo)
+    check(tracked?.tracked == true, "файл в HEAD есть")
+    check(tracked?.changes == [ch(.modified, 1..<2), ch(.added, 3..<4)],
+          "полоски против HEAD (получено \(String(describing: tracked?.changes)))")
+
+    let fresh = Git.lineChanges(text: "fresh\n", path: "src/new.txt", repository: repo)
+    check(fresh?.tracked == false && fresh?.changes == [ch(.added, 0..<1)], "новый файл — весь добавлен")
+    let ignoredFile = Git.lineChanges(text: "noise\n", path: "debug.log", repository: repo)
+    check(ignoredFile?.tracked == false && ignoredFile?.changes.isEmpty == true, "игнорируемый файл — без полосок")
+
+    let liveBlame = Git.blame(text: edited, path: "src/app.txt", repository: repo, lineCount: 5)
+    check(liveBlame?.commit(atLine: 0)?.author == "Pilot Test", "blame: автор неизменённой строки")
+    check(liveBlame?.commit(atLine: 0)?.summary == "Initial", "blame: сообщение коммита")
+    check(liveBlame?.commit(atLine: 1)?.isUncommitted == true, "blame: изменённая строка не закоммичена")
+    check(liveBlame?.commit(atLine: 3)?.isUncommitted == true, "blame: дописанная строка не закоммичена")
+}
+
+
 // ────────────────────────── Режимы палитры ──────────────────────────
 section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 6, "режимов палитры шесть")
+check(PaletteMode.allCases.count == 8, "режимов палитры восемь")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
 }
-check(!PaletteMode.files.requiresLanguageServer, "поиск файлов не требует LSP")
-check(!PaletteMode.outline.requiresLanguageServer, "структура файла не требует LSP")
-check(!PaletteMode.classes.requiresLanguageServer, "поиск по классам не требует LSP")
-check(PaletteMode.symbols.requiresLanguageServer, "символы проекта требуют LSP")
-check(PaletteMode.references.requiresLanguageServer, "использования требуют LSP")
-check(!PaletteMode.assetUsages.requiresLanguageServer, "использования ассета Unity не требуют LSP")
 
 
 // ─────────────────────────────── Unity ───────────────────────────────
@@ -1503,6 +2177,351 @@ if let so = UnityInspector.content(file: soFile, model: soModel, caret: 0, resol
     check(so.source?.description == playerGUID, "скрипт ScriptableObject'а")
     check(so.sections.first?.properties.first?.key == "m_Description", "поля SO без служебных")
 }
+
+// ────────────────────────── Фильтр навигатора ──────────────────────────
+section("Фильтр навигатора")
+let idx7 = FileIndex(root: URL(fileURLWithPath: "/"))
+for p in ["Sources/UI/CodeView.swift", "Sources/Code/Lexer.swift", "README.md", "codegen.sh"] {
+    idx7.appendCached(rel: p)
+}
+let byName = idx7.filter(name: "code", limit: 10, shouldStop: { false }).map { idx7.relPath($0) }
+check(byName == ["Sources/UI/CodeView.swift", "codegen.sh"],
+      "фильтр ищет по имени файла, а не по пути, без учёта регистра (получено: \(byName))")
+check(idx7.filter(name: "", limit: 10, shouldStop: { false }).isEmpty, "пустой фильтр — пусто")
+check(idx7.filter(name: "e", limit: 2, shouldStop: { false }).count == 2, "фильтр уважает лимит")
+check(idx7.filter(name: "view.swift", limit: 10, shouldStop: { false }).count == 1, "совпадение в конце имени")
+
+section("Git")
+check(GitInfo.parse(head: "ref: refs/heads/main\n") == "main", "ветка из HEAD")
+check(GitInfo.parse(head: "ref: refs/heads/claude/feature-x") == "claude/feature-x", "ветка со слешем")
+check(GitInfo.parse(head: "29970deadb287d5457bc98c3dcc0b28c522c90c3\n") == "29970de", "отсоединённый HEAD — короткий хэш")
+check(GitInfo.parse(head: "") == nil, "пустой HEAD")
+
+// ─────────────────────── Структура: типы в объявлениях ───────────────────────
+section("Структура: типы в объявлениях")
+
+let declSource = """
+namespace Game
+{
+    public class Stash<T> : Base<T>, IStash where T : struct
+    {
+        [SerializeField] private Foo _foo;
+        private readonly List<Player> _players = new();
+        public static World Default { get; }
+        public ref T Get(int entity) => ref _items[entity];
+        public Stash<U> Other<U>() where U : struct => null;
+        private int[] _numbers;
+        public event Action<int> Changed;
+        public delegate void Handler<TArg>(TArg value);
+        public enum Mode { Idle, Run = 2, Jump }
+        Dictionary<string, List<int>> Map() { return null; }
+    }
+}
+"""
+let declItems = OutlineBuilder.build(model: SyntaxModel(text: declSource, spec: Languages.csharp))
+func declNamed(_ n: String) -> OutlineItem? { declItems.first { $0.name == n } }
+check(declNamed("Stash")?.genericParams == ["T"], "параметры дженерика типа (получено \(declNamed("Stash")?.genericParams ?? []))")
+check(declNamed("Stash")?.bases == ["Base<T>", "IStash"], "базовые типы без where (получено \(declNamed("Stash")?.bases ?? []))")
+check(declNamed("_foo")?.typeText == "Foo", "атрибут не прилипает к типу поля (получено \(declNamed("_foo")?.typeText ?? "nil"))")
+check(declNamed("_players")?.typeText == "List<Player>", "дженерик-тип поля (получено \(declNamed("_players")?.typeText ?? "nil"))")
+check(declNamed("Default")?.typeText == "World", "тип свойства, static не входит (получено \(declNamed("Default")?.typeText ?? "nil"))")
+check(declNamed("Get")?.typeText == "T", "возвращаемый тип `ref T` → T (получено \(declNamed("Get")?.typeText ?? "nil"))")
+check(declNamed("Other")?.kind == .method, "дженерик-метод `Other<U>()` попал в структуру")
+check(declNamed("Other")?.typeText == "Stash<U>", "его возвращаемый тип (получено \(declNamed("Other")?.typeText ?? "nil"))")
+check(declNamed("_numbers")?.typeText == "int[]", "массив (получено \(declNamed("_numbers")?.typeText ?? "nil"))")
+check(declNamed("Changed")?.kind == .field && declNamed("Changed")?.typeText == "Action<int>",
+      "у event имя — последнее слово, тип — перед ним (получено \(declNamed("Changed").map { "\($0.name): \($0.typeText ?? "nil")" } ?? "nil"))")
+check(declNamed("Action") == nil, "тип события не записан как имя")
+check(declNamed("Handler")?.kind == .method, "делегат-дженерик назван по имени, а не по типу")
+check(["Idle", "Run", "Jump"].allSatisfy { n in declNamed(n)?.kind == .enumCase && declNamed(n)?.container == "Mode" },
+      "значения enum с контейнером (получено \(declItems.filter { $0.kind == .enumCase }.map(\.name)))")
+check(declNamed("Map")?.typeText == "Dictionary<string,List<int>>", "вложенные дженерики (получено \(declNamed("Map")?.typeText ?? "nil"))")
+check(declNamed("2") == nil && declNamed("entity") == nil, "значения и параметры не объявления")
+
+// ─────────────────────────── Быстрый навигатор ───────────────────────────
+section("Быстрый навигатор")
+
+let navRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-nav-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: navRoot)
+let playerSystemSource = """
+using Game.Components;
+using Game.Ecs;
+using Vec = Game.Components.Health;
+
+namespace Game.Systems
+{
+    public sealed class PlayerSystem : BaseSystem
+    {
+        private Stash<Health> _health;
+        private readonly List<Player> _players = new();
+        private Vec _alias;
+        public Player Leader { get; private set; }
+
+        public override void OnAwake()
+        {
+            _health = World.GetStash<Health>();
+            ref var health = ref _health.Get(0);
+            health.Damage(1);
+            var player = new Player();
+            player.Move(2);
+            Leader.Move(3);
+            foreach (var p in _players) { p.Move(4); }
+            Log("Damage");
+            var world = World.Default;
+            world.GetStash<Health>();
+            Helper.Run();
+            this.Log("x");
+            // Damage в комментарии
+            var unknown = Something();
+            unknown.Damage(5);
+            _health.Get(1).Current = 0;
+            health.value = 1;
+        }
+        public enum Mode { Idle, Run = 2 }
+        void SetMode() { var m = Mode.Run; }
+    }
+    public class Player
+    {
+        public void Move(int dx) { }
+    }
+    public static class Helper { public static void Run() { } }
+}
+"""
+let damageSystemSource = """
+using Game.Components;
+using Game.Ecs;
+namespace Game.Systems
+{
+    [IncludeStash(typeof(Health))]
+    [IncludeStash(typeof(Game.Components.Health), "_hp")]
+    public partial class DamageSystem
+    {
+        private Filter _filter;
+        void OnUpdate()
+        {
+            foreach (var entity in _filter) { _health.Get(entity.Id).Damage(1); _hp.Has(entity.Id); }
+        }
+    }
+}
+"""
+let navFiles: [String: String] = [
+    "Assets/Game/Health.cs": """
+        using System;
+        namespace Game.Components
+        {
+            public struct Health
+            {
+                public int Current;
+                public float value;
+                public int Max { get; set; }
+                public void Damage(int amount) { Current -= amount; }
+            }
+        }
+        """,
+    "Assets/Game/Stash.cs": """
+        namespace Game.Ecs
+        {
+            public class Stash<T> where T : struct
+            {
+                public ref T Get(int entity) => ref _items[entity];
+                public bool Has(int entity) => true;
+                private T[] _items;
+            }
+            public class Filter
+            {
+                public Enumerator GetEnumerator() => default;
+                public struct Enumerator { public Entity Current => default; }
+            }
+            public struct Entity { public int Id; }
+            public class World
+            {
+                public Stash<T> GetStash<T>() where T : struct => null;
+                public static World Default { get; }
+            }
+        }
+        """,
+    "Assets/Game/BaseSystem.cs": """
+        namespace Game.Systems
+        {
+            public abstract class BaseSystem
+            {
+                protected World World;
+                public virtual void OnAwake() { }
+                protected void Log(string message) { }
+            }
+        }
+        """,
+    "Assets/Game/PlayerSystem.cs": playerSystemSource,
+    "Other/Player.cs": "namespace Other { public class Player { public void Move(int dx) { } } }",
+    "Assets/Game/DamageSystem.cs": damageSystemSource,
+    "Docs/readme.md": "Damage Damage Damage",
+]
+for (path, text) in navFiles {
+    let url = navRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? text.write(to: url, atomically: true, encoding: .utf8)
+}
+let symbols = SymbolIndex.build(root: navRoot, files: Array(navFiles.keys), shouldStop: { false })
+check(symbols != nil, "индекс символов построен")
+let symbolIndex = symbols ?? SymbolIndex(root: navRoot)
+check(symbolIndex.files.contains { $0.path == "Assets/Game/PlayerSystem.cs" && $0.usings == ["Game.Components", "Game.Ecs"]
+                                   && $0.aliases["Vec"] == "Game.Components.Health" && $0.namespaces == ["Game.Systems"] },
+      "using, псевдонимы и namespace файла")
+check(!symbolIndex.files.contains { $0.path.hasSuffix(".md") }, "Markdown не индексируется")
+
+let playerModel = SyntaxModel(text: playerSystemSource, spec: Languages.csharp)
+let navDocument = NavDocument(url: navRoot.appendingPathComponent("Assets/Game/PlayerSystem.cs"),
+                              relPath: "Assets/Game/PlayerSystem.cs", model: playerModel,
+                              outline: OutlineBuilder.build(model: playerModel))
+let navigator = LocalNavigator(index: symbolIndex, document: navDocument)
+
+/// ⌘B на слове `word` в n-м вхождении `context` внутри PlayerSystem.cs.
+func jump(_ context: String, _ word: String, occurrence: Int = 0) -> LocalNavigator.Answer {
+    let text = playerSystemSource as NSString
+    var searchFrom = 0
+    var found = NSRange(location: NSNotFound, length: 0)
+    for _ in 0...occurrence {
+        found = text.range(of: context, options: [], range: NSRange(location: searchFrom, length: text.length - searchFrom))
+        guard found.location != NSNotFound else { return .none }
+        searchFrom = found.location + found.length
+    }
+    let inner = (context as NSString).range(of: word)
+    return navigator.definition(at: found.location + inner.location)
+}
+func landed(_ answer: LocalNavigator.Answer) -> String {
+    guard let first = answer.declarations.first else { return "ничего" }
+    return "\(first.container ?? "-").\(first.name) в \(first.path)\(answer.isExact ? "" : " (кандидатов \(answer.declarations.count))")"
+}
+func expect(_ answer: LocalNavigator.Answer, _ name: String, in path: String, container: String? = nil, _ label: String) {
+    let first = answer.declarations.first
+    check(answer.isExact && first?.name == name && first?.path == path && (container == nil || first?.container == container),
+          "\(label) (получено: \(landed(answer)))")
+}
+
+expect(jump("health.Damage(1)", "Damage"), "Damage", in: "Assets/Game/Health.cs", container: "Health",
+       "ref var из Stash<Health>.Get → T подставлен → Health.Damage")
+expect(jump("player.Move(2)", "Move"), "Move", in: "Assets/Game/PlayerSystem.cs", container: "Player",
+       "var = new Player → Player из своего namespace, а не Other.Player")
+expect(jump("Leader.Move(3)", "Move"), "Move", in: "Assets/Game/PlayerSystem.cs",
+       "тип свойства → его метод")
+expect(jump("p.Move(4)", "Move"), "Move", in: "Assets/Game/PlayerSystem.cs",
+       "foreach по List<Player> → элемент Player")
+expect(jump("World.GetStash<Health>()", "GetStash"), "GetStash", in: "Assets/Game/Stash.cs", container: "World",
+       "поле World из базового класса → World.GetStash")
+expect(jump("world.GetStash<Health>()", "GetStash"), "GetStash", in: "Assets/Game/Stash.cs",
+       "var = World.Default (static-свойство через поле базового класса) → World")
+expect(jump("Helper.Run()", "Run"), "Run", in: "Assets/Game/PlayerSystem.cs", container: "Helper",
+       "статический вызов через имя типа")
+expect(jump("this.Log(\"x\")", "Log"), "Log", in: "Assets/Game/BaseSystem.cs",
+       "this. → метод базового класса")
+expect(jump("Log(\"Damage\")", "Log"), "Log", in: "Assets/Game/BaseSystem.cs",
+       "голый вызов → член базового класса")
+expect(jump("Mode.Run", "Run"), "Run", in: "Assets/Game/PlayerSystem.cs", container: "Mode",
+       "значение вложенного enum")
+expect(jump("new Player()", "Player"), "Player", in: "Assets/Game/PlayerSystem.cs",
+       "тип после new — ближайший по namespace")
+expect(jump("private Vec _alias", "Vec"), "Health", in: "Assets/Game/Health.cs",
+       "псевдоним using")
+expect(jump("player.Move(2)", "player"), "player", in: "Assets/Game/PlayerSystem.cs",
+       "локальная переменная")
+expect(jump("_health.Get(1).Current", "Current"), "Current", in: "Assets/Game/Health.cs",
+       "поле результата дженерик-метода")
+expect(jump("health.value", "value"), "value", in: "Assets/Game/Health.cs",
+       "поле с именем-контекстным словом `value`")
+let fallbackAnswer = jump("unknown.Damage(5)", "Damage")
+check(fallbackAnswer.declarations.first?.name == "Damage" && fallbackAnswer.declarations.count == 1
+        && fallbackAnswer.isExact,
+      "тип неизвестен, но объявление с таким именем одно — прыгаем (получено: \(landed(fallbackAnswer)))")
+check(jump("Log(\"Damage\")", "Damage").declarations.isEmpty, "слово в строке — не идентификатор")
+check(jump("// Damage в комментарии", "Damage").declarations.isEmpty, "слово в комментарии — не идентификатор")
+check(jump("public void Move", "Move").declarations.isEmpty, "на самом объявлении прыгать некуда")
+
+let moveCandidates = LocalNavigator(index: symbolIndex, document: NavDocument(
+    url: navRoot.appendingPathComponent("x.cs"), relPath: "x.cs",
+    model: SyntaxModel(text: "class X { void F(dynamic d) { d.Move(1); } }", spec: Languages.csharp),
+    outline: OutlineBuilder.build(model: SyntaxModel(text: "class X { void F(dynamic d) { d.Move(1); } }", spec: Languages.csharp))))
+    .definition(at: ("class X { void F(dynamic d) { d.Move(1); } }" as NSString).range(of: "Move").location)
+check(!moveCandidates.isExact && moveCandidates.declarations.count == 2,
+      "тип неизвестен, одноимённых два — список выбора (получено: \(landed(moveCandidates)))")
+
+// Morpeh: поля от [IncludeStash] и foreach по Filter
+let damageModel = SyntaxModel(text: damageSystemSource, spec: Languages.csharp)
+let damageNavigator = LocalNavigator(index: symbolIndex, document: NavDocument(
+    url: navRoot.appendingPathComponent("Assets/Game/DamageSystem.cs"), relPath: "Assets/Game/DamageSystem.cs",
+    model: damageModel, outline: OutlineBuilder.build(model: damageModel)))
+func jumpDamage(_ context: String, _ word: String) -> LocalNavigator.Answer {
+    let at = (damageSystemSource as NSString).range(of: context)
+    guard at.location != NSNotFound else { return .none }
+    return damageNavigator.definition(at: at.location + (context as NSString).range(of: word).location)
+}
+expect(jumpDamage("_health.Get(entity.Id).Damage(1)", "Damage"), "Damage", in: "Assets/Game/Health.cs",
+       "[IncludeStash] даёт поле _health: Stash<Health> → Get → Health.Damage")
+expect(jumpDamage("_health.Get(entity.Id)", "_health"), "_health", in: "Assets/Game/DamageSystem.cs",
+       "само поле ведёт к атрибуту")
+expect(jumpDamage("_hp.Has(entity.Id)", "Has"), "Has", in: "Assets/Game/Stash.cs",
+       "явное имя поля из второго аргумента")
+expect(jumpDamage("_health.Get(entity.Id)", "Id"), "Id", in: "Assets/Game/Stash.cs", container: "Entity",
+       "foreach по Filter → GetEnumerator().Current → Entity")
+let stashFields = symbolIndex.symbols.filter { $0.name.hasPrefix("_h") && $0.container == "DamageSystem" }
+check(stashFields.map(\.name).sorted() == ["_health", "_hp"] && stashFields.allSatisfy { $0.typeText == "Stash<Health>" },
+      "в индексе два поля стэшей (получено \(stashFields.map { "\($0.name): \($0.typeText ?? "nil")" }))")
+
+let noIndex = LocalNavigator(index: nil, document: navDocument)
+check(noIndex.definition(at: (playerSystemSource as NSString).range(of: "Leader.Move").location).declarations.first?.name == "Leader",
+      "без индекса — хотя бы структура самого файла")
+
+// ⌘R: по тексту проекта, без строк и комментариев, только тот же язык
+let damageOffset = (playerSystemSource as NSString).range(of: "health.Damage").location + 7
+let damageRefs = navigator.references(at: damageOffset, root: navRoot, files: Array(navFiles.keys), shouldStop: { false })
+check(damageRefs.count == 4, "Damage: объявление и три вызова, без строки, комментария и .md (получено \(damageRefs.map { "\($0.path):\($0.line)" }))")
+check(damageRefs.first?.path == "Assets/Game/PlayerSystem.cs", "текущий файл — первым")
+let localRefs = navigator.references(at: (playerSystemSource as NSString).range(of: "player.Move").location,
+                                     root: navRoot, files: Array(navFiles.keys), shouldStop: { false })
+check(localRefs.count == 2 && localRefs.allSatisfy { $0.path == "Assets/Game/PlayerSystem.cs" },
+      "локальная переменная — только в своём файле (получено \(localRefs.count))")
+check(LocalNavigator.containsWord(Data("a Damage b".utf8), Array("Damage".utf8)), "слово целиком найдено")
+check(!LocalNavigator.containsWord(Data("TakeDamage".utf8), Array("Damage".utf8)), "часть слова не считается")
+
+// ⌘T
+func findSymbols(_ q: String) -> [String] {
+    symbolIndex.search(q, limit: 20, shouldStop: { false }).map { "\(symbolIndex[$0.id].container ?? "-").\(symbolIndex[$0.id].name)" }
+}
+check(findSymbols("PlaSys").first == "Game.Systems.PlayerSystem", "⌘T: аббревиатура типа (получено \(findSymbols("PlaSys")))")
+check(Set(findSymbols("Move").prefix(2)) == ["Player.Move"], "⌘T: оба Move (получено \(findSymbols("Move")))")
+check(findSymbols("world.getstash").first == "World.GetStash", "⌘T: запрос с точкой — по контейнеру")
+check(findSymbols("").isEmpty, "⌘T: пустой запрос — пусто")
+
+// индекс типов для ⇧⇧ — из того же разбора
+let derivedTypes = TypeIndex.make(root: navRoot, entries: symbolIndex.typeEntries())
+let derivedNames = (0..<derivedTypes.count).map { derivedTypes.declaration(Int32($0)).name }.sorted()
+check(derivedNames == ["BaseSystem", "DamageSystem", "Entity", "Enumerator", "Filter", "Health", "Helper", "Mode",
+                      "Player", "Player", "PlayerSystem", "Stash", "World"],
+      "типы для ⇧⇧ из индекса символов (получено \(derivedNames))")
+
+// кэш
+let symbolRoundTrip = SymbolIndex.deserialize(symbolIndex.serialized(), root: navRoot)
+check(symbolRoundTrip?.symbols == symbolIndex.symbols && symbolRoundTrip?.files == symbolIndex.files,
+      "кэш символов: туда и обратно без потерь")
+check(symbolRoundTrip?.typesByName["Player"]?.count == 2, "после загрузки из кэша таблицы построены")
+check(SymbolIndex.deserialize("pilot-types 1\nF\tx", root: navRoot) == nil, "чужой формат кэша отвергается")
+try? FileManager.default.removeItem(at: navRoot)
+
+// производительность: разбор, как на крупном проекте, но в памяти
+let perfSource = String(repeating: """
+    public sealed class System0 : BaseSystem
+    {
+        private Stash<Health> _health;
+        public override void OnUpdate(float dt) { var h = _health.Get(0); h.Damage(1); }
+    }
+
+    """, count: 2000)
+let tExtract = Date()
+let perfExtract = SymbolIndex.extract(text: perfSource, spec: Languages.csharp, path: "perf.cs")
+let extractMs = Date().timeIntervalSince(tExtract) * 1000
+print(String(format: "  объявления из файла на %d строк: %.0f мс, найдено %d", 10_000, extractMs, perfExtract.1.count))
+check(perfExtract.1.count == 6000, "в синтетике по три объявления на класс (получено \(perfExtract.1.count))")
+check(extractMs < 400, "разбор 10 000 строк быстрее 400 мс")
 
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
