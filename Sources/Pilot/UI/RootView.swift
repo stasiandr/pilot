@@ -6,6 +6,8 @@ struct RootView: View {
     @State private var doubleShift: DoubleShiftMonitor?
     /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
+    /// Инспектор Unity справа. Появляется только у сцен, префабов и ассетов.
+    @AppStorage("pilot.showsInspector") private var showsInspector = true
 
     var body: some View {
         ZStack {
@@ -21,6 +23,20 @@ struct RootView: View {
                         statusBar
                     }
                 }
+                .inspector(isPresented: inspectorVisibility) {
+                    UnityInspectorView(workspace: workspace)
+                        .inspectorColumnWidth(min: 260, ideal: 330, max: 600)
+                }
+                .toolbar {
+                    if hasUnityObjects {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button { showsInspector.toggle() } label: {
+                                Image(systemName: "sidebar.trailing")
+                            }
+                            .help("Инспектор Unity (⌥⌘0)")
+                        }
+                    }
+                }
             }
 
             if workspace.isPaletteOpen {
@@ -31,6 +47,15 @@ struct RootView: View {
         .onAppear {
             doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
         }
+    }
+
+    private var hasUnityObjects: Bool { workspace.document?.unityFile != nil }
+
+    /// Выбор пользователя помним, но показываем инспектор только там, где
+    /// ему есть что показать.
+    private var inspectorVisibility: Binding<Bool> {
+        Binding(get: { showsInspector && hasUnityObjects },
+                set: { if hasUnityObjects { showsInspector = $0 } })
     }
 
     /// На стартовом экране дереву показывать нечего — панель прячется,

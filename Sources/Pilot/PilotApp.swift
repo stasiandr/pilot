@@ -5,6 +5,7 @@ import AppKit
 struct PilotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var workspace = Workspace()
+    @AppStorage("pilot.showsInspector") private var showsInspector = true
 
     var body: some Scene {
         Window("Pilot", id: "main") {
@@ -75,6 +76,9 @@ struct PilotApp: App {
                 Button("Ассет ↔ .meta") { workspace.toggleMetaFile() }
                     .keyboardShortcut("m", modifiers: [.command, .control])
                     .disabled(!workspace.unity.isActive)
+                Button(showsInspector ? "Скрыть инспектор" : "Показать инспектор") { showsInspector.toggle() }
+                    .keyboardShortcut("0", modifiers: [.command, .option])
+                    .disabled(workspace.document?.unityFile == nil)
                 Divider()
                 Button("Назад") { workspace.goBack() }
                     .keyboardShortcut("[", modifiers: .command)

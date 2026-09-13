@@ -16,6 +16,9 @@ final class UnityAssetIndex: @unchecked Sendable {   // неизменяем п�
     /// Пути относительно корня проекта.
     private let pathByGUID: [UnityGUID: String]
     private let guidByPath: [String: UnityGUID]
+    /// Скрипты по имени файла: `Team` → `Assets/Scripts/Team.cs`. Так
+    /// находится enum, объявленный в своём файле.
+    private let scriptByName: [String: String]
 
     var count: Int { pathByGUID.count }
 
@@ -24,19 +27,27 @@ final class UnityAssetIndex: @unchecked Sendable {   // неизменяем п�
     init(entries: [(UnityGUID, String)]) {
         var byGUID: [UnityGUID: String] = [:]
         var byPath: [String: UnityGUID] = [:]
+        var scripts: [String: String] = [:]
         byGUID.reserveCapacity(entries.count)
         byPath.reserveCapacity(entries.count)
         for (guid, path) in entries {
             if byGUID[guid] == nil { byGUID[guid] = path }
             byPath[path] = guid
+            if path.hasSuffix(".cs") {
+                let name = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+                if scripts[name] == nil { scripts[name] = path }
+            }
         }
         pathByGUID = byGUID
         guidByPath = byPath
+        scriptByName = scripts
     }
 
     func path(for guid: UnityGUID) -> String? { pathByGUID[guid] }
 
     func guid(forAsset relPath: String) -> UnityGUID? { guidByPath[relPath] }
+
+    func scriptPath(named name: String) -> String? { scriptByName[name] }
 
     /// Имя, под которым ассет виден в Unity, — имя файла без расширения.
     /// Для скрипта это заодно и имя класса: Unity требует, чтобы они совпадали.

@@ -14,6 +14,12 @@ struct LoadedDocument: Sendable {
     var unityFile: UnityYAMLFile? = nil
     /// Растёт при повторном разборе того же файла — вьюхе пора перекрасить.
     var revision = 0
+    /// Растёт, когда меняется сам текст (правка из инспектора): вьюха
+    /// подменяет содержимое, не сбрасывая прокрутку.
+    var edition = 0
+    /// Когда файл менялся на диске на момент чтения. Перед записью сверяемся:
+    /// если Unity успел его пересохранить, наша правка легла бы поверх чужой.
+    var modificationDate: Date? = nil
 
     enum LoadError: Error, LocalizedError {
         case tooLarge(Int)
@@ -57,7 +63,17 @@ struct LoadedDocument: Sendable {
         } else {
             throw LoadError.binary
         }
+        var document = make(url: url, text: text, unity: unity)
+        document.modificationDate = modificationDate(of: url)
+        return document
+    }
 
+    static func modificationDate(of url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    /// Документ из уже известного текста — например, после правки из инспектора.
+    static func make(url: URL, text: String, unity: UnityContext?) -> LoadedDocument {
         let spec = Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
         let outline = OutlineBuilder.build(model: model)
@@ -75,7 +91,8 @@ struct LoadedDocument: Sendable {
             model: model, lexicalOutline: OutlineBuilder.build(model: model), context: unity) else { return self }
         return LoadedDocument(url: url, text: text, model: model, languageName: languageName,
                               outline: semantics.outline, unityFile: semantics.serialized,
-                              revision: revision + 1)
+                              revision: revision + 1, edition: edition,
+                              modificationDate: modificationDate)
     }
 }
 
@@ -291,6 +308,35 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
         textView.scroll(NSPoint(x: 0, y: 0))
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
+        ruler?.model = doc.model
+        ruler?.eventLines = Self.gutterMarkers(for: doc)
+        ruler?.invalidateWidth()
+        highlightVisible()
+    }
+
+    /// Тот же файл, новый текст — правка из инспектора. Прокрутку и
+    /// выделение сохраняем: иначе после каждой правки экран прыгал бы в начало.
+    func replaceContents(_ doc: LoadedDocument) {
+        guard let storage = textView.textStorage else { return }
+        let origin = scrollView.contentView.bounds.origin
+        let selection = textView.selectedRange()
+        model = doc.model
+        document = doc
+        lastHighlighted = nil
+
+        isApplying = true
+        storage.beginEditing()
+        storage.setAttributedString(NSAttributedString(
+            string: doc.text,
+            attributes: [.font: Theme.editorFont(size: fontSize), .foregroundColor: Theme.color(.plain)]))
+        storage.endEditing()
+        isApplying = false
+
+        let length = storage.length
+        let location = min(selection.location, length)
+        textView.setSelectedRange(NSRange(location: location, length: min(selection.length, length - location)))
+        scrollView.contentView.scroll(to: origin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
         ruler?.model = doc.model
         ruler?.eventLines = Self.gutterMarkers(for: doc)
         ruler?.invalidateWidth()
@@ -515,8 +561,15 @@ struct CodeView: NSViewControllerRepresentable {
 
         var documentChanged = false
         if let document {
-            if context.coordinator.shownURL != document.url {
+            if context.coordinator.shownURL == document.url,
+               context.coordinator.edition != document.edition {
+                context.coordinator.edition = document.edition
+                context.coordinator.revision = document.revision
+                context.coordinator.decorationsVersion = decorationsVersion
+                controller.replaceContents(document)
+            } else if context.coordinator.shownURL != document.url {
                 context.coordinator.shownURL = document.url
+                context.coordinator.edition = document.edition
                 context.coordinator.revision = document.revision
                 context.coordinator.decorationsVersion = decorationsVersion
                 controller.show(document)
@@ -582,6 +635,7 @@ struct CodeView: NSViewControllerRepresentable {
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
         var revision = 0
+        var edition = 0
         var decorationsVersion = 0
     }
 }

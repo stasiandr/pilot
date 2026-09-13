@@ -19,6 +19,9 @@ final class UnityService: ObservableObject {
     /// Индекс ассетов готов — пора заново разобрать открытый файл.
     var onAssetsReady: (() -> Void)?
 
+    /// Разобранные скрипты — для типов полей в инспекторе.
+    private var scriptInfos: [String: UnityCSharp.ScriptInfo] = [:]
+
     private let generation = AtomicCounter()
     private let queue = DispatchQueue(label: "pilot.unity", qos: .utility)
 
@@ -34,6 +37,7 @@ final class UnityService: ObservableObject {
     func workspaceChanged(to root: URL?) {
         let current = generation.bump()
         assets = nil
+        scriptInfos = [:]
         isIndexingAssets = false
         decorationsVersion += 1
         project = root.flatMap(UnityProjectInfo.find(inWorkspace:))
@@ -103,15 +107,7 @@ final class UnityService: ObservableObject {
                 end: model.position(at: NSMaxRange(range)))))
 
         case .asset(let guid, let fileID):
-            if guid.isBuiltin { return .unavailable("Встроенный ресурс Unity — в проекте его нет") }
-            guard let assets else { return .unavailable("Индекс ассетов ещё строится…") }
-            guard let path = assets.path(for: guid), let url = url(forAsset: path) else {
-                return .unavailable("Ассет \(guid) не найден — битая ссылка")
-            }
-            let range = await Task.detached(priority: .userInitiated) {
-                Self.landing(in: url, fileID: fileID, className: assets.displayName(for: guid))
-            }.value
-            return .target(NavTarget(url: url, range: range))
+            return await target(forAsset: guid, fileID: fileID)
         }
     }
 
@@ -142,6 +138,46 @@ final class UnityService: ObservableObject {
             return LSPRange(start: LSPPosition(line: typeLine, character: 0),
                             end: LSPPosition(line: typeLine, character: length))
         }
+    }
+
+    /// Переход к ассету по GUID — из инспектора. Скрипт открывается на
+    /// объявлении класса, префаб — на объекте `fileID`.
+    func target(forAsset guid: UnityGUID, fileID: Int64?) async -> Jump {
+        if guid.isBuiltin { return .unavailable("Встроенный ресурс Unity — в проекте его нет") }
+        guard let assets else { return .unavailable("Индекс ассетов ещё строится…") }
+        guard let path = assets.path(for: guid), let url = url(forAsset: path) else {
+            return .unavailable("Ассет \(guid) не найден — битая ссылка")
+        }
+        let range = await Task.detached(priority: .userInitiated) {
+            Self.landing(in: url, fileID: fileID, className: assets.displayName(for: guid))
+        }.value
+        return .target(NavTarget(url: url, range: range))
+    }
+
+    // MARK: - Скрипты для инспектора
+
+    /// Типы полей и enum'ы скрипта. Файлы маленькие, читаем синхронно
+    /// и один раз за сессию проекта.
+    func scriptInfo(for guid: UnityGUID?) -> UnityCSharp.ScriptInfo? {
+        guard let guid, let path = assets?.path(for: guid), path.hasSuffix(".cs") else { return nil }
+        return scriptInfo(atPath: path)
+    }
+
+    private func scriptInfo(atPath path: String) -> UnityCSharp.ScriptInfo? {
+        if let cached = scriptInfos[path] { return cached }
+        guard let url = url(forAsset: path),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let info = UnityCSharp.scriptInfo(from: text)
+        scriptInfos[path] = info
+        return info
+    }
+
+    /// Значения enum'а: сначала в самом скрипте, потом в файле `Имя.cs`.
+    func enumMembers(_ type: String, script: UnityGUID?) -> [UnityCSharp.EnumMember]? {
+        let name = type.split(separator: ".").last.map(String.init) ?? type
+        if let members = scriptInfo(for: script)?.enums[name] { return members }
+        guard let path = assets?.scriptPath(named: name) else { return nil }
+        return scriptInfo(atPath: path)?.enums[name]
     }
 
     // MARK: - Где используется ассет (⇧⌘R)

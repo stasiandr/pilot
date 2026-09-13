@@ -109,4 +109,136 @@ enum UnityCSharp {
         }
         return nil
     }
+
+    // MARK: - Типы полей для инспектора
+
+    /// Что инспектору нужно знать о скрипте: тип каждого поля и enum'ы,
+    /// объявленные в файле. В YAML bool — это `0`/`1`, а enum — число;
+    /// только по скрипту видно, что показать переключатель или список.
+    struct ScriptInfo: Sendable {
+        var fieldTypes: [String: String] = [:]
+        var enums: [String: [EnumMember]] = [:]
+
+        /// Тип поля по ключу из YAML: `<Health>k__BackingField` → поле `Health`.
+        func type(ofKey key: String) -> String? {
+            if key.hasPrefix("<"), let close = key.firstIndex(of: ">") {
+                return fieldTypes[String(key[key.index(after: key.startIndex)..<close])]
+            }
+            return fieldTypes[key]
+        }
+    }
+
+    struct EnumMember: Sendable, Equatable {
+        var name: String
+        var value: Int
+    }
+
+    static func scriptInfo(from text: String) -> ScriptInfo {
+        let clean = stripComments(text)
+        return ScriptInfo(fieldTypes: fieldTypes(in: clean), enums: enums(in: clean))
+    }
+
+    private static let fieldPattern = try! NSRegularExpression(pattern:
+        #"(?:\[[^\]\n]*\]\s*)*(?:\b(?:public|private|protected|internal|static|readonly|new|volatile)\s+)*"#
+        + #"\b([A-Za-z_][\w.]*(?:<[^;=(){}]*?>)?(?:\[\])?\??)\s+([A-Za-z_]\w*)\s*(?:=[^;{}]*)?;"#)
+    private static let propertyPattern = try! NSRegularExpression(pattern:
+        #"\b([A-Za-z_][\w.]*(?:<[^;=(){}]*?>)?(?:\[\])?\??)\s+([A-Za-z_]\w*)\s*\{\s*(?:get|set|private|protected|internal|init)"#)
+    private static let notTypes: Set<String> = ["return", "throw", "yield", "goto", "break", "continue",
+                                                "else", "case", "using", "namespace", "await", "new"]
+
+    static func fieldTypes(in text: String) -> [String: String] {
+        var result: [String: String] = [:]
+        let ns = text as NSString
+        for pattern in [fieldPattern, propertyPattern] {
+            for match in pattern.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+                let type = ns.substring(with: match.range(at: 1))
+                let name = ns.substring(with: match.range(at: 2))
+                guard !notTypes.contains(type), result[name] == nil else { continue }
+                result[name] = type
+            }
+        }
+        return result
+    }
+
+    private static let enumPattern = try! NSRegularExpression(pattern:
+        #"(\[\s*(?:System\.)?Flags(?:Attribute)?\s*\][\s\S]{0,80}?)?\benum\s+([A-Za-z_]\w*)\s*(?::\s*\w+)?\s*\{([^}]*)\}"#)
+
+    /// Enum'ы файла с числовыми значениями. `[Flags]` пропускаем: там
+    /// значение — сумма флагов, и список его не покажет.
+    static func enums(in text: String) -> [String: [EnumMember]] {
+        var result: [String: [EnumMember]] = [:]
+        let ns = text as NSString
+        for match in enumPattern.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            guard match.range(at: 1).location == NSNotFound else { continue }
+            let name = ns.substring(with: match.range(at: 2))
+            let body = ns.substring(with: match.range(at: 3))
+            var members: [EnumMember] = []
+            var next = 0
+            var understood = true
+            for part in body.split(separator: ",") {
+                var item = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                while item.hasPrefix("["), let close = item.firstIndex(of: "]") {   // [InspectorName("…")]
+                    item = item[item.index(after: close)...].trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                guard !item.isEmpty else { continue }
+                let pieces = item.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+                var value = next
+                if pieces.count == 2 {
+                    guard let explicit = integer(pieces[1]) else { understood = false; break }   // выражение — не берёмся
+                    value = explicit
+                }
+                members.append(EnumMember(name: pieces[0], value: value))
+                next = value + 1
+            }
+            if understood, !members.isEmpty { result[name] = members }
+        }
+        return result
+    }
+
+    private static func integer(_ text: String) -> Int? {
+        if let v = Int(text) { return v }
+        if text.hasPrefix("0x") || text.hasPrefix("0X") { return Int(text.dropFirst(2), radix: 16) }
+        let shift = text.components(separatedBy: "<<").map { $0.trimmingCharacters(in: .whitespaces) }
+        if shift.count == 2, let a = Int(shift[0]), let b = Int(shift[1]) { return a << b }
+        return nil
+    }
+
+    /// Комментарии мешают регуляркам: закомментированное поле — не поле.
+    private static func stripComments(_ text: String) -> String {
+        var out = ""
+        out.reserveCapacity(text.utf8.count)
+        var it = text.unicodeScalars.makeIterator()
+        var pending: Unicode.Scalar? = nil
+        var inLine = false, inBlock = false, inString = false
+        var previous: Unicode.Scalar = " "
+        while let c = pending ?? it.next() {
+            pending = nil
+            if inLine { if c == "\n" { inLine = false; out.unicodeScalars.append(c) }; previous = c; continue }
+            if inBlock {
+                if previous == "*" && c == "/" { inBlock = false; previous = " "; continue }
+                if c == "\n" { out.unicodeScalars.append(c) }
+                previous = c
+                continue
+            }
+            if inString {
+                out.unicodeScalars.append(c)
+                if c == "\"" && previous != "\\" { inString = false }
+                previous = c
+                continue
+            }
+            if c == "/" {
+                let n = it.next()
+                if n == "/" { inLine = true; previous = " "; continue }
+                if n == "*" { inBlock = true; previous = " "; continue }
+                out.unicodeScalars.append(c)
+                pending = n
+                previous = c
+                continue
+            }
+            if c == "\"" { inString = true }
+            out.unicodeScalars.append(c)
+            previous = c
+        }
+        return out
+    }
 }

@@ -1290,6 +1290,220 @@ check(UnityCSharp.classDeclaration(named: "Play", in: unityScript) == nil, "Play
 check(UnityCSharp.classDeclaration(named: "Enemy", in: "// class Enemy\nsealed class Enemy {}\r\n")?.line == 1,
       "закомментированное объявление пропускается")
 
+
+section("Unity / инспектор")
+
+let soText = """
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: \(playerGUID), type: 3}
+  m_Name: 2P_Host
+  m_Description: 
+  m_EnableEditors: 1
+  m_MainEditorInstance:
+    Name: Main Editor
+    <CorrespondingNodeId>k__BackingField: Main Editor|0_run
+    m_Nodes:
+    - Main Editor|0_run
+    - Main Editor|0_deploy
+    m_Role: 3
+  m_EditorInstances:
+  - Name: Player 2
+    m_Nodes:
+    - Player 2|1_run
+    m_AdvancedConfiguration:
+      StreamLogsToMainEditor: 1
+      LogsColor: {r: 0.3643, g: 0.581, b: 0.8679, a: 1}
+  - Name: 'Player: 3'
+    m_Nodes: []
+  m_LocalInstances: []
+  m_Title: 'D - GRAVITY RAMP
+
+    fires on Play'
+  m_Quote: "ROW \\xB7 rest"
+  'm_Metrics[0]': 15677.869
+  m_Tail: 5
+"""
+let soModel = SyntaxModel(text: soText, spec: Languages.unityYAML)
+let soFile = UnityYAMLFile.parse(soModel.units)!
+let soProps = soFile.properties(ofObjectAt: 0, in: soModel)
+func prop(_ path: String, in props: [UnityProperty]) -> UnityProperty? {
+    var current: UnityProperty? = nil
+    var list = props
+    for key in path.split(separator: ".").map(String.init) {
+        if let p = current { current = p.child(key) } else { current = list.first { $0.key == key } }
+        list = []
+    }
+    return current
+}
+func textAt(_ range: NSRange, _ model: SyntaxModel) -> String {
+    String(decoding: model.units[range.location..<NSMaxRange(range)], as: UTF16.self)
+}
+check(soProps.map(\.key) == ["m_ObjectHideFlags", "m_GameObject", "m_Enabled", "m_Script", "m_Name", "m_Description",
+                             "m_EnableEditors", "m_MainEditorInstance", "m_EditorInstances", "m_LocalInstances",
+                             "m_Title", "m_Quote", "m_Metrics[0]", "m_Tail"],
+      "поля верхнего уровня (получено \(soProps.map(\.key)))")
+check(prop("m_Name", in: soProps)?.value.scalar?.text == "2P_Host", "простой скаляр")
+check(prop("m_Description", in: soProps)?.value.scalar?.raw == "", "пустое значение")
+check(prop("m_MainEditorInstance.m_Role", in: soProps)?.value.scalar?.raw == "3", "вложенная структура")
+check(prop("m_MainEditorInstance.<CorrespondingNodeId>k__BackingField", in: soProps)?.value.scalar?.text == "Main Editor|0_run",
+      "backing-поле автосвойства")
+if case .sequence(let nodes)? = prop("m_MainEditorInstance.m_Nodes", in: soProps)?.value {
+    check(nodes.map { $0.value.scalar?.text ?? "?" } == ["Main Editor|0_run", "Main Editor|0_deploy"], "список скаляров")
+} else { check(false, "список скаляров") }
+if case .sequence(let instances)? = prop("m_EditorInstances", in: soProps)?.value {
+    check(instances.count == 2, "список структур без отступа (получено \(instances.count))")
+    check(instances.first?.child("Name")?.value.scalar?.text == "Player 2", "первое поле элемента — на строке с дефисом")
+    check(instances.first?.child("m_AdvancedConfiguration")?.child("LogsColor")?.value.flowFields?.map(\.key) == ["r", "g", "b", "a"],
+          "flow-структура цвета")
+    check(instances.last?.child("Name")?.value.scalar?.text == "Player: 3", "строка в одинарных кавычках")
+    if case .sequence(let empty)? = instances.last?.child("m_Nodes")?.value { check(empty.isEmpty, "[] — пустой список") }
+    else { check(false, "[] — пустой список") }
+} else { check(false, "список структур без отступа") }
+let title = prop("m_Title", in: soProps)?.value.scalar
+check(title?.multiline == true && title?.text == "D - GRAVITY RAMP\nfires on Play",
+      "многострочная строка склеивается (получено \(title?.text.debugDescription ?? "nil"))")
+check(prop("m_Quote", in: soProps)?.value.scalar?.text == "ROW · rest", "двойные кавычки с \\xB7")
+check(prop("m_Tail", in: soProps)?.value.scalar?.raw == "5", "после многострочной строки разбор продолжается")
+if let name = prop("m_Name", in: soProps)?.value.scalar { check(textAt(name.range, soModel) == "2P_Host", "диапазон значения точный") }
+
+// Правки: меняется только значение, остальной файл — байт в байт
+func edited(_ edits: [UnityEdit?]) -> String? { UnityEdits.apply(edits.compactMap { $0 }, to: soText)?.text }
+let renamed = edited([UnityEdits.scalar(prop("m_Name", in: soProps)!.value.scalar!, text: "Host")])
+check(renamed == soText.replacingOccurrences(of: "m_Name: 2P_Host", with: "m_Name: Host"), "правка имени — ровно одна замена")
+let described = edited([UnityEdits.scalar(prop("m_Description", in: soProps)!.value.scalar!, text: "a: b")])
+check(described?.contains("m_Description: 'a: b'\n") == true, "строка с `: ` берётся в кавычки")
+check(UnityEdits.scalar(prop("m_Tail", in: soProps)!.value.scalar!, text: "abc") == nil, "в числовое поле текст не пишется")
+check(edited([UnityEdits.scalar(prop("m_Tail", in: soProps)!.value.scalar!, text: "2,50")])?.hasSuffix("m_Tail: 2.50") == true,
+      "число с запятой")
+check(UnityEdits.scalar(title!, text: "x") == nil, "многострочную строку инспектор не правит")
+let quoted = UnityEdits.scalar(prop("m_EditorInstances.1.Name", in: soProps)?.value.scalar
+                               ?? (prop("m_EditorInstances", in: soProps)?.child("1")?.child("Name")?.value.scalar)!,
+                               text: "it's")
+check(quoted?.text == "'it''s'", "одинарные кавычки сохраняются, ' удваивается")
+if let color = prop("m_EditorInstances", in: soProps)?.child("0")?.child("m_AdvancedConfiguration")?.child("LogsColor")?
+    .value.flowFields?.first(where: { $0.key == "g" }) {
+    check(edited([UnityEdits.number(color, text: "0.5")])?.contains("{r: 0.3643, g: 0.5, b: 0.8679, a: 1}") == true,
+          "правка поля внутри {…}")
+}
+if let applied = UnityEdits.apply([UnityEdits.scalar(prop("m_Name", in: soProps)!.value.scalar!, text: "Very Long Name")!,
+                                   UnityEdits.scalar(prop("m_Tail", in: soProps)!.value.scalar!, text: "7")!], to: soText) {
+    check(UnityEdits.apply(applied.inverse, to: applied.text)?.text == soText, "обратные правки возвращают файл как был")
+}
+if let rename = UnityEdits.scalar(prop("m_Name", in: soProps)!.value.scalar!, text: "X"), let applied = edited([rename]) {
+    check(UnityEdits.apply([rename], to: applied) == nil, "правка по устаревшим позициям не применяется")
+}
+check(UnityEdits.apply([UnityEdit(range: NSRange(location: 5, length: 5), text: "x"),
+                        UnityEdit(range: NSRange(location: 8, length: 1), text: "y")], to: soText) == nil,
+      "пересекающиеся правки отвергаются")
+
+check(UnityScalarCodec.encode("plain", like: .plain) == "plain", "простая строка без кавычек")
+check(UnityScalarCodec.encode("#tag", like: .plain) == "'#tag'", "# в начале — в кавычках")
+check(UnityScalarCodec.encode("a\"b", like: .doubleQuoted) == "\"a\\\"b\"", "двойные кавычки экранируются")
+check(UnityScalarCodec.encode("line1\nline2", like: .plain) == "\"line1\\nline2\"", "перевод строки — через \\n")
+check(UnityNumber.format(1) == "1" && UnityNumber.format(0.5) == "0.5" && UnityNumber.format(0.00001) == "0.00001",
+      "числа в формате Unity (получено \(UnityNumber.format(0.00001)))")
+check(UnityNumber.format(0.70710677) == "0.70710677", "float печатается кратчайшим представлением")
+
+check(UnityNames.nicify("m_LocalPosition") == "Local Position", "m_LocalPosition → Local Position")
+check(UnityNames.nicify("<Health>k__BackingField") == "Health", "backing-поле → имя свойства")
+check(UnityNames.nicify("_moveSpeed") == "Move Speed", "_moveSpeed → Move Speed")
+check(UnityNames.nicify("m_HDR") == "HDR", "аббревиатура не разбивается")
+check(UnityNames.nicify("UIScale") == "UI Scale", "UIScale → UI Scale")
+check(UnityNames.nicify("near clip plane") == "Near clip plane", "ключ с пробелами")
+
+// Поворот: те же углы, что у Quaternion.Euler в Unity
+func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-4 }
+let qx = UnityRotation.quaternion(x: 90, y: 0, z: 0)
+check(near(qx.x, 0.70710678) && near(qx.w, 0.70710678), "Euler(90,0,0) = (0.7071, 0, 0, 0.7071)")
+let q30 = UnityRotation.quaternion(x: 30, y: 45, z: 60)
+check(near(q30.x, 0.3919) && near(q30.y, 0.2005) && near(q30.z, 0.3604) && near(q30.w, 0.8224),
+      "Euler(30,45,60) совпадает с Unity (получено \(q30))")
+for (x, y, z) in [(30.0, 45.0, 60.0), (10.0, 200.0, 350.0), (0.0, 90.0, 0.0), (270.0, 0.0, 0.0), (45.0, 0.0, 135.0)] {
+    let q = UnityRotation.quaternion(x: x, y: y, z: z)
+    let e = UnityRotation.euler(x: q.x, y: q.y, z: q.z, w: q.w)
+    let back = UnityRotation.quaternion(x: e.x, y: e.y, z: e.z)
+    let same = near(abs(q.x * back.x + q.y * back.y + q.z * back.z + q.w * back.w), 1)
+    check(same, "углы → кватернион → углы → тот же поворот (\(x), \(y), \(z)) → \(e)")
+}
+let e0 = UnityRotation.euler(x: 0, y: 0, z: 0, w: 1)
+check(e0.x == 0 && e0.y == 0 && e0.z == 0, "нулевой поворот — нули, без -0 и 360")
+
+// Типы полей из скрипта
+let typedScript = """
+using UnityEngine;
+public class Mover : MonoBehaviour {
+    [SerializeField] private bool loop = true;
+    [SerializeField, Range(0, 10)] float speed = 2f; // скорость
+    public Mode mode;
+    // public int commented;
+    [field: SerializeField] public Team Side { get; private set; }
+    public List<Vector3> points = new List<Vector3>();
+    void Update() { return; }
+    public enum Mode { Idle, Walk = 5, Run }
+}
+[System.Flags] enum Mask { A = 1, B = 2 }
+enum Team : byte { Red, [InspectorName("Синие")] Blue = 0x10 }
+"""
+let info = UnityCSharp.scriptInfo(from: typedScript)
+check(info.fieldTypes["loop"] == "bool", "тип поля с атрибутом")
+check(info.fieldTypes["speed"] == "float", "тип поля без модификатора")
+check(info.fieldTypes["mode"] == "Mode", "поле-enum")
+check(info.fieldTypes["commented"] == nil, "закомментированное поле не считается")
+check(info.fieldTypes["points"] == "List<Vector3>", "дженерик-тип (получено \(info.fieldTypes["points"] ?? "nil"))")
+check(info.type(ofKey: "<Side>k__BackingField") == "Team", "тип автосвойства по backing-полю")
+check(info.enums["Mode"] == [.init(name: "Idle", value: 0), .init(name: "Walk", value: 5), .init(name: "Run", value: 6)],
+      "значения enum с явным номером")
+check(info.enums["Team"]?.last == .init(name: "Blue", value: 16), "enum с атрибутом и hex-значением")
+check(info.enums["Mask"] == nil, "[Flags]-enum не показывается списком")
+
+// Модель инспектора на сцене из теста выше
+let inspectorScene = UnityYAMLFile.parse(sceneModel.units)!
+let resolveNames: (UnityGUID) -> String? = { assetIndex.displayName(for: $0) }
+func caretAt(_ needle: String) -> Int { (sceneText as NSString).range(of: needle).location }
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("speed: 5"),
+                                        resolve: resolveNames) {
+    check(content.kind == .gameObject && content.title == "Play Button", "курсор в компоненте — инспектор его GameObject'а")
+    check(content.sections.map(\.title) == ["Transform", "Player", "Image"],
+          "компоненты GameObject'а (получено \(content.sections.map(\.title)))")
+    check(content.focusedSection == 1, "подсвечен компонент под курсором")
+    check(content.path.map(\.name) == ["Canvas"], "предки в хлебных крошках")
+    check(content.sections[1].properties.map(\.key) == ["speed"], "служебные поля скрыты")
+    check(content.sections[1].enabled != nil, "у MonoBehaviour есть переключатель Enabled")
+    check(content.name?.value.scalar?.text == "Play Button", "имя GameObject'а — редактируемое поле")
+} else { check(false, "инспектор для компонента") }
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("m_Name: Canvas"),
+                                        resolve: resolveNames) {
+    check(content.children.map(\.name) == ["Play Button"], "дети — по m_Children (получено \(content.children.map(\.name)))")
+    check(content.path.isEmpty, "у корня предков нет")
+}
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("m_Name: Badge"),
+                                        resolve: resolveNames) {
+    check(content.path.map(\.name) == ["Canvas", "Play Button", "Icon"],
+          "предки идут через вложенный префаб (получено \(content.path.map(\.name)))")
+}
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("value: Icon"),
+                                        resolve: resolveNames) {
+    check(content.kind == .prefabInstance && content.title == "Icon", "вложенный префаб в инспекторе")
+    check(content.sections.first?.properties.map(\.key) == ["m_LocalPosition.x", "m_Name"],
+          "переопределения префаба (получено \(content.sections.first?.properties.map(\.key) ?? []))")
+    check(content.source?.description == buttonPrefabGUID, "ссылка на исходный префаб")
+}
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("m_PrefabInstance: {fileID: 300}"),
+                                        resolve: resolveNames) {
+    check(content.kind == .prefabInstance, "stripped-заглушка ведёт к вложенному префабу")
+}
+if let so = UnityInspector.content(file: soFile, model: soModel, caret: 0, resolve: resolveNames) {
+    check(so.kind == .asset && so.title == "2P_Host", "ScriptableObject в инспекторе")
+    check(so.source?.description == playerGUID, "скрипт ScriptableObject'а")
+    check(so.sections.first?.properties.first?.key == "m_Description", "поля SO без служебных")
+}
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

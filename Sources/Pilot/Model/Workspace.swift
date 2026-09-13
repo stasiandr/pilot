@@ -880,6 +880,104 @@ final class Workspace: ObservableObject {
         navigate(to: NavTarget(url: target, range: nil))
     }
 
+    // MARK: - Инспектор Unity: правки
+
+    /// Идёт запись и повторный разбор — инспектор на это время не правит.
+    @Published private(set) var isApplyingEdit = false
+
+    /// Записывает правки инспектора в файл.
+    ///
+    /// Меняются только значения — остальной текст остаётся байт в байт, и
+    /// дифф в git ровно на то, что поменяли. Перед записью сверяемся с диском:
+    /// если Unity успел пересохранить файл, правка поверх него испортила бы
+    /// чужие изменения, поэтому файл перечитывается, а правка отменяется.
+    /// Отмена — штатная, через ⌘Z: обратные правки регистрируются в `undoManager`.
+    func applyUnityEdits(_ edits: [UnityEdit], to url: URL? = nil, undoManager: UndoManager?,
+                         actionName: String) {
+        guard !edits.isEmpty, !isApplyingEdit else { return }
+        let target = url ?? document?.url
+        guard let target else { return }
+
+        // Правка может прийти из отмены, когда открыт уже другой файл.
+        let current = document?.url == target ? document : nil
+        let baseText: String
+        let baseDate: Date?
+        if let current {
+            baseText = current.text
+            baseDate = current.modificationDate
+        } else {
+            guard let text = try? String(contentsOf: target, encoding: .utf8) else { return }
+            baseText = text
+            baseDate = nil
+        }
+        if let baseDate, let onDisk = LoadedDocument.modificationDate(of: target), onDisk != baseDate {
+            showNotice("Файл изменился на диске — перечитал, повторите правку")
+            open(file: target, reveal: currentCaretRange())
+            return
+        }
+        guard let applied = UnityEdits.apply(edits, to: baseText) else {
+            showNotice("Правка не легла в файл — перечитайте его")
+            return
+        }
+        do {
+            try applied.text.write(to: target, atomically: true, encoding: .utf8)
+        } catch {
+            showNotice("Не удалось записать файл: \(error.localizedDescription)")
+            return
+        }
+
+        undoManager?.registerUndo(withTarget: self) { workspace in
+            workspace.applyUnityEdits(applied.inverse, to: target, undoManager: undoManager,
+                                      actionName: actionName)
+        }
+        undoManager?.setActionName(actionName)
+
+        guard let current else { return }
+        isApplyingEdit = true
+        let context = unity.context
+        let edition = current.edition + 1
+        let text = applied.text
+        work.async { [weak self] in
+            var reloaded = LoadedDocument.make(url: target, text: text, unity: context)
+            reloaded.edition = edition
+            reloaded.modificationDate = LoadedDocument.modificationDate(of: target)
+            Task { @MainActor in
+                guard let self else { return }
+                self.isApplyingEdit = false
+                guard self.document?.url == target else { return }
+                self.document = reloaded
+                self.updateBreadcrumb()
+            }
+        }
+    }
+
+    private func currentCaretRange() -> LSPRange? {
+        guard let document else { return nil }
+        let position = document.model.position(at: caretOffset)
+        return LSPRange(start: position, end: position)
+    }
+
+    /// Перейти к объекту этого же файла — из хлебных крошек и ссылок инспектора.
+    func revealUnityObject(fileID: Int64) {
+        guard let document, let file = document.unityFile, let object = file.object(fileID) else { return }
+        let range = object.nameRange ?? object.typeNameRange
+        navigate(to: NavTarget(url: document.url, range: LSPRange(
+            start: document.model.position(at: range.location),
+            end: document.model.position(at: NSMaxRange(range)))))
+    }
+
+    /// Открыть ассет по GUID — ссылка в инспекторе.
+    func openUnityAsset(guid: UnityGUID, fileID: Int64? = nil) {
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.unity.target(forAsset: guid, fileID: fileID) {
+            case .target(let target):   self.navigate(to: target)
+            case .unavailable(let why): self.showNotice(why)
+            case .notReference:         break
+            }
+        }
+    }
+
     func showNotice(_ text: String) {
         notice = text
         noticeTask?.cancel()
