@@ -8,6 +8,7 @@ struct RootView: View {
     @ObservedObject var workspace: Workspace
     @State private var doubleShift: DoubleShiftMonitor?
     @State private var tabSwitch: TabSwitchMonitor?
+    @State private var paletteKeys: PaletteKeyMonitor?
     @State private var paletteSpace: CGSize = .zero
     /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
@@ -42,6 +43,7 @@ struct RootView: View {
         .onAppear {
             doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
             tabSwitch = TabSwitchMonitor(workspace: workspace)
+            paletteKeys = PaletteKeyMonitor(workspace: workspace)
             syncSidebar(animated: false)
         }
         // Открыли или закрыли проект — панель встаёт как была, без анимации.

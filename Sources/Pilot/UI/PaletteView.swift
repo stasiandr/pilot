@@ -11,8 +11,6 @@ struct PaletteView: View {
     @ObservedObject var workspace: Workspace
     /// Сколько места под палитрой: от этого зависит, куда встанет предпросмотр.
     var available: CGSize = .zero
-    @FocusState private var focused: Bool
-    @State private var keyMonitor: Any?
     @StateObject private var preview = PreviewLoader()
     @AppStorage("pilot.palettePreview") private var previewEnabled = true
 
@@ -35,8 +33,7 @@ struct PaletteView: View {
             )
             .shadow(color: .black.opacity(0.30), radius: 40, y: 18)
         }
-        .onAppear { focused = true; installKeyMonitor(); refreshPreview() }
-        .onDisappear { removeKeyMonitor() }
+        .onAppear { refreshPreview() }
         .onChange(of: selectedTarget) { _, _ in refreshPreview() }
         .onChange(of: previewEnabled) { _, _ in refreshPreview() }
     }
@@ -109,11 +106,8 @@ struct PaletteView: View {
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            TextField(placeholder, text: $workspace.query)
-                .textFieldStyle(.plain)
-                .font(.system(size: 19, weight: .regular))
-                .focused($focused)
-                .onSubmit { workspace.activateSelection() }
+            // Return, стрелки и Esc ловит PaletteKeyMonitor.
+            PaletteQueryField(text: $workspace.query, placeholder: placeholder)
 
             if workspace.paletteBusy || isIndexingForMode {
                 ProgressView().controlSize(.small).scaleEffect(0.8)
@@ -247,38 +241,72 @@ struct PaletteView: View {
         let rowHeight: CGFloat = workspace.items.first?.secondary?.isEmpty == false ? 43 : 29
         return min(420, CGFloat(workspace.items.count) * rowHeight + 16)
     }
+}
 
-    // MARK: - Клавиатура
-    //
-    // Локальный монитор надёжнее, чем .onKeyPress: поле ввода держит фокус
-    // и само съедает стрелки.
+// MARK: - Поле запроса
 
-    private func installKeyMonitor() {
-        removeKeyMonitor()
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            switch event.keyCode {
-            case 126: workspace.moveSelection(-1); return nil     // ↑
-            case 125: workspace.moveSelection(1);  return nil     // ↓
-            case 36, 76: workspace.activateSelection(); return nil // Return
-            case 53: workspace.isPaletteOpen = false; return nil   // Esc
-            case 48:                                               // Tab — как в fzf
-                workspace.moveSelection(event.modifierFlags.contains(.shift) ? -1 : 1)
-                return nil
-            default:
-                // ^N / ^P — привычная навигация для тех, кто из терминала
-                if event.modifierFlags.contains(.control),
-                   let ch = event.charactersIgnoringModifiers?.lowercased() {
-                    if ch == "n" { workspace.moveSelection(1); return nil }
-                    if ch == "p" { workspace.moveSelection(-1); return nil }
-                }
-                return event
-            }
+/// Своё поле, а не SwiftUI TextField: курсор должен стоять в нём с того
+/// момента, как поле попало в окно. @FocusState из onAppear ставил его
+/// позже, и первые буквы после ⌘P или ⇧⇧ уходили в редактор.
+struct PaletteQueryField: NSViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+
+    func makeNSView(context: Context) -> Field {
+        let field = Field()
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = .systemFont(ofSize: 19)
+        field.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.delegate = context.coordinator
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return field
+    }
+
+    func updateNSView(_ field: Field, context: Context) {
+        context.coordinator.text = $text
+        if field.stringValue != text { field.stringValue = text }
+        if field.placeholderString != placeholder { field.placeholderString = placeholder }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var text: Binding<String>
+
+        init(text: Binding<String>) { self.text = text }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            text.wrappedValue = field.stringValue
         }
     }
 
-    private func removeKeyMonitor() {
-        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
-        keyMonitor = nil
+    final class Field: NSTextField {
+        /// Поле открытой палитры — его ищет PaletteKeyMonitor.
+        static weak var current: Field?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else {
+                if Field.current === self { Field.current = nil }
+                return
+            }
+            Field.current = self
+            window.makeFirstResponder(self)
+        }
+
+        override func becomeFirstResponder() -> Bool {
+            guard super.becomeFirstResponder() else { return false }
+            // NSTextField при фокусе выделяет всё, и набранное до появления
+            // поля стёрла бы следующая буква. Курсор — в конец.
+            currentEditor()?.selectedRange = NSRange(location: stringValue.utf16.count, length: 0)
+            return true
+        }
     }
 }
 
