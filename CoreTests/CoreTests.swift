@@ -2202,6 +2202,146 @@ check(bigFile?.objects.count == 50_000, "большая сцена: все 50 00
 check(bigOutline.count == 50_000, "большая сцена: структура на все объекты")
 check(parseMs < 1500, "сцена на 50k объектов разбирается быстрее 1.5 с (получено \(Int(parseMs)) мс)")
 
+section("Unity / иерархия")
+
+if let scene, let hierarchy = UnityHierarchy.build(file: scene, resolve: { _ in nil }) {
+    func names(_ nodes: [Int]) -> [String] { nodes.map { hierarchy.nodes[$0].name } }
+    func node(_ fileID: Int64) -> Int? { hierarchy.node(forFileID: fileID) }
+    check(names(hierarchy.roots) == ["Canvas"], "корень сцены (получено \(names(hierarchy.roots)))")
+    if let canvas = node(100), let button = node(200), let icon = node(300), let badge = node(400) {
+        check(names(hierarchy.nodes[canvas].children) == ["Play Button"], "дети Canvas")
+        check(names(hierarchy.nodes[button].children) == ["Icon"], "вложенный префаб — ребёнок своего родителя")
+        check(hierarchy.nodes[icon].isPrefab && !hierarchy.nodes[button].isPrefab, "вложенный префаб помечен")
+        check(names(hierarchy.nodes[icon].children) == ["Badge"], "добавленное во вложенный префаб — под ним")
+        check(names(hierarchy.ancestors(of: badge)) == ["Canvas", "Play Button", "Icon"], "предки от корня")
+        check(hierarchy.node(forObjectAt: scene.index(ofFileID: 202)!, in: scene) == button,
+              "компонент ведёт к своему GameObject'у")
+        check(hierarchy.node(forObjectAt: scene.index(ofFileID: -301)!, in: scene) == icon,
+              "заглушка ведёт к вложенному префабу")
+        check(hierarchy.node(forObjectAt: scene.index(ofFileID: 101)!, in: scene) == canvas,
+              "Transform ведёт к своему GameObject'у")
+    } else {
+        check(false, "все объекты сцены есть в иерархии")
+    }
+} else {
+    check(false, "иерархия сцены строится")
+}
+
+// Порядок детей — по m_Children, а не по файлу; заглушка вложенного префаба
+// стоит в m_Children, как у Unity. `m_Children: []` не глотает следующие ключи.
+let orderedPrefab = """
+--- !u!1 &1
+GameObject:
+  m_Name: Root
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Children:
+  - {fileID: 22}
+  - {fileID: -40}
+  - {fileID: 12}
+  m_Father: {fileID: 0}
+--- !u!1 &11
+GameObject:
+  m_Name: Second
+  m_IsActive: 0
+--- !u!4 &12
+Transform:
+  m_GameObject: {fileID: 11}
+  m_Children: []
+  m_Father: {fileID: 2}
+--- !u!1 &21
+GameObject:
+  m_Name: First
+  m_IsActive: 1
+--- !u!4 &22
+Transform:
+  m_GameObject: {fileID: 21}
+  m_Children: []
+  m_Father: {fileID: 2}
+--- !u!1001 &30
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 2}
+  m_SourcePrefab: {fileID: 100100000, guid: \(buttonPrefabGUID), type: 3}
+--- !u!4 &-40 stripped
+Transform:
+  m_PrefabInstance: {fileID: 30}
+"""
+let orderedFile = UnityYAMLFile.parse(SyntaxModel(text: orderedPrefab, spec: Languages.unityYAML).units)!
+check(orderedFile.object(2)?.children == [22, -40, 12], "m_Children разобран (получено \(orderedFile.object(2)?.children ?? []))")
+check(orderedFile.object(12)?.children == [] && orderedFile.object(12)?.father == 2, "m_Children: [] — и m_Father после него")
+check(orderedFile.object(11)?.isInactive == true && orderedFile.object(21)?.isInactive == false, "m_IsActive")
+if let h = UnityHierarchy.build(file: orderedFile, resolve: { $0.description == buttonPrefabGUID ? "Button" : nil }) {
+    let root = h.roots.first!
+    let kids = h.nodes[root].children.map { h.nodes[$0].name }
+    check(kids == ["First", "Button", "Second"], "дети в порядке m_Children (получено \(kids))")
+    check(h.nodes[h.node(forFileID: 11)!].isActive == false, "выключенный GameObject")
+}
+
+// Корни сцены: SceneRoots (Unity 2022+) и m_RootOrder (раньше).
+func rootNames(_ text: String) -> [String] {
+    guard let file = UnityYAMLFile.parse(SyntaxModel(text: text, spec: Languages.unityYAML).units),
+          let h = UnityHierarchy.build(file: file, resolve: { _ in nil }) else { return [] }
+    return h.roots.map { h.nodes[$0].name }
+}
+func rootObject(_ go: Int, _ name: String, order: Int? = nil) -> String {
+    """
+    --- !u!1 &\(go)
+    GameObject:
+      m_Name: \(name)
+    --- !u!4 &\(go + 1)
+    Transform:
+      m_GameObject: {fileID: \(go)}
+      m_Children: []
+      m_Father: {fileID: 0}
+    \(order.map { "  m_RootOrder: \($0)\n" } ?? "")
+    """
+}
+let prefabRoot = """
+--- !u!1001 &90
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 1, guid: \(buttonPrefabGUID), type: 3}
+      propertyPath: m_Name
+      value: Enemy
+      objectReference: {fileID: 0}
+    - target: {fileID: 2, guid: \(buttonPrefabGUID), type: 3}
+      propertyPath: m_RootOrder
+      value: 1
+      objectReference: {fileID: 0}
+
+"""
+check(rootNames(rootObject(10, "Camera") + rootObject(20, "Light") + prefabRoot + """
+--- !u!1660057539 &9223372036854775807
+SceneRoots:
+  m_ObjectHideFlags: 0
+  m_Roots:
+  - {fileID: 21}
+  - {fileID: 90}
+  - {fileID: 11}
+""") == ["Light", "Enemy", "Camera"], "корни — по SceneRoots, вложенный префаб в нём своим fileID")
+check(rootNames(rootObject(10, "Camera", order: 2) + rootObject(20, "Light", order: 0) + prefabRoot)
+      == ["Light", "Enemy", "Camera"], "без SceneRoots корни — по m_RootOrder, у префаба — из переопределений")
+check(rootNames(rootObject(10, "Camera") + rootObject(20, "Light")) == ["Camera", "Light"],
+      "без порядка — как в файле")
+let settingsAsset = "--- !u!114 &11400000\nMonoBehaviour:\n  m_Name: Settings\n  speed: 5\n"
+check(UnityHierarchy.build(file: UnityYAMLFile.parse(SyntaxModel(text: settingsAsset, spec: Languages.unityYAML).units)!,
+                           resolve: { _ in nil }) == nil,
+      "у ScriptableObject иерархии нет")
+
+// Большая сцена: 12 500 GameObject'ов, по десять детей у каждого.
+if let bigFile {
+    let t = Date()
+    let bigHierarchy = UnityHierarchy.build(file: bigFile, resolve: { assetIndex.displayName(for: $0) })
+    let ms = Date().timeIntervalSince(t) * 1000
+    print(String(format: "  иерархия сцены на 12 500 объектов: %.0f мс", ms))
+    check(bigHierarchy?.nodes.count == 12_500 && bigHierarchy?.roots.count == 1, "большая сцена: все узлы, один корень")
+    check(ms < 300, "иерархия большой сцены быстрее 300 мс (получено \(Int(ms)) мс)")
+}
+
 section("Unity / C#")
 
 let unityScript = """

@@ -18,6 +18,8 @@ struct LoadedDocument: Sendable {
     var revision: String? = nil
     /// Сцена, префаб или другой сериализованный ассет Unity — разобранный.
     var unityFile: UnityYAMLFile? = nil
+    /// Её иерархия: GameObject'ы и вложенные префабы — для дерева проекта.
+    var unityHierarchy: UnityHierarchy? = nil
     /// Версия модели, по которой построены структура и `unityFile`. Текст
     /// правят, разбор догоняет с задержкой — пока версии не совпали,
     /// позициям из разбора верить нельзя.
@@ -71,6 +73,7 @@ struct LoadedDocument: Sendable {
                               languageName: spec?.name ?? "Plain Text",
                               outline: semantics?.outline ?? outline, encoding: encoding,
                               revision: revision, unityFile: semantics?.serialized,
+                              unityHierarchy: semantics?.hierarchy,
                               semanticsVersion: model.version)
     }
 
