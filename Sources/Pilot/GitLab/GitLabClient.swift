@@ -157,6 +157,15 @@ extension GitLabClient {
                          query: ["state": "opened", "order_by": "updated_at", "sort": "desc"], limit: 300)
     }
 
+    /// Поиск по всем MR проекта, включая слитые и закрытые: GitLab ищет
+    /// слова в заголовке и описании. Одна страница — дальше человек уточнит.
+    func searchMergeRequests(_ project: GitLabRemote, text: String, author: String?) async throws -> [GLMergeRequest] {
+        var query = ["state": "all", "order_by": "updated_at", "sort": "desc", "per_page": "30"]
+        if !text.isEmpty { query["search"] = text }
+        if let author { query["author_username"] = author }
+        return try await get("/projects/\(project.encodedProject)/merge_requests", query: query)
+    }
+
     func mergeRequest(_ project: GitLabRemote, iid: Int) async throws -> GLMergeRequest {
         try await get(mrPath(project, iid))
     }

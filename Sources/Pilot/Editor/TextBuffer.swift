@@ -21,8 +21,24 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     /// Размер шрифта, которым сейчас набран текст: при показе буфера
     /// с другим размером шрифт переставляется.
     var fontSize: CGFloat
+    /// Что было на экране, когда ушли на другую вкладку. nil — буфер
+    /// ещё не показывали: откроется с начала.
+    var viewState: ViewState?
     /// Где был курсор, когда ушли на другой файл.
-    var lastCaret = 0
+    var lastCaret: Int { viewState?.selection.location ?? 0 }
+    /// Когда вкладку последний раз делали активной. По этому порядку ходит
+    /// ⌃Tab, и по нему же выбирается, какую вкладку закрыть сверх лимита.
+    var lastActivated = 0
+
+    /// Прокрутка — первой видимой строкой, а не координатой: раскладка
+    /// ленивая, и координата далёкой строки до раскладки — лишь оценка.
+    struct ViewState {
+        var selection: NSRange
+        var topLine: Int
+        /// На сколько точек первая видимая строка уехала за верхний край.
+        var topOffset: CGFloat
+        var scrollX: CGFloat
+    }
 
     private(set) var isDirty = false
     private var savedUnits: [UInt16]
@@ -56,11 +72,19 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
         document.outline = outline
     }
 
+    /// Разбор устарел не из-за правки (например, дособрался индекс GUID):
+    /// вкладка переразберёт файл, когда на неё вернутся.
+    func invalidateSemantics() {
+        document.semanticsVersion = -1
+    }
+
     /// Структура и разбор Unity вместе с версией модели, по которой они
     /// построены: пока текст её не догнал, позициям разбора не верим.
-    func setSemantics(outline: [OutlineItem], unityFile: UnityYAMLFile?, version: Int) {
+    func setSemantics(outline: [OutlineItem], unityFile: UnityYAMLFile?, hierarchy: UnityHierarchy?,
+                      version: Int) {
         document.outline = outline
         document.unityFile = unityFile
+        document.unityHierarchy = hierarchy
         document.semanticsVersion = version
     }
 
