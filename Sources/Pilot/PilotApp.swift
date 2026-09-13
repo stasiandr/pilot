@@ -18,6 +18,7 @@ struct PilotApp: App {
     @StateObject private var workspace = Workspace()
     @AppStorage(Experimental.lspDaemonKey) private var lspDaemon = false
     @AppStorage("pilot.showsInspector") private var showsInspector = true
+    @AppStorage("pilot.showsSidebar") private var showsSidebar = true
 
     var body: some Scene {
         Window("Pilot", id: "main") {
@@ -35,7 +36,14 @@ struct PilotApp: App {
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1100, height: 720)
         .commands {
-            SidebarCommands()   // «Показать/скрыть боковую панель», ⌃⌘S
+            // Не SidebarCommands: штатный пункт шлёт AppKit'овский toggleSidebar:,
+            // и на раскрытии SwiftUI сам же схлопывает панель обратно — она
+            // появлялась рывком. Через настройку RootView ведёт её с анимацией.
+            CommandGroup(replacing: .sidebar) {
+                Button(showsSidebar ? "Скрыть навигатор" : "Показать навигатор") { showsSidebar.toggle() }
+                    .keyboardShortcut("s", modifiers: [.control, .command])
+                    .disabled(workspace.root == nil)
+            }
             CommandGroup(after: .appSettings) {
                 Menu("Экспериментальное") {
                     // Перезапуск — прямо в сеттере: onChange в меню команд

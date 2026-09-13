@@ -1613,6 +1613,15 @@ struct CodeView: NSViewControllerRepresentable {
         return hasher.finalize()
     }
 
+    /// Редактор занимает всё, что ему дают. Без этого SwiftUI на каждом
+    /// проходе раскладки выспрашивал бы размеры у AppKit через Auto Layout
+    /// по всему дереву скролла, текста и линейки — а пока выезжает панель,
+    /// раскладка идёт каждый кадр.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsViewController: CodeViewController,
+                      context: Context) -> CGSize? {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
