@@ -9,7 +9,7 @@ enum PilotMain {
         if let socket = LSPDaemon.socketArgument(CommandLine.arguments) {
             LSPDaemon.run(socketPath: socket)
         }
-        if let request = OpenRequest.launch, LaunchForwarding.forward(request) {
+        if LaunchForwarding.forward(OpenRequest.launch) {
             exit(0)
         }
         PilotApp.main()

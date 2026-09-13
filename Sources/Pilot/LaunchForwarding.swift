@@ -5,13 +5,20 @@ import AppKit
 /// процесс отдаёт файл уже открытому Pilot и сразу выходит: одно окно,
 /// с вкладками и прогретым индексом.
 enum LaunchForwarding {
-    /// true — запрос отдан, этому процессу пора выйти.
+    /// true — запрос отдан, этому процессу пора выйти. Без запроса — тоже:
+    /// Unity присылает и пути, которых нет на диске (из стектрейсов самой
+    /// Unity), и тогда открытое окно просто выходит вперёд, а не рядом
+    /// появляется второе.
     ///
     /// Адрес уходит Apple Event'ом прямо в процесс: через LaunchServices
     /// (`NSWorkspace.open`, `open -a`) он попадает самому отправителю —
     /// у двух процессов один бандл.
-    static func forward(_ request: OpenRequest) -> Bool {
+    static func forward(_ request: OpenRequest?) -> Bool {
         guard let running = runningInstance() else { return false }
+        guard let request else {
+            running.activate()
+            return true
+        }
         let event = NSAppleEventDescriptor.appleEvent(
             withEventClass: AEEventClass(kInternetEventClass), eventID: AEEventID(kAEGetURL),
             targetDescriptor: NSAppleEventDescriptor(processIdentifier: running.processIdentifier),
