@@ -169,13 +169,29 @@ final class Workspace: ObservableObject {
             }
             // 2. Всё равно пересканируем — кэш мог устареть.
             let counter = self.scanGeneration
-            let fresh = FileIndex.build(root: url, shouldStop: { !counter.isCurrent(generation) })
+            var shown = cached?.display
+            let fresh = FileIndex.scan(root: url, shouldStop: { !counter.isCurrent(generation) },
+                                       early: { early in
+                // Без кэша отслеживаемые файлы от git — первое, что можно
+                // показать: ⌘P начинает работать через доли секунды.
+                guard cached == nil else { return }
+                shown = early.display
+                Task { @MainActor in
+                    guard counter.isCurrent(generation) else { return }
+                    self.adopt(early, tree: nil, indexing: true)
+                }
+                let tree = FileTree.build(paths: early.display)
+                Task { @MainActor in
+                    guard counter.isCurrent(generation) else { return }
+                    self.fileTree = tree
+                }
+            })
             guard counter.isCurrent(generation) else { return }
             IndexCache.save(fresh, root: url)
 
-            // Обычно кэш совпадает с диском один в один — тогда дерево
-            // не пересобираем, и панель не перерисовывается впустую.
-            let tree = cached?.display == fresh.display ? nil : FileTree.build(paths: fresh.display)
+            // Обычно свежий список совпадает с уже показанным один в один —
+            // тогда дерево не пересобираем, и панель не перерисовывается впустую.
+            let tree = shown == fresh.display ? nil : FileTree.build(paths: fresh.display)
             Task { @MainActor in
                 guard self.scanGeneration.isCurrent(generation) else { return }
                 self.adopt(fresh, tree: tree, indexing: false)
