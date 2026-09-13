@@ -31,6 +31,23 @@ enum Occurrences {
         return (text, NSRange(location: start, length: end - start + 1))
     }
 
+    /// Символ под курсором: идентификатор в коде, а не ключевое слово и не
+    /// слово в строке или комментарии. У такого есть объявление и использования.
+    static func symbol(in model: SyntaxModel, at offset: Int) -> (text: String, range: NSRange)? {
+        guard let found = identifier(in: model, at: offset) else { return nil }
+        guard model.spec != nil else { return found }
+        let start = found.range.location
+        let line = model.line(containing: start)
+        guard let token = model.tokens(fromLine: line, toLine: line)
+                .first(where: { Int($0.start) <= start && start < Int($0.start + $0.length) }) else {
+            return found
+        }
+        switch token.kind {
+        case .keyword, .comment, .docComment, .string, .escape, .number: return nil
+        default: return found
+        }
+    }
+
     /// Все вхождения слова как самостоятельного идентификатора.
     static func find(_ word: String, in model: SyntaxModel) -> [NSRange] {
         let needle = Array(word.utf16)

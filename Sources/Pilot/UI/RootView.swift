@@ -138,6 +138,7 @@ struct RootView: View {
                          onGoToDefinition: { workspace.goToDefinition(at: $0) },
                          onLineClick: { workspace.lineClicked($0) },
                          onCommentLine: workspace.isReviewDocument ? { workspace.commentOnLine($0) } : nil,
+                         contextActions: { workspace.contextActions(at: $0) },
                          requestCompletions: { offset, trigger, retrigger in
                              await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)
                          })

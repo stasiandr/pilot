@@ -182,6 +182,11 @@ struct PilotApp: App {
                 Button("Отметить конфликт решённым") { workspace.markConflictsResolved() }
                     .disabled(!workspace.isConflictedFile || !workspace.conflicts.isEmpty)
                 Divider()
+                // Меню собирает редактор у курсора — уходит первому ответчику.
+                Button("Действия в контексте…") {
+                    NSApp.sendAction(#selector(CodeTextView.showContextActions(_:)), to: nil, from: nil)
+                }
+                .keyboardShortcut(".", modifiers: .command)
                 // Не требует LSP: пока сервер не готов, отвечает быстрый
                 // навигатор по индексу объявлений проекта.
                 Button("Перейти к объявлению") {
