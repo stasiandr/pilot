@@ -1687,11 +1687,11 @@ theirs 2
 after
 
 """
-let found = MergeConflicts.find(in: conflictModel(simpleConflict))
-check(found == [MergeConflict(start: 1, base: nil, separator: 3, end: 6,
-                              currentLabel: "HEAD", incomingLabel: "feature/login")],
-      "простой конфликт: строки маркеров и метки (получено \(found))")
-check(found.first?.current == 2..<3 && found.first?.incoming == 4..<6, "текущее и входящее")
+let simpleFound = MergeConflicts.find(in: conflictModel(simpleConflict))
+check(simpleFound == [MergeConflict(start: 1, base: nil, separator: 3, end: 6,
+                                    currentLabel: "HEAD", incomingLabel: "feature/login")],
+      "простой конфликт: строки маркеров и метки (получено \(simpleFound))")
+check(simpleFound.first?.current == 2..<3 && simpleFound.first?.incoming == 4..<6, "текущее и входящее")
 check(resolve(simpleConflict, .current) == "before\nmine\nafter\n", "принять текущее")
 check(resolve(simpleConflict, .incoming) == "before\ntheirs 1\ntheirs 2\nafter\n", "принять входящее")
 check(resolve(simpleConflict, .both) == "before\nmine\ntheirs 1\ntheirs 2\nafter\n", "принять оба")
@@ -1725,8 +1725,8 @@ check(MergeConflicts.find(in: conflictModel("<<<<<<<< x\na\n=======\nb\n>>>>>>> 
       "восемь символов — не маркер")
 check(MergeConflicts.find(in: conflictModel("<<<<<<< a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")).first?.start == 1,
       "повторный <<<<<<< начинает конфликт заново")
-check(MergeConflicts.conflict(atLine: 4, in: found)?.start == 1, "конфликт под курсором находится по строке")
-check(MergeConflicts.conflict(atLine: 7, in: found) == nil, "строка после конфликта — вне его")
+check(MergeConflicts.conflict(atLine: 4, in: simpleFound)?.start == 1, "конфликт под курсором находится по строке")
+check(MergeConflicts.conflict(atLine: 7, in: simpleFound) == nil, "строка после конфликта — вне его")
 
 let bigConflictText = String(repeating: "let value = compute()\n", count: 100_000)
     + "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n"
