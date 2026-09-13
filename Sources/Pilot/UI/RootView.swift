@@ -44,6 +44,9 @@ struct RootView: View {
             if workspace.root != nil {
                 JumpBar(workspace: workspace)
             }
+            if workspace.review.active != nil {
+                ReviewBar(workspace: workspace)
+            }
             content
             if workspace.root != nil {
                 statusBar
@@ -61,10 +64,20 @@ struct RootView: View {
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
-                     lineChanges: workspace.git.lineChanges,
+                     lineChanges: workspace.editorLineChanges,
+                     commentMarks: workspace.editorCommentMarks,
+                     isReview: workspace.isReviewDocument,
+                     popover: workspace.linePopover,
+                     popoverContent: { request in
+                         AnyView(LineInspector(workspace: workspace, line: request.line,
+                                               compose: request.compose)
+                            .preferredColorScheme(.dark))
+                     },
                      focusRequest: workspace.editorFocusRequest,
                      onCaretChange: { workspace.caretMoved(to: $0) },
-                     onGoToDefinition: { workspace.goToDefinition(at: $0) })
+                     onGoToDefinition: { workspace.goToDefinition(at: $0) },
+                     onLineClick: { workspace.lineClicked($0) },
+                     onCommentLine: workspace.isReviewDocument ? { workspace.commentOnLine($0) } : nil)
         } else if workspace.root == nil {
             StartView(workspace: workspace)
         } else {

@@ -10,6 +10,12 @@ struct LoadedDocument: Sendable {
     let languageName: String
     /// Структура файла для навигации. Строится здесь же, в фоне.
     let outline: [OutlineItem]
+    /// Коммит, из которого взят текст; nil — файл с диска. Ревью MR
+    /// показывает файл в версии MR, и она может не совпадать с рабочей копией.
+    var revision: String? = nil
+
+    /// Один и тот же файл в разных версиях — разные документы.
+    var identity: String { revision.map { "\(url.path)@\($0)" } ?? url.path }
 
     enum LoadError: Error, LocalizedError {
         case tooLarge(Int)
@@ -39,6 +45,10 @@ struct LoadedDocument: Sendable {
         } catch {
             throw LoadError.unreadable(error.localizedDescription)
         }
+        return try make(url: url, data: data, revision: nil)
+    }
+
+    static func make(url: URL, data: Data, revision: String?) throws -> LoadedDocument {
         if data.count > maxBytes { throw LoadError.tooLarge(data.count) }
 
         // Эвристика бинарности: NUL в первых 8 КБ.
@@ -59,7 +69,7 @@ struct LoadedDocument: Sendable {
         let outline = OutlineBuilder.build(model: model)
         return LoadedDocument(url: url, text: text, model: model,
                               languageName: spec?.name ?? "Plain Text",
-                              outline: outline)
+                              outline: outline, revision: revision)
     }
 }
 
@@ -153,6 +163,30 @@ final class CodeTextView: NSTextView {
         super.draw(dirtyRect)
     }
 
+    // MARK: Контекстное меню
+
+    /// Задан — в меню текста появляется «Комментировать строку».
+    var onCommentLine: ((Int) -> Void)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = super.menu(for: event) ?? NSMenu()
+        guard onCommentLine != nil else { return menu }
+        let point = convert(event.locationInWindow, from: nil)
+        let index = characterIndexForInsertion(at: point)
+        let item = NSMenuItem(title: "Комментировать строку…", action: #selector(commentFromMenu(_:)),
+                              keyEquivalent: "")
+        item.target = self
+        item.representedObject = index
+        menu.insertItem(item, at: 0)
+        menu.insertItem(.separator(), at: 1)
+        return menu
+    }
+
+    @objc private func commentFromMenu(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int else { return }
+        onCommentLine?(index)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Не перехватываем Cmd+P и Cmd+F — их обрабатывает окно.
         if event.modifierFlags.contains(.command) {
@@ -185,7 +219,27 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var onCaretChange: ((Int) -> Void)?
     /// ⌘+клик по символу.
     var onGoToDefinition: ((Int) -> Void)?
+    /// Клик по номеру строки — показать, что с ней: удалённое, треды ревью.
+    var onLineClick: ((Int) -> Void)? {
+        didSet { if isViewLoaded { applyLineHandlers() } }
+    }
+    /// «Комментировать строку» в меню текста; nil — пункта нет.
+    var onCommentLine: ((Int) -> Void)? {
+        didSet { if isViewLoaded { applyLineHandlers() } }
+    }
+
+    /// Обработчики приходят из SwiftUI и до создания вьюх, и после.
+    private func applyLineHandlers() {
+        ruler?.onLineClick = onLineClick
+        textView.onCommentLine = onCommentLine.map { handler in
+            { [weak self] offset in
+                guard let self, let model = self.model else { return }
+                handler(model.line(containing: min(offset, max(0, model.units.count - 1))))
+            }
+        }
+    }
     private let scrollView = CodeScrollView()
+    private var popover: NSPopover?
     private var textView: CodeTextView!
     private var ruler: LineNumberRuler?
 
@@ -245,6 +299,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         scrollView.hasVerticalRuler = true
         scrollView.rulersVisible = true
         self.ruler = ruler
+        applyLineHandlers()
 
         scrollView.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(
@@ -336,6 +391,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     func show(_ doc: LoadedDocument) {
         guard let storage = textView.textStorage else { return }
+        closePopover()
         model = doc.model
         lastHighlighted = nil
 
@@ -358,15 +414,52 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     }
 
     func showEmpty() {
+        closePopover()
         model = nil
         textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
         ruler?.model = nil
         ruler?.setChanges([])
+        ruler?.setCommentMarks([:], column: false)
     }
 
     /// Отличия от HEAD — полосками в колонке номеров.
     func setLineChanges(_ changes: [LineDiff.Change]) {
         ruler?.setChanges(changes)
+    }
+
+    /// Треды ревью — значками у строк. `column` оставляет под них место
+    /// и тогда, когда тредов ещё нет: иначе гаттер дёргался бы от первого.
+    func setCommentMarks(_ marks: [Int: CommentMark], column: Bool) {
+        ruler?.setCommentMarks(marks, column: column)
+    }
+
+    // MARK: Всплывающее окно у строки
+
+    /// Окно рядом с номером строки: что было удалено, треды, новый комментарий.
+    func presentPopover(line: Int, content: AnyView) {
+        closePopover()
+        guard let ruler, let rect = ruler.rect(forLine: line) else { return }
+        scrollLineIntoView(line)
+        let host = NSHostingController(rootView: content)
+        host.sizingOptions = [.preferredContentSize]
+        let popover = NSPopover()
+        popover.contentViewController = host
+        popover.behavior = .transient
+        popover.animates = true
+        // Прямоугольник считаем заново: прокрутка могла сдвинуть строку.
+        popover.show(relativeTo: ruler.rect(forLine: line) ?? rect, of: ruler, preferredEdge: .maxX)
+        self.popover = popover
+    }
+
+    func closePopover() {
+        popover?.close()
+        popover = nil
+    }
+
+    private func scrollLineIntoView(_ line: Int) {
+        guard let model, line < model.lineCount else { return }
+        let start = Int(model.lineStarts[line])
+        textView.scrollRangeToVisible(NSRange(location: start, length: 0))
     }
 
     /// Вхождения красим не все сразу, а вместе с остальной подсветкой —
@@ -464,8 +557,82 @@ final class LineNumberRuler: NSRulerView {
 
     func invalidateWidth() {
         let digits = max(3, String(model?.lineCount ?? 0).count)
-        ruleThickness = CGFloat(digits) * 8.0 + 20
+        ruleThickness = CGFloat(digits) * 8.0 + 20 + (hasCommentColumn ? Self.commentColumn : 0)
         needsDisplay = true
+    }
+
+    // MARK: Треды ревью
+
+    /// Слева от номеров — место под значок треда.
+    private static let commentColumn: CGFloat = 16
+    private var hasCommentColumn = false
+    private var commentMarks: [Int: CommentMark] = [:]
+    var onLineClick: ((Int) -> Void)?
+
+    func setCommentMarks(_ marks: [Int: CommentMark], column: Bool) {
+        guard marks != commentMarks || column != hasCommentColumn else { return }
+        commentMarks = marks
+        if column != hasCommentColumn {
+            hasCommentColumn = column
+            invalidateWidth()
+        }
+        needsDisplay = true
+    }
+
+    private func drawCommentMark(_ mark: CommentMark, top: CGFloat, height: CGFloat) {
+        let symbol = mark.open ? "text.bubble.fill" : "checkmark.bubble"
+        let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
+        guard let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) else { return }
+        let tint = mark.open ? Theme.reviewThread : Theme.gutterText
+        let tinted = NSImage(size: image.size, flipped: false) { rect in
+            image.draw(in: rect)
+            tint.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        let size = tinted.size
+        let origin = NSPoint(x: 3, y: top + (height - size.height) / 2)
+        tinted.draw(in: NSRect(origin: origin, size: size))
+    }
+
+    /// Где на линейке строка — для клика и для стрелки всплывающего окна.
+    func rect(forLine line: Int) -> NSRect? {
+        guard let textView, let layout = textView.layoutManager, let model,
+              line >= 0, line < model.lineCount else { return nil }
+        let start = Int(model.lineStarts[line])
+        let lineRect: NSRect
+        if start >= (textView.textStorage?.length ?? 0) {
+            lineRect = layout.extraLineFragmentRect
+        } else {
+            lineRect = layout.lineFragmentRect(forGlyphAt: layout.glyphIndexForCharacter(at: start),
+                                               effectiveRange: nil)
+        }
+        let origin = convert(NSPoint.zero, from: textView)
+        let y = origin.y + textView.textContainerInset.height + lineRect.minY
+        return NSRect(x: 0, y: y, width: ruleThickness, height: max(lineRect.height, 1))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let onLineClick, let line = line(at: convert(event.locationInWindow, from: nil)) else {
+            super.mouseDown(with: event)
+            return
+        }
+        onLineClick(line)
+    }
+
+    private func line(at point: NSPoint) -> Int? {
+        guard let textView, let layout = textView.layoutManager,
+              let container = textView.textContainer, let model, model.lineCount > 0 else { return nil }
+        let inText = textView.convert(point, from: self)
+        let y = inText.y - textView.textContainerInset.height
+        guard y >= 0 else { return nil }
+        let glyph = layout.glyphIndex(for: NSPoint(x: 0, y: y), in: container)
+        let char = layout.characterIndexForGlyph(at: glyph)
+        let line = model.line(containing: min(char, max(0, model.units.count - 1)))
+        // Ниже последней строки клик ничего не значит.
+        guard let rect = rect(forLine: line), point.y <= rect.maxY + 2 else { return nil }
+        return line
     }
 
     /// Фон — как у редактора, без системной разделительной линии:
@@ -532,6 +699,9 @@ final class LineNumberRuler: NSRulerView {
             if line < marks.count, marks[line] != 0 {
                 drawMark(marks[line], top: y, height: lineRect.height)
             }
+            if hasCommentColumn, let mark = commentMarks[line] {
+                drawCommentMark(mark, top: y, height: lineRect.height)
+            }
             line += 1
         }
     }
@@ -593,6 +763,12 @@ final class LineNumberRuler: NSRulerView {
     }
 }
 
+/// Значок треда ревью у строки: открытый ярче, решённый — приглушён.
+struct CommentMark: Equatable {
+    var count: Int
+    var open: Bool
+}
+
 // MARK: - Мост в SwiftUI
 
 struct CodeView: NSViewControllerRepresentable {
@@ -601,30 +777,41 @@ struct CodeView: NSViewControllerRepresentable {
     let reveal: Workspace.RevealRequest?
     let occurrences: [NSRange]
     let lineChanges: [LineDiff.Change]
+    var commentMarks: [Int: CommentMark] = [:]
+    /// Документ из ревью: под значки тредов в гаттере всегда есть место.
+    var isReview = false
+    var popover: Workspace.LinePopoverRequest? = nil
+    var popoverContent: (Workspace.LinePopoverRequest) -> AnyView? = { _ in nil }
     let focusRequest: Int
     let onCaretChange: (Int) -> Void
     let onGoToDefinition: (Int) -> Void
+    var onLineClick: ((Int) -> Void)? = nil
+    var onCommentLine: ((Int) -> Void)? = nil
 
     func makeNSViewController(context: Context) -> CodeViewController {
         let controller = CodeViewController()
         controller.onCaretChange = onCaretChange
         controller.onGoToDefinition = onGoToDefinition
+        controller.onLineClick = onLineClick
+        controller.onCommentLine = onCommentLine
         return controller
     }
 
     func updateNSViewController(_ controller: CodeViewController, context: Context) {
         controller.onCaretChange = onCaretChange
         controller.onGoToDefinition = onGoToDefinition
+        controller.onLineClick = onLineClick
+        controller.onCommentLine = onCommentLine
 
         var documentChanged = false
         if let document {
-            if context.coordinator.shownURL != document.url {
-                context.coordinator.shownURL = document.url
+            if context.coordinator.shownDocument != document.identity {
+                context.coordinator.shownDocument = document.identity
                 controller.show(document)
                 documentChanged = true
             }
-        } else if context.coordinator.shownURL != nil {
-            context.coordinator.shownURL = nil
+        } else if context.coordinator.shownDocument != nil {
+            context.coordinator.shownDocument = nil
             controller.showEmpty()
         }
 
@@ -642,6 +829,26 @@ struct CodeView: NSViewControllerRepresentable {
         if documentChanged || context.coordinator.lineChanges != lineChanges {
             context.coordinator.lineChanges = lineChanges
             controller.setLineChanges(lineChanges)
+        }
+
+        if documentChanged || context.coordinator.commentMarks != commentMarks
+            || context.coordinator.isReview != isReview {
+            context.coordinator.commentMarks = commentMarks
+            context.coordinator.isReview = isReview
+            controller.setCommentMarks(commentMarks, column: isReview)
+        }
+
+        // Окно у строки — тоже по номеру запроса, один раз. После смены
+        // документа — на следующем витке, когда текст уже разложен.
+        if let popover, popover.seq != context.coordinator.appliedPopover {
+            context.coordinator.appliedPopover = popover.seq
+            if let content = popoverContent(popover) {
+                if documentChanged {
+                    DispatchQueue.main.async { controller.presentPopover(line: popover.line, content: content) }
+                } else {
+                    controller.presentPopover(line: popover.line, content: content)
+                }
+            }
         }
 
         // Переход применяем один раз на запрос; порядковый номер нужен,
@@ -678,10 +885,13 @@ struct CodeView: NSViewControllerRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        var shownURL: URL?
+        var shownDocument: String?
         var fontSize: CGFloat = 12.5
         var appliedReveal: Int = -1
         var lineChanges: [LineDiff.Change] = []
+        var commentMarks: [Int: CommentMark] = [:]
+        var isReview = false
+        var appliedPopover = 0
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
     }

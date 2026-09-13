@@ -11,7 +11,8 @@ struct NavigatorView: View {
         content
             .pilotEdgeBar(.top) { tabBar }
             .pilotEdgeBar(.bottom) {
-                if workspace.navigatorTab != .recent, workspace.root != nil { filterField }
+                if workspace.navigatorTab == .project || workspace.navigatorTab == .outline,
+                   workspace.root != nil { filterField }
             }
     }
 
@@ -26,6 +27,7 @@ struct NavigatorView: View {
             switch workspace.navigatorTab {
             case .project: EmptyView()
             case .outline: OutlineList(workspace: workspace)
+            case .review:  ReviewNavigator(workspace: workspace)
             case .recent:  RecentList(workspace: workspace)
             }
         }

@@ -55,12 +55,13 @@ final class Workspace: ObservableObject {
     // MARK: Навигатор
 
     enum NavigatorTab: Hashable, CaseIterable {
-        case project, outline, recent
+        case project, outline, review, recent
 
         var icon: String {
             switch self {
             case .project: return "folder"
             case .outline: return "list.bullet.indent"
+            case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock"
             }
         }
@@ -69,6 +70,7 @@ final class Workspace: ObservableObject {
             switch self {
             case .project: return "folder.fill"
             case .outline: return "list.bullet.indent"
+            case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock.fill"
             }
         }
@@ -77,6 +79,7 @@ final class Workspace: ObservableObject {
             switch self {
             case .project: return "Проект"
             case .outline: return "Структура файла"
+            case .review:  return "Ревью мерж-реквестов"
             case .recent:  return "Недавние проекты"
             }
         }
@@ -101,15 +104,33 @@ final class Workspace: ObservableObject {
 
     let lsp = LSPService()
     let git = GitService()
-    private var gitObservation: AnyCancellable?
+    let review = ReviewService()
+    private var observations: [AnyCancellable] = []
 
     init() {
-        // Статус-строка и полоски у номеров строк читают git через workspace:
-        // его изменения должны перерисовывать то же, что и наши.
-        gitObservation = git.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+        // Статус-строка, полоски у номеров строк и панель ревью читают git
+        // и GitLab через workspace: их изменения должны перерисовывать то же,
+        // что и наши.
+        for publisher in [git.objectWillChange, review.objectWillChange] {
+            observations.append(publisher.sink { [weak self] _ in self?.objectWillChange.send() })
         }
         git.onStatusChange = { [weak self] in self?.gitStatusChanged() }
+    }
+
+    /// Окно у строки: удалённое, треды, новый комментарий. Номер запроса —
+    /// по той же причине, что и у reveal: повторный клик по той же строке.
+    struct LinePopoverRequest: Equatable {
+        var seq: Int
+        var line: Int
+        /// Сразу с полем для нового комментария.
+        var compose: Bool
+    }
+    @Published private(set) var linePopover: LinePopoverRequest?
+    private var popoverCounter = 0
+
+    func requestLinePopover(line: Int, compose: Bool) {
+        popoverCounter += 1
+        linePopover = LinePopoverRequest(seq: popoverCounter, line: line, compose: compose)
     }
 
     private var index: FileIndex?
@@ -199,6 +220,7 @@ final class Workspace: ObservableObject {
         rememberRecent(url)
         lsp.workspaceChanged(to: url)
         git.workspaceChanged(to: url)
+        review.workspaceChanged(to: url)
 
         let generation = scanGeneration.bump()
         isIndexing = true
@@ -293,6 +315,7 @@ final class Workspace: ObservableObject {
         _ = loadGeneration.bump()
         lsp.workspaceChanged(to: nil)
         git.workspaceChanged(to: nil)
+        review.workspaceChanged(to: nil)
         root = nil
         index = nil
         fileTree = nil
@@ -427,8 +450,8 @@ final class Workspace: ObservableObject {
 
     /// Следующий/предыдущий изменённый блок; по кругу, как и вхождения.
     func jumpToChange(_ direction: Int) {
-        guard let document, !git.lineChanges.isEmpty else { return }
-        let changes = git.lineChanges
+        let changes = editorLineChanges
+        guard let document, !changes.isEmpty else { return }
         let line = document.model.line(containing: caretOffset)
         let target: LineDiff.Change?
         if direction > 0 {
@@ -757,7 +780,9 @@ final class Workspace: ObservableObject {
     func goToDefinition(at offset: Int) {
         guard let document else { return }
 
-        guard lsp.isReady else {
+        // Файл из MR сервер не видел: у него на руках рабочая копия, и его
+        // позиции указали бы не туда. Для версии MR — только лексический поиск.
+        guard lsp.isReady, document.revision == nil else {
             jumpToLexicalDeclaration(at: offset, in: document)
             return
         }
@@ -906,26 +931,55 @@ final class Workspace: ObservableObject {
             let result = Result { try LoadedDocument.load(url: url) }
             Task { @MainActor in
                 guard counter.isCurrent(generation) else { return }
-                switch result {
-                case .success(let doc):
-                    self.document = doc
-                    self.loadError = nil
-                    self.caretOffset = 0
-                    self.occurrences = []
-                    self.occurrenceWord = nil
-                    self.breadcrumb = ""
-                    self.currentOutlineItem = nil
-                    self.requestReveal(reveal)
-                    // Сервер поднимается здесь — лениво, при первом файле
-                    // подходящего языка, а не при запуске приложения.
-                    self.lsp.documentOpened(doc)
-                    self.git.documentOpened(doc)
-                case .failure(let error):
-                    self.document = nil
-                    self.loadError = error.localizedDescription
-                    self.git.documentOpened(nil)
-                }
+                self.present(result, reveal: reveal)
             }
+        }
+    }
+
+    /// Файл в версии MR: текст берётся из коммита, а не с диска.
+    func open(reviewFile file: ReviewFile, reveal: LSPRange? = nil) {
+        isPaletteOpen = false
+        loadError = nil
+        let generation = loadGeneration.bump()
+        let counter = loadGeneration
+
+        Task { [weak self] in
+            guard let self else { return }
+            let result: Result<LoadedDocument, Error>
+            do {
+                result = .success(try await self.review.loadDocument(for: file))
+            } catch {
+                result = .failure(error)
+            }
+            guard counter.isCurrent(generation) else { return }
+            self.present(result, reveal: reveal)
+        }
+    }
+
+    private func present(_ result: Result<LoadedDocument, Error>, reveal: LSPRange?) {
+        switch result {
+        case .success(let doc):
+            document = doc
+            loadError = nil
+            caretOffset = 0
+            occurrences = []
+            occurrenceWord = nil
+            breadcrumb = ""
+            currentOutlineItem = nil
+            requestReveal(reveal)
+            if doc.revision == nil {
+                // Сервер поднимается здесь — лениво, при первом файле
+                // подходящего языка, а не при запуске приложения.
+                lsp.documentOpened(doc)
+                git.documentOpened(doc)
+            } else {
+                // Версия из MR: полоски и треды даёт ревью, а не HEAD.
+                git.documentOpened(nil)
+            }
+        case .failure(let error):
+            document = nil
+            loadError = error.localizedDescription
+            git.documentOpened(nil)
         }
     }
 

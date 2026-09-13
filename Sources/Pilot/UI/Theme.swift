@@ -158,6 +158,13 @@ enum Theme {
     static var gitRenamed: NSColor { Macchiato.sky }
     static var gitConflicted: NSColor { Macchiato.peach }
 
+    /// Открытый тред ревью — значок у строки. Голубой не спорит ни с одной
+    /// из полосок диффа.
+    static var reviewThread: NSColor { Macchiato.sky }
+    /// Фон удалённых строк во всплывающем окне.
+    static var removedLineBackground: NSColor { Macchiato.red.withAlphaComponent(0.14) }
+    static var removedLineText: NSColor { Macchiato.red }
+
     static func git(_ state: GitFileState) -> NSColor {
         switch state {
         case .added, .untracked: return gitAdded

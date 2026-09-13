@@ -15,10 +15,12 @@ enum LineDiff {
 
     /// Изменение в координатах нового текста: номера строк с нуля, как в
     /// SyntaxModel. У `.deleted` диапазон пустой — строки удалены перед
-    /// `lines.lowerBound`.
+    /// `lines.lowerBound`. `oldLines` — какие строки старого текста блок
+    /// заменил: по ним показывается, что было удалено.
     struct Change: Equatable {
         var kind: Kind
         var lines: Range<Int>
+        var oldLines: Range<Int> = 0..<0
     }
 
     /// Предел числа правок для Myers: дальше время O((N+M)·D) и память O(D²)
@@ -179,7 +181,7 @@ enum LineDiff {
 
             let lines = (offset + j0)..<(offset + j)
             let kind: Kind = lines.isEmpty ? .deleted : (i == i0 ? .added : .modified)
-            result.append(Change(kind: kind, lines: lines))
+            result.append(Change(kind: kind, lines: lines, oldLines: (offset + i0)..<(offset + i)))
         }
         return result
     }
