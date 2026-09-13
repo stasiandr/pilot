@@ -13,6 +13,9 @@ struct PaletteView: View {
     var available: CGSize = .zero
     @StateObject private var preview = PreviewLoader()
     @AppStorage("pilot.palettePreview") private var previewEnabled = true
+    /// Строку выделили мышью: она и так на виду, а прокрутка к центру
+    /// увела бы из-под курсора и второй клик двойного попал бы в соседнюю.
+    @State private var selectedByClick = false
 
     var body: some View {
         PilotGlassGroup(spacing: 14) {
@@ -218,9 +221,14 @@ struct PaletteView: View {
                         PaletteRow(item: item, isSelected: index == workspace.selection)
                             .id(index)
                             .contentShape(Rectangle())
+                            // Клик выделяет — видно предпросмотр, двойной открывает.
+                            // Не onTapGesture(count: 2): одиночный ждал бы второго.
                             .onTapGesture {
+                                selectedByClick = index != workspace.selection
                                 workspace.selection = index
-                                workspace.activateSelection()
+                                if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                                    workspace.activateSelection()
+                                }
                             }
                     }
                 }
@@ -229,6 +237,7 @@ struct PaletteView: View {
             }
             .frame(height: height)
             .onChange(of: workspace.selection) { _, new in
+                if selectedByClick { selectedByClick = false; return }
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(new, anchor: .center) }
             }
         }
