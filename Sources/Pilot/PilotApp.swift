@@ -2,9 +2,21 @@ import SwiftUI
 import AppKit
 
 @main
+enum PilotMain {
+    static func main() {
+        // Тот же исполняемый файл работает и демоном языковых серверов —
+        // тогда никакого интерфейса, только сокет (см. LSPDaemon).
+        if let socket = LSPDaemon.socketArgument(CommandLine.arguments) {
+            LSPDaemon.run(socketPath: socket)
+        }
+        PilotApp.main()
+    }
+}
+
 struct PilotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var workspace = Workspace()
+    @AppStorage(Experimental.lspDaemonKey) private var lspDaemon = false
 
     var body: some Scene {
         Window("Pilot", id: "main") {
@@ -22,6 +34,19 @@ struct PilotApp: App {
         .defaultSize(width: 1100, height: 720)
         .commands {
             SidebarCommands()   // «Показать/скрыть боковую панель», ⌃⌘S
+            CommandGroup(after: .appSettings) {
+                Menu("Экспериментальное") {
+                    // Перезапуск — прямо в сеттере: onChange в меню команд
+                    // срабатывает ненадёжно. @AppStorage пишет в UserDefaults
+                    // синхронно, и LSPService уже видит новое значение.
+                    Toggle("Держать языковые серверы между запусками", isOn: Binding(
+                        get: { lspDaemon },
+                        set: {
+                            lspDaemon = $0
+                            workspace.lsp.daemonSettingChanged(reopening: workspace.document)
+                        }))
+                }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Открыть папку…") { workspace.promptForFolder() }
                     .keyboardShortcut("o", modifiers: .command)

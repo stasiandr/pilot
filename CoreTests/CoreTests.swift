@@ -44,6 +44,49 @@ let nested = IgnoreMatcher(
     useSoftSkip: false)
 check(nested.isIgnored(relPath: "sub/a.log", name: "a.log", isDir: false), "nested layer applies in subtree")
 check(!nested.isIgnored(relPath: "other/a.log", name: "a.log", isDir: false), "nested layer skips other subtree")
+// база-префикс, но не папка: sub2 не лежит внутри sub
+check(!nested.isIgnored(relPath: "sub2/a.log", name: "a.log", isDir: false), "nested layer: sub2 is not inside sub")
+
+// Быстрые пути матчера: точное имя, окончание, обязательный литерал.
+func literal(_ p: String) -> String { String(decoding: IgnoreRule.longestLiteral(Array(p.utf8)), as: UTF8.self) }
+check(literal("[Aa]ssets/StreamingAssets/**/*.bank") == "ssets/StreamingAssets/", "литерал: класс и ** пропущены")
+check(literal("**/.idea/**/workspace.xml") == "workspace.xml", "литерал: слеш после ** не обязателен")
+check(literal("*.[oa]") == ".", "литерал: до класса")
+check(literal("x[]ab]cd") == "cd", "литерал: `]` сразу после `[` — часть класса")
+func kind(_ line: String) -> String {
+    switch IgnoreRule(line: line)!.kind {
+    case .literal: return "literal"
+    case .suffix: return "suffix"
+    case .glob: return "glob"
+    }
+}
+check(kind("Thumbs.db") == "literal" && kind("/Assets/link.xml") == "literal", "без спецсимволов -> literal")
+check(kind("*.csproj") == "suffix", "*.csproj -> suffix")
+check(kind("/*.csproj") == "glob", "якорный *.csproj — не суффикс: * не проходит через /")
+check(kind("[Bb]in/") == "glob", "класс -> glob")
+
+// Главная проверка: быстрые пути отвечают ровно как полный глоб.
+let patterns = ["Thumbs.db", "*.csproj", "*.pidb.meta", "[Bb]in", "**/.idea/**/workspace.xml",
+                "[Aa]ssets/StreamingAssets/**/*.bank", "[Aa]ssets/**/*.meta", "src/*.ts", "a?c",
+                "**/obj", "*", "*.[oa]", "build_ios*", "Assets/eWolf/Thumbs.db.meta", "**"]
+let texts = ["Thumbs.db", "x.csproj", "a/x.csproj", ".csproj", "x.pidb.meta", "bin", "Bin", "cabin",
+             ".idea/workspace.xml", "a/.idea/b/workspace.xml", "workspace.xml",
+             "Assets/StreamingAssets/x/y.bank", "assets/StreamingAssets/y.bank", "Assets/StreamingAssets.bank",
+             "Assets/a/b/c.meta", "Assets/c.meta", "src/a.ts", "src/a/b.ts", "abc", "a/c", "obj", "x/y/obj",
+             "x.o", "x.c", "build_ios_1", "Assets/eWolf/Thumbs.db.meta", "", "Папка/файл.cs"]
+var mismatches: [String] = []
+for p in patterns {
+    for anchored in ["", "/"] {
+        let rule = IgnoreRule(line: anchored + p)!
+        for t in texts {
+            let fast = Array(t.utf8).withUnsafeBufferPointer { rule.matches($0) }
+            if fast != Glob.match(pattern: rule.pattern, text: Array(t.utf8)) {
+                mismatches.append("\(anchored)\(p) ~ \(t)")
+            }
+        }
+    }
+}
+check(mismatches.isEmpty, "быстрые пути совпадают с глобом (расхождения: \(mismatches))")
 
 // ──────────────────────────── Fuzzy ────────────────────────────
 section("Fuzzy")
@@ -286,6 +329,257 @@ do {
           "неполное тело не выдаётся")
 }
 
+// ────────────────────────── LSP: таймауты и отмена ──────────────────────────
+section("LSP / таймауты")
+
+/// Результат запроса из фоновой задачи: семафор даёт happens-before.
+final class RequestOutcome: @unchecked Sendable { var text = "не завершился" }
+
+/// Запускает запрос в отдельной задаче и ждёт его не дольше `limit` секунд.
+/// nil — запрос так и не завершился.
+func runRequest(_ client: LSPClient, timeout: TimeInterval, cancelAfter: TimeInterval? = nil,
+                limit: TimeInterval = 3) -> String? {
+    let done = DispatchSemaphore(value: 0)
+    let outcome = RequestOutcome()
+    let task = Task.detached {
+        do {
+            let result = try await client.request("pilot/ping", [:], timeout: timeout)
+            outcome.text = result is NSNull ? "ответ" : "ответ \(result)"
+        } catch {
+            outcome.text = "\(error)"
+        }
+        done.signal()
+    }
+    if let cancelAfter {
+        Thread.sleep(forTimeInterval: cancelAfter)
+        task.cancel()
+    }
+    return done.wait(timeout: .now() + limit) == .success ? outcome.text : nil
+}
+
+func testServer(_ command: [String]) -> LSPClient {
+    let config = ServerConfig(id: "test", languageId: "plaintext", fileExtensions: [],
+                              command: command, displayName: "test")
+    let client = LSPClient(config: config, root: URL(fileURLWithPath: NSTemporaryDirectory()))
+    try? client.start()
+    return client
+}
+
+do {
+    // `cat` — эхо: наш запрос возвращается как «запрос от сервера», клиент
+    // на него отвечает, а эхо ответа закрывает исходный запрос.
+    let echo = testServer(["/bin/cat"])
+    check(runRequest(echo, timeout: 2) == "ответ", "эхо-сервер: запрос получает ответ")
+    echo.stop()
+
+    // Сервер, который молчит. Запрос обязан упасть по таймауту, а не повиснуть:
+    // вызывающий иначе никогда не узнает, что ответа не будет.
+    let silent = testServer(["/bin/sleep", "30"])
+    let t0 = Date()
+    let timedOut = runRequest(silent, timeout: 0.2)
+    check(timedOut?.contains("timeout") == true,
+          "молчащий сервер: запрос завершается таймаутом (получено: \(timedOut ?? "повис"))")
+    check(Date().timeIntervalSince(t0) < 1.5, "таймаут срабатывает вовремя")
+
+    // Отмена задачи снимает запрос сразу, не дожидаясь таймаута.
+    let t1 = Date()
+    let cancelled = runRequest(silent, timeout: 30, cancelAfter: 0.1)
+    check(cancelled != nil, "отменённый запрос завершается (получено: \(cancelled ?? "повис"))")
+    check(Date().timeIntervalSince(t1) < 1.5, "отмена не ждёт таймаута")
+    silent.stop()
+}
+
+// ────────────────────────── LSP: демон ──────────────────────────
+section("LSP / демон")
+
+/// Ждёт условия, не дольше `timeout` секунд.
+func eventually(_ timeout: TimeInterval = 3, _ condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    return condition()
+}
+
+final class ResultBox<T>: @unchecked Sendable { var value: Result<T, Error>? }
+
+/// Асинхронный вызов из синхронного кода тестов. nil — не дождались.
+func blocking<T>(_ body: @escaping @Sendable () async throws -> T) -> Result<T, Error>? {
+    let done = DispatchSemaphore(value: 0)
+    let box = ResultBox<T>()
+    Task.detached {
+        do { box.value = .success(try await body()) } catch { box.value = .failure(error) }
+        done.signal()
+    }
+    return done.wait(timeout: .now() + 5) == .success ? box.value : nil
+}
+
+/// Уведомления, которые клиент получил через демона.
+final class Heard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var methods: [String] = []
+    func add(_ method: String) { lock.lock(); methods.append(method); lock.unlock() }
+    func count(_ method: String) -> Int { lock.lock(); defer { lock.unlock() }; return methods.filter { $0 == method }.count }
+}
+
+do {
+    signal(SIGPIPE, SIG_IGN)
+    let tmp = NSTemporaryDirectory()
+    // `cat` вместо Roslyn: он возвращает всё, что ему пишут, поэтому через
+    // эхо видно, что именно демон переслал серверу и сколько раз.
+    let catConfig = ServerConfig(id: "cat", languageId: "plaintext", fileExtensions: ["txt"],
+                                 command: ["/bin/cat"], displayName: "cat")
+    let rootA = URL(fileURLWithPath: tmp + "pilot-daemon-a")
+    let rootB = URL(fileURLWithPath: tmp + "pilot-daemon-b")
+    for root in [rootA, rootB] {
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    final class Exited: @unchecked Sendable { var value = false }
+    var sockets: [String] = []
+
+    func makeDaemon(_ policy: LSPDaemon.Policy, build: String = "b1",
+                    executable: String? = nil) -> (LSPDaemon, String, Exited) {
+        let socket = tmp + "pilot-test-\(UUID().uuidString.prefix(8)).sock"
+        sockets.append(socket)
+        let daemon = LSPDaemon(socketPath: socket, build: build, executablePath: executable, policy: policy)
+        let exited = Exited()
+        daemon.onExit = { exited.value = true }
+        try? daemon.start()
+        return (daemon, socket, exited)
+    }
+
+    func client(_ socket: String, root: URL, heard: Heard? = nil) -> LSPClient? {
+        guard let fd = UnixSocket.connectTo(socket) else { return nil }
+        let c = LSPClient(config: catConfig, root: root)
+        if let heard { c.onNotification = { method, _ in heard.add(method) } }
+        c.connect(daemonSocket: fd)
+        return c
+    }
+
+    var quiet = LSPDaemon.Policy()
+    quiet.sweepInterval = 3600
+    quiet.exitWhenEmptyAfter = 3600
+
+    // Два клиента, один сервер.
+    var keepAll = quiet
+    keepAll.keepIfLoadTookAtLeast = 0
+    let (daemon, socket, _) = makeDaemon(keepAll)
+    let heardA = Heard(), heardB = Heard()
+    let a = client(socket, root: rootA, heard: heardA)!
+    let attachA = blocking { try await a.attach(build: "b1") }
+    check((try? attachA?.get()) == false, "первый клиент запускает сервер")
+    check((try? blocking { try await a.initialize() }?.get()) != nil, "initialize через демона")
+    let b = client(socket, root: rootA, heard: heardB)!
+    check((try? blocking { try await b.attach(build: "b1") }?.get()) == true,
+          "второй клиент того же проекта получает работающий сервер")
+    check((try? blocking { try await b.initialize() }?.get()) != nil, "второй initialize — из сохранённого")
+    check(daemon.snapshot().servers == 1, "сервер один на двоих")
+
+    let ping = blocking { try await b.request("pilot/ping", [:], timeout: 2) }
+    check((try? ping?.get()) is NSNull, "запрос проходит через демона к серверу и обратно")
+
+    // Общий документ открывается на сервере один раз и закрывается последним.
+    let doc = rootA.appendingPathComponent("a.txt")
+    a.didOpen(url: doc, languageId: "plaintext", text: "x")
+    b.didOpen(url: doc, languageId: "plaintext", text: "x")
+    check(eventually { heardA.count("textDocument/didOpen") == 1 }, "didOpen дошёл до сервера")
+    Thread.sleep(forTimeInterval: 0.2)
+    check(heardB.count("textDocument/didOpen") == 1, "второй didOpen того же файла сервер не получил")
+    a.stop()
+    check(eventually { daemon.snapshot().connections == 1 }, "отключение клиента демон заметил")
+    Thread.sleep(forTimeInterval: 0.2)
+    check(heardB.count("textDocument/didClose") == 0, "файл ещё открыт у второго — didClose нет")
+    b.didClose(url: doc)
+    check(eventually { heardB.count("textDocument/didClose") == 1 }, "последний закрывший — didClose дошёл")
+
+    // Клиентов нет, а дорогой (по политике) сервер остаётся.
+    b.stop()
+    check(eventually { daemon.snapshot().connections == 0 }, "все клиенты отключились")
+    check(daemon.snapshot().servers == 1, "дорогой сервер пережил уход клиентов")
+    let c = client(socket, root: rootA)!
+    check((try? blocking { try await c.attach(build: "b1") }?.get()) == true, "новый клиент застаёт его живым")
+    c.stop()
+
+    // Лимит серверов без клиентов: лишний — самый давний — уходит.
+    let d = client(socket, root: rootB)!
+    _ = blocking { try await d.attach(build: "b1") }
+    _ = blocking { try await d.initialize() }
+    check(daemon.snapshot().servers == 2, "второй проект — второй сервер")
+    d.stop()
+    check(eventually { daemon.snapshot().connections == 0 }, "и этот клиент ушёл")
+    // Лимит проверяем на копии политики: подменить её у живого демона нельзя.
+    var one = keepAll
+    one.maxIdleServers = 1
+    let (limited, limitedSocket, _) = makeDaemon(one)
+    for root in [rootA, rootB] {
+        let e = client(limitedSocket, root: root)!
+        _ = blocking { try await e.attach(build: "b1") }
+        _ = blocking { try await e.initialize() }
+        e.stop()
+    }
+    check(eventually { limited.snapshot().servers == 1 }, "без клиентов держим не больше одного — по политике")
+
+    // Дешёвый сервер (cat поднимается мгновенно) после ухода клиента не держим.
+    let (cheap, cheapSocket, _) = makeDaemon(quiet)
+    let f = client(cheapSocket, root: rootA)!
+    _ = blocking { try await f.attach(build: "b1") }
+    _ = blocking { try await f.initialize() }
+    f.stop()
+    check(eventually { cheap.snapshot().servers == 0 }, "быстро поднимающийся сервер останавливается сразу")
+
+    // Сборки не совпали. Исполняемый файл демона не менялся — устарел клиент.
+    let exe = tmp + "pilot-fake-exe-\(UUID().uuidString.prefix(8))"
+    FileManager.default.createFile(atPath: exe, contents: Data())
+    let (fresh, freshSocket, freshExited) = makeDaemon(quiet, build: LSPDaemon.buildID(executable: exe), executable: exe)
+    let old = client(freshSocket, root: rootA)!
+    if case .failure(RPCError.serverError(let code, _))? = blocking({ try await old.attach(build: "old") }) {
+        check(code == LSPDaemon.staleClientCode, "старый клиент получает отказ, демон остаётся")
+    } else {
+        check(false, "старый клиент получает отказ, демон остаётся")
+    }
+    check(!freshExited.value && fresh.snapshot().connections >= 0, "свежий демон не уходит из-за старого клиента")
+    old.stop()
+    // Файл демона пересобрали — устарел сам демон: отказывает и уходит.
+    Thread.sleep(forTimeInterval: 0.01)
+    try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: exe)
+    let fresher = client(freshSocket, root: rootA)!
+    let staleExit = Heard()
+    fresher.onExit = { _ in staleExit.add("exit") }
+    if case .failure(RPCError.serverError(let code, _))? = blocking({ try await fresher.attach(build: "new") }) {
+        check(code == LSPDaemon.staleDaemonCode, "пересобранный Pilot: демон сообщает, что устарел")
+    } else {
+        check(false, "пересобранный Pilot: демон сообщает, что устарел")
+    }
+    check(eventually { freshExited.value }, "устаревший демон уходит сам")
+    check(eventually { staleExit.count("exit") == 1 }, "клиент видит, что демон закрыл соединение")
+    check(UnixSocket.connectTo(freshSocket) == nil, "сокет устаревшего демона убран")
+    try? FileManager.default.removeItem(atPath: exe)
+
+    // Демона выключили в настройках: Pilot просит его уйти.
+    let (quitting, quitSocket, quitExited) = makeDaemon(quiet)
+    LSPDaemon.requestQuit(socketPath: quitSocket)
+    check(eventually { quitExited.value }, "по pilot/quit демон уходит")
+    LSPDaemon.requestQuit(socketPath: quitSocket)   // демона уже нет — просто ничего
+    _ = daemon; _ = limited; _ = cheap; _ = quitting
+    for socket in sockets { unlink(socket) }
+    for root in [rootA, rootB] { try? FileManager.default.removeItem(at: root) }
+}
+
+do {
+    var config = ServerConfig(id: "x", languageId: "csharp", fileExtensions: ["cs", "csx"],
+                              command: ["/bin/x", "--stdio"], displayName: "X")
+    config.settings = ["a.b": false]
+    config.opensSolution = true
+    config.projectsLoadedNotification = "done"
+    let back = ServerConfig(json: config.json)
+    check(back?.command == config.command && back?.fileExtensions == config.fileExtensions
+          && back?.settings["a.b"] as? Bool == false && back?.opensSolution == true
+          && back?.projectsLoadedNotification == "done",
+          "конфигурация сервера переживает JSON — так она уходит демону")
+}
+
 // ────────────────────────── LSP: разбор ответов ──────────────────────────
 section("LSP / разбор")
 
@@ -319,6 +613,53 @@ let syms = LSPSymbol.parse(json("[{\"name\":\"Foo\",\"kind\":5,\"containerName\"
 check(syms.count == 1 && syms[0].name == "Foo", "symbol: имя разобрано")
 check(syms[0].kindLabel == "class", "symbol: вид -> class")
 check(syms[0].range?.start.line == 2, "symbol: диапазон разобран")
+
+do {
+    var config = ServerConfig(id: "t", languageId: "csharp", fileExtensions: [], command: ["x"],
+                              displayName: "t")
+    config.settings = ServerRegistry.roslynSettings
+    let request = json("{\"items\":[{\"section\":\"csharp|inlay_hints.csharp_enable_inlay_hints_for_types\"},{\"section\":\"projects.dotnet_enable_automatic_restore\"},{\"scopeUri\":\"file:///a\"}]}")
+    let answer = config.configurationResponse(request)
+    check(answer.count == 3, "configuration: по ответу на каждый запрошенный элемент")
+    check(answer[0] is NSNull, "configuration: неизвестная секция -> null")
+    check(answer[1] as? Bool == false, "configuration: автоматический restore выключен")
+    check(answer[2] is NSNull, "configuration: элемент без секции -> null")
+    check(config.configurationResponse(nil).isEmpty, "configuration: без параметров -> пустой массив")
+}
+
+do {
+    // Папка с исполняемым `mono` выпадает из PATH, остальные — в том же порядке.
+    let fm = FileManager.default
+    let monoDir = NSTemporaryDirectory() + "pilot-mono-\(UUID().uuidString)"
+    try? fm.createDirectory(atPath: monoDir, withIntermediateDirectories: true)
+    fm.createFile(atPath: monoDir + "/mono", contents: Data("#!/bin/sh\n".utf8),
+                  attributes: [.posixPermissions: 0o755])
+    let stripped = DotnetRuntime.pathWithoutMono("/usr/bin:\(monoDir):/bin")
+    check(stripped == "/usr/bin:/bin", "PATH без Mono (получено \(stripped))")
+    check(DotnetRuntime.pathWithoutMono("/usr/bin:/bin") == "/usr/bin:/bin", "PATH без Mono не меняется")
+    try? fm.removeItem(atPath: monoDir)
+}
+
+let slnText = """
+Microsoft Visual Studio Solution File, Format Version 11.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Assembly-CSharp", "Assembly-CSharp.csproj", "{4DF3AB5E}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Folder", "Folder", "{0000}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UI", "Sub\\UI.csproj", "{1111}"
+EndProject
+"""
+check(ServerRegistry.projectCount(solutionText: slnText, isXML: false) == 2,
+      "sln: считаются проекты, но не папки решения")
+let slnxText = """
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/App/App.csproj" />
+    <Project Path="src/Lib/Lib.csproj" />
+  </Folder>
+</Solution>
+"""
+check(ServerRegistry.projectCount(solutionText: slnxText, isXML: true) == 2, "slnx: два проекта")
 
 let capsBool = ServerCapabilities.parse(json("{\"capabilities\":{\"definitionProvider\":true,\"hoverProvider\":false}}"))
 check(capsBool.definition && !capsBool.hover, "capabilities: булев вид")
@@ -756,6 +1097,91 @@ check(bigTree.fileCount == 100_000, "в большом дереве все 100k 
 check(bigTree.root.children.count == 1 && bigTree.node(at: "src")?.children.count == 200,
       "большое дерево: src и 200 модулей в нём")
 check(treeMs < 1500, "дерево из 100k файлов строится быстрее 1.5 с (получено \(Int(treeMs)) мс)")
+
+// ─────────────────────────── Файлы от git ───────────────────────────
+section("Файлы от git")
+
+check(GitFiles.split(Data("a.cs\0dir/b.cs\0".utf8)) == ["a.cs", "dir/b.cs"], "split: пути через NUL")
+check(GitFiles.split(Data("a.cs\0b.cs".utf8)) == ["a.cs", "b.cs"], "split: последний путь без NUL")
+check(GitFiles.split(Data()).isEmpty, "split: пусто -> пусто")
+check(GitFiles.split(Data(".gitignore\0src/.idea/x.xml\0src/a.cs\0a.b/c.cs\0x/.cs\0".utf8)) == ["src/a.cs", "a.b/c.cs"],
+      "split: скрытые файлы и папки отсеиваются, точка внутри имени — нет")
+check(GitFiles.split(Data("vendor/lib/\0Папка/файл.cs\0".utf8)) == ["Папка/файл.cs"],
+      "split: вложенный репозиторий (слеш на конце) отсеивается, не-ASCII цел")
+
+if let git = GitFiles.executable {
+    // Изолируемся от настроек пользователя: его глобальный excludesFile
+    // или подпись коммитов не должны влиять на тест.
+    setenv("GIT_CONFIG_GLOBAL", "/dev/null", 1)
+    setenv("GIT_CONFIG_NOSYSTEM", "1", 1)
+
+    let fm = FileManager.default
+    let repo = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("pilot-git-\(UUID().uuidString)")
+    func write(_ rel: String) {
+        let url = repo.appendingPathComponent(rel)
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data("x".utf8).write(to: url)
+    }
+    func runGit(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: git)
+        p.arguments = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + args
+        p.currentDirectoryURL = repo
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+    }
+
+    for rel in ["src/App.cs", "src/Old.cs", "README.md", ".hidden/secret.cs", "bin/out.dll"] { write(rel) }
+    try? Data("bin/\n".utf8).write(to: repo.appendingPathComponent(".gitignore"))
+    runGit(["init", "-q"])
+    runGit(["add", "."])
+    runGit(["commit", "-q", "-m", "init"])
+    write("notes.txt")                                                   // новый, не игнорируется
+    write("Папка с пробелом/файл.cs")                                   // пробелы и не-ASCII
+    write("bin/new.dll")                                                 // новый, но игнорируется
+    write(".hidden/new.cs")                                              // новый, но скрытый
+
+    let tracked = GitFiles.tracked(root: repo) ?? []
+    check(Set(tracked) == ["src/App.cs", "src/Old.cs", "README.md"],
+          "tracked: отслеживаемые без скрытых (получено \(tracked.sorted()))")
+    let all = Set(GitFiles.complete(root: repo, tracked: tracked) ?? [])
+    check(all == ["src/App.cs", "src/Old.cs", "README.md", "notes.txt", "Папка с пробелом/файл.cs"],
+          "complete: плюс новые, без игнорируемых и скрытых (получено \(all.sorted()))")
+
+    // Главное: от git или обходом — индекс один и тот же.
+    let viaGit = FileIndex.scan(root: repo, shouldStop: { false })
+    let viaWalk = FileIndex.build(root: repo, shouldStop: { false })
+    check(Set(viaGit.display) == Set(viaWalk.display),
+          "git и обход диска дают одинаковый набор (git: \(viaGit.display.sorted()), обход: \(viaWalk.display.sorted()))")
+
+    var earlyCount = -1
+    _ = FileIndex.scan(root: repo, shouldStop: { false }, early: { earlyCount = $0.count })
+    check(earlyCount == 3, "early: сначала приходят отслеживаемые файлы (получено \(earlyCount))")
+
+    // Удалён с диска, но не закоммичен: осознанно остаётся в списке —
+    // проверка стоила бы lstat на каждый файл проекта.
+    try? fm.removeItem(at: repo.appendingPathComponent("src/Old.cs"))
+    check(GitFiles.tracked(root: repo)?.contains("src/Old.cs") == true,
+          "удалённый, но не закоммиченный файл остаётся в списке")
+
+    let sub = FileIndex.scan(root: repo.appendingPathComponent("src"), shouldStop: { false })
+    check(sub.display == ["App.cs", "Old.cs"], "подпапка репозитория: пути относительно неё (получено \(sub.display))")
+
+    let plain = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pilot-plain-\(UUID().uuidString)")
+    try? fm.createDirectory(at: plain, withIntermediateDirectories: true)
+    try? Data("x".utf8).write(to: plain.appendingPathComponent("a.cs"))
+    check(GitFiles.tracked(root: plain) == nil, "не репозиторий -> nil")
+    check(FileIndex.scan(root: plain, shouldStop: { false }).display == ["a.cs"],
+          "не репозиторий -> обход диска")
+
+    try? fm.removeItem(at: repo)
+    try? fm.removeItem(at: plain)
+} else {
+    print("  git не найден — проверки со списком файлов от git пропущены")
+}
 
 // ─────────────────────────── Индекс типов ───────────────────────────
 section("Индекс типов")
