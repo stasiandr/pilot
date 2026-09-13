@@ -109,6 +109,15 @@ final class Workspace: ObservableObject {
         findRequest = FindRequest(seq: findCounter, action: action)
     }
 
+    /// ⌘. — меню действий у курсора; номер запроса, как у reveal.
+    @Published private(set) var contextActionsRequest = 0
+
+    func showContextActions() {
+        guard buffer != nil else { return }
+        isPaletteOpen = false
+        contextActionsRequest += 1
+    }
+
     /// Курсор в открытом документе: позиция, объявление под ним, вхождения.
     /// Не @Published — см. EditorCaret.
     let caret = EditorCaret()

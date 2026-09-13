@@ -300,14 +300,6 @@ final class CodeTextView: NSTextView {
         onCommentLine?(index)
     }
 
-    /// ⌘. — меню действий у курсора. Приходит из меню приложения по цепочке
-    /// ответчиков: без фокуса в тексте показывать его негде.
-    var onContextActions: (() -> Void)?
-
-    @objc func showContextActions(_ sender: Any?) {
-        onContextActions?()
-    }
-
     // MARK: Правила ввода
 
     /// Задаются при показе буфера: у каждого файла свои.
@@ -606,9 +598,6 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         }
         textView.onCompletionRequest = { [weak self] in
             self?.requestCompletion(trigger: nil, manual: true)
-        }
-        textView.onContextActions = { [weak self] in
-            self?.presentContextActions()
         }
 
         scrollView.contentView = CodeClipView()
@@ -1081,15 +1070,20 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         }
 
         // Меню, открытое с клавиатуры, встаёт без выделения — и Return
-        // ничего не делает. Стрелка вниз в очереди выделит первый пункт.
-        if let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-                                       timestamp: ProcessInfo.processInfo.systemUptime,
-                                       windowNumber: window.windowNumber, context: nil,
-                                       characters: KeyShortcut(NSDownArrowFunctionKey, []).key,
-                                       charactersIgnoringModifiers: KeyShortcut(NSDownArrowFunctionKey, []).key,
-                                       isARepeat: false, keyCode: 125) {
+        // ничего не делает. Стрелка вниз выделяет первый пункт; шлём её,
+        // когда меню уже ведёт клавиатуру, — иначе её может забрать текст.
+        let arrow = KeyShortcut(NSDownArrowFunctionKey, []).key
+        let windowNumber = window.windowNumber
+        let tracking = NotificationCenter.default.addObserver(
+            forName: NSMenu.didBeginTrackingNotification, object: menu, queue: nil) { _ in
+            guard let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                              timestamp: ProcessInfo.processInfo.systemUptime,
+                                              windowNumber: windowNumber, context: nil, characters: arrow,
+                                              charactersIgnoringModifiers: arrow, isARepeat: false,
+                                              keyCode: 125) else { return }
             NSApp.postEvent(down, atStart: false)
         }
+        defer { NotificationCenter.default.removeObserver(tracking) }
         // Вьюха перевёрнутая: maxY — низ строки.
         menu.popUp(positioning: nil, at: NSPoint(x: rect.minX, y: rect.maxY + 2), in: textView)
     }
@@ -1822,6 +1816,8 @@ struct CodeView: NSViewControllerRepresentable {
     var conflictAction: Workspace.ConflictActionRequest? = nil
     let focusRequest: Int
     var findRequest: Workspace.FindRequest? = nil
+    /// ⌘. — номер запроса меню действий у курсора.
+    var contextActionsRequest = 0
     let completionTriggers: [String]
     /// Смысловые украшения и их версия: сменилась — перекрашиваем.
     var decorator: CodeDecorator? = nil
@@ -1959,6 +1955,16 @@ struct CodeView: NSViewControllerRepresentable {
             context.coordinator.appliedFind = findRequest.seq
             DispatchQueue.main.async { controller.performFind(findRequest.action) }
         }
+
+        // Меню модальное — не изнутри обновления вью. Фокус мог быть
+        // в дереве или палитре: меню всё равно о тексте, отдаём фокус ему.
+        if contextActionsRequest != context.coordinator.appliedContextActions {
+            context.coordinator.appliedContextActions = contextActionsRequest
+            DispatchQueue.main.async {
+                controller.focusText()
+                controller.presentContextActions()
+            }
+        }
     }
 
     /// Дешёвая подпись набора вхождений: сравнивать массивы целиком
@@ -1985,6 +1991,7 @@ struct CodeView: NSViewControllerRepresentable {
         // Редактор пересоздан (после экрана «нет файла») — старый ⌘F
         // не должен открыть панель поиска сам по себе.
         coordinator.appliedFind = findRequest?.seq ?? 0
+        coordinator.appliedContextActions = contextActionsRequest
         return coordinator
     }
 
@@ -2007,6 +2014,7 @@ struct CodeView: NSViewControllerRepresentable {
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
         var appliedFind = 0
+        var appliedContextActions = 0
         var decorationsVersion = 0
         var semanticsVersion = -1
         var appliedEdit = -1
