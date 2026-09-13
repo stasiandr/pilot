@@ -56,6 +56,10 @@ final class Workspace: ObservableObject {
     @Published private(set) var editorFocusRequest = 0
 
     func focusEditor() { editorFocusRequest += 1 }
+    /// То же для поля фильтра внизу навигатора.
+    @Published private(set) var navigatorFilterFocusRequest = 0
+
+    func focusNavigatorFilter() { navigatorFilterFocusRequest += 1 }
 
     /// Позиция курсора в открытом документе — отсюда берутся запросы к LSP.
     @Published private(set) var caretOffset: Int = 0
