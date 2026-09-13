@@ -11,6 +11,11 @@ struct RootView: View {
     @State private var paletteSpace: CGSize = .zero
     /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
+    /// Что показывает сплит прямо сейчас. Не вычисляется из `showsSidebar`:
+    /// @AppStorage отдаёт новое значение не сразу, и сплит в том же кадре
+    /// читал старое — панель возвращалась на место и потом появлялась
+    /// рывком, без анимации. @State меняется синхронно и в той же транзакции.
+    @State private var sidebarVisibility: NavigationSplitViewVisibility = .detailOnly
     /// Инспектор Unity справа. Появляется только у сцен, префабов и ассетов.
     @AppStorage("pilot.showsInspector") private var showsInspector = true
 
@@ -35,7 +40,20 @@ struct RootView: View {
         .onAppear {
             doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
             tabSwitch = TabSwitchMonitor(workspace: workspace)
+            syncSidebar(animated: false)
         }
+        // Открыли или закрыли проект — панель встаёт как была, без анимации.
+        .onChange(of: workspace.root) { _, _ in syncSidebar(animated: false) }
+        // ⌃⌘S из меню меняет настройку — панель выезжает так же, как по кнопке.
+        .onChange(of: showsSidebar) { _, _ in syncSidebar(animated: true) }
+    }
+
+    private func syncSidebar(animated: Bool) {
+        let visibility: NavigationSplitViewVisibility = showsSidebar && workspace.root != nil ? .all : .detailOnly
+        guard sidebarVisibility != visibility else { return }
+        var transaction = Transaction(animation: animated ? .default : nil)
+        transaction.disablesAnimations = !animated
+        withTransaction(transaction) { sidebarVisibility = visibility }
     }
 
     private var hasUnityObjects: Bool { workspace.document?.unityFile != nil }
@@ -51,8 +69,12 @@ struct RootView: View {
     /// но выбор пользователя не трогаем: откроется проект — вернётся.
     private var columnVisibility: Binding<NavigationSplitViewVisibility> {
         Binding(
-            get: { showsSidebar && workspace.root != nil ? .all : .detailOnly },
-            set: { if workspace.root != nil { showsSidebar = $0 != .detailOnly } })
+            get: { sidebarVisibility },
+            set: { visibility in
+                guard workspace.root != nil else { return }
+                sidebarVisibility = visibility
+                showsSidebar = visibility != .detailOnly
+            })
     }
 
     // MARK: - Редактор
