@@ -33,6 +33,9 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
 
     var url: URL { document.url }
     var model: SyntaxModel { document.model }
+    /// Версия файла из коммита (ревью MR): правок в ней не бывает,
+    /// и сохранять её поверх рабочей копии нельзя.
+    var isReadOnly: Bool { document.revision != nil }
 
     init(document: LoadedDocument, fontSize: CGFloat) {
         self.document = document
@@ -112,6 +115,7 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     /// иначе у скрипта после сохранения пропал бы бит исполнения.
     /// Если текст не ложится в исходную кодировку — сохраняем в UTF-8.
     func save() throws {
+        guard !isReadOnly else { return }
         let text = storage.string
         let data = text.data(using: document.encoding) ?? Data(text.utf8)
         let fm = FileManager.default

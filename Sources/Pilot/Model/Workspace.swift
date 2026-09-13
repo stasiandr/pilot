@@ -69,12 +69,13 @@ final class Workspace: ObservableObject {
     // MARK: Навигатор
 
     enum NavigatorTab: Hashable, CaseIterable {
-        case project, outline, recent
+        case project, outline, review, recent
 
         var icon: String {
             switch self {
             case .project: return "folder"
             case .outline: return "list.bullet.indent"
+            case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock"
             }
         }
@@ -83,6 +84,7 @@ final class Workspace: ObservableObject {
             switch self {
             case .project: return "folder.fill"
             case .outline: return "list.bullet.indent"
+            case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock.fill"
             }
         }
@@ -91,6 +93,7 @@ final class Workspace: ObservableObject {
             switch self {
             case .project: return "Проект"
             case .outline: return "Структура файла"
+            case .review:  return "Ревью мерж-реквестов"
             case .recent:  return "Недавние проекты"
             }
         }
@@ -127,7 +130,8 @@ final class Workspace: ObservableObject {
 
     private var unityChanges: AnyCancellable?
     let git = GitService()
-    private var gitObservation: AnyCancellable?
+    let review = ReviewService()
+    private var observations: [AnyCancellable] = []
     private var lspObservation: AnyCancellable?
     private var lspReadyObservation: AnyCancellable?
 
@@ -135,10 +139,11 @@ final class Workspace: ObservableObject {
         unity.onAssetsReady = { [weak self] in self?.unityAssetsReady() }
         // Статус-строка и меню смотрят на воркспейс — пусть видят и Unity.
         unityChanges = unity.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
-        // Статус-строка и полоски у номеров строк читают git через workspace:
-        // его изменения должны перерисовывать то же, что и наши.
-        gitObservation = git.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+        // Статус-строка, полоски у номеров строк и панель ревью читают git
+        // и GitLab через workspace: их изменения должны перерисовывать то же,
+        // что и наши.
+        for publisher in [git.objectWillChange, review.objectWillChange] {
+            observations.append(publisher.sink { [weak self] _ in self?.objectWillChange.send() })
         }
         git.onStatusChange = { [weak self] in self?.gitStatusChanged() }
         // То же с языковым сервером: без этого фишка в статус-строке и пункты
@@ -151,6 +156,22 @@ final class Workspace: ObservableObject {
             // Издатель срабатывает до записи нового значения — ждём её.
             Task { @MainActor in self?.languageServerBecameReady() }
         }
+    }
+
+    /// Окно у строки: удалённое, треды, новый комментарий. Номер запроса —
+    /// по той же причине, что и у reveal: повторный клик по той же строке.
+    struct LinePopoverRequest: Equatable {
+        var seq: Int
+        var line: Int
+        /// Сразу с полем для нового комментария.
+        var compose: Bool
+    }
+    @Published private(set) var linePopover: LinePopoverRequest?
+    private var popoverCounter = 0
+
+    func requestLinePopover(line: Int, compose: Bool) {
+        popoverCounter += 1
+        linePopover = LinePopoverRequest(seq: popoverCounter, line: line, compose: compose)
     }
 
     private var index: FileIndex?
@@ -245,6 +266,7 @@ final class Workspace: ObservableObject {
         languageServerProven = false
         lsp.workspaceChanged(to: url)
         git.workspaceChanged(to: url)
+        review.workspaceChanged(to: url)
         unity.workspaceChanged(to: url)
         requestedFile = nil
         let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
@@ -376,6 +398,7 @@ final class Workspace: ObservableObject {
         languageServerProven = false
         lsp.workspaceChanged(to: nil)
         git.workspaceChanged(to: nil)
+        review.workspaceChanged(to: nil)
         unity.workspaceChanged(to: nil)
         requestedFile = nil
         root = nil
@@ -512,8 +535,8 @@ final class Workspace: ObservableObject {
 
     /// Следующий/предыдущий изменённый блок; по кругу, как и вхождения.
     func jumpToChange(_ direction: Int) {
-        guard let document, !git.lineChanges.isEmpty else { return }
-        let changes = git.lineChanges
+        let changes = editorLineChanges
+        guard let document, !changes.isEmpty else { return }
         let line = document.model.line(containing: caretOffset)
         let target: LineDiff.Change?
         if direction > 0 {
@@ -933,7 +956,9 @@ final class Workspace: ObservableObject {
             return
         }
 
-        guard lsp.isReady else {
+        // Файл из MR сервер не видел: у него на руках рабочая копия, и его
+        // позиции указали бы не туда. Для версии MR — только свой навигатор.
+        guard lsp.isReady, document.revision == nil else {
             jumpToLocalDeclaration(at: offset, in: document)
             return
         }
@@ -1159,15 +1184,39 @@ final class Workspace: ObservableObject {
             let result = Result { try LoadedDocument.load(url: url, unity: unityContext) }
             Task { @MainActor in
                 guard counter.isCurrent(generation) else { return }
-                switch result {
-                case .success(let doc):
-                    self.activate(TextBuffer(document: doc, fontSize: self.fontSize), reveal: reveal)
-                case .failure(let error):
-                    self.setBuffer(nil)
-                    self.loadError = error.localizedDescription
-                    self.git.documentOpened(nil)
-                }
+                self.present(result, reveal: reveal)
             }
+        }
+    }
+
+    /// Файл в версии MR: текст берётся из коммита, а не с диска.
+    func open(reviewFile file: ReviewFile, reveal: LSPRange? = nil) {
+        isPaletteOpen = false
+        loadError = nil
+        let generation = loadGeneration.bump()
+        let counter = loadGeneration
+
+        Task { [weak self] in
+            guard let self else { return }
+            let result: Result<LoadedDocument, Error>
+            do {
+                result = .success(try await self.review.loadDocument(for: file))
+            } catch {
+                result = .failure(error)
+            }
+            guard counter.isCurrent(generation) else { return }
+            self.present(result, reveal: reveal)
+        }
+    }
+
+    private func present(_ result: Result<LoadedDocument, Error>, reveal: LSPRange?) {
+        switch result {
+        case .success(let doc):
+            activate(TextBuffer(document: doc, fontSize: fontSize), reveal: reveal)
+        case .failure(let error):
+            setBuffer(nil)
+            loadError = error.localizedDescription
+            git.documentOpened(nil)
         }
     }
 
@@ -1182,10 +1231,16 @@ final class Workspace: ObservableObject {
         breadcrumb = ""
         currentOutlineItem = nil
         requestReveal(reveal)
-        // Сервер поднимается здесь — лениво, при первом файле
-        // подходящего языка, а не при запуске приложения.
-        lsp.documentOpened(buffer.document)
-        git.documentOpened(buffer.document)
+        if buffer.isReadOnly {
+            // Версия из MR: полоски и треды даёт ревью, а не HEAD. Серверу
+            // её не показываем — у него на руках рабочая копия того же файла.
+            git.documentOpened(nil)
+        } else {
+            // Сервер поднимается здесь — лениво, при первом файле
+            // подходящего языка, а не при запуске приложения.
+            lsp.documentOpened(buffer.document)
+            git.documentOpened(buffer.document)
+        }
     }
 
     /// Смена открытого буфера. Уходящий остаётся в памяти, только если
@@ -1193,7 +1248,7 @@ final class Workspace: ObservableObject {
     private func setBuffer(_ new: TextBuffer?) {
         if let old = buffer, old !== new {
             old.lastCaret = caretOffset
-            if !old.isDirty {
+            if !old.isDirty, !old.isReadOnly {
                 unsaved[old.url] = nil
                 lsp.documentClosed(old.url)
             }
@@ -1347,6 +1402,10 @@ final class Workspace: ObservableObject {
     /// посчитана, должен совпадать с текстом — иначе позиции уже сдвинулись.
     func applyUnityEdits(_ edits: [UnityEdit], actionName: String) {
         guard !edits.isEmpty, let buffer, buffer.document.isSemanticsFresh else { return }
+        guard buffer.document.revision == nil else {
+            showNotice("Это версия файла из мерж-реквеста — она только для чтения")
+            return
+        }
         guard UnityEdits.validate(edits, in: buffer.storage.string as NSString) else {
             showNotice("Текст уже другой — правка не применена")
             return

@@ -115,21 +115,22 @@ enum Git {
 
     /// Изменённые строки текста относительно HEAD. `path` — от корня репозитория.
     /// `tracked == false` — файла в HEAD нет, и blame по нему бессмыслен.
+    /// `old` — текст из HEAD: по нему показывается, что было удалено.
     static func lineChanges(text: String, path: String, repository: URL)
-        -> (changes: [LineDiff.Change], tracked: Bool)? {
+        -> (changes: [LineDiff.Change], tracked: Bool, old: String)? {
         if let head = run(["cat-file", "blob", "HEAD:\(path)"], in: repository), head.status == 0 {
             // Декодируем так же, как документ при открытии, — иначе файл
             // не в UTF-8 целиком загорелся бы изменённым.
             let old = String(data: head.stdout, encoding: .utf8)
                 ?? String(data: head.stdout, encoding: .isoLatin1) ?? ""
-            return (LineDiff.changes(old: old, new: text), true)
+            return (LineDiff.changes(old: old, new: text), true, old)
         }
         // В HEAD файла нет: он либо новый, либо игнорируемый. Код 0 —
         // игнорируется, 1 — нет; всё прочее — git сломан, молчим.
         guard let ignored = run(["check-ignore", "-q", "--", path], in: repository) else { return nil }
         switch ignored.status {
-        case 0:  return ([], false)
-        case 1:  return (LineDiff.changes(old: "", new: text), false)
+        case 0:  return ([], false, "")
+        case 1:  return (LineDiff.changes(old: "", new: text), false, "")
         default: return nil
         }
     }

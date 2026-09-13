@@ -1428,12 +1428,20 @@ check(doubleShift([("s", 0), ("0", 0.08), ("s", 0.2), ("0", 0.28),
 // ─────────────────────────── Git: диф строк ───────────────────────────
 section("Git: диф строк")
 
+/// Старые диапазоны сверяются отдельно ниже — здесь только вид и новые строки.
+func shape(_ changes: [LineDiff.Change]) -> [LineDiff.Change] {
+    changes.map { LineDiff.Change(kind: $0.kind, lines: $0.lines) }
+}
 func diff(_ old: String, _ new: String, maxEdits: Int = LineDiff.maxEdits) -> [LineDiff.Change] {
-    LineDiff.changes(old: old, new: new, maxEdits: maxEdits)
+    shape(LineDiff.changes(old: old, new: new, maxEdits: maxEdits))
 }
 func ch(_ kind: LineDiff.Kind, _ lines: Range<Int>) -> LineDiff.Change {
     LineDiff.Change(kind: kind, lines: lines)
 }
+
+let withOld = LineDiff.changes(old: "1\n2\n3\n4\n5\n6\n7\n", new: "1\nX\n3\n4\n5\n7\nY\n")
+check(withOld.map(\.oldLines) == [1..<2, 5..<6, 7..<7],
+      "старые строки блоков: заменённая, удалённая, пусто у добавленной (получено \(withOld.map(\.oldLines)))")
 
 check(diff("a\nb\nc\n", "a\nb\nc\n").isEmpty, "одинаковые тексты -> изменений нет")
 check(diff("a\nc\n", "a\nb\nc\n") == [ch(.added, 1..<2)], "вставка строки -> added")
@@ -1602,11 +1610,12 @@ if Git.executable == nil {
     let edited = "one\nTWO\nthree\nfour\n"
     let tracked = Git.lineChanges(text: edited, path: "src/app.txt", repository: repo)
     check(tracked?.tracked == true, "файл в HEAD есть")
-    check(tracked?.changes == [ch(.modified, 1..<2), ch(.added, 3..<4)],
+    check(tracked.map { shape($0.changes) } == [ch(.modified, 1..<2), ch(.added, 3..<4)],
           "полоски против HEAD (получено \(String(describing: tracked?.changes)))")
 
     let fresh = Git.lineChanges(text: "fresh\n", path: "src/new.txt", repository: repo)
-    check(fresh?.tracked == false && fresh?.changes == [ch(.added, 0..<1)], "новый файл — весь добавлен")
+    check(fresh?.tracked == false && fresh.map { shape($0.changes) } == [ch(.added, 0..<1)],
+          "новый файл — весь добавлен")
     let ignoredFile = Git.lineChanges(text: "noise\n", path: "debug.log", repository: repo)
     check(ignoredFile?.tracked == false && ignoredFile?.changes.isEmpty == true, "игнорируемый файл — без полосок")
 
@@ -1616,6 +1625,119 @@ if Git.executable == nil {
     check(liveBlame?.commit(atLine: 1)?.isUncommitted == true, "blame: изменённая строка не закоммичена")
     check(liveBlame?.commit(atLine: 3)?.isUncommitted == true, "blame: дописанная строка не закоммичена")
 }
+
+
+// ─────────────────────────── GitLab: remote ───────────────────────────
+section("GitLab: remote")
+
+let scpRemote = GitLabRemote.parse("git@gitlab.com:stasiandr/dacha-simulator.git")
+check(scpRemote == GitLabRemote(host: "gitlab.com", projectPath: "stasiandr/dacha-simulator"), "scp-форма")
+check(GitLabRemote.parse("ssh://git@gitlab.example.com:2222/group/sub/app.git")
+        == GitLabRemote(host: "gitlab.example.com", projectPath: "group/sub/app"), "ssh:// с портом и подгруппой")
+check(GitLabRemote.parse("https://oauth2:secret@GitLab.com/group/app/")
+        == GitLabRemote(host: "gitlab.com", projectPath: "group/app"), "https с логином, регистр хоста, хвостовой слеш")
+check(GitLabRemote.parse("/Users/me/repos/app.git") == nil, "локальный путь — не GitLab")
+check(GitLabRemote.parse("git@gitlab.com:app.git") == nil, "без владельца — не проект")
+check(scpRemote?.encodedProject == "stasiandr%2Fdacha-simulator", "слеш в пути проекта кодируется для API")
+
+
+// ─────────────────────────── GitLab: дифф MR ───────────────────────────
+section("GitLab: дифф MR")
+
+// Старый файл: a b c d e f g h i j (строки 1–10).
+// Новый:       a b C d e X f g h Y j  — c→C, вставлен X, удалена i→Y заменена.
+let mrDiffText = """
+@@ -1,6 +1,7 @@
+ a
+ b
+-c
++C
+ d
+ e
++X
+ f
+@@ -7,4 +8,4 @@ fn context
+ g
+ h
+-i
++Y
+ j
+\\ No newline at end of file
+"""
+let mrDiff = UnifiedDiff.parse(mrDiffText)
+check(mrDiff.blocks.map(\.kind) == [.modified, .added, .modified],
+      "виды блоков (получено \(mrDiff.blocks.map(\.kind)))")
+check(mrDiff.blocks.map(\.newLines) == [2..<3, 5..<6, 9..<10],
+      "новые строки блоков (получено \(mrDiff.blocks.map(\.newLines)))")
+check(mrDiff.blocks.map(\.oldLines) == [2..<3, 5..<5, 8..<9],
+      "старые строки блоков (получено \(mrDiff.blocks.map(\.oldLines)))")
+check(mrDiff.blocks.first?.removed == ["c"], "текст удалённой строки сохраняется")
+check(mrDiff.additions == 3 && mrDiff.deletions == 2, "+3 −2")
+check(mrDiff.hunks == [0..<7, 7..<11], "видимые в диффе строки (получено \(mrDiff.hunks))")
+
+check(mrDiff.oldLine(forNewLine: 0) == 0, "неизменённая строка до правок — тот же номер")
+check(mrDiff.oldLine(forNewLine: 2) == nil, "изменённая строка старого номера не имеет")
+check(mrDiff.oldLine(forNewLine: 6) == 5, "после вставки X новая f(6) — старая f(5)")
+check(mrDiff.oldLine(forNewLine: 10) == 9, "последняя строка j")
+check(mrDiff.newLine(forOldLine: 5) == 6, "старая f показывается на новом месте")
+check(mrDiff.newLine(forOldLine: 8) == 9, "удалённая i показывается у заменившего блока")
+
+let mrComment = mrDiff.commentLines(forNewLine: 6)
+check(mrComment.old == 6 && mrComment.new == 7, "комментарий к неизменённой строке — обе стороны, с единицы")
+check(mrDiff.commentLines(forNewLine: 5).old == nil, "к добавленной — только новая сторона")
+check(mrDiff.displayLine(for: GLPosition(oldLine: 9, newLine: nil)) == 9, "тред на удалённой строке")
+check(mrDiff.displayLine(for: GLPosition(oldLine: 6, newLine: 7)) == 6, "тред на неизменённой строке")
+
+let newFileDiff = UnifiedDiff.parse("@@ -0,0 +1,3 @@\n+x\n+y\n+z\n")
+check(newFileDiff.blocks == [UnifiedDiff.Block(kind: .added, newLines: 0..<3, oldLines: 0..<0, removed: [])],
+      "новый файл — один добавленный блок")
+let deletedFileDiff = UnifiedDiff.parse("@@ -1,2 +0,0 @@\n-x\n-y\n")
+check(deletedFileDiff.blocks.first?.removed == ["x", "y"] && deletedFileDiff.blocks.first?.kind == .deleted,
+      "удалённый файл — все строки в removed")
+check(UnifiedDiff.parse("").blocks.isEmpty, "пустой дифф (too_large) — без блоков")
+
+
+// ─────────────────────────── GitLab: JSON ───────────────────────────
+section("GitLab: JSON")
+
+let mrJSON = """
+{"id": 1, "iid": 42, "title": "Ревью", "description": null, "state": "opened", "draft": true,
+ "author": {"id": 7, "username": "ada", "name": "Ada", "avatar_url": "x"},
+ "reviewers": [{"id": 8, "username": "stas", "name": "Stas"}],
+ "source_branch": "feature", "target_branch": "main",
+ "web_url": "https://gitlab.com/g/p/-/merge_requests/42", "sha": "abc",
+ "updated_at": "2026-09-12T10:01:06.027Z", "user_notes_count": 3,
+ "diff_refs": {"base_sha": "b", "head_sha": "h", "start_sha": "s"}, "unknown_field": [1, 2]}
+"""
+let decodedMR = try? GitLabJSON.decoder.decode(GLMergeRequest.self, from: Data(mrJSON.utf8))
+check(decodedMR?.iid == 42 && decodedMR?.isDraft == true && decodedMR?.reference == "!42", "MR: iid, черновик")
+check(decodedMR?.diffRefs == GLDiffRefs(baseSha: "b", headSha: "h", startSha: "s"), "MR: diff_refs")
+check(decodedMR?.updatedAt != nil, "MR: дата с долями секунды")
+check(decodedMR?.reviewers?.first?.username == "stas", "MR: ревьюеры")
+
+let discussionsJSON = """
+[{"id": "d1", "individual_note": false, "notes": [
+   {"id": 10, "type": "DiffNote", "body": "Почему так?", "system": false, "resolvable": true, "resolved": false,
+    "created_at": "2026-09-12T10:00:00Z", "author": {"id": 8, "username": "stas", "name": "Stas"},
+    "position": {"base_sha": "b", "start_sha": "s", "head_sha": "h", "old_path": "a.swift", "new_path": "a.swift",
+                 "position_type": "text", "old_line": null, "new_line": 12}},
+   {"id": 11, "type": "DiffNote", "body": "Так надо", "system": false, "resolvable": true, "resolved": true,
+    "author": {"id": 7, "username": "ada", "name": "Ada"}}]},
+ {"id": "d2", "individual_note": true, "notes": [
+   {"id": 12, "type": null, "body": "added 1 commit", "system": true, "author": {"id": 7, "username": "ada", "name": "Ada"}}]}]
+"""
+let discussions = (try? GitLabJSON.decoder.decode([GLDiscussion].self, from: Data(discussionsJSON.utf8))) ?? []
+check(discussions.count == 2, "треды декодируются (получено \(discussions.count))")
+check(discussions.first?.position?.newLine == 12 && discussions.first?.position?.oldLine == nil,
+      "позиция DiffNote: только новая строка")
+check(discussions.first?.isResolvable == true && discussions.first?.isResolved == false,
+      "тред решён, только если решены все его заметки")
+check(discussions.last?.isSystem == true, "системная заметка — не тред для ревью")
+
+let approvalsJSON = #"{"approved": false, "approvals_left": 1, "approved_by": [{"user": {"id": 8, "username": "stas", "name": "Stas"}}]}"#
+let approvals = try? GitLabJSON.decoder.decode(GLApprovals.self, from: Data(approvalsJSON.utf8))
+check(approvals?.isApproved(by: GLUser(id: 8, username: "stas", name: "Stas")) == true, "апрув от меня виден")
+check(approvals?.isApproved(by: GLUser(id: 9, username: "bob", name: "Bob")) == false, "чужой апрув — не мой")
 
 
 // ────────────────────────── Режимы палитры ──────────────────────────

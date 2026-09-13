@@ -34,7 +34,8 @@ struct UnityInspectorView: View {
                 }
                 // Текст правили, а разбор ещё не догнал: позиции полей
                 // устарели, писать по ним нельзя. Это доли секунды.
-                .disabled(!document.isSemanticsFresh)
+                // Версия файла из мерж-реквеста — только для чтения.
+                .disabled(!document.isSemanticsFresh || document.revision != nil)
                 .overlay(alignment: .topTrailing) {
                     if !document.isSemanticsFresh {
                         ProgressView().controlSize(.mini).padding(6)

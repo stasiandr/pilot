@@ -113,6 +113,25 @@ struct PilotApp: App {
                 Button("Предыдущее изменение") { workspace.jumpToChange(-1) }
                     .keyboardShortcut(.upArrow, modifiers: [.control, .option])
                 Divider()
+                Button("Ревью мерж-реквестов") { workspace.navigatorTab = .review }
+                    .keyboardShortcut("r", modifiers: [.command, .option])
+                    .disabled(workspace.root == nil)
+                Button("Комментировать строку…") { workspace.commentOnCaretLine() }
+                    .keyboardShortcut("c", modifiers: [.command, .option])
+                    .disabled(!workspace.isReviewDocument)
+                Button("Следующий тред") { workspace.jumpToThread(1) }
+                    .keyboardShortcut("]", modifiers: [.command, .option])
+                    .disabled(!workspace.isReviewDocument)
+                Button("Предыдущий тред") { workspace.jumpToThread(-1) }
+                    .keyboardShortcut("[", modifiers: [.command, .option])
+                    .disabled(!workspace.isReviewDocument)
+                Button("Следующий файл MR") { workspace.openAdjacentReviewFile(1) }
+                    .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+                    .disabled(workspace.review.active == nil)
+                Button("Предыдущий файл MR") { workspace.openAdjacentReviewFile(-1) }
+                    .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                    .disabled(workspace.review.active == nil)
+                Divider()
                 // Не требует LSP: пока сервер не готов, отвечает быстрый
                 // навигатор по индексу объявлений проекта.
                 Button("Перейти к объявлению") {

@@ -20,6 +20,22 @@ final class GitService: ObservableObject {
     @Published private(set) var lineChanges: [LineDiff.Change] = []
     /// Авторство строк открытого файла. Считается с задержкой и дольше всего.
     @Published private(set) var blame: GitBlame?
+    /// Текст открытого файла в HEAD — чтобы показать, что было удалено.
+    private var headText = ""
+    private var headLines: [String]?
+
+    /// Строки из HEAD, которые заменил блок изменений на строке `line`.
+    func removedLines(at line: Int) -> [String]? {
+        guard let change = lineChanges.first(where: { $0.lines.contains(line) })
+                ?? lineChanges.first(where: { $0.lines.isEmpty && $0.lines.lowerBound == line }),
+              !change.oldLines.isEmpty else { return nil }
+        if headLines == nil {
+            headLines = headText.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.hasSuffix("\r") ? String($0.dropLast()) : String($0) }
+        }
+        guard let lines = headLines, change.oldLines.upperBound <= lines.count else { return nil }
+        return Array(lines[change.oldLines])
+    }
 
     /// Статус обновился — палитре пора перерисовать буквы.
     var onStatusChange: (() -> Void)?
@@ -99,6 +115,8 @@ final class GitService: ObservableObject {
         self.document = document
         lineChanges = []
         blame = nil
+        headText = ""
+        headLines = nil
         recomputeDocument()
     }
 
@@ -129,6 +147,8 @@ final class GitService: ObservableObject {
                   let result = Git.lineChanges(text: text, path: path, repository: repo) else { return }
             Task { @MainActor in
                 guard let self, counter.isCurrent(generation) else { return }
+                self.headText = result.old
+                self.headLines = nil
                 if self.lineChanges != result.changes { self.lineChanges = result.changes }
                 if result.tracked {
                     self.scheduleBlame(text: text, path: path, repository: repo,
