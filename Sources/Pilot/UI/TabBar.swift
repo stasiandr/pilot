@@ -3,7 +3,9 @@ import AppKit
 import UniformTypeIdentifiers
 
 /// Вкладки открытых файлов над jump bar, как в Xcode. Клик — перейти,
-/// крестик или ⌘W — закрыть, перетаскиванием меняется порядок.
+/// крестик или ⌘W — закрыть, ⌥ с крестиком — закрыть все остальные,
+/// как в Safari; перетаскиванием меняется порядок.
+/// Временная вкладка — курсивом, как в Rider; двойной клик её оставляет.
 struct TabBar: View {
     @ObservedObject var workspace: Workspace
     /// Вкладка, которую сейчас тащат.
@@ -24,8 +26,16 @@ struct TabBar: View {
                                 detail: details[index],
                                 isActive: tab.tabID == active,
                                 isDirty: tab.isDirty,
+                                isPreview: tab === workspace.previewTab,
                                 onSelect: { workspace.selectTab(tab) },
-                                onClose: { workspace.closeTab(tab) })
+                                onKeepOpen: { workspace.keepTabOpen(tab) },
+                                onClose: {
+                                    if NSEvent.modifierFlags.contains(.option) {
+                                        workspace.closeOtherTabs(tab)
+                                    } else {
+                                        workspace.closeTab(tab)
+                                    }
+                                })
                             .contextMenu { menu(for: tab, at: index, path: paths[index]) }
                             .onDrag {
                                 dragged = tab
@@ -58,6 +68,10 @@ struct TabBar: View {
 
     @ViewBuilder
     private func menu(for tab: TextBuffer, at index: Int, path: String) -> some View {
+        if tab === workspace.previewTab {
+            Button("Оставить вкладку открытой") { workspace.keepTabOpen(tab) }
+            Divider()
+        }
         Button("Закрыть вкладку") { workspace.closeTab(tab) }
         Button("Закрыть другие вкладки") { workspace.closeOtherTabs(tab) }
             .disabled(workspace.tabs.count < 2)
@@ -80,7 +94,10 @@ private struct TabItem: View {
     let detail: String?
     let isActive: Bool
     let isDirty: Bool
+    /// Временная: займёт место следующий файл, открытый кликом в дереве.
+    let isPreview: Bool
     let onSelect: () -> Void
+    let onKeepOpen: () -> Void
     let onClose: () -> Void
 
     @State private var hovering = false
@@ -97,6 +114,7 @@ private struct TabItem: View {
                 .accessibilityHidden(true)
             Text(Tabs.shortened(name))
                 .font(.system(size: 12, weight: isActive ? .medium : .regular))
+                .italic(isPreview)
                 .foregroundStyle(isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
             if let detail {
                 Text(Tabs.shortened(detail, limit: 28))
@@ -119,11 +137,16 @@ private struct TabItem: View {
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(background))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .onTapGesture(perform: onSelect)
-        .help(path)
+        // Не onTapGesture(count: 2): с ним одиночный клик ждал бы, не будет ли
+        // второго, и вкладки переключались бы с задержкой.
+        .onTapGesture {
+            onSelect()
+            if isPreview, (NSApp.currentEvent?.clickCount ?? 1) >= 2 { onKeepOpen() }
+        }
+        .help(isPreview ? path + "\nВременная вкладка — двойной клик оставит её открытой" : path)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
-        .accessibilityLabel(name + (isDirty ? ", не сохранено" : ""))
+        .accessibilityLabel(name + (isPreview ? ", временная" : "") + (isDirty ? ", не сохранено" : ""))
     }
 
     private var background: Color {
@@ -146,7 +169,7 @@ private struct TabItem: View {
                 }
                 .buttonStyle(.plain)
                 .onHover { hoveringClose = $0 }
-                .help("Закрыть вкладку (⌘W)")
+                .help("Закрыть вкладку (⌘W)\nС ⌥ — закрыть все остальные")
             } else if isDirty {
                 Circle()
                     .fill(.secondary)

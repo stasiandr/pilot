@@ -27,7 +27,9 @@ struct FileTreeView: NSViewRepresentable {
     var hierarchy: UnityHierarchy? = nil
     /// GameObject или вложенный префаб под курсором.
     var selectedObject: Int64? = nil
-    let onOpen: (_ relPath: String, _ focusEditor: Bool) -> Void
+    /// `preview` — во временную вкладку, фокус остаётся в дереве;
+    /// иначе — в обычную, и фокус уходит в текст.
+    let onOpen: (_ relPath: String, _ preview: Bool) -> Void
     var onSelectObject: (_ fileID: Int64, _ focusEditor: Bool) -> Void = { _, _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -358,8 +360,9 @@ struct FileTreeView: NSViewRepresentable {
         // MARK: Действия
 
         /// Клик по папке раскрывает её — стрелочка слишком мелкая мишень.
-        /// Файл по клику только выделяется: открывается двойным кликом.
-        /// Объект иерархии клик выбирает — инспектор сразу на нём.
+        /// Файл по клику открывается во временной вкладке, как в Rider:
+        /// следующий такой клик займёт её же. Объект иерархии клик
+        /// выбирает — инспектор сразу на нём.
         @objc func rowClicked(_ sender: NSOutlineView) {
             let row = sender.clickedRow
             guard row >= 0 else { return }
@@ -367,7 +370,11 @@ struct FileTreeView: NSViewRepresentable {
                 select(item, focusEditor: false)
                 return
             }
-            guard let node = sender.item(atRow: row) as? FileTree.Node, node.isDirectory else { return }
+            guard let node = sender.item(atRow: row) as? FileTree.Node else { return }
+            guard node.isDirectory else {
+                open(node, preview: true)
+                return
+            }
             if sender.isItemExpanded(node) {
                 sender.animator().collapseItem(node)
             } else {
@@ -375,7 +382,8 @@ struct FileTreeView: NSViewRepresentable {
             }
         }
 
-        /// Двойной клик по файлу открывает его и уводит в текст, как Return.
+        /// Двойной клик по файлу оставляет его открытым насовсем и уводит
+        /// в текст, как Return.
         /// Папку первый клик уже раскрыл — второй её не трогает. Объект
         /// иерархии первый клик выбрал — второй его раскрывает.
         @objc func rowDoubleClicked(_ sender: NSOutlineView) {
@@ -391,7 +399,7 @@ struct FileTreeView: NSViewRepresentable {
                 return
             }
             guard let node = sender.item(atRow: row) as? FileTree.Node, !node.isDirectory else { return }
-            open(node, focusEditor: true)
+            open(node, preview: false)
         }
 
         /// Return: папку раскрыть, файл открыть и уйти в текст.
@@ -405,11 +413,11 @@ struct FileTreeView: NSViewRepresentable {
             if node.isDirectory {
                 if outline.isItemExpanded(node) { outline.collapseItem(node) } else { outline.expandItem(node) }
             } else {
-                open(node, focusEditor: true)
+                open(node, preview: false)
             }
         }
 
-        private func open(_ node: FileTree.Node, focusEditor: Bool) {
+        private func open(_ node: FileTree.Node, preview: Bool) {
             // Отмечаем заранее: когда документ загрузится, дерево уже
             // выделило эту строку и прыгать никуда не должно.
             if node.relPath != shownSelection {
@@ -417,7 +425,7 @@ struct FileTreeView: NSViewRepresentable {
             }
             shownSelection = node.relPath
             shownObject = nil
-            onOpen?(node.relPath, focusEditor)
+            onOpen?(node.relPath, preview)
         }
 
         private func select(_ item: HierarchyItem, focusEditor: Bool) {
@@ -560,7 +568,7 @@ struct FileTreeView: NSViewRepresentable {
                 } else {
                     collapsedHierarchies.remove(node.relPath)
                     // Раскрыли неоткрытую сцену — открываем, иерархия придёт с разбором.
-                    if node.relPath != hierarchyPath { open(node, focusEditor: false) }
+                    if node.relPath != hierarchyPath { open(node, preview: true) }
                 }
             }
         }

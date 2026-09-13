@@ -1,9 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// Сайдбар в духе навигатора Xcode: ряд вкладок сверху, список посередине,
-/// фильтр снизу. На macOS 26 NavigationSplitView сам делает его плавающей
-/// стеклянной панелью.
+/// Сайдбар в духе навигатора Xcode: вкладки в тулбаре над ним, рядом
+/// с кнопкой панели, список посередине, фильтр снизу. На macOS 26
+/// NavigationSplitView сам делает его плавающей стеклянной панелью.
 struct NavigatorView: View {
     @ObservedObject var workspace: Workspace
     @AppStorage("pilot.showsInspector") private var showsInspector = true
@@ -11,7 +11,9 @@ struct NavigatorView: View {
 
     var body: some View {
         content
-            .pilotEdgeBar(.top) { tabBar }
+            .toolbar {
+                ToolbarItem(placement: .automatic) { tabBar }
+            }
             .pilotEdgeBar(.bottom) {
                 if hasFilter { filterField }
             }
@@ -63,11 +65,12 @@ struct NavigatorView: View {
                          showsHierarchy: workspace.unity.isActive && !filtering,
                          hierarchy: workspace.document?.unityHierarchy,
                          selectedObject: workspace.unityHierarchySelection,
-                         onOpen: { relPath, focusEditor in
+                         onOpen: { relPath, preview in
                              guard let root = workspace.root else { return }
                              workspace.navigate(to: NavTarget(url: root.appendingPathComponent(relPath),
-                                                              range: nil))
-                             if focusEditor { workspace.focusEditor() }
+                                                              range: nil),
+                                                preview: preview)
+                             if !preview { workspace.focusEditor() }
                          },
                          onSelectObject: { fileID, focusEditor in
                              // Выбрали объект — значит, будут его править: нужен инспектор.
@@ -93,8 +96,9 @@ struct NavigatorView: View {
     // MARK: - Вкладки
 
     /// Как в Xcode 26: иконки в ряд, выбранная — в залитом акцентом круге.
+    /// Стоят в строке заголовка: место там всё равно пустует.
     private var tabBar: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 0) {
             ForEach(Workspace.NavigatorTab.allCases, id: \.self) { tab in
                 let selected = workspace.navigatorTab == tab
                 Button {
@@ -104,7 +108,7 @@ struct NavigatorView: View {
                         .symbolRenderingMode(.monochrome)
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-                        .frame(width: 30, height: 26)
+                        .frame(width: 28, height: 26)
                         .background {
                             if selected {
                                 Capsule().fill(Color.accentColor)
@@ -116,10 +120,9 @@ struct NavigatorView: View {
                 .help(tab.title)
                 .accessibilityLabel(tab.title)
             }
-            Spacer()
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        // Без Spacer: в элементе тулбара он выбросил бы весь элемент.
+        .padding(.horizontal, 2)
     }
 
     // MARK: - Фильтр

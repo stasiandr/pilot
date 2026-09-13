@@ -25,6 +25,13 @@ final class Workspace: ObservableObject {
     /// Открытые вкладки, слева направо. У каждой свой буфер: текст, история
     /// отмены, выделение и прокрутка — ушёл на другую и вернулся, всё на месте.
     @Published private(set) var tabs: [TextBuffer] = []
+    /// Временная вкладка, как в Rider: файл, открытый кликом в дереве.
+    /// Следующий такой клик занимает её место; правка, двойной клик
+    /// по файлу или по вкладке оставляют её насовсем. Всегда одна и
+    /// всегда без несохранённых правок.
+    @Published private(set) var previewTab: TextBuffer?
+    /// Файл, который сейчас читается во временную вкладку.
+    private var previewLoad: URL?
     /// Активная вкладка — файл в редакторе. nil — пустой редактор или
     /// файл, который не открылся как текст.
     @Published private(set) var buffer: TextBuffer?
@@ -1153,11 +1160,11 @@ final class Workspace: ObservableObject {
     var canGoForward: Bool { historyIndex >= 0 && historyIndex < history.count - 1 }
 
     /// Переход с записью в историю. Без истории go-to-definition —
-    /// ловушка: провалился и не вернёшься.
-    func navigate(to target: NavTarget) {
+    /// ловушка: провалился и не вернёшься. `preview` — во временную вкладку.
+    func navigate(to target: NavTarget, preview: Bool = false) {
         rememberPosition()
         appendHistory(target)
-        jump(to: target)
+        jump(to: target, preview: preview)
     }
 
     /// Текущая запись истории — там, где курсор сейчас: вернёмся именно сюда.
@@ -1198,12 +1205,13 @@ final class Workspace: ObservableObject {
 
     /// Переход без диапазона — «открыть файл»: уже открытый остаётся,
     /// где был, а не прыгает в начало.
-    private func jump(to target: NavTarget) {
+    private func jump(to target: NavTarget, preview: Bool = false) {
         isPaletteOpen = false
         if document?.url == target.url {
+            if !preview, target.range == nil, let buffer { keepTabOpen(buffer) }
             if let range = target.range { requestReveal(range) }
         } else {
-            open(file: target.url, reveal: target.range)
+            open(file: target.url, reveal: target.range, preview: preview)
         }
     }
 
@@ -1220,11 +1228,21 @@ final class Workspace: ObservableObject {
     ///
     /// Файл, уже открытый во вкладке, не перечитывается: переходим на неё,
     /// а там правки, ⌘Z, выделение и прокрутка.
-    func open(file url: URL, reveal: LSPRange? = nil) {
+    ///
+    /// `preview` — во временную вкладку, на место прежней временной.
+    /// Открыть файл явно (⌘P, двойной клик) — значит оставить его вкладку
+    /// насовсем; переход к месту в файле (⌘B) её временность не трогает.
+    func open(file url: URL, reveal: LSPRange? = nil, preview: Bool = false) {
         isPaletteOpen = false
         requestedFile = url
         let generation = loadGeneration.bump()
+        // Второй клик двойного приходит, пока файл первого ещё читается:
+        // он займёт временную вкладку так же, но уже насовсем. Иначе
+        // исход зависел бы от того, успел ли файл прочитаться между кликами.
+        let replacingPreview = preview || previewLoad == url
+        previewLoad = preview ? url : nil
         if let tab = tab(for: url, revision: nil) {
+            if !preview, reveal == nil { keepTabOpen(tab) }
             activate(tab, reveal: reveal)
             return
         }
@@ -1237,7 +1255,7 @@ final class Workspace: ObservableObject {
             let result = Result { try LoadedDocument.load(url: url, unity: unityContext) }
             Task { @MainActor in
                 guard counter.isCurrent(generation) else { return }
-                self.present(result, reveal: reveal)
+                self.present(result, reveal: reveal, preview: preview, replacingPreview: replacingPreview)
             }
         }
     }
@@ -1247,6 +1265,7 @@ final class Workspace: ObservableObject {
     /// предыдущего, а не открывает новую.
     func open(reviewFile file: ReviewFile, reveal: LSPRange? = nil) {
         isPaletteOpen = false
+        previewLoad = nil
         let generation = loadGeneration.bump()
         if let tab = reviewTab(for: file) {
             activate(tab, reveal: reveal)
@@ -1269,11 +1288,14 @@ final class Workspace: ObservableObject {
     }
 
     private func present(_ result: Result<LoadedDocument, Error>, reveal: LSPRange?,
+                         preview: Bool = false, replacingPreview: Bool = false,
                          replacingReviewTab: Bool = false) {
+        previewLoad = nil
         switch result {
         case .success(let doc):
             // Пока файл читался, его могли открыть другим путём.
             if let existing = tab(for: doc.url, revision: doc.revision) {
+                if !preview, reveal == nil { keepTabOpen(existing) }
                 activate(existing, reveal: reveal)
                 return
             }
@@ -1283,10 +1305,16 @@ final class Workspace: ObservableObject {
                 // Версия из MR правок не знает — терять при замене нечего.
                 discard(current)
                 tabs.insert(buffer, at: index)
+            } else if replacingPreview, let old = previewTab,
+                      let index = tabs.firstIndex(where: { $0 === old }) {
+                // Во временной вкладке правок нет: с первой же она перестаёт быть временной.
+                discard(old)
+                tabs.insert(buffer, at: index)
             } else {
                 let active = self.buffer.flatMap { current in tabs.firstIndex { $0 === current } }
                 tabs.insert(buffer, at: Tabs.insertionIndex(active: active, count: tabs.count))
             }
+            if preview { previewTab = buffer }
             adopt(buffer)
             activate(buffer, reveal: reveal)
             trimTabs()
@@ -1303,6 +1331,14 @@ final class Workspace: ObservableObject {
     func tab(for url: URL, revision: String?) -> TextBuffer? {
         let path = url.standardizedFileURL.path
         return tabs.first { $0.document.revision == revision && $0.url.standardizedFileURL.path == path }
+    }
+
+    /// Временная вкладка остаётся насовсем: двойной клик по ней или по
+    /// файлу в дереве, первая правка.
+    func keepTabOpen(_ tab: TextBuffer) {
+        guard tab === previewTab else { return }
+        previewTab = nil
+        persistTabs()
     }
 
     /// Буфер стал вкладкой: его правки и «грязность» теперь касаются нас.
@@ -1420,6 +1456,7 @@ final class Workspace: ObservableObject {
     /// Вкладка уходит из памяти вместе с правками — спрашивать надо до этого.
     private func discard(_ tab: TextBuffer) {
         tabs.removeAll { $0 === tab }
+        if tab === previewTab { previewTab = nil }
         tab.onEdit = nil
         tab.onDirtyChange = nil
         if !tab.isReadOnly { lsp.documentClosed(tab.url) }
@@ -1494,6 +1531,8 @@ final class Workspace: ObservableObject {
         isRestoringTabs = false
         for tab in tabs where !tab.isReadOnly { lsp.documentClosed(tab.url) }
         tabs = []
+        previewTab = nil
+        previewLoad = nil
         setBuffer(nil)
         updateUnsavedCount()
     }
@@ -1516,9 +1555,11 @@ final class Workspace: ObservableObject {
         guard let root, !isRestoringTabs else { return }
         let files = tabs.filter { !$0.isReadOnly }.map(\.url.path)
         let active = buffer.flatMap { $0.isReadOnly ? nil : $0.url.path } ?? ""
-        let entry: [String: Any] = ["files": files, "active": active]
+        let preview = previewTab?.url.path ?? ""
+        let entry: [String: Any] = ["files": files, "active": active, "preview": preview]
         if let persistedTabs, persistedTabs["files"] as? [String] == files,
-           persistedTabs["active"] as? String == active { return }
+           persistedTabs["active"] as? String == active,
+           persistedTabs["preview"] as? String == preview { return }
         persistedTabs = entry
 
         var all = UserDefaults.standard.dictionary(forKey: Self.tabsKey) ?? [:]
@@ -1538,6 +1579,7 @@ final class Workspace: ObservableObject {
               let files = entry["files"] as? [String], !files.isEmpty else { return }
         persistedTabs = entry
         let active = entry["active"] as? String
+        let preview = entry["preview"] as? String
         let urls = files.map { URL(fileURLWithPath: $0) }
         let activeURL = urls.first { $0.path == active }
 
@@ -1559,14 +1601,14 @@ final class Workspace: ObservableObject {
                 if url == activeURL {
                     Task { @MainActor in
                         guard let self, restoreCounter.isCurrent(restore) else { return }
-                        self.adoptRestored([url], documents: [url: document],
+                        self.adoptRestored([url], documents: [url: document], preview: preview,
                                            activate: loadCounter.isCurrent(load) ? url : nil)
                     }
                 }
             }
             Task { @MainActor in
                 guard let self, restoreCounter.isCurrent(restore) else { return }
-                self.adoptRestored(urls, documents: documents, activate: nil)
+                self.adoptRestored(urls, documents: documents, preview: preview, activate: nil)
                 self.isRestoringTabs = false
                 self.persistTabs()
             }
@@ -1574,8 +1616,10 @@ final class Workspace: ObservableObject {
     }
 
     /// Прочитанные вкладки — в сохранённом порядке, впереди открытых за это
-    /// время. Уже открытый файл второй раз не открывается.
-    private func adoptRestored(_ urls: [URL], documents: [URL: LoadedDocument], activate url: URL?) {
+    /// время. Уже открытый файл второй раз не открывается. Временная
+    /// вкладка остаётся временной, если за это время не появилась другая.
+    private func adoptRestored(_ urls: [URL], documents: [URL: LoadedDocument], preview: String?,
+                               activate url: URL?) {
         var restored: [TextBuffer] = []
         for url in urls {
             if let existing = tab(for: url, revision: nil) {
@@ -1584,6 +1628,7 @@ final class Workspace: ObservableObject {
                 let buffer = TextBuffer(document: document, fontSize: fontSize)
                 adopt(buffer)
                 restored.append(buffer)
+                if url.path == preview, previewTab == nil { previewTab = buffer }
             }
         }
         tabs = restored + tabs.filter { tab in !restored.contains { $0 === tab } }
@@ -1790,6 +1835,8 @@ final class Workspace: ObservableObject {
     }
 
     private func dirtyChanged(_ buffer: TextBuffer) {
+        // Начали править — файл нужен, временной вкладке больше не быть.
+        if buffer.isDirty { keepTabOpen(buffer) }
         // Точка на вкладке — у любой, не только у активной.
         objectWillChange.send()
         updateUnsavedCount()

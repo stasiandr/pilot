@@ -21,8 +21,10 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: columnVisibility) {
+            // Уже 275 — не влезут вкладки навигатора в строке заголовка:
+            // тулбар спрячет их в «»».
             NavigatorView(workspace: workspace)
-                .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 480)
+                .navigationSplitViewColumnWidth(min: 275, ideal: 280, max: 480)
         } detail: {
             detail
                 .inspector(isPresented: inspectorVisibility) {
