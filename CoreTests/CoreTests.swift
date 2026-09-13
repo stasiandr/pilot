@@ -1850,6 +1850,57 @@ let approvals = try? GitLabJSON.decoder.decode(GLApprovals.self, from: Data(appr
 check(approvals?.isApproved(by: GLUser(id: 8, username: "stas", name: "Stas")) == true, "апрув от меня виден")
 check(approvals?.isApproved(by: GLUser(id: 9, username: "bob", name: "Bob")) == false, "чужой апрув — не мой")
 
+// ────────────────────────── Поиск MR ──────────────────────────
+section("GitLab: поиск MR")
+
+func testMR(_ iid: Int, _ title: String, author: String = "ada", reviewer: String? = nil,
+            branch: String = "feature", labels: [String]? = nil) -> GLMergeRequest {
+    GLMergeRequest(id: 1000 + iid, iid: iid, title: title, description: nil, state: "opened", draft: nil,
+                   author: GLUser(id: author.count, username: author, name: author.capitalized),
+                   reviewers: reviewer.map { [GLUser(id: 99, username: $0, name: "Ревьюер")] }, assignees: nil,
+                   sourceBranch: branch, targetBranch: "develop", webUrl: "", sha: nil, updatedAt: nil,
+                   userNotesCount: nil, diffRefs: nil, hasConflicts: nil, labels: labels)
+}
+let searchList = [
+    testMR(10, "Починить загрузку ассетов", branch: "fix/asset-loading"),
+    testMR(11, "Ёлка в меню", author: "bob", reviewer: "stas", labels: ["UI"]),
+    testMR(12, "Рефакторинг сцены", branch: "loading-screen"),
+    testMR(123, "Новый HUD"),
+    testMR(7, "HUD: поправить отступы PROJ-123"),
+]
+func found(_ query: String) -> [Int] { MergeRequestSearch(query).filter(searchList).map(\.iid) }
+
+check(found("") == [10, 11, 12, 123, 7], "пустой запрос — весь список в исходном порядке")
+check(found("загрузку") == [10], "слово из заголовка")
+check(found("ЗАГРУЗКУ ассетов") == [10], "регистр не важен, все слова должны найтись")
+check(found("загрузку сцены").isEmpty, "слова — через И")
+check(found("елка") == [11], "ё и е не различаются")
+check(found("loading") == [10, 12], "по ветке-источнику (получено \(found("loading")))")
+check(found("develop").isEmpty, "целевая ветка не ищется — иначе нашлось бы всё")
+check(found("ui") == [11], "по метке")
+check(found("@st") == [11], "@логин — ревьюер по началу логина")
+check(found("@bob") == [11] && found("@ob").isEmpty, "@логин — автор, только с начала")
+check(found("bob") == [11], "имя автора без @")
+check(found("!123") == [123], "!номер — только этот MR, не PROJ-123 в заголовке")
+check(found("#12") == [12], "#номер — так же")
+check(found("123") == [123, 7], "число: сначала MR с таким номером, потом совпадения в тексте (получено \(found("123")))")
+check(found("hud") == [123, 7], "совпадения в заголовке — в исходном порядке")
+check(found("hud ada") == [123, 7], "слово не из заголовка тоже подходит")
+check(found("загрузку ada") == [10], "смесь заголовка и автора")
+
+let fixSearch = MergeRequestSearch("fix @ada !12 Загрузка")
+check(fixSearch.apiSearch == "fix Загрузка" && fixSearch.apiAuthor == "ada",
+      "в API — слова как ввели, @логин отдельно, !номер не уходит (получено «\(fixSearch.apiSearch)»)")
+check(MergeRequestSearch("!42").iid == 42 && MergeRequestSearch("42").iid == 42, "номер из !42 и 42")
+check(MergeRequestSearch("42 fix").iid == nil, "номер — только когда запрос из одного числа")
+check(!MergeRequestSearch("a").wantsServer && MergeRequestSearch("ab").wantsServer, "GitLab — от двух букв")
+check(MergeRequestSearch("!7").wantsServer && MergeRequestSearch("@x").wantsServer, "номер и автор — сразу")
+check(MergeRequestSearch("   ").isEmpty, "пробелы — пустой запрос")
+
+let labeledJSON = #"{"id": 2, "iid": 5, "title": "t", "state": "merged", "author": {"id": 1, "username": "a", "name": "A"}, "source_branch": "s", "target_branch": "t", "web_url": "", "labels": ["bug", "UI"]}"#
+let labeledMR = try? GitLabJSON.decoder.decode(GLMergeRequest.self, from: Data(labeledJSON.utf8))
+check(labeledMR?.labels == ["bug", "UI"] && labeledMR?.isOpen == false, "MR: метки и состояние")
+
 
 // ────────────────────────── Режимы палитры ──────────────────────────
 section("Режимы палитры")

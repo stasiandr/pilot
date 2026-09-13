@@ -85,8 +85,10 @@ struct MergeRequestList: View {
     private var review: ReviewService { workspace.review }
 
     var body: some View {
+        let listing = review.listing
+        let searching = !review.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty
         List {
-            ForEach(review.sections, id: \.title) { section in
+            ForEach(listing.sections, id: \.title) { section in
                 Section(section.title) {
                     ForEach(section.items) { mr in
                         Button { workspace.openReview(mr) } label: { row(mr) }
@@ -94,7 +96,26 @@ struct MergeRequestList: View {
                     }
                 }
             }
-            if review.mergeRequests.isEmpty {
+            if !listing.found.isEmpty || review.isSearching {
+                Section {
+                    ForEach(listing.found) { mr in
+                        Button { workspace.openReview(mr) } label: { row(mr) }
+                            .buttonStyle(.plain)
+                    }
+                } header: {
+                    HStack(spacing: 6) {
+                        Text("Ещё в GitLab")
+                        if review.isSearching { ProgressView().controlSize(.mini) }
+                    }
+                }
+            }
+            if searching {
+                if listing.isEmpty && !review.isSearching {
+                    Text("Ничего не найдено")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+                }
+            } else if review.mergeRequests.isEmpty {
                 Text("Открытых мерж-реквестов нет")
                     .font(.system(size: 12))
                     .foregroundStyle(.tertiary)
@@ -110,6 +131,7 @@ struct MergeRequestList: View {
     private func row(_ mr: GLMergeRequest) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
+                if !mr.isOpen { StateBadge(state: mr.state) }
                 if mr.isDraft { DraftBadge() }
                 Text(mr.title)
                     .font(.system(size: 13))
@@ -165,6 +187,37 @@ struct DraftBadge: View {
     }
 }
 
+/// Слитый или закрытый MR — такие попадают в список только из поиска.
+struct StateBadge: View {
+    let state: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 9, weight: .semibold))
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(color.opacity(0.2)))
+            .foregroundStyle(color)
+    }
+
+    private var title: String {
+        switch state {
+        case "merged": return "Слит"
+        case "closed": return "Закрыт"
+        case "locked": return "Заблокирован"
+        default:       return state
+        }
+    }
+
+    private var color: Color {
+        switch state {
+        case "merged": return Color(nsColor: Theme.reviewMerged)
+        case "closed": return Color(nsColor: Theme.gitDeleted)
+        default:       return .secondary
+        }
+    }
+}
+
 // MARK: - Открытый MR
 
 struct MergeRequestDetail: View {
@@ -216,6 +269,7 @@ struct MergeRequestDetail: View {
             .foregroundStyle(.secondary)
 
             HStack(alignment: .firstTextBaseline, spacing: 5) {
+                if !mr.isOpen { StateBadge(state: mr.state) }
                 if mr.isDraft { DraftBadge() }
                 Text(mr.title).font(.system(size: 13, weight: .semibold)).lineLimit(3)
             }

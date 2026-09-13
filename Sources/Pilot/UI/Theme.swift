@@ -226,6 +226,8 @@ enum Theme {
     /// Открытый тред ревью — значок у строки. Голубой не спорит ни с одной
     /// из полосок диффа.
     static var reviewThread: NSColor { Macchiato.sky }
+    /// Слитый MR в результатах поиска — лиловым, как принято в GitHub и GitLab.
+    static var reviewMerged: NSColor { Macchiato.mauve }
     /// Конфликт слияния: текущее (HEAD) — зелёным, входящее — синим,
     /// общий предок — серым, строки маркеров — персиковым, как буква U.
     static var conflictCurrent: NSColor { Macchiato.green.withAlphaComponent(0.10) }

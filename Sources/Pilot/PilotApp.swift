@@ -113,7 +113,7 @@ struct PilotApp: App {
                 Button("Предыдущее изменение") { workspace.jumpToChange(-1) }
                     .keyboardShortcut(.upArrow, modifiers: [.control, .option])
                 Divider()
-                Button("Ревью мерж-реквестов") { workspace.navigatorTab = .review }
+                Button("Ревью мерж-реквестов") { workspace.showReviews() }
                     .keyboardShortcut("r", modifiers: [.command, .option])
                     .disabled(workspace.root == nil)
                 Button("Комментировать строку…") { workspace.commentOnCaretLine() }

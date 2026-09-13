@@ -6,14 +6,27 @@ import AppKit
 /// стеклянной панелью.
 struct NavigatorView: View {
     @ObservedObject var workspace: Workspace
+    @FocusState private var filterFocused: Bool
 
     var body: some View {
         content
             .pilotEdgeBar(.top) { tabBar }
             .pilotEdgeBar(.bottom) {
-                if workspace.navigatorTab == .project || workspace.navigatorTab == .outline,
-                   workspace.root != nil { filterField }
+                if hasFilter { filterField }
             }
+            .onChange(of: workspace.navigatorFilterFocusRequest) { _, _ in
+                // Поле могло появиться в этом же обновлении — фокус после него.
+                DispatchQueue.main.async { filterFocused = true }
+            }
+    }
+
+    private var hasFilter: Bool {
+        guard workspace.root != nil else { return false }
+        switch workspace.navigatorTab {
+        case .project, .outline: return true
+        case .review:            return workspace.isReviewSearchVisible
+        case .recent:            return false
+        }
     }
 
     /// Дерево проекта не пересоздаётся при переключении вкладок — оно
@@ -103,12 +116,22 @@ struct NavigatorView: View {
 
     private var filterField: some View {
         HStack(spacing: 6) {
-            Image(systemName: "line.3.horizontal.decrease.circle")
+            Image(systemName: workspace.navigatorTab == .review ? "magnifyingglass" : "line.3.horizontal.decrease.circle")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
-            TextField("Фильтр", text: filterBinding)
+            TextField(workspace.navigatorTab == .review ? "Поиск мерж-реквестов" : "Фильтр",
+                      text: filterBinding)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
+                .help(workspace.navigatorTab == .review
+                      ? "Слова из названия, ветки, меток или имени; !123 — номер, @логин — автор или ревьюер. Слитые и закрытые ищутся в GitLab."
+                      : "")
+                .focused($filterFocused)
+                .onSubmit(submitFilter)
+                .onExitCommand {
+                    if filterBinding.wrappedValue.isEmpty { workspace.focusEditor() }
+                    else { filterBinding.wrappedValue = "" }
+                }
             if !filterBinding.wrappedValue.isEmpty {
                 Button { filterBinding.wrappedValue = "" } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -126,15 +149,21 @@ struct NavigatorView: View {
         .padding(.vertical, 8)
     }
 
-    /// Одно поле на две вкладки: в проекте фильтрует файлы,
-    /// в структуре — объявления.
+    /// Одно поле на три вкладки: в проекте фильтрует файлы,
+    /// в структуре — объявления, в ревью — ищет мерж-реквесты.
     private var filterBinding: Binding<String> {
         switch workspace.navigatorTab {
         case .outline:
             return Binding(get: { workspace.outlineFilter }, set: { workspace.outlineFilter = $0 })
+        case .review:
+            return Binding(get: { workspace.review.searchQuery }, set: { workspace.review.searchQuery = $0 })
         default:
             return $workspace.navigatorFilter
         }
+    }
+
+    private func submitFilter() {
+        if workspace.navigatorTab == .review { workspace.openTopReviewSearchResult() }
     }
 }
 

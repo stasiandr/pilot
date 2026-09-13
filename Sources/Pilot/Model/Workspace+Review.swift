@@ -70,6 +70,30 @@ extension Workspace {
 
     // MARK: - MR
 
+    /// ⌥⌘R: вкладка ревью, а над списком MR — сразу в поиск.
+    func showReviews() {
+        navigatorTab = .review
+        if isReviewSearchVisible { focusNavigatorFilter() }
+    }
+
+    /// Поиск есть, пока виден список: у открытого MR своя панель.
+    var isReviewSearchVisible: Bool { review.phase == .ready && review.active == nil }
+
+    /// Return в поиске: верхний найденный MR. Для `!123` — именно этот номер,
+    /// даже если GitLab ещё не ответил на поиск.
+    func openTopReviewSearchResult() {
+        let search = MergeRequestSearch(review.searchQuery)
+        let top = review.listing.first
+        guard let iid = search.iid, top?.iid != iid else {
+            if let top { openReview(top) }
+            return
+        }
+        Task {
+            if let mr = await review.mergeRequest(iid: iid) { openReview(mr) }
+            else if let top { openReview(top) }
+        }
+    }
+
     /// Открывает MR и сразу первый файл — ревью начинается с кода, а не со списка.
     func openReview(_ mr: GLMergeRequest) {
         Task {
