@@ -144,7 +144,7 @@ struct RootView: View {
                 Label("Символ в проекте", systemImage: "number")
             }
             .help("Символ в проекте (⌘T)")
-            .disabled(!workspace.lsp.isReady)
+            .disabled(!workspace.canSearchSymbols)
         }
     }
 
@@ -392,9 +392,40 @@ struct ActivityView: View {
                 Text(Theme.count(workspace.fileCount, "файл", "файла", "файлов"))
                     .foregroundStyle(.tertiary)
             }
+            navigationIndex
             languageServer
         }
         .lineLimit(1)
+    }
+
+    /// Быстрый навигатор виден, только пока он и отвечает: как только
+    /// Roslyn готов, остаётся одна его фишка.
+    @ViewBuilder
+    private var navigationIndex: some View {
+        if workspace.root != nil {
+            switch workspace.navigationEngine {
+            case .languageServer:
+                EmptyView()
+            case .indexing:
+                if workspace.isTypeIndexing {
+                    divider
+                    ProgressView().controlSize(.mini)
+                    Text("Индекс").foregroundStyle(.secondary)
+                        .help("Собираю объявления проекта для ⌘B, ⌘T и ⌘R.")
+                }
+            case .index:
+                divider
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Color(nsColor: Theme.fastIndex))
+                Text("Индекс").foregroundStyle(.secondary)
+                    .help("""
+                        ⌘B, ⌘T и ⌘R отвечают по быстрому индексу: \(workspace.symbolIndex?.count ?? 0) объявлений. \
+                        Это приближение — без перегрузок и типов из лямбд. \
+                        Когда языковой сервер будет готов, навигация незаметно перейдёт на него.
+                        """)
+            }
+        }
     }
 
     /// Состояние языкового сервера — единственное место, где он виден,
@@ -410,6 +441,12 @@ struct ActivityView: View {
             ProgressView().controlSize(.mini)
             Text(name).foregroundStyle(.secondary)
                 .help("\(name): \(detail). Просмотр и поиск работают уже сейчас.")
+        case .ready where !workspace.languageServerProven:
+            // Рукопожатие прошло, но solution ещё грузится: отвечает быстрый индекс.
+            divider
+            ProgressView().controlSize(.mini)
+            Text(name).foregroundStyle(.secondary)
+                .help("\(name) загружает проект. Пока навигация идёт по быстрому индексу и перейдёт на \(name) сама.")
         case .ready:
             divider
             Circle().fill(.green).frame(width: 6, height: 6)

@@ -93,28 +93,32 @@ final class FileIndex: @unchecked Sendable {
             let frame = queue[head]
             head += 1
 
-            guard let children = try? fm.contentsOfDirectory(
-                at: frame.url,
-                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
+            // Без пула временные NSURL и их кэши свойств живут до конца всего
+            // обхода: на Unity-проекте в 270 000 файлов это 1,7 ГБ против 115 МБ.
+            drainingAutoreleased {
+                guard let children = try? fm.contentsOfDirectory(
+                    at: frame.url,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                    options: [.skipsHiddenFiles]
+                ) else { return }
 
-            for child in children {
-                let name = child.lastPathComponent
-                let rel = frame.rel.isEmpty ? name : frame.rel + "/" + name
+                for child in children {
+                    let name = child.lastPathComponent
+                    let rel = frame.rel.isEmpty ? name : frame.rel + "/" + name
 
-                let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                if values?.isSymbolicLink == true { continue }   // не ходим по симлинкам
-                let isDir = values?.isDirectory ?? false
+                    let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                    if values?.isSymbolicLink == true { continue }   // не ходим по симлинкам
+                    let isDir = values?.isDirectory ?? false
 
-                if frame.ignore.isIgnored(relPath: rel, name: name, isDir: isDir) { continue }
+                    if frame.ignore.isIgnored(relPath: rel, name: name, isDir: isDir) { continue }
 
-                if isDir {
-                    // .gitignore самой подпапки действует только на её содержимое
-                    let childIgnore = frame.ignore.adding(IgnoreLayer.load(at: child, base: rel))
-                    queue.append(Frame(url: child, rel: rel, ignore: childIgnore))
-                } else {
-                    index.append(rel: rel)
+                    if isDir {
+                        // .gitignore самой подпапки действует только на её содержимое
+                        let childIgnore = frame.ignore.adding(IgnoreLayer.load(at: child, base: rel))
+                        queue.append(Frame(url: child, rel: rel, ignore: childIgnore))
+                    } else {
+                        index.append(rel: rel)
+                    }
                 }
             }
         }
