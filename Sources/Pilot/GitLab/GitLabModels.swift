@@ -35,9 +35,11 @@ struct GLMergeRequest: Codable, Identifiable, Equatable, Sendable {
     /// Есть только в ответе на запрос одного MR, в списке его нет.
     var diffRefs: GLDiffRefs?
     var hasConflicts: Bool?
+    var labels: [String]?
 
     var isDraft: Bool { draft ?? false }
     var reference: String { "!\(iid)" }
+    var isOpen: Bool { state == "opened" }
 }
 
 /// Один файл из `…/merge_requests/:iid/diffs`.

@@ -70,11 +70,45 @@ extension Workspace {
 
     // MARK: - MR
 
+    /// Вкладка, где этот файл MR уже открыт.
+    func reviewTab(for file: ReviewFile) -> TextBuffer? {
+        guard let active = review.active, let repository = review.repository else { return nil }
+        let sha = file.raw.deletedFile ? active.refs.baseSha : active.refs.headSha
+        return tab(for: repository.appendingPathComponent(file.path), revision: sha)
+    }
+
+    /// ⌥⌘R: вкладка ревью, а над списком MR — сразу в поиск.
+    func showReviews() {
+        navigatorTab = .review
+        if isReviewSearchVisible { focusNavigatorFilter() }
+    }
+
+    /// Поиск есть, пока виден список: у открытого MR своя панель.
+    var isReviewSearchVisible: Bool { review.phase == .ready && review.active == nil }
+
+    /// Return в поиске: верхний найденный MR. Для `!123` — именно этот номер,
+    /// даже если GitLab ещё не ответил на поиск.
+    func openTopReviewSearchResult() {
+        let search = MergeRequestSearch(review.searchQuery)
+        let top = review.listing.first
+        guard let iid = search.iid, top?.iid != iid else {
+            if let top { openReview(top) }
+            return
+        }
+        Task {
+            if let mr = await review.mergeRequest(iid: iid) { openReview(mr) }
+            else if let top { openReview(top) }
+        }
+    }
+
     /// Открывает MR и сразу первый файл — ревью начинается с кода, а не со списка.
     func openReview(_ mr: GLMergeRequest) {
         Task {
             await review.open(mr)
             guard let files = review.active?.files, review.active?.mr.iid == mr.iid else { return }
+            // Файлы прошлого MR к этому не относятся: ни полосок, ни тредов.
+            let ours = Set(files.compactMap { reviewTab(for: $0) }.map(ObjectIdentifier.init))
+            closeTabs(tabs.filter { $0.isReadOnly && !ours.contains(ObjectIdentifier($0)) })
             if let first = files.first(where: { !$0.raw.deletedFile }) ?? files.first {
                 open(reviewFile: first)
             }
@@ -87,10 +121,12 @@ extension Workspace {
         open(reviewFile: next)
     }
 
-    /// Выход из ревью возвращает файл в версии рабочей копии, если он есть.
+    /// Выход из ревью закрывает вкладки с версиями из MR — правок в них нет,
+    /// терять нечего — и возвращает файл в версии рабочей копии, если он есть.
     func closeReview() {
         let url = document?.revision != nil ? document?.url : nil
         review.close()
+        closeTabs(tabs.filter(\.isReadOnly))
         if let url, FileManager.default.fileExists(atPath: url.path) {
             open(file: url)
         }

@@ -18,6 +18,8 @@ struct LoadedDocument: Sendable {
     var revision: String? = nil
     /// Сцена, префаб или другой сериализованный ассет Unity — разобранный.
     var unityFile: UnityYAMLFile? = nil
+    /// Её иерархия: GameObject'ы и вложенные префабы — для дерева проекта.
+    var unityHierarchy: UnityHierarchy? = nil
     /// Версия модели, по которой построены структура и `unityFile`. Текст
     /// правят, разбор догоняет с задержкой — пока версии не совпали,
     /// позициям из разбора верить нельзя.
@@ -71,6 +73,7 @@ struct LoadedDocument: Sendable {
                               languageName: spec?.name ?? "Plain Text",
                               outline: semantics?.outline ?? outline, encoding: encoding,
                               revision: revision, unityFile: semantics?.serialized,
+                              unityHierarchy: semantics?.hierarchy,
                               semanticsVersion: model.version)
     }
 
@@ -456,13 +459,19 @@ final class CodeScrollView: NSScrollView {
 }
 
 /// Вторая половина той же истории: система считает, что линейка всё ещё
-/// лежит поверх текста, и прокручивает клип-вью на её ширину влево
-/// (bounds.x = −44). Раз клип уже справа от линейки, левее нуля ему незачем.
+/// лежит поверх текста, и даёт клип-вью отступ слева на её ширину. С ним
+/// свайп трекпадом свободно уводит текст на 44 точки вправо, в пустоту,
+/// а программная прокрутка встаёт на bounds.x = −44. Раз клип уже справа
+/// от линейки, отступ слева ему не нужен; нижний и правый — под полосы
+/// прокрутки — остаются.
 final class CodeClipView: NSClipView {
-    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
-        var rect = super.constrainBoundsRect(proposedBounds)
-        if rect.origin.x < 0 { rect.origin.x = 0 }
-        return rect
+    override var contentInsets: NSEdgeInsets {
+        get { super.contentInsets }
+        set {
+            var insets = newValue
+            insets.left = 0
+            super.contentInsets = insets
+        }
     }
 }
 
@@ -612,13 +621,30 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         view.window?.makeFirstResponder(textView)
     }
 
+    /// Действие панели поиска. Показ панели сам отдаёт фокус её полю.
+    func performFind(_ action: NSTextFinder.Action) {
+        let clip = scrollView.contentView
+        let insetBefore = clip.contentInsets.top
+        let sender = NSMenuItem()
+        sender.tag = action.rawValue
+        textView.performTextFinderAction(sender)
+        // На macOS 26 панель не раздвигает текст, а ложится поверх него
+        // отступом клипа, и первая строка файла пряталась под ней. Сдвигаем
+        // текст на её высоту: видно ровно то же, что и до ⌘F.
+        let delta = clip.contentInsets.top - insetBefore
+        if delta > 0 {
+            clip.scroll(to: NSPoint(x: clip.bounds.minX, y: clip.bounds.minY - delta))
+            scrollView.reflectScrolledClipView(clip)
+        }
+    }
+
     // MARK: - Показ буфера
 
     /// У каждого буфера свой NSTextStorage: подменяем его под layout manager,
     /// а не переписываем текст — так правки и история отмены остаются
     /// с файлом, пока смотрим другие.
     func show(_ buffer: TextBuffer) {
-        self.buffer?.lastCaret = textView.selectedRange().location
+        saveViewState()
         self.buffer?.onDisplayEdit = nil
         hideCompletion()
         closePopover()
@@ -648,14 +674,31 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.lineCommentToken = buffer.model.spec?.lineComments.first.map { String(decoding: $0, as: UTF8.self) }
         textView.colonOpensBlock = buffer.model.spec?.indentBased ?? false
 
-        textView.setSelectedRange(NSRange(location: 0, length: 0))
-        textView.scroll(NSPoint(x: 0, y: 0))
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
         ruler?.model = buffer.model
         rulerLineCount = buffer.model.lineCount
-        ruler?.currentLine = 0
         ruler?.eventLines = Self.gutterMarkers(for: buffer.document)
         ruler?.invalidateWidth()
+        // Вкладка, где уже были, — ровно как её оставили; новая — с начала.
+        if let state = buffer.viewState {
+            let length = buffer.storage.length
+            let location = min(state.selection.location, length)
+            textView.setSelectedRange(NSRange(location: location,
+                                              length: min(state.selection.length, length - location)))
+            scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
+            // Высота текста после подмены хранилища досчитывается не сразу,
+            // и далёкая строка могла упереться в старую. Второй проход, когда
+            // раскладка дошла, почти всегда ничего не двигает.
+            DispatchQueue.main.async { [weak self, weak buffer] in
+                guard let self, let buffer, self.buffer === buffer else { return }
+                self.scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
+            }
+        } else {
+            textView.setSelectedRange(NSRange(location: 0, length: 0))
+            textView.scroll(NSPoint(x: 0, y: 0))
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
+        }
+        ruler?.currentLine = buffer.model.line(containing: min(textView.selectedRange().location,
+                                                               max(0, buffer.model.units.count - 1)))
         highlightVisible()
         textView.updateCurrentLineHighlight()
     }
@@ -672,6 +715,46 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     private func clearTemporaryAttributes(_ layout: NSLayoutManager) {
         let length = layout.textStorage?.length ?? 0
         if length > 0 { layout.setTemporaryAttributes([:], forCharacterRange: NSRange(location: 0, length: length)) }
+    }
+
+    /// Запоминает, что было на экране: выделение и первую видимую строку.
+    func saveViewState() {
+        guard let buffer, let layout = textView.layoutManager, let container = textView.textContainer
+        else { return }
+        let bounds = scrollView.contentView.bounds
+        let y = max(0, bounds.minY - textView.textContainerInset.height)
+        var topLine = 0
+        var topOffset: CGFloat = 0
+        if buffer.storage.length > 0 {
+            let glyph = layout.glyphIndex(for: NSPoint(x: 0, y: y), in: container)
+            let character = layout.characterIndexForGlyph(at: glyph)
+            topLine = buffer.model.line(containing: min(character, max(0, buffer.model.units.count - 1)))
+            let lineGlyph = layout.glyphIndexForCharacter(at: Int(buffer.model.lineStarts[topLine]))
+            topOffset = y - layout.lineFragmentRect(forGlyphAt: lineGlyph, effectiveRange: nil).minY
+        }
+        buffer.viewState = TextBuffer.ViewState(selection: textView.selectedRange(), topLine: topLine,
+                                                topOffset: max(0, topOffset), scrollX: bounds.minX)
+    }
+
+    /// Ставит строку к верхнему краю. Как и `scrollCentering`, уточняет
+    /// позицию после раскладки: до неё координата далёкой строки — оценка.
+    private func scroll(toLine line: Int, offset: CGFloat, x: CGFloat) {
+        guard let model, let layout = textView.layoutManager, let container = textView.textContainer,
+              let storage = textView.textStorage, storage.length > 0 else { return }
+        let line = max(0, min(line, model.lineCount - 1))
+        let character = min(Int(model.lineStarts[line]), storage.length - 1)
+        let clip = scrollView.contentView
+        for _ in 0..<4 {
+            let glyph = layout.glyphIndexForCharacter(at: character)
+            layout.ensureLayout(forGlyphRange: NSRange(location: glyph, length: 1))
+            let rect = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+            let target = NSPoint(x: x, y: max(0, rect.minY + textView.textContainerInset.height + offset))
+            if abs(clip.bounds.origin.y - target.y) < 1, abs(clip.bounds.origin.x - target.x) < 1 { break }
+            clip.scroll(to: target)
+            scrollView.reflectScrolledClipView(clip)
+            layout.ensureLayout(forBoundingRect: clip.bounds, in: container)
+        }
+        highlightVisible()
     }
 
     /// Разбор файла обновился (правка, индекс ассетов) — перекрашиваем
@@ -715,7 +798,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     }
 
     func showEmpty() {
-        self.buffer?.lastCaret = textView.selectedRange().location
+        saveViewState()
         self.buffer?.onDisplayEdit = nil
         hideCompletion()
         closePopover()
@@ -1647,6 +1730,7 @@ struct CodeView: NSViewControllerRepresentable {
     var conflicts: [MergeConflict] = []
     var conflictAction: Workspace.ConflictActionRequest? = nil
     let focusRequest: Int
+    var findRequest: Workspace.FindRequest? = nil
     let completionTriggers: [String]
     /// Смысловые украшения и их версия: сменилась — перекрашиваем.
     var decorator: CodeDecorator? = nil
@@ -1775,6 +1859,13 @@ struct CodeView: NSViewControllerRepresentable {
             // Вьюха могла только что появиться и ещё не попасть в окно.
             DispatchQueue.main.async { controller.focusText() }
         }
+
+        // После фокуса и тоже в следующем витке: ⌘F из палитры закрывает её,
+        // и фокус сперва уходит в текст, а уже потом — в поле поиска.
+        if let findRequest, findRequest.seq != context.coordinator.appliedFind {
+            context.coordinator.appliedFind = findRequest.seq
+            DispatchQueue.main.async { controller.performFind(findRequest.action) }
+        }
     }
 
     /// Дешёвая подпись набора вхождений: сравнивать массивы целиком
@@ -1787,7 +1878,19 @@ struct CodeView: NSViewControllerRepresentable {
         return hasher.finalize()
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator {
+        let coordinator = Coordinator()
+        // Редактор пересоздан (после экрана «нет файла») — старый ⌘F
+        // не должен открыть панель поиска сам по себе.
+        coordinator.appliedFind = findRequest?.seq ?? 0
+        return coordinator
+    }
+
+    /// Редактор убирают совсем — например, вместо текста сообщение «файл
+    /// не открыть». Вкладка должна вернуться туда же, где её оставили.
+    static func dismantleNSViewController(_ controller: CodeViewController, coordinator: Coordinator) {
+        controller.saveViewState()
+    }
 
     final class Coordinator {
         weak var shown: TextBuffer?
@@ -1801,6 +1904,7 @@ struct CodeView: NSViewControllerRepresentable {
         var appliedConflictAction = 0
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
+        var appliedFind = 0
         var decorationsVersion = 0
         var semanticsVersion = -1
         var appliedEdit = -1
