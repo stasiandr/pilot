@@ -5,11 +5,16 @@ import AppKit
 
 struct LoadedDocument: Sendable {
     let url: URL
-    let text: String
     let model: SyntaxModel
     let languageName: String
-    /// Структура файла для навигации. Строится здесь же, в фоне.
-    let outline: [OutlineItem]
+    /// Структура файла для навигации. Строится здесь же, в фоне,
+    /// и пересобирается после правок.
+    var outline: [OutlineItem]
+    /// В ней же файл и сохраняется.
+    let encoding: String.Encoding
+
+    /// Текущий текст. Берётся из модели: она правится вместе с редактором.
+    var text: String { model.text }
 
     enum LoadError: Error, LocalizedError {
         case tooLarge(Int)
@@ -33,18 +38,22 @@ struct LoadedDocument: Sendable {
     static let maxBytes = 64 * 1024 * 1024
 
     static func load(url: URL) throws -> LoadedDocument {
-        let text = try readText(url: url, maxBytes: maxBytes)
+        let (text, encoding) = try readTextAndEncoding(url: url, maxBytes: maxBytes)
         let spec = Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
         let outline = OutlineBuilder.build(model: model)
-        return LoadedDocument(url: url, text: text, model: model,
+        return LoadedDocument(url: url, model: model,
                               languageName: spec?.name ?? "Plain Text",
-                              outline: outline)
+                              outline: outline, encoding: encoding)
     }
 
     /// Текст файла с теми же проверками, что и при открытии: размер,
     /// бинарность, кодировка. Нужен и предпросмотру в палитре.
     static func readText(url: URL, maxBytes: Int) throws -> String {
+        try readTextAndEncoding(url: url, maxBytes: maxBytes).0
+    }
+
+    static func readTextAndEncoding(url: URL, maxBytes: Int) throws -> (String, String.Encoding) {
         let data: Data
         do {
             data = try Data(contentsOf: url, options: .mappedIfSafe)
@@ -57,9 +66,9 @@ struct LoadedDocument: Sendable {
         let probe = data.prefix(8192)
         if probe.contains(0) { throw LoadError.binary }
 
-        if let s = String(data: data, encoding: .utf8) { return s }
+        if let s = String(data: data, encoding: .utf8) { return (s, .utf8) }
         // фолбэк, чтобы не падать на legacy-кодировках
-        if let s = String(data: data, encoding: .isoLatin1) { return s }
+        if let s = String(data: data, encoding: .isoLatin1) { return (s, .isoLatin1) }
         throw LoadError.binary
     }
 }
@@ -154,6 +163,130 @@ final class CodeTextView: NSTextView {
         super.draw(dirtyRect)
     }
 
+    // MARK: Правила ввода
+
+    /// Задаются при показе буфера: у каждого файла свои.
+    var indentUnit = "    "
+    var lineEnding = "\n"
+    var lineCommentToken: String?
+    var colonOpensBlock = false
+    /// ⌥Esc и «Esc без списка» — показать варианты дополнения.
+    var onCompletionRequest: (() -> Void)?
+
+    /// Return: отступ как у текущей строки, после `{` — глубже,
+    /// `{|}` раскрывается в три строки.
+    override func insertNewline(_ sender: Any?) {
+        let ns = string as NSString
+        let selection = selectedRange()
+        let startLine = ns.lineRange(for: NSRange(location: selection.location, length: 0))
+        let prefix = ns.substring(with: NSRange(location: startLine.location,
+                                                length: selection.location - startLine.location))
+        let end = NSMaxRange(selection)
+        let endLine = ns.lineRange(for: NSRange(location: end, length: 0))
+        var contentEnd = NSMaxRange(endLine)
+        while contentEnd > end, ns.character(at: contentEnd - 1) == 0x0A || ns.character(at: contentEnd - 1) == 0x0D {
+            contentEnd -= 1
+        }
+        let suffix = ns.substring(with: NSRange(location: end, length: contentEnd - end))
+        let insertion = EditingRules.newline(linePrefix: prefix, lineSuffix: suffix,
+                                             indentUnit: indentUnit, lineEnding: lineEnding,
+                                             colonOpensBlock: colonOpensBlock)
+        insertText(insertion.text, replacementRange: selection)
+        setSelectedRange(NSRange(location: selection.location + insertion.caret, length: 0))
+        scrollRangeToVisible(selectedRange())
+    }
+
+    /// Tab: с выделением на несколько строк — сдвиг строк, иначе отступ.
+    override func insertTab(_ sender: Any?) {
+        if selectionSpansLines {
+            transformSelectedLines { EditingRules.indent($0, unit: indentUnit) }
+        } else {
+            insertText(indentUnit, replacementRange: selectedRange())
+        }
+    }
+
+    override func insertBacktab(_ sender: Any?) {
+        transformSelectedLines { EditingRules.outdent($0, unit: indentUnit) }
+    }
+
+    /// Backspace в отступе стирает до предыдущей позиции табуляции.
+    override func deleteBackward(_ sender: Any?) {
+        let selection = selectedRange()
+        guard selection.length == 0, selection.location > 0 else { return super.deleteBackward(sender) }
+        let ns = string as NSString
+        let line = ns.lineRange(for: NSRange(location: selection.location, length: 0))
+        let prefix = ns.substring(with: NSRange(location: line.location, length: selection.location - line.location))
+        let width = EditingRules.backspaceWidth(linePrefix: prefix, indentUnit: indentUnit)
+        guard width > 1 else { return super.deleteBackward(sender) }
+        replace(NSRange(location: selection.location - width, length: width), with: "")
+    }
+
+    /// `}` в пустой строке встаёт под парную `{`, как в Xcode.
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        let text = (insertString as? String) ?? (insertString as? NSAttributedString)?.string
+        if text == "}", let storage = textStorage {
+            let target = replacementRange.location == NSNotFound ? selectedRange() : replacementRange
+            let ns = storage.string as NSString
+            let line = ns.lineRange(for: NSRange(location: target.location, length: 0))
+            let prefixRange = NSRange(location: line.location, length: target.location - line.location)
+            let prefix = ns.substring(with: prefixRange)
+            if !prefix.isEmpty, prefix.allSatisfy({ $0 == " " || $0 == "\t" }) {
+                var units = [UInt16](repeating: 0, count: target.location)
+                ns.getCharacters(&units, range: NSRange(location: 0, length: target.location))
+                let indent = EditingRules.closingBraceIndent(in: units, before: line.location)
+                    ?? String(prefix.dropLast(EditingRules.dedentBeforeClosing(linePrefix: prefix, indentUnit: indentUnit)))
+                if indent != prefix {
+                    super.insertText(indent + "}", replacementRange: NSRange(
+                        location: line.location, length: NSMaxRange(target) - line.location))
+                    return
+                }
+            }
+        }
+        super.insertText(insertString, replacementRange: replacementRange)
+    }
+
+    override func complete(_ sender: Any?) {
+        onCompletionRequest?()
+    }
+
+    /// ⌘/ — закомментировать или раскомментировать строки выделения.
+    @objc func toggleLineComment(_ sender: Any?) {
+        guard let token = lineCommentToken else { NSSound.beep(); return }
+        transformSelectedLines { EditingRules.toggleComment($0, token: token) }
+    }
+
+    /// Правка с отменой: через shouldChangeText/didChangeText, как при наборе.
+    func replace(_ range: NSRange, with text: String) {
+        guard shouldChangeText(in: range, replacementString: text) else { return }
+        replaceCharacters(in: range, with: text)
+        didChangeText()
+    }
+
+    private var selectionSpansLines: Bool {
+        let selection = selectedRange()
+        guard selection.length > 0 else { return false }
+        return (string as NSString).rangeOfCharacter(from: .newlines, options: [], range: selection).location != NSNotFound
+    }
+
+    /// Применяет преобразование к строкам, которые задевает выделение,
+    /// одной правкой — одним шагом отмены.
+    private func transformSelectedLines(_ transform: ([String]) -> [String]) {
+        let ns = string as NSString
+        var selection = selectedRange()
+        // Выделение, кончающееся в начале строки, эту строку не захватывает.
+        if selection.length > 0, ns.character(at: NSMaxRange(selection) - 1) == 0x0A { selection.length -= 1 }
+        let range = ns.lineRange(for: selection)
+        let block = ns.substring(with: range) as NSString
+        let terminator = block.hasSuffix("\r\n") ? "\r\n" : (block.hasSuffix("\n") ? "\n" : "")
+        let body = block.substring(to: block.length - (terminator as NSString).length)
+        let separator = body.contains("\r\n") ? "\r\n" : "\n"
+        let lines = body.components(separatedBy: separator)
+        let newBody = transform(lines).joined(separator: separator)
+        guard newBody != body else { return }
+        replace(range, with: newBody + terminator)
+        setSelectedRange(NSRange(location: range.location, length: (newBody as NSString).length))
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Не перехватываем Cmd+P и Cmd+F — их обрабатывает окно.
         if event.modifierFlags.contains(.command) {
@@ -177,6 +310,25 @@ final class CodeScrollView: NSScrollView {
         clip.size.width -= edge - clip.minX
         clip.origin.x = edge
         contentView.frame = clip
+        // Текст не уже клипа: иначе полоса текущей строки обрывалась бы
+        // на ширину линейки раньше правого края.
+        if let text = documentView as? NSTextView {
+            text.minSize = NSSize(width: clip.width, height: text.minSize.height)
+            if text.frame.width < clip.width {
+                text.setFrameSize(NSSize(width: clip.width, height: text.frame.height))
+            }
+        }
+    }
+}
+
+/// Вторая половина той же истории: система считает, что линейка всё ещё
+/// лежит поверх текста, и прокручивает клип-вью на её ширину влево
+/// (bounds.x = −44). Раз клип уже справа от линейки, левее нуля ему незачем.
+final class CodeClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        if rect.origin.x < 0 { rect.origin.x = 0 }
+        return rect
     }
 }
 
@@ -186,11 +338,18 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var onCaretChange: ((Int) -> Void)?
     /// ⌘+клик по символу.
     var onGoToDefinition: ((Int) -> Void)?
+    /// Варианты дополнения в позиции: `trigger` — символ, открывший список
+    /// (например «.»), `retrigger` — переспросить при неполном списке.
+    var requestCompletions: ((_ offset: Int, _ trigger: String?, _ retrigger: Bool) async -> CompletionList?)?
+    /// Символы, после которых список открывается сам.
+    var completionTriggers: Set<String> = ["."]
+
     private let scrollView = CodeScrollView()
     private var textView: CodeTextView!
     private var ruler: LineNumberRuler?
 
-    private var model: SyntaxModel?
+    private var buffer: TextBuffer?
+    private var model: SyntaxModel? { buffer?.model }
     private var fontSize: CGFloat = 12.5
     private var isApplying = false
     private var lastHighlighted: ClosedRange<Int>?
@@ -214,10 +373,22 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         // Контейнер передаём в инициализатор: replaceTextContainer на уже
         // готовом NSTextView оставляет висеть его собственный layout manager.
         textView = CodeTextView(frame: .zero, textContainer: container)
-        textView.isEditable = false          // просмотрщик, но выделение и ⌘C работают
+        textView.isEditable = true
         textView.isSelectable = true
         textView.isRichText = false
-        textView.allowsUndo = false
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        // Редактор кода: никакой «умной» типографики и автозамен.
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isGrammarCheckingEnabled = false
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.isAutomaticDataDetectionEnabled = false
+        textView.isAutomaticTextCompletionEnabled = false
+        textView.smartInsertDeleteEnabled = false
         textView.isHorizontallyResizable = true
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width, .height]
@@ -225,7 +396,9 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.font = font
         textView.backgroundColor = .clear
         textView.drawsBackground = false
+        textView.insertionPointColor = Theme.caret
         textView.selectedTextAttributes = [.backgroundColor: Theme.selection]
+        textView.typingAttributes = [.font: font, .foregroundColor: Theme.color(.plain)]
         textView.textContainerInset = NSSize(width: 4, height: 10)
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
@@ -233,7 +406,11 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.onCommandClick = { [weak self] index in
             self?.onGoToDefinition?(index)
         }
+        textView.onCompletionRequest = { [weak self] in
+            self?.requestCompletion(trigger: nil, manual: true)
+        }
 
+        scrollView.contentView = CodeClipView()
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
@@ -252,7 +429,17 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             self, selector: #selector(viewportChanged),
             name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
 
+        popup.onPick = { [weak self] index in self?.acceptCompletion(index) }
+
         self.view = scrollView
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        // Ушли в другое приложение или окно — список дополнений закрываем.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(windowResigned),
+            name: NSWindow.didResignKeyNotification, object: view.window)
     }
 
     deinit {
@@ -263,14 +450,282 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         view.window?.makeFirstResponder(textView)
     }
 
+    // MARK: - Показ буфера
+
+    /// У каждого буфера свой NSTextStorage: подменяем его под layout manager,
+    /// а не переписываем текст — так правки и история отмены остаются
+    /// с файлом, пока смотрим другие.
+    func show(_ buffer: TextBuffer) {
+        self.buffer?.lastCaret = textView.selectedRange().location
+        hideCompletion()
+        self.buffer = buffer
+        lastHighlighted = nil
+
+        let font = Theme.editorFont(size: fontSize)
+        if buffer.fontSize != fontSize {
+            isApplying = true
+            buffer.storage.addAttribute(.font, value: font,
+                                        range: NSRange(location: 0, length: buffer.storage.length))
+            isApplying = false
+            buffer.fontSize = fontSize
+        }
+        textView.layoutManager?.replaceTextStorage(buffer.storage)
+        textView.breakUndoCoalescing()
+        textView.typingAttributes = [.font: font, .foregroundColor: Theme.color(.plain)]
+        textView.indentUnit = buffer.indentUnit
+        textView.lineEnding = buffer.lineEnding
+        textView.lineCommentToken = buffer.model.spec?.lineComments.first.map { String(decoding: $0, as: UTF8.self) }
+        textView.colonOpensBlock = buffer.model.spec?.indentBased ?? false
+
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        textView.scroll(NSPoint(x: 0, y: 0))
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
+        ruler?.model = buffer.model
+        ruler?.currentLine = 0
+        ruler?.invalidateWidth()
+        highlightVisible()
+        textView.updateCurrentLineHighlight()
+    }
+
+    func showEmpty() {
+        self.buffer?.lastCaret = textView.selectedRange().location
+        hideCompletion()
+        buffer = nil
+        // Пустое хранилище вместо стирания текста: буфер мог остаться
+        // в памяти с несохранёнными правками.
+        textView.layoutManager?.replaceTextStorage(NSTextStorage())
+        ruler?.model = nil
+        ruler?.setChanges([])
+    }
+
+    func undoManager(for view: NSTextView) -> UndoManager? {
+        buffer?.undoManager
+    }
+
+    // MARK: - Курсор и правки
+
     func textViewDidChangeSelection(_ notification: Notification) {
         if textView.updateCurrentLineHighlight() { ruler?.needsDisplay = true }
         if let model {
             ruler?.currentLine = model.line(containing: min(textView.selectedRange().location,
                                                             max(0, model.units.count - 1)))
         }
+        if popup.isVisible && !isCaretInSession { hideCompletion() }
         onCaretChange?(textView.selectedRange().location)
     }
+
+    /// Что сейчас набирают — нужно, чтобы решить, открывать ли дополнение.
+    private var pendingInput: String?
+
+    func textView(_ textView: NSTextView, shouldChangeTextIn range: NSRange,
+                  replacementString: String?) -> Bool {
+        let undoing = buffer?.undoManager.isUndoing == true || buffer?.undoManager.isRedoing == true
+        pendingInput = undoing || isApplyingCompletion ? nil : replacementString
+        return true
+    }
+
+    /// Текст уже в модели (TextBuffer правит её в том же вызове) — осталось
+    /// перекрасить видимое и решить судьбу списка дополнений.
+    func textDidChange(_ notification: Notification) {
+        lastHighlighted = nil
+        highlightVisible()
+        if let model, String(model.lineCount).count != ruler?.digits { ruler?.invalidateWidth() }
+        ruler?.needsDisplay = true
+
+        let input = pendingInput
+        pendingInput = nil
+        completionAfterEdit(input)
+    }
+
+    /// Клавиши, пока открыт список: стрелки ходят по нему, Return и Tab
+    /// вставляют, Esc закрывает. Esc без списка — открывает его, как в Xcode.
+    func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        if popup.isVisible {
+            switch selector {
+            case #selector(NSResponder.moveUp(_:)):        moveCompletion(-1); return true
+            case #selector(NSResponder.moveDown(_:)):      moveCompletion(1); return true
+            case #selector(NSResponder.pageUp(_:)),
+                 #selector(NSResponder.scrollPageUp(_:)):  moveCompletion(-CompletionPopup.maxVisibleRows); return true
+            case #selector(NSResponder.pageDown(_:)),
+                 #selector(NSResponder.scrollPageDown(_:)): moveCompletion(CompletionPopup.maxVisibleRows); return true
+            case #selector(NSResponder.insertNewline(_:)),
+                 #selector(NSResponder.insertTab(_:)):     acceptCompletion(selectedRow); return true
+            case #selector(NSResponder.cancelOperation(_:)): hideCompletion(); return true
+            default: return false
+            }
+        }
+        if selector == #selector(NSResponder.cancelOperation(_:)) {
+            requestCompletion(trigger: nil, manual: true)
+            return true
+        }
+        return false
+    }
+
+    // MARK: - Автодополнение
+
+    private struct CompletionSession {
+        /// Начало слова, которое дополняем.
+        var anchor: Int
+        /// Где стоял курсор, когда спрашивали: правки сервера — от этой точки.
+        var requestOffset: Int
+        var list: CompletionList
+        var manual: Bool
+    }
+
+    private let popup = CompletionPopup()
+    private var session: CompletionSession?
+    private var filtered: [Int] = []
+    private var selectedRow = 0
+    /// Выделенный вариант — по имени, а не по номеру: номера смысла не
+    /// имеют, когда сервер прислал новый список.
+    private var selectedLabel: String?
+    private var completionTask: Task<Void, Never>?
+    private var isApplyingCompletion = false
+    /// Больше строк в список не кладём: дальше человек всё равно допечатает.
+    private let maxRows = 200
+
+    private var caret: Int { textView.selectedRange().location }
+
+    /// Начало идентификатора, в конце которого стоит курсор.
+    private func wordStart(before offset: Int) -> Int {
+        guard let model else { return offset }
+        var i = min(offset, model.units.count)
+        while i > 0, WordCompletion.isIdentPart(model.units[i - 1]) { i -= 1 }
+        return i
+    }
+
+    /// Курсор ещё в дополняемом слове — список можно оставить.
+    private var isCaretInSession: Bool {
+        guard let session else { return false }
+        let caret = self.caret
+        return textView.selectedRange().length == 0 && caret >= session.anchor && wordStart(before: caret) == session.anchor
+    }
+
+    private func completionAfterEdit(_ input: String?) {
+        guard let input, !input.isEmpty else {
+            // Стирание, вставка из буфера, отмена: список подстраиваем
+            // или закрываем, но сами не открываем.
+            if popup.isVisible { isCaretInSession ? refilter() : hideCompletion() }
+            return
+        }
+        let typedWord = input.utf16.allSatisfy(WordCompletion.isIdentPart)
+        if completionTriggers.contains(where: { input.hasSuffix($0) }) {
+            requestCompletion(trigger: String(input.suffix(1)), manual: false)
+        } else if typedWord && input.utf16.count <= 2 {
+            if popup.isVisible, isCaretInSession, let session, !session.list.isIncomplete {
+                refilter()
+            } else {
+                requestCompletion(trigger: nil, manual: false, delay: popup.isVisible ? 0 : 90_000_000,
+                                  retrigger: popup.isVisible)
+            }
+        } else {
+            hideCompletion()
+        }
+    }
+
+    private func requestCompletion(trigger: String?, manual: Bool, delay: UInt64 = 0, retrigger: Bool = false) {
+        completionTask?.cancel()
+        completionTask = Task { @MainActor [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard let self, !Task.isCancelled, let request = self.requestCompletions else { return }
+            let offset = self.caret
+            let anchor = self.wordStart(before: offset)
+            guard let list = await request(offset, trigger, retrigger), !Task.isCancelled else { return }
+            // Пока ждали ответ, курсор мог уйти из слова.
+            guard self.wordStart(before: self.caret) == anchor, self.caret >= anchor else { return }
+            self.session = CompletionSession(anchor: anchor, requestOffset: offset, list: list,
+                                             manual: manual || trigger != nil)
+            self.refilter()
+        }
+    }
+
+    private func refilter() {
+        guard let session, let model, let window = view.window else { return hideCompletion() }
+        let caret = self.caret
+        let prefix = String(decoding: model.units[session.anchor..<max(session.anchor, caret)], as: UTF16.self)
+        let items = session.list.items
+
+        // Без сервера и без явной просьбы — не раньше двух букв: иначе список
+        // слов выскакивал бы на каждую первую букву.
+        let fromWords = items.allSatisfy { $0.edit == nil && $0.kind == 1 || $0.kind == 14 }
+        if !session.manual && prefix.utf16.count < (fromWords ? 2 : 1) { return hideCompletion(keepSession: true) }
+
+        filtered = Array(CompletionRanking.rank(items, prefix: prefix).prefix(maxRows))
+        // Набрали слово целиком — дополнять нечего.
+        if filtered.isEmpty || (filtered.count == 1 && items[filtered[0]].matchText == prefix) {
+            return hideCompletion(keepSession: true)
+        }
+        selectedRow = selectedLabel.flatMap { label in filtered.firstIndex { items[$0].label == label } } ?? 0
+        selectedLabel = items[filtered[selectedRow]].label
+
+        let anchorRect = textView.firstRect(forCharacterRange: NSRange(location: session.anchor, length: 0),
+                                            actualRange: nil)
+        popup.show(rows: filtered.map { items[$0] }, selection: selectedRow, anchor: anchorRect, parent: window)
+    }
+
+    private func moveCompletion(_ delta: Int) {
+        guard !filtered.isEmpty else { return }
+        selectedRow = max(0, min(filtered.count - 1, selectedRow + delta))
+        selectedLabel = session.map { $0.list.items[filtered[selectedRow]].label }
+        popup.select(selectedRow)
+    }
+
+    private func hideCompletion(keepSession: Bool = false) {
+        popup.hide()
+        if !keepSession {
+            session = nil
+            selectedLabel = nil
+            completionTask?.cancel()
+        }
+    }
+
+    @objc private func windowResigned() { hideCompletion() }
+
+    /// Вставка варианта. Правку сервера растягиваем на то, что успели
+    /// допечатать после запроса; сниппет раскрываем и выделяем первую
+    /// заглушку; сопутствующие правки (импорты) — выше по файлу, после
+    /// основной, чтобы не сдвинуть её координаты.
+    private func acceptCompletion(_ row: Int) {
+        guard let session, let model, filtered.indices.contains(row) else { return hideCompletion() }
+        let item = session.list.items[filtered[row]]
+        let caret = self.caret
+        let typed = caret - session.requestOffset
+
+        var range: NSRange
+        if let edit = item.edit {
+            let start = model.offset(at: edit.range.start)
+            var end = model.offset(at: edit.range.end)
+            if end >= session.requestOffset { end = max(caret, end + typed) }
+            range = NSRange(location: min(start, caret), length: max(0, end - min(start, caret)))
+        } else {
+            range = NSRange(location: session.anchor, length: max(0, caret - session.anchor))
+        }
+        let expansion = item.isSnippet ? Snippet.expand(item.textToInsert)
+                                       : Snippet.Expansion(text: item.textToInsert, selection: nil)
+        let additional = item.additionalEdits
+            .map { (model.nsRange(for: $0.range), $0.newText) }
+            .filter { NSMaxRange($0.0) <= range.location }
+            .sorted { $0.0.location > $1.0.location }
+
+        hideCompletion()
+        isApplyingCompletion = true
+        textView.breakUndoCoalescing()
+        textView.replace(range, with: expansion.text)
+        var shift = 0
+        for (extra, text) in additional {
+            textView.replace(extra, with: text)
+            shift += (text as NSString).length - extra.length
+        }
+        isApplyingCompletion = false
+
+        let base = range.location + shift
+        let selection = expansion.selection.map { NSRange(location: base + $0.location, length: $0.length) }
+            ?? NSRange(location: base + (expansion.text as NSString).length, length: 0)
+        textView.setSelectedRange(selection)
+        textView.scrollRangeToVisible(selection)
+    }
+
+    // MARK: - Переходы
 
     /// Прокручивает к диапазону, выделяет его и коротко подсвечивает.
     /// Без вспышки после перехода глазами не найти, куда именно попал.
@@ -333,36 +788,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     @objc private func viewportChanged() {
         highlightVisible()
         ruler?.needsDisplay = true
-    }
-
-    func show(_ doc: LoadedDocument) {
-        guard let storage = textView.textStorage else { return }
-        model = doc.model
-        lastHighlighted = nil
-
-        let font = Theme.editorFont(size: fontSize)
-        isApplying = true
-        storage.beginEditing()
-        storage.setAttributedString(NSAttributedString(
-            string: doc.text,
-            attributes: [.font: font, .foregroundColor: Theme.color(.plain)]))
-        storage.endEditing()
-        isApplying = false
-
-        textView.scroll(NSPoint(x: 0, y: 0))
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
-        ruler?.model = doc.model
-        ruler?.currentLine = 0
-        ruler?.invalidateWidth()
-        highlightVisible()
-        textView.updateCurrentLineHighlight()
-    }
-
-    func showEmpty() {
-        model = nil
-        textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
-        ruler?.model = nil
-        ruler?.setChanges([])
+        if popup.isVisible { hideCompletion(keepSession: true) }
     }
 
     /// Отличия от HEAD — полосками в колонке номеров.
@@ -381,9 +807,13 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     func setFontSize(_ size: CGFloat) {
         fontSize = max(8, min(32, size))
-        guard let storage = textView.textStorage, storage.length > 0 else { return }
         let font = Theme.editorFont(size: fontSize)
-        storage.addAttribute(.font, value: font, range: NSRange(location: 0, length: storage.length))
+        textView.typingAttributes[.font] = font
+        guard let buffer, buffer.storage.length > 0 else { return }
+        isApplying = true
+        buffer.storage.addAttribute(.font, value: font, range: NSRange(location: 0, length: buffer.storage.length))
+        isApplying = false
+        buffer.fontSize = fontSize
         lastHighlighted = nil
         ruler?.font = font
         ruler?.invalidateWidth()
@@ -403,12 +833,11 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         let rect = scrollView.contentView.bounds
         let glyphRange = layout.glyphRange(forBoundingRect: rect, in: container)
         let charRange = layout.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
-        guard charRange.length > 0 else { return }
 
         let pad = 40   // запас строк сверху и снизу, чтобы скролл был плавным
         let firstLine = max(0, model.line(containing: charRange.location) - pad)
         let lastLine = min(model.lineCount - 1,
-                           model.line(containing: min(NSMaxRange(charRange), model.units.count - 1)) + pad)
+                           model.line(containing: min(NSMaxRange(charRange), max(0, model.units.count - 1))) + pad)
         guard firstLine <= lastLine else { return }
 
         // Уже покрашено — второй раз не тратимся.
@@ -463,9 +892,13 @@ final class LineNumberRuler: NSRulerView {
 
     required init(coder: NSCoder) { fatalError() }
 
+    /// Сколько цифр в номере последней строки — при каком числе
+    /// ширина колонки считалась в последний раз.
+    private(set) var digits = 0
+
     func invalidateWidth() {
-        let digits = max(3, String(model?.lineCount ?? 0).count)
-        ruleThickness = CGFloat(digits) * 8.0 + 20
+        digits = String(model?.lineCount ?? 0).count
+        ruleThickness = CGFloat(max(3, digits)) * 8.0 + 20
         needsDisplay = true
     }
 
@@ -597,14 +1030,16 @@ final class LineNumberRuler: NSRulerView {
 // MARK: - Мост в SwiftUI
 
 struct CodeView: NSViewControllerRepresentable {
-    let document: LoadedDocument?
+    let buffer: TextBuffer?
     let fontSize: CGFloat
     let reveal: Workspace.RevealRequest?
     let occurrences: [NSRange]
     let lineChanges: [LineDiff.Change]
     let focusRequest: Int
+    let completionTriggers: [String]
     let onCaretChange: (Int) -> Void
     let onGoToDefinition: (Int) -> Void
+    let requestCompletions: (Int, String?, Bool) async -> CompletionList?
 
     func makeNSViewController(context: Context) -> CodeViewController {
         let controller = CodeViewController()
@@ -616,16 +1051,21 @@ struct CodeView: NSViewControllerRepresentable {
     func updateNSViewController(_ controller: CodeViewController, context: Context) {
         controller.onCaretChange = onCaretChange
         controller.onGoToDefinition = onGoToDefinition
+        controller.requestCompletions = requestCompletions
+        // «.» — всегда: и без сервера после точки ждёшь список членов.
+        controller.completionTriggers = Set(completionTriggers).union(["."])
 
+        // Буфер сравниваем по идентичности: тот же файл, перечитанный
+        // с диска, — уже другой буфер.
         var documentChanged = false
-        if let document {
-            if context.coordinator.shownURL != document.url {
-                context.coordinator.shownURL = document.url
-                controller.show(document)
+        if let buffer {
+            if context.coordinator.shown !== buffer {
+                context.coordinator.shown = buffer
+                controller.show(buffer)
                 documentChanged = true
             }
-        } else if context.coordinator.shownURL != nil {
-            context.coordinator.shownURL = nil
+        } else if context.coordinator.shown != nil {
+            context.coordinator.shown = nil
             controller.showEmpty()
         }
 
@@ -647,9 +1087,9 @@ struct CodeView: NSViewControllerRepresentable {
 
         // Переход применяем один раз на запрос; порядковый номер нужен,
         // чтобы повторный прыжок в то же место тоже сработал.
-        if let reveal, let document, reveal.seq != context.coordinator.appliedReveal {
+        if let reveal, let buffer, reveal.seq != context.coordinator.appliedReveal {
             context.coordinator.appliedReveal = reveal.seq
-            let range = reveal.range.map { document.model.nsRange(for: $0) }
+            let range = reveal.range.map { buffer.model.nsRange(for: $0) }
                 ?? NSRange(location: 0, length: 0)
             // Документ только что заменён — даём раскладке дойти до конца.
             if documentChanged {
@@ -679,7 +1119,7 @@ struct CodeView: NSViewControllerRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        var shownURL: URL?
+        weak var shown: TextBuffer?
         var fontSize: CGFloat = 12.5
         var appliedReveal: Int = -1
         var lineChanges: [LineDiff.Change] = []

@@ -57,15 +57,19 @@ struct RootView: View {
     private var content: some View {
         if let error = workspace.loadError {
             notice(icon: "exclamationmark.triangle", title: error)
-        } else if workspace.document != nil {
-            CodeView(document: workspace.document,
+        } else if let buffer = workspace.buffer {
+            CodeView(buffer: buffer,
                      fontSize: workspace.fontSize,
                      reveal: workspace.reveal,
                      occurrences: workspace.occurrences,
                      lineChanges: workspace.git.lineChanges,
                      focusRequest: workspace.editorFocusRequest,
+                     completionTriggers: workspace.lsp.completionTriggers,
                      onCaretChange: { workspace.caretMoved(to: $0) },
-                     onGoToDefinition: { workspace.goToDefinition(at: $0) })
+                     onGoToDefinition: { workspace.goToDefinition(at: $0) },
+                     requestCompletions: { offset, trigger, retrigger in
+                         await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)
+                     })
         } else if workspace.root == nil {
             StartView(workspace: workspace)
         } else {
@@ -361,6 +365,9 @@ struct ActivityView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .layoutPriority(1)
+                    if workspace.isCurrentDirty {
+                        Circle().fill(.secondary).frame(width: 5, height: 5)
+                    }
                 }
 
                 // Не Spacer: Spacer внутри элемента тулбара SwiftUI принимает

@@ -101,7 +101,29 @@ enum ServerRegistry {
             command: ["omnisharp", "-lsp"],
             displayName: "OmniSharp"))
 
+        // 4. SourceKit-LSP — идёт вместе с Xcode и Command Line Tools.
+        //    SwiftPM-проекты понимает сам, по Package.swift.
+        if let sourcekit = discoverSourceKit() {
+            list.append(ServerConfig(
+                id: "sourcekit-lsp",
+                languageId: "swift",
+                fileExtensions: ["swift"],
+                command: [sourcekit],
+                displayName: "SourceKit-LSP"))
+        }
+
         return list
+    }
+
+    /// Сначала PATH (swiftly, свой тулчейн), затем выбранный Xcode и CLT.
+    /// `xcrun --find` не зовём: лишний процесс на каждый поиск сервера.
+    private static func discoverSourceKit() -> String? {
+        if let onPath = ServerConfig.searchPath(for: "sourcekit-lsp") { return onPath }
+        let candidates = [
+            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/sourcekit-lsp",
+            "/Library/Developer/CommandLineTools/usr/bin/sourcekit-lsp",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private static func solutionArguments(root: URL, executable: String) -> [String] {

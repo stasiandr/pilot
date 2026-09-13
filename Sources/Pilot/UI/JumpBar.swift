@@ -75,7 +75,8 @@ struct JumpBar: View {
                         if insideRoot { siblingsMenu(parent: parent) }
                     } label: {
                         let icon = isFile ? Theme.fileIcon(forName: name) : Theme.folderIcon
-                        SegmentLabel(symbol: icon.symbol, color: icon.color, title: name)
+                        SegmentLabel(symbol: icon.symbol, color: icon.color, title: name,
+                                     edited: isFile && workspace.isCurrentDirty)
                     }
                 }
 
@@ -185,6 +186,8 @@ struct SegmentLabel: View {
     var keyword: String? = nil
     let title: String
     var dimmed = false
+    /// Несохранённые правки — точка после имени, как в Xcode.
+    var edited = false
 
     var body: some View {
         HStack(spacing: 4) {
@@ -203,6 +206,12 @@ struct SegmentLabel: View {
                 .font(.system(size: 12))
                 .foregroundStyle(dimmed ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
                 .lineLimit(1)
+            if edited {
+                Circle()
+                    .fill(.secondary)
+                    .frame(width: 6, height: 6)
+                    .help("Есть несохранённые изменения (⌘S)")
+            }
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 3)

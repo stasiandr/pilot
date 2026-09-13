@@ -1228,6 +1228,165 @@ check(GitInfo.parse(head: "ref: refs/heads/claude/feature-x") == "claude/feature
 check(GitInfo.parse(head: "29970deadb287d5457bc98c3dcc0b28c522c90c3\n") == "29970de", "отсоединённый HEAD — короткий хэш")
 check(GitInfo.parse(head: "") == nil, "пустой HEAD")
 
+// ────────────────────────── Правка модели ──────────────────────────
+section("Правка модели")
+
+/// Главный инвариант редактора: модель после серии инкрементальных правок
+/// неотличима от модели, построенной с нуля по получившемуся тексту.
+func sameModel(_ a: SyntaxModel, _ b: SyntaxModel) -> Bool {
+    guard a.units == b.units, a.lineStarts == b.lineStarts, a.lineStates == b.lineStates else { return false }
+    let ta = a.tokens(fromLine: 0, toLine: a.lineCount - 1).map { "\($0.start):\($0.length):\($0.kind)" }
+    let tb = b.tokens(fromLine: 0, toLine: b.lineCount - 1).map { "\($0.start):\($0.length):\($0.kind)" }
+    return ta == tb
+}
+
+let editBase = """
+using System;
+/* блочный
+   комментарий */
+namespace Demo {
+    public class Foo {
+        string s = "строка";
+        const string V = @"дословная
+строка";
+        int Bar(int x) => x * 2; // хвост
+    }
+}
+"""
+var editModel = SyntaxModel(text: editBase, spec: Languages.csharp)
+var editText = Array(editBase.utf16)
+let fragments = ["x", "\n", "/*", "*/", "\"", "@\"", "{\n    }", "", "  ", "// c\n", "привет", "\r\n"]
+var editFailures = 0
+for step in 0..<600 {
+    let a = Int.random(in: 0...editText.count)
+    let b = min(editText.count, a + Int.random(in: 0...6))
+    let piece = Array(fragments.randomElement()!.utf16)
+    editText.replaceSubrange(a..<b, with: piece)
+    editModel.replace(NSRange(location: a, length: b - a), with: piece)
+    let fresh = SyntaxModel(text: String(decoding: editText, as: UTF16.self), spec: Languages.csharp)
+    if !sameModel(editModel, fresh) {
+        editFailures += 1
+        if editFailures == 1 { print("     расхождение на шаге \(step): замена \(a)..<\(b)") }
+        editModel = fresh
+    }
+}
+check(editFailures == 0, "600 случайных правок: модель совпадает с построенной заново (расхождений: \(editFailures))")
+
+// Правка в конце, стирание всего, вставка в пустой документ.
+let tail = SyntaxModel(text: "a\nb", spec: Languages.swift)
+tail.replace(NSRange(location: 3, length: 0), with: Array("\n".utf16))
+check(tail.lineCount == 3 && tail.lineStarts == [0, 2, 4], "перевод строки в конце добавляет строку")
+tail.replace(NSRange(location: 0, length: tail.units.count), with: [])
+check(tail.lineCount == 1 && tail.units.isEmpty, "стирание всего оставляет одну пустую строку")
+tail.replace(NSRange(location: 0, length: 0), with: Array("let x = 1\n".utf16))
+check(sameModel(tail, SyntaxModel(text: "let x = 1\n", spec: Languages.swift)), "вставка в пустой документ")
+
+// Открытый /* переразбирает хвост файла, закрытый — возвращает как было.
+let comment = SyntaxModel(text: "int a;\nint b;\nint c;\n", spec: Languages.csharp)
+comment.replace(NSRange(location: 0, length: 0), with: Array("/*".utf16))
+check(comment.tokens(fromLine: 2, toLine: 2).first?.kind == .comment, "открытый /* делает комментарием и дальние строки")
+comment.replace(NSRange(location: 0, length: 2), with: [])
+check(comment.tokens(fromLine: 2, toLine: 2).first.map { $0.kind != .comment } == true, "убранный /* возвращает подсветку")
+
+// Снимок не видит последующих правок.
+let snapModel = SyntaxModel(text: "abc", spec: nil)
+let snap = snapModel.snapshot()
+snapModel.replace(NSRange(location: 0, length: 3), with: Array("xyz\n".utf16))
+check(snap.text == "abc" && snap.lineCount == 1 && snapModel.version == snap.version + 1,
+      "снимок неизменен после правки оригинала")
+
+// ────────────────────────── Правила редактирования ──────────────────────────
+section("Правила редактирования")
+
+check(EditingRules.indentUnit(in: Array("a {\n    b {\n        c\n    }\n}\n".utf16)) == "    ", "отступ 4 пробела")
+check(EditingRules.indentUnit(in: Array("a:\n  b:\n    c: 1\n".utf16)) == "  ", "отступ 2 пробела (YAML)")
+check(EditingRules.indentUnit(in: Array("a {\n\tb\n\t\tc\n}\n".utf16)) == "\t", "отступ табами")
+check(EditingRules.indentUnit(in: Array("один\nдва\n".utf16)) == "    ", "без отступов — 4 пробела")
+check(EditingRules.lineEnding(in: Array("a\r\nb".utf16)) == "\r\n", "CRLF распознан")
+check(EditingRules.lineEnding(in: Array("a\nb".utf16)) == "\n", "LF распознан")
+
+let nl1 = EditingRules.newline(linePrefix: "    foo()", lineSuffix: "", indentUnit: "    ", lineEnding: "\n", colonOpensBlock: false)
+check(nl1 == .init(text: "\n    ", caret: 5), "Return сохраняет отступ")
+let nl2 = EditingRules.newline(linePrefix: "    if x {", lineSuffix: "", indentUnit: "    ", lineEnding: "\n", colonOpensBlock: false)
+check(nl2 == .init(text: "\n        ", caret: 9), "после { — на уровень глубже")
+let nl3 = EditingRules.newline(linePrefix: "func f() {", lineSuffix: "}", indentUnit: "    ", lineEnding: "\n", colonOpensBlock: false)
+check(nl3 == .init(text: "\n    \n", caret: 5), "{|} раскрывается в три строки (получено \(nl3))")
+let nl4 = EditingRules.newline(linePrefix: "def f():", lineSuffix: "", indentUnit: "    ", lineEnding: "\r\n", colonOpensBlock: true)
+check(nl4 == .init(text: "\r\n    ", caret: 6), "Python: после «:» глубже, CRLF сохраняется")
+let nl5 = EditingRules.newline(linePrefix: "x = a ? b :", lineSuffix: "", indentUnit: "    ", lineEnding: "\n", colonOpensBlock: false)
+check(nl5.text == "\n", "в C-подобных «:» блок не открывает")
+
+check(EditingRules.dedentBeforeClosing(linePrefix: "        ", indentUnit: "    ") == 4, "} снимает один уровень")
+check(EditingRules.dedentBeforeClosing(linePrefix: "  x", indentUnit: "    ") == 0, "} после кода отступ не трогает")
+check(EditingRules.dedentBeforeClosing(linePrefix: "\t\t", indentUnit: "\t") == 1, "} снимает таб")
+let braceText = Array("class A {\n    func f() {\n        x()\n        \n".utf16)
+check(EditingRules.closingBraceIndent(in: braceText, before: braceText.count - 1) == "    ", "} встаёт под парную { (func)")
+let braceText2 = Array("class A {\n    func f() {\n    }\n  \n".utf16)
+check(EditingRules.closingBraceIndent(in: braceText2, before: braceText2.count - 1) == "", "} встаёт под парную { (class)")
+check(EditingRules.closingBraceIndent(in: Array("x\n  ".utf16), before: 4) == nil, "без парной скобки — nil")
+check(EditingRules.backspaceWidth(linePrefix: "      ", indentUnit: "    ") == 2, "backspace до позиции табуляции")
+check(EditingRules.backspaceWidth(linePrefix: "        ", indentUnit: "    ") == 4, "backspace — целый уровень")
+check(EditingRules.backspaceWidth(linePrefix: "  x", indentUnit: "    ") == 1, "backspace после кода — один символ")
+
+check(EditingRules.indent(["a", "", "  b"], unit: "    ") == ["    a", "", "      b"], "сдвиг вправо не трогает пустые строки")
+check(EditingRules.outdent(["      a", "\tb", " c"], unit: "    ") == ["  a", "b", "c"], "сдвиг влево")
+let commented = EditingRules.toggleComment(["    a", "", "  b"], token: "//")
+check(commented == ["  //   a", "", "  // b"], "комментарий на общем минимальном отступе (получено \(commented))")
+check(EditingRules.toggleComment(commented, token: "//") == ["    a", "", "  b"], "повторный ⌘/ возвращает как было")
+check(EditingRules.toggleComment(["// a", "b"], token: "//") == ["// // a", "// b"], "смешанный блок — комментируется весь")
+
+// ────────────────────────── Автодополнение ──────────────────────────
+section("Автодополнение")
+
+let listJSON: [String: Any] = [
+    "isIncomplete": true,
+    "itemDefaults": ["editRange": ["start": ["line": 1, "character": 4], "end": ["line": 1, "character": 6]],
+                     "insertTextFormat": 2],
+    "items": [
+        ["label": "Count", "kind": 10, "detail": "int", "sortText": "b"],
+        ["label": "Contains", "kind": 2, "textEditText": "Contains(${1:item})", "sortText": "a"],
+        ["label": "Where", "kind": 2,
+         "textEdit": ["insert": ["start": ["line": 1, "character": 4], "end": ["line": 1, "character": 6]],
+                      "replace": ["start": ["line": 1, "character": 4], "end": ["line": 1, "character": 9]],
+                      "newText": "Where"],
+         "additionalTextEdits": [["range": ["start": ["line": 0, "character": 0], "end": ["line": 0, "character": 0]],
+                                  "newText": "using System.Linq;\n"]]],
+    ],
+]
+let parsed = CompletionList.parse(listJSON)
+check(parsed.isIncomplete && parsed.items.count == 3, "CompletionList разобран")
+check(parsed.items[0].edit?.range.start.character == 4 && parsed.items[0].isSnippet, "itemDefaults.editRange и формат по умолчанию")
+check(parsed.items[1].edit?.newText == "Contains(${1:item})", "textEditText из LSP 3.17")
+check(parsed.items[2].edit?.range.end.character == 6, "InsertReplaceEdit: берётся insert, а не replace")
+check(parsed.items[2].additionalEdits.first?.newText == "using System.Linq;\n", "сопутствующие правки")
+check(CompletionList.parse([["label": "x"]]).items.first?.label == "x", "ответ массивом")
+
+let sn1 = Snippet.expand("Contains(${1:item})")
+check(sn1 == .init(text: "Contains(item)", selection: NSRange(location: 9, length: 4)), "сниппет: заглушка выделяется")
+let sn2 = Snippet.expand("foo($1, $2)$0")
+check(sn2 == .init(text: "foo(, )", selection: NSRange(location: 4, length: 0)), "сниппет: курсор в первое поле")
+let sn3 = Snippet.expand("if ${1:cond} {\n\t$0\n}")
+check(sn3.text == "if cond {\n\t\n}" && sn3.selection == NSRange(location: 3, length: 4), "сниппет с переводами строк")
+check(Snippet.expand("a \\$ b ${TM_FILENAME} c").text == "a $ b  c", "экранирование и переменные")
+check(Snippet.expand("f(${1:x ${2:y}})").text == "f(x y)", "вложенные поля")
+check(Snippet.expand("${1|one,two|}").text == "one", "выбор — первый вариант")
+check(Snippet.expand("plain").selection == nil, "без полей — без выделения")
+
+let rankItems = ["getTextDocument", "GetType", "target", "gt", "forget"].map { CompletionItem(label: $0) }
+let ranked = CompletionRanking.rank(rankItems, prefix: "gt").map { rankItems[$0].label }
+check(ranked.first == "gt", "точное совпадение первым (получено \(ranked))")
+check(ranked.contains("getTextDocument") && ranked.contains("GetType"), "горбы находятся")
+check(!ranked.contains("forget"), "подпоследовательность не с начала слова отсекается")
+let casePref = CompletionRanking.rank(["Value", "value"].map { CompletionItem(label: $0) }, prefix: "va")
+check(casePref.first == 1, "совпадение с учётом регистра выше")
+check(CompletionRanking.rank(rankItems, prefix: "").count == rankItems.count, "пустой префикс — всё")
+
+let wordModel = SyntaxModel(text: "let counter = 1\ncounter += st\nlet co", spec: Languages.swift)
+let words = WordCompletion.items(in: wordModel, excluding: wordModel.units.count).map(\.label)
+check(words.contains("counter") && !words.contains("st"), "слова файла: от трёх букв")
+check(!words.contains("co"), "набираемое слово не предлагается")
+check(words.contains("func"), "ключевые слова языка")
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

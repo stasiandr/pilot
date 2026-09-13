@@ -10,6 +10,7 @@ struct PilotApp: App {
         Window("Pilot", id: "main") {
             RootView(workspace: workspace)
                 .task {
+                    delegate.workspace = workspace
                     // Путь из командной строки открываем после первого кадра:
                     // окно должно появиться мгновенно, а индексация идёт фоном.
                     // Без пути остаётся стартовый экран с выбором проекта.
@@ -36,6 +37,26 @@ struct PilotApp: App {
                 Button("Закрыть проект") { workspace.closeProject() }
                     .keyboardShortcut("w", modifiers: [.command, .shift])
                     .disabled(workspace.root == nil)
+            }
+            CommandGroup(replacing: .saveItem) {
+                Button("Сохранить") { workspace.save() }
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(!workspace.isCurrentDirty)
+                Button("Сохранить все") { workspace.saveAll() }
+                    .keyboardShortcut("s", modifiers: [.command, .option])
+                    .disabled(workspace.unsavedCount == 0)
+            }
+            CommandGroup(after: .pasteboard) {
+                Divider()
+                // Уходит первому ответчику — тексту редактора, если фокус в нём.
+                Button("Закомментировать строки") {
+                    NSApp.sendAction(#selector(CodeTextView.toggleLineComment(_:)), to: nil, from: nil)
+                }
+                .keyboardShortcut("/", modifiers: .command)
+                Button("Показать варианты") {
+                    NSApp.sendAction(#selector(NSTextView.complete(_:)), to: nil, from: nil)
+                }
+                .keyboardShortcut(.escape, modifiers: .option)
             }
             CommandGroup(after: .toolbar) {
                 Button("Перейти к файлу…") { workspace.openPalette(mode: .files) }
@@ -97,6 +118,14 @@ struct PilotApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Чтобы при выходе спросить про несохранённые правки.
+    weak var workspace: Workspace?
+
+    @MainActor
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        workspace?.confirmUnsavedChanges() == false ? .terminateCancel : .terminateNow
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Палитра — Catppuccin Macchiato, тёмная; ставим до появления окна,
         // чтобы не мигнуть светлым хромом.
