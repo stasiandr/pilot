@@ -135,7 +135,8 @@ struct PaletteView: View {
         switch workspace.paletteMode {
         case .files:   return workspace.isIndexing
         case .classes: return workspace.isIndexing || workspace.isTypeIndexing
-        case .outline, .symbols, .references, .changes: return false
+        case .symbols: return workspace.symbolIndex == nil && !workspace.lsp.isReady
+        case .outline, .references, .declarations, .changes: return false
         }
     }
 
@@ -152,7 +153,7 @@ struct PaletteView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help("Типов в индексе")
-        case .symbols, .references, .outline, .changes:
+        case .symbols, .references, .declarations, .outline, .changes:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
                     .font(.system(size: 11, design: .monospaced))
@@ -184,11 +185,15 @@ struct PaletteView: View {
             }
             return "Начните вводить имя класса — можно заглавными: USvc → UserService"
         case .symbols:
-            if !workspace.lsp.isReady { return lspNotReadyMessage }
-            return workspace.query.isEmpty ? "Начните вводить имя символа" : "Ничего не найдено"
+            if !workspace.canSearchSymbols { return "Собираю символы проекта…" }
+            if !workspace.query.isEmpty { return "Ничего не найдено" }
+            return workspace.lsp.isReady
+                ? "Начните вводить имя символа"
+                : "Начните вводить имя символа — пока \(workspace.lsp.serverName ?? "языковой сервер") греется, ищу по быстрому индексу"
         case .references:
-            if !workspace.lsp.isReady { return lspNotReadyMessage }
             return "Использований не найдено"
+        case .declarations:
+            return "Ничего не найдено"
         case .outline:
             return workspace.document == nil
                 ? "Сначала откройте файл"
@@ -196,15 +201,6 @@ struct PaletteView: View {
         case .changes:
             if workspace.git.repository == nil { return "Проект не под git" }
             return workspace.query.isEmpty ? "Изменений нет — всё закоммичено" : "Ничего не найдено"
-        }
-    }
-
-    private var lspNotReadyMessage: String {
-        switch workspace.lsp.state {
-        case .stopped:            return "Языковой сервер не запущен — откройте файл .cs"
-        case .starting(let what): return "Языковой сервер ещё греется: \(what)"
-        case .failed(let why):    return "Языковой сервер не поднялся: \(why)"
-        case .ready:              return "Ничего не найдено"
         }
     }
 

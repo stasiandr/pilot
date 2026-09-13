@@ -51,6 +51,9 @@ enum Theme {
 
     static var separator: NSColor { Macchiato.surface0 }
 
+    /// Молния быстрого индекса в статус-строке: пока навигация идёт по нему.
+    static var fastIndex: NSColor { Macchiato.yellow }
+
     // MARK: - Иконки файлов
 
     struct Icon {
