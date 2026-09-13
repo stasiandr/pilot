@@ -55,14 +55,10 @@ final class Workspace: ObservableObject {
 
     func focusEditor() { editorFocusRequest += 1 }
 
-    /// Позиция курсора в открытом документе — отсюда берутся запросы к LSP.
-    @Published private(set) var caretOffset: Int = 0
-    /// Вхождения идентификатора под курсором — подсвечиваются в тексте.
-    @Published private(set) var occurrences: [NSRange] = []
-    /// Где мы находимся: «Класс › Метод».
-    @Published private(set) var breadcrumb: String = ""
-    /// Объявление, внутри которого курсор, — для jump bar и навигатора структуры.
-    @Published private(set) var currentOutlineItem: OutlineItem?
+    /// Курсор в открытом документе: позиция, объявление под ним, вхождения.
+    /// Не @Published — см. EditorCaret.
+    let caret = EditorCaret()
+    var caretOffset: Int { caret.offset }
     /// Ветка git — подзаголовок окна, как в Xcode.
     @Published private(set) var branch: String?
 
@@ -283,7 +279,7 @@ final class Workspace: ObservableObject {
         fileTree = nil
         history.removeAll()
         historyIndex = -1
-        currentOutlineItem = nil
+        caret.setOutlineItem(nil)
         branch = GitInfo.branch(at: url)
         navigatorFilter = ""
         filteredTree = nil
@@ -437,9 +433,8 @@ final class Workspace: ObservableObject {
         query = ""
         results = []
         items = []
-        occurrences = []
-        breadcrumb = ""
-        currentOutlineItem = nil
+        caret.reset()
+        occurrenceWord = nil
         branch = nil
         navigatorFilter = ""
         filteredTree = nil
@@ -639,39 +634,29 @@ final class Workspace: ObservableObject {
 
     func caretMoved(to offset: Int) {
         guard offset != caretOffset else { return }
-        caretOffset = offset
-        updateBreadcrumb()
+        caret.setOffset(offset)
+        updateOutlineItem()
         scheduleOccurrences()
     }
 
-    private func updateBreadcrumb() {
-        guard let document, !document.outline.isEmpty else {
-            breadcrumb = ""
-            currentOutlineItem = nil
-            return
-        }
-        // Объемлющее объявление — последнее, начавшееся до курсора.
+    /// Объемлющее объявление — последнее, начавшееся до курсора.
+    private func updateOutlineItem() {
+        guard let document else { return caret.setOutlineItem(nil) }
         var current: OutlineItem?
         for item in document.outline {
             if item.range.location <= caretOffset { current = item } else { break }
         }
-        currentOutlineItem = current
-        guard let current else { breadcrumb = ""; return }
-        if let container = current.container, !container.isEmpty {
-            breadcrumb = "\(container) › \(current.name)"
-        } else {
-            breadcrumb = current.name
-        }
+        caret.setOutlineItem(current)
     }
 
     /// Подсветка вхождений. С задержкой: при протягивании выделения
     /// курсор двигается десятки раз в секунду.
     private func scheduleOccurrences() {
         occurrenceTask?.cancel()
-        guard let document else { occurrences = []; occurrenceWord = nil; return }
+        guard let document else { caret.setOccurrences([]); occurrenceWord = nil; return }
 
         guard let identifier = Occurrences.identifier(in: document.model, at: caretOffset) else {
-            occurrences = []
+            caret.setOccurrences([])
             occurrenceWord = nil
             return
         }
@@ -683,7 +668,7 @@ final class Workspace: ObservableObject {
             let found = Occurrences.find(identifier.text, in: document.model)
             guard !Task.isCancelled else { return }
             self.occurrenceWord = identifier.text
-            self.occurrences = found
+            self.caret.setOccurrences(found)
         }
     }
 
@@ -711,6 +696,7 @@ final class Workspace: ObservableObject {
 
     /// Следующее/предыдущее вхождение слова под курсором.
     func jumpToOccurrence(_ direction: Int) {
+        let occurrences = caret.occurrences
         guard let document, !occurrences.isEmpty else { return }
         let next: NSRange?
         if direction > 0 {
@@ -1255,11 +1241,8 @@ final class Workspace: ObservableObject {
     private func activate(_ buffer: TextBuffer, reveal: LSPRange?) {
         setBuffer(buffer)
         loadError = nil
-        caretOffset = 0
-        occurrences = []
+        caret.reset()
         occurrenceWord = nil
-        breadcrumb = ""
-        currentOutlineItem = nil
         requestReveal(reveal)
         if buffer.isReadOnly {
             // Версия из MR: полоски и треды даёт ревью, а не HEAD. Серверу
@@ -1309,7 +1292,7 @@ final class Workspace: ObservableObject {
 
         // Вхождения посчитаны по старому тексту; пересчитаются на следующем
         // движении курсора, а оно после набора будет всегда.
-        occurrences = []
+        caret.setOccurrences([])
         occurrenceWord = nil
 
         // Структура и полоски git — с задержкой: пока печатаешь, незачем.
@@ -1347,7 +1330,7 @@ final class Workspace: ObservableObject {
                 self.objectWillChange.send()
                 buffer.setSemantics(outline: semantics?.outline ?? outline,
                                     unityFile: semantics?.serialized, version: snapshot.version)
-                self.updateBreadcrumb()
+                self.updateOutlineItem()
             }
         }
     }
@@ -1575,7 +1558,13 @@ final class Workspace: ObservableObject {
         }
         // После точки нужны члены типа — словами файла тут не помочь.
         guard trigger == nil, buffer === self.buffer else { return nil }
-        return CompletionList(items: WordCompletion.items(in: buffer.model, excluding: offset))
+        // Слова — по снимку и в фоне: на большом файле это десятки
+        // миллисекунд, и набор их ждать не должен.
+        let snapshot = buffer.model.snapshot()
+        let items = await Task.detached(priority: .userInitiated) {
+            WordCompletion.items(in: snapshot, excluding: offset)
+        }.value
+        return CompletionList(items: items)
     }
 
     // MARK: - Навигация в палитре

@@ -158,9 +158,9 @@ struct OutlineList: View {
                     .listStyle(.sidebar)
                     .environment(\.sidebarRowSize, .small)
                     .onAppear {
-                        if let id = workspace.currentOutlineItem?.id { proxy.scrollTo(id, anchor: .center) }
+                        if let id = workspace.caret.outlineItem?.id { proxy.scrollTo(id, anchor: .center) }
                     }
-                    .onChange(of: workspace.currentOutlineItem?.id) { _, id in
+                    .onChange(of: workspace.caret.outlineItem?.id) { _, id in
                         if let id { proxy.scrollTo(id) }
                     }
                 }
@@ -171,7 +171,7 @@ struct OutlineList: View {
     }
 
     private var selection: Binding<Int?> {
-        Binding(get: { workspace.currentOutlineItem?.id },
+        Binding(get: { workspace.caret.outlineItem?.id },
                 set: { id in
                     guard let id, let item = workspace.document?.outline.first(where: { $0.id == id })
                     else { return }

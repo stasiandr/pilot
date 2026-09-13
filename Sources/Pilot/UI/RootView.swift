@@ -83,33 +83,35 @@ struct RootView: View {
                    hint: workspace.unity.isActive
                        ? "⇧⌘R — где используется этот ассет  ·  ⌃⌘M — открыть его .meta" : nil)
         } else if let buffer = workspace.buffer {
-            CodeView(buffer: buffer,
-                     fontSize: workspace.fontSize,
-                     reveal: workspace.reveal,
-                     occurrences: workspace.occurrences,
-                     lineChanges: workspace.editorLineChanges,
-                     commentMarks: workspace.editorCommentMarks,
-                     isReview: workspace.isReviewDocument,
-                     popover: workspace.linePopover,
-                     popoverContent: { request in
-                         AnyView(LineInspector(workspace: workspace, line: request.line,
-                                               compose: request.compose)
-                            .preferredColorScheme(.dark))
-                     },
-                     conflicts: workspace.conflicts,
-                     conflictAction: workspace.conflictAction,
-                     focusRequest: workspace.editorFocusRequest,
-                     completionTriggers: workspace.lsp.completionTriggers,
-                     decorator: workspace.unity.decorator(),
-                     decorationsVersion: workspace.unity.decorationsVersion,
-                     editRequest: workspace.editRequest,
-                     onCaretChange: { workspace.caretMoved(to: $0) },
-                     onGoToDefinition: { workspace.goToDefinition(at: $0) },
-                     onLineClick: { workspace.lineClicked($0) },
-                     onCommentLine: workspace.isReviewDocument ? { workspace.commentOnLine($0) } : nil,
-                     requestCompletions: { offset, trigger, retrigger in
-                         await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)
-                     })
+            OccurrencesReader(caret: workspace.caret) { occurrences in
+                CodeView(buffer: buffer,
+                         fontSize: workspace.fontSize,
+                         reveal: workspace.reveal,
+                         occurrences: occurrences,
+                         lineChanges: workspace.editorLineChanges,
+                         commentMarks: workspace.editorCommentMarks,
+                         isReview: workspace.isReviewDocument,
+                         popover: workspace.linePopover,
+                         popoverContent: { request in
+                             AnyView(LineInspector(workspace: workspace, line: request.line,
+                                                   compose: request.compose)
+                                .preferredColorScheme(.dark))
+                         },
+                         conflicts: workspace.conflicts,
+                         conflictAction: workspace.conflictAction,
+                         focusRequest: workspace.editorFocusRequest,
+                         completionTriggers: workspace.lsp.completionTriggers,
+                         decorator: workspace.unity.decorator(),
+                         decorationsVersion: workspace.unity.decorationsVersion,
+                         editRequest: workspace.editRequest,
+                         onCaretChange: { workspace.caretMoved(to: $0) },
+                         onGoToDefinition: { workspace.goToDefinition(at: $0) },
+                         onLineClick: { workspace.lineClicked($0) },
+                         onCommentLine: workspace.isReviewDocument ? { workspace.commentOnLine($0) } : nil,
+                         requestCompletions: { offset, trigger, retrigger in
+                             await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)
+                         })
+            }
         } else if workspace.root == nil {
             StartView(workspace: workspace)
         } else {
@@ -253,9 +255,7 @@ struct RootView: View {
                 unityChip
                 blameLabel
                 changesChip
-                let position = doc.model.position(at: workspace.caretOffset)
-                Text("Строка: \(position.line + 1)   Столбец: \(position.character + 1)")
-                    .monospacedDigit()
+                CaretPositionLabel(caret: workspace.caret, model: doc.model)
             } else {
                 Spacer()
                 noticeLabel
@@ -317,34 +317,10 @@ struct RootView: View {
 
     // MARK: - Git
 
-    /// Кто и когда последним трогал строку под курсором. Появляется, когда
-    /// blame досчитается; до тех пор места в строке не занимает.
     @ViewBuilder
     private var blameLabel: some View {
-        if let doc = workspace.document,
-           let commit = workspace.git.blame?.commit(atLine: doc.model.line(containing: workspace.caretOffset)) {
-            if commit.isUncommitted {
-                Text("Не закоммичено")
-                    .foregroundStyle(.tertiary)
-                    .help("Строка отличается от HEAD")
-            } else {
-                HStack(spacing: 6) {
-                    Text("\(commit.author), \(Self.ago(commit.time))")
-                        .layoutPriority(1)
-                    Text(commit.summary)
-                        .foregroundStyle(.tertiary)
-                        .truncationMode(.tail)
-                }
-                .lineLimit(1)
-                .frame(maxWidth: 420, alignment: .trailing)
-                .help("\(commit.shortSHA) · \(commit.author) · \(Self.fullDate(commit.time))\n\(commit.summary)")
-                .contextMenu {
-                    Button("Скопировать хэш коммита") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(commit.sha, forType: .string)
-                    }
-                }
-            }
+        if let doc = workspace.document, let blame = workspace.git.blame {
+            BlameLabel(caret: workspace.caret, blame: blame, model: doc.model)
         }
     }
 
@@ -385,14 +361,14 @@ struct RootView: View {
         return lines.joined(separator: "\n")
     }
 
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
+    fileprivate static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.locale = Locale(identifier: "ru_RU")
         formatter.unitsStyle = .full
         return formatter
     }()
 
-    private static let fullFormatter: DateFormatter = {
+    fileprivate static let fullFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "ru_RU")
         formatter.dateStyle = .long
@@ -400,12 +376,12 @@ struct RootView: View {
         return formatter
     }()
 
-    private static func ago(_ date: Date?) -> String {
+    fileprivate static func ago(_ date: Date?) -> String {
         guard let date else { return "" }
         return relativeFormatter.localizedString(for: date, relativeTo: Date())
     }
 
-    private static func fullDate(_ date: Date?) -> String {
+    fileprivate static func fullDate(_ date: Date?) -> String {
         date.map(fullFormatter.string(from:)) ?? ""
     }
 
@@ -570,4 +546,64 @@ struct ActivityView: View {
     private var divider: some View {
         Text("|").foregroundStyle(.quaternary)
     }
+}
+
+// MARK: - Надписи, которые следят за курсором
+
+/// Строка и столбец курсора. Отдельными видами, а не частью RootView:
+/// курсор двигается на каждое нажатие, и перерисовываться должны только
+/// эти надписи, а не всё окно.
+private struct CaretPositionLabel: View {
+    let caret: EditorCaret
+    let model: SyntaxModel
+
+    var body: some View {
+        let position = model.position(at: caret.offset)
+        Text("Строка: \(position.line + 1)   Столбец: \(position.character + 1)")
+            .monospacedDigit()
+    }
+}
+
+/// Кто и когда последним трогал строку под курсором. Появляется, когда
+/// blame досчитается; до тех пор места в строке не занимает.
+private struct BlameLabel: View {
+    let caret: EditorCaret
+    let blame: GitBlame
+    let model: SyntaxModel
+
+    var body: some View {
+        if let commit = blame.commit(atLine: model.line(containing: caret.offset)) {
+            if commit.isUncommitted {
+                Text("Не закоммичено")
+                    .foregroundStyle(.tertiary)
+                    .help("Строка отличается от HEAD")
+            } else {
+                HStack(spacing: 6) {
+                    Text("\(commit.author), \(RootView.ago(commit.time))")
+                        .layoutPriority(1)
+                    Text(commit.summary)
+                        .foregroundStyle(.tertiary)
+                        .truncationMode(.tail)
+                }
+                .lineLimit(1)
+                .frame(maxWidth: 420, alignment: .trailing)
+                .help("\(commit.shortSHA) · \(commit.author) · \(RootView.fullDate(commit.time))\n\(commit.summary)")
+                .contextMenu {
+                    Button("Скопировать хэш коммита") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(commit.sha, forType: .string)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Вхождения слова под курсором меняются при каждом переходе на другое
+/// слово — перечитывает их только редактор, а не всё окно.
+private struct OccurrencesReader<Content: View>: View {
+    let caret: EditorCaret
+    @ViewBuilder let content: ([NSRange]) -> Content
+
+    var body: some View { content(caret.occurrences) }
 }

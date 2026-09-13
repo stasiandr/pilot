@@ -44,7 +44,7 @@ enum OutlineKind: UInt8 {
     }
 }
 
-struct OutlineItem: Identifiable {
+struct OutlineItem: Identifiable, Equatable {
     var id: Int
     var name: String
     var kind: OutlineKind

@@ -219,6 +219,32 @@ final class CodeTextView: NSTextView {
         super.draw(dirtyRect)
     }
 
+    // MARK: Перерисовка пачкой
+
+    /// Прямоугольник, накопленный за перекраску; nil — копить не просим.
+    private var batchedDisplay: NSRect?
+
+    /// Каждый временный атрибут зовёт setNeedsDisplay, а NSTextView на
+    /// каждый ещё и доводит раскладку видимой области — перекраска тысячи
+    /// токенов обходилась в тысячу таких проходов. Копим прямоугольник
+    /// и отдаём его одним вызовом.
+    func batchingDisplay(_ body: () -> Void) {
+        guard batchedDisplay == nil else { return body() }
+        batchedDisplay = .null
+        body()
+        let rect = batchedDisplay ?? .null
+        batchedDisplay = nil
+        if !rect.isNull { super.setNeedsDisplay(rect, avoidAdditionalLayout: false) }
+    }
+
+    override func setNeedsDisplay(_ rect: NSRect, avoidAdditionalLayout flag: Bool) {
+        if let batched = batchedDisplay {
+            batchedDisplay = batched.union(rect)
+            return
+        }
+        super.setNeedsDisplay(rect, avoidAdditionalLayout: flag)
+    }
+
     // MARK: Конфликты слияния
 
     /// Полосы под блоками конфликта: текущее, база, входящее, маркеры.
@@ -482,7 +508,12 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var decorator: CodeDecorator?
     private var fontSize: CGFloat = 12.5
     private var isApplying = false
-    private var lastHighlighted: ClosedRange<Int>?
+    /// Покрашенный участок текста. В символах, а не строках: временные
+    /// атрибуты едут вместе с текстом, и участок сдвигается вслед за правками.
+    private var painted: NSRange?
+    /// Правленый текст, ещё не перекрашенный, — вместе с тем, что за правкой
+    /// разобралось по-новому (после открытого `/*`, например).
+    private var unpainted: NSRange?
     private var occurrences: [NSRange] = []
 
     override func loadView() {
@@ -588,10 +619,15 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// с файлом, пока смотрим другие.
     func show(_ buffer: TextBuffer) {
         self.buffer?.lastCaret = textView.selectedRange().location
+        self.buffer?.onDisplayEdit = nil
         hideCompletion()
         closePopover()
         self.buffer = buffer
-        lastHighlighted = nil
+        painted = nil
+        unpainted = nil
+        buffer.onDisplayEdit = { [weak self] range, delta, settled in
+            self?.textEdited(range, delta: delta, settled: settled)
+        }
         // Версия файла из MR — только для чтения: её правки некуда сохранить.
         textView.isEditable = !buffer.isReadOnly
 
@@ -602,8 +638,9 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
                                         range: NSRange(location: 0, length: buffer.storage.length))
             isApplying = false
             buffer.fontSize = fontSize
+            buffer.fixAttributesAhead()
         }
-        textView.layoutManager?.replaceTextStorage(buffer.storage)
+        replaceStorage(with: buffer.storage)
         textView.breakUndoCoalescing()
         textView.typingAttributes = [.font: font, .foregroundColor: Theme.color(.plain)]
         textView.indentUnit = buffer.indentUnit
@@ -615,6 +652,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.scroll(NSPoint(x: 0, y: 0))
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
         ruler?.model = buffer.model
+        rulerLineCount = buffer.model.lineCount
         ruler?.currentLine = 0
         ruler?.eventLines = Self.gutterMarkers(for: buffer.document)
         ruler?.invalidateWidth()
@@ -622,12 +660,26 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.updateCurrentLineHighlight()
     }
 
+    /// Подсветка живёт во временных атрибутах раскладки, а не в тексте:
+    /// они привязаны к позициям, и чужой файл не должен их унаследовать.
+    private func replaceStorage(with storage: NSTextStorage) {
+        guard let layout = textView.layoutManager else { return }
+        clearTemporaryAttributes(layout)
+        layout.replaceTextStorage(storage)
+        clearTemporaryAttributes(layout)
+    }
+
+    private func clearTemporaryAttributes(_ layout: NSLayoutManager) {
+        let length = layout.textStorage?.length ?? 0
+        if length > 0 { layout.setTemporaryAttributes([:], forCharacterRange: NSRange(location: 0, length: length)) }
+    }
+
     /// Разбор файла обновился (правка, индекс ассетов) — перекрашиваем
     /// ссылки и значки, текст не трогаем.
     func invalidateDecorations() {
         if let buffer { ruler?.eventLines = Self.gutterMarkers(for: buffer.document) }
         ruler?.needsDisplay = true
-        lastHighlighted = nil
+        painted = nil
         highlightVisible()
     }
 
@@ -664,12 +716,13 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     func showEmpty() {
         self.buffer?.lastCaret = textView.selectedRange().location
+        self.buffer?.onDisplayEdit = nil
         hideCompletion()
         closePopover()
         buffer = nil
         // Пустое хранилище вместо стирания текста: буфер мог остаться
         // в памяти с несохранёнными правками.
-        textView.layoutManager?.replaceTextStorage(NSTextStorage())
+        replaceStorage(with: NSTextStorage())
         ruler?.model = nil
         ruler?.eventLines = []
         ruler?.setChanges([])
@@ -831,6 +884,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     /// Что сейчас набирают — нужно, чтобы решить, открывать ли дополнение.
     private var pendingInput: String?
+    /// Сколько строк было, когда гаттер рисовали после правки.
+    private var rulerLineCount = 0
 
     func textView(_ textView: NSTextView, shouldChangeTextIn range: NSRange,
                   replacementString: String?) -> Bool {
@@ -842,10 +897,15 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Текст уже в модели (TextBuffer правит её в том же вызове) — осталось
     /// перекрасить видимое и решить судьбу списка дополнений.
     func textDidChange(_ notification: Notification) {
-        lastHighlighted = nil
-        highlightVisible()
-        if let model, String(model.lineCount).count != ruler?.digits { ruler?.invalidateWidth() }
-        ruler?.needsDisplay = true
+        repaintEdited()
+        highlightVisible(toolTips: false)
+        // Номера и пометки у строк сдвигаются, только когда меняется число
+        // строк; буква внутри строки гаттер не трогает.
+        if let model, model.lineCount != rulerLineCount {
+            rulerLineCount = model.lineCount
+            if String(model.lineCount).count != ruler?.digits { ruler?.invalidateWidth() }
+            ruler?.needsDisplay = true
+        }
 
         let input = pendingInput
         pendingInput = nil
@@ -1084,17 +1144,21 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     }
 
     private func flash(_ range: NSRange) {
-        guard range.length > 0, let storage = textView.textStorage else { return }
+        guard range.length > 0, let layout = textView.layoutManager else { return }
         flashToken += 1
         let token = flashToken
-        storage.addAttribute(.backgroundColor,
-                             value: NSColor.findHighlightColor.withAlphaComponent(0.55),
-                             range: range)
+        layout.addTemporaryAttribute(.backgroundColor,
+                                     value: NSColor.findHighlightColor.withAlphaComponent(0.55),
+                                     forCharacterRange: range)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
             guard let self, self.flashToken == token,
-                  let storage = self.textView.textStorage,
-                  NSMaxRange(range) <= storage.length else { return }
-            storage.removeAttribute(.backgroundColor, range: range)
+                  let layout = self.textView.layoutManager,
+                  let length = layout.textStorage?.length else { return }
+            let clamped = NSIntersectionRange(range, NSRange(location: 0, length: length))
+            if clamped.length > 0 { layout.removeTemporaryAttribute(.backgroundColor, forCharacterRange: clamped) }
+            // Вспышка могла закрыть вхождения — перекрашиваем видимое.
+            self.painted = nil
+            self.highlightVisible()
         }
     }
 
@@ -1115,10 +1179,27 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Вхождения красим не все сразу, а вместе с остальной подсветкой —
     /// то есть только в видимой области. Иначе на файле с тысячами
     /// совпадений каждый скролл упирался бы в применение атрибутов.
+    /// Здесь — только в уже покрашенном, остальное докрасит `highlightVisible`.
+    /// Снимаем и ставим фон точечно, на самих словах: слово под курсором
+    /// меняется на каждой букве, и перерисовывать ради него весь экран незачем.
     func setOccurrences(_ ranges: [NSRange]) {
+        let old = occurrences
         occurrences = ranges
-        lastHighlighted = nil
-        highlightVisible()
+        guard !(old.isEmpty && ranges.isEmpty), let painted, let layout = textView.layoutManager,
+              let length = layout.textStorage?.length else { return }
+        let area = NSIntersectionRange(painted, NSRange(location: 0, length: length))
+        guard area.length > 0 else { return }
+        textView.batchingDisplay {
+            for occurrence in old {
+                let r = NSIntersectionRange(occurrence, area)
+                if r.length > 0 { layout.removeTemporaryAttribute(.backgroundColor, forCharacterRange: r) }
+            }
+            for occurrence in ranges where NSIntersectionRange(occurrence, area).length > 0
+                && NSMaxRange(occurrence) <= length {
+                layout.addTemporaryAttribute(.backgroundColor, value: Theme.occurrenceHighlight,
+                                             forCharacterRange: occurrence)
+            }
+        }
     }
 
     func setFontSize(_ size: CGFloat) {
@@ -1130,7 +1211,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         buffer.storage.addAttribute(.font, value: font, range: NSRange(location: 0, length: buffer.storage.length))
         isApplying = false
         buffer.fontSize = fontSize
-        lastHighlighted = nil
+        buffer.fixAttributesAhead()
+        painted = nil
         ruler?.font = font
         ruler?.invalidateWidth()
         highlightVisible()
@@ -1139,7 +1221,18 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     }
 
     /// Красит только те строки, что попали в видимую область (+ запас).
-    private func highlightVisible() {
+    ///
+    /// Цвета, подчёркивания и фон — временными атрибутами раскладки, а не
+    /// атрибутами текста. На раскладку они не влияют, и TextKit только
+    /// перерисовывает строки. Атрибут текста — это правка: TextKit заново
+    /// «чинит» шрифты, строит глифы и раскладку всех перекрашенных строк
+    /// и пересчитывает размер вью, и на файле в 10 000 строк каждая буква
+    /// стоила десятки миллисекунд.
+    ///
+    /// `toolTips: false` — после правки текста: подсказки (единственное,
+    /// что остаётся в тексте) сдвинулись вместе с ним, а разбор, по которому
+    /// их ставить, ещё не догнал правку — обновятся с ним.
+    private func highlightVisible(toolTips: Bool = true) {
         guard !isApplying,
               let model, model.spec != nil,
               let storage = textView.textStorage,
@@ -1158,48 +1251,129 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         guard firstLine <= lastLine else { return }
 
         // Уже покрашено — второй раз не тратимся.
-        if let last = lastHighlighted, last.contains(firstLine), last.contains(lastLine) { return }
+        if let painted, let wanted = textRange(lines: firstLine...lastLine),
+           NSIntersectionRange(painted, wanted) == wanted { return }
 
-        let start = Int(model.lineStarts[firstLine])
-        let end = lastLine + 1 < model.lineCount ? Int(model.lineStarts[lastLine + 1]) : storage.length
-        let range = NSRange(location: start, length: max(0, min(end, storage.length) - start))
-        guard range.length > 0 else { return }
+        if let range = paint(lines: firstLine...lastLine, afterEdit: !toolTips) { painted = range }
+    }
 
-        let tokens = model.tokens(fromLine: firstLine, toLine: lastLine)
-
-        isApplying = true
-        storage.beginEditing()
-        storage.addAttribute(.foregroundColor, value: Theme.color(.plain), range: range)
-        for t in tokens {
-            let r = NSRange(location: Int(t.start), length: Int(t.length))
-            guard r.location >= 0, NSMaxRange(r) <= storage.length, r.length > 0 else { continue }
-            storage.addAttribute(.foregroundColor, value: Theme.color(t.kind), range: r)
+    /// Правка текста — ещё посреди её обработки, так что только считаем:
+    /// сдвигаем покрашенное и запоминаем, что перекрасить.
+    private func textEdited(_ range: NSRange, delta: Int, settled: Int) {
+        let oldLength = range.length - delta
+        painted = painted.map { Self.shift($0, byEditAt: range.location, from: oldLength, to: range.length) }
+        // Фон вхождений уехал вместе с текстом — пусть и они: снимать его
+        // будут по этим позициям.
+        if !occurrences.isEmpty {
+            occurrences = occurrences.map { Self.shift($0, byEditAt: range.location, from: oldLength, to: range.length) }
         }
-        storage.removeAttribute(.backgroundColor, range: range)
-        storage.removeAttribute(.underlineStyle, range: range)
-        storage.removeAttribute(.toolTip, range: range)
-        if let decorator, let document = buffer?.document {
-            for d in decorator(document, range) {
-                guard d.range.length > 0, NSMaxRange(d.range) <= storage.length else { continue }
-                if let color = d.color { storage.addAttribute(.foregroundColor, value: color, range: d.range) }
-                if d.underline {
-                    storage.addAttribute(.underlineStyle,
-                                         value: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
-                                         range: d.range)
+        let from = model.map { $0.lineRange($0.line(containing: range.location)).lowerBound } ?? range.location
+        let fresh = NSRange(location: from, length: max(settled, NSMaxRange(range)) - from)
+        unpainted = unpainted.map {
+            NSUnionRange(Self.shift($0, byEditAt: range.location, from: oldLength, to: range.length), fresh)
+        } ?? fresh
+    }
+
+    /// Куда уедет участок текста, когда `length` символов с `location`
+    /// заменят на `newLength`. Задетый правкой — растягивается на весь новый текст.
+    static func shift(_ r: NSRange, byEditAt location: Int, from length: Int, to newLength: Int) -> NSRange {
+        if NSMaxRange(r) <= location { return r }
+        if r.location >= location + length {
+            return NSRange(location: r.location + newLength - length, length: r.length)
+        }
+        let start = min(r.location, location)
+        let end = max(NSMaxRange(r) + newLength - length, location + newLength)
+        return NSRange(location: start, length: end - start)
+    }
+
+    /// После правки перекрашиваем только задетые строки, и только если они
+    /// были покрашены: иначе их докрасит `highlightVisible`, когда покажутся.
+    /// Набор буквы — одна строка вместо всего экрана: меньше и красить,
+    /// и перерисовывать.
+    private func repaintEdited() {
+        guard let edited = unpainted else { return }
+        unpainted = nil
+        guard !isApplying, let painted, let model, model.spec != nil else { return }
+        let range = NSIntersectionRange(edited, painted)
+        guard range.length > 0 else { return }
+        let first = model.line(containing: range.location)
+        let last = model.line(containing: NSMaxRange(range) - 1)
+        paint(lines: first...last, afterEdit: true)
+    }
+
+    private func textRange(lines: ClosedRange<Int>) -> NSRange? {
+        guard let model, let storage = textView.textStorage else { return nil }
+        let start = Int(model.lineStarts[lines.lowerBound])
+        let end = lines.upperBound + 1 < model.lineCount ? Int(model.lineStarts[lines.upperBound + 1]) : storage.length
+        let range = NSRange(location: start, length: max(0, min(end, storage.length) - start))
+        return range.length > 0 ? range : nil
+    }
+
+    /// Красит строки целиком: лексер начинает с состояния на входе в строку.
+    /// `afterEdit` — разбор отстаёт от текста: вхождения и подсказки по нему
+    /// врут, их не трогаем (вхождения после правки и так сбрасываются).
+    @discardableResult
+    private func paint(lines: ClosedRange<Int>, afterEdit: Bool) -> NSRange? {
+        guard let model, let storage = textView.textStorage, let layout = textView.layoutManager,
+              let range = textRange(lines: lines) else { return nil }
+        let tokens = model.tokens(fromLine: lines.lowerBound, toLine: lines.upperBound)
+
+        var tips: [(range: NSRange, text: String)] = []
+        textView.batchingDisplay {
+            // Прежние цвета, подчёркивания и фон — одним вызовом; обычный текст
+            // берёт цвет из самого текста, так что красим только остальное.
+            layout.setTemporaryAttributes([:], forCharacterRange: range)
+            for t in tokens where t.kind != .plain {
+                let r = NSRange(location: Int(t.start), length: Int(t.length))
+                guard r.location >= 0, NSMaxRange(r) <= storage.length, r.length > 0 else { continue }
+                layout.addTemporaryAttribute(.foregroundColor, value: Theme.color(t.kind), forCharacterRange: r)
+            }
+            if let decorator, let document = buffer?.document {
+                for d in decorator(document, range) {
+                    guard d.range.length > 0, NSMaxRange(d.range) <= storage.length else { continue }
+                    if let color = d.color {
+                        layout.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: d.range)
+                    }
+                    if d.underline {
+                        layout.addTemporaryAttribute(.underlineStyle,
+                                                     value: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
+                                                     forCharacterRange: d.range)
+                    }
+                    if let tip = d.toolTip { tips.append((d.range, tip)) }
                 }
-                if let tip = d.toolTip { storage.addAttribute(.toolTip, value: tip, range: d.range) }
+            }
+            guard !afterEdit else { return }
+            for occurrence in occurrences {
+                guard NSIntersectionRange(occurrence, range).length > 0,
+                      NSMaxRange(occurrence) <= storage.length else { continue }
+                layout.addTemporaryAttribute(.backgroundColor, value: Theme.occurrenceHighlight,
+                                             forCharacterRange: occurrence)
             }
         }
-        for occurrence in occurrences {
-            guard NSIntersectionRange(occurrence, range).length > 0,
-                  NSMaxRange(occurrence) <= storage.length else { continue }
-            storage.addAttribute(.backgroundColor,
-                                 value: Theme.occurrenceHighlight, range: occurrence)
+        if !afterEdit { applyToolTips(tips, in: range, storage: storage) }
+        return range
+    }
+
+    /// Подсказки временными атрибутами не сделать — они остаются в тексте.
+    /// Правка текста дорогая (см. `highlightVisible`), поэтому трогаем его,
+    /// только если подсказки на этом участке и правда другие.
+    private func applyToolTips(_ tips: [(range: NSRange, text: String)], in range: NSRange,
+                               storage: NSTextStorage) {
+        let wanted = tips
+            .map { (range: NSIntersectionRange($0.range, range), text: $0.text) }
+            .filter { $0.range.length > 0 }
+            .sorted { $0.range.location < $1.range.location }
+        var existing: [(range: NSRange, text: String)] = []
+        storage.enumerateAttribute(.toolTip, in: range) { value, r, _ in
+            if let text = value as? String { existing.append((r, text)) }
         }
+        guard !wanted.elementsEqual(existing, by: { $0.range == $1.range && $0.text == $1.text }) else { return }
+        isApplying = true
+        storage.beginEditing()
+        storage.removeAttribute(.toolTip, range: range)
+        for tip in wanted { storage.addAttribute(.toolTip, value: tip.text, range: tip.range) }
         storage.endEditing()
         isApplying = false
-
-        lastHighlighted = firstLine...lastLine
     }
 }
 

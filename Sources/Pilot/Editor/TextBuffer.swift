@@ -30,6 +30,10 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     /// Правка: `range` — в координатах текста до неё (так её ждёт LSP).
     var onEdit: ((TextBuffer, LSPRange, String) -> Void)?
     var onDirtyChange: ((TextBuffer) -> Void)?
+    /// Та же правка для редактора, в координатах после неё: `range` — новый
+    /// текст, `delta` — изменение длины, с `settled` токены прежние.
+    /// Приходит посреди обработки правки: только запомнить, не рисовать.
+    var onDisplayEdit: ((_ range: NSRange, _ delta: Int, _ settled: Int) -> Void)?
 
     var url: URL { document.url }
     var model: SyntaxModel { document.model }
@@ -50,6 +54,35 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
         ])
         super.init()
         storage.delegate = self
+        fixAttributesAhead()
+    }
+
+    // MARK: - Атрибуты текста
+
+    private var fixGeneration = 0
+
+    /// NSTextStorage «чинит» атрибуты — подбирает шрифт под символы — лениво,
+    /// при первом обращении. Пока в тексте остаётся непочиненный кусок,
+    /// каждая правка обходится TextKit в проход по нему: на файле в 10 000
+    /// строк это больше миллисекунды на букву. Поэтому чиним весь текст
+    /// заранее — кусками между событиями, чтобы не задержать ни открытие,
+    /// ни набор. Звать и после смены шрифта: она снова всё «ломает».
+    func fixAttributesAhead() {
+        fixGeneration += 1
+        fixAttributes(from: 0, generation: fixGeneration)
+    }
+
+    private func fixAttributes(from start: Int, generation: Int) {
+        // Кусок — около 2 мс работы.
+        let chunk = 65_536
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(1)) { [weak self] in
+            guard let self, self.fixGeneration == generation else { return }
+            let length = self.storage.length
+            guard start < length else { return }
+            let end = min(length, start + chunk)
+            self.storage.ensureAttributesAreFixed(in: NSRange(location: start, length: end - start))
+            self.fixAttributes(from: end, generation: generation)
+        }
     }
 
     func setOutline(_ outline: [OutlineItem]) {
@@ -86,8 +119,9 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
 
         var replacement = [UInt16](repeating: 0, count: editedRange.length)
         (storage.string as NSString).getCharacters(&replacement, range: editedRange)
-        model.replace(oldRange, with: replacement)
+        let settled = model.replace(oldRange, with: replacement)
 
+        onDisplayEdit?(editedRange, delta, settled)
         onEdit?(self, range, String(decoding: replacement, as: UTF16.self))
         updateDirty()
     }

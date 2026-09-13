@@ -132,7 +132,11 @@ final class SyntaxModel: @unchecked Sendable {
     /// на входе в очередную строку за правкой совпало с прежним: дальше всё
     /// разобрано так же, как было. Открытый `/*` честно переразберёт файл
     /// до конца, обычный набор — одну строку.
-    func replace(_ range: NSRange, with replacement: [UInt16]) {
+    ///
+    /// Возвращает смещение (в тексте после правки), с которого токены те же,
+    /// что были, — только сдвинулись: перекрашивать нужно лишь то, что до него.
+    @discardableResult
+    func replace(_ range: NSRange, with replacement: [UInt16]) -> Int {
         let start = max(0, min(range.location, units.count))
         let oldEnd = max(start, min(NSMaxRange(range), units.count))
         let delta = Int32(replacement.count - (oldEnd - start))
@@ -156,8 +160,10 @@ final class SyntaxModel: @unchecked Sendable {
             for i in (firstLine + 1 + inserted.count)..<lineStarts.count { lineStarts[i] += delta }
         }
 
-        guard let spec, !units.isEmpty else { return }
         let editEndLine = firstLine + inserted.count
+        guard let spec, !units.isEmpty else {
+            return editEndLine + 1 < lineStarts.count ? Int(lineStarts[editEndLine + 1]) : units.count
+        }
         let n = units.count
         var state = LexState(packed: lineStates[firstLine])
         var line = firstLine
@@ -168,6 +174,7 @@ final class SyntaxModel: @unchecked Sendable {
         // Тот же цикл, что в build(), только с первой затронутой строки.
         var states = lineStates
         lineStates = []   // чтобы правка states не копировала массив (CoW)
+        var settled = n
         units.withUnsafeBufferPointer { buf in
             let u = buf.baseAddress!
             while i < n {
@@ -176,7 +183,7 @@ final class SyntaxModel: @unchecked Sendable {
                     line += 1
                     guard line < count else { return }
                     let packed = state.packed
-                    if line > editEndLine && states[line] == packed { return }
+                    if line > editEndLine && states[line] == packed { settled = i; return }
                     states[line] = packed
                     continue
                 }
@@ -184,6 +191,7 @@ final class SyntaxModel: @unchecked Sendable {
             }
         }
         lineStates = states
+        return settled
     }
 
     // MARK: - Проход 2: токены видимых строк

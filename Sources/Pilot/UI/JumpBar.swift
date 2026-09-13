@@ -115,7 +115,7 @@ struct JumpBar: View {
                 }
             }
         } label: {
-            if let item = workspace.currentOutlineItem {
+            if let item = workspace.caret.outlineItem {
                 SegmentLabel(badge: item.kind, keyword: item.keyword, title: item.name)
             } else {
                 SegmentLabel(title: document.outline.isEmpty ? "Нет структуры" : "Нет выделения",
