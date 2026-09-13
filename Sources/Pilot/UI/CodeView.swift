@@ -687,6 +687,19 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             buffer.fixAttributesAhead()
         }
         replaceStorage(with: buffer.storage)
+        // Подмена хранилища выделение не трогает: оно остаётся от прошлого
+        // файла и может лежать за концом этого. Первое же чтение атрибутов
+        // по нему (typingAttributes → updateFontPanel) — NSRangeException,
+        // поэтому ставим выделение раньше всего остального.
+        // Вкладка, где уже были, — ровно как её оставили; новая — с начала.
+        let length = buffer.storage.length
+        if let selection = buffer.viewState?.selection {
+            let location = min(selection.location, length)
+            textView.setSelectedRange(NSRange(location: location,
+                                              length: min(selection.length, length - location)))
+        } else {
+            textView.setSelectedRange(NSRange(location: 0, length: 0))
+        }
         textView.breakUndoCoalescing()
         textView.typingAttributes = [.font: font, .foregroundColor: Theme.color(.plain)]
         textView.indentUnit = buffer.indentUnit
@@ -698,12 +711,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         rulerLineCount = buffer.model.lineCount
         ruler?.eventLines = Self.gutterMarkers(for: buffer.document)
         ruler?.invalidateWidth()
-        // Вкладка, где уже были, — ровно как её оставили; новая — с начала.
         if let state = buffer.viewState {
-            let length = buffer.storage.length
-            let location = min(state.selection.location, length)
-            textView.setSelectedRange(NSRange(location: location,
-                                              length: min(state.selection.length, length - location)))
             scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
             // Высота текста после подмены хранилища досчитывается не сразу,
             // и далёкая строка могла упереться в старую. Второй проход, когда
@@ -713,7 +721,6 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
                 self.scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
             }
         } else {
-            textView.setSelectedRange(NSRange(location: 0, length: 0))
             textView.scroll(NSPoint(x: 0, y: 0))
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
         }
