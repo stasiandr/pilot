@@ -12,6 +12,10 @@ enum PilotMain {
         if LaunchForwarding.forward(OpenRequest.launch) {
             exit(0)
         }
+        // AppKit принимает пути из командной строки за документы и шлёт их
+        // ещё раз, как из Finder, — а `File.cs:12:5` от Unity такого файла
+        // нет, и вылезало окно ошибки. Аргументы Pilot разбирает сам.
+        UserDefaults.standard.register(defaults: ["NSTreatUnknownArgumentsAsOpen": "NO"])
         PilotApp.main()
     }
 }

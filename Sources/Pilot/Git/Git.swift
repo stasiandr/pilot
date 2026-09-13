@@ -31,14 +31,20 @@ enum Git {
 
     /// Ближайшая папка с `.git` (каталогом или файлом — у worktree и
     /// подмодулей это файл). Процесс ради этого не нужен: пара вызовов stat.
+    ///
+    /// Идём по строке пути, а не по URL: у `file:///` из Apple Event
+    /// `deletingLastPathComponent()` даёт `file:///../`, дальше `../../` —
+    /// и вне репозитория цикл не кончался.
     static func repositoryRoot(for directory: URL) -> URL? {
         let fm = FileManager.default
-        var dir = directory.standardizedFileURL
+        var path = directory.standardizedFileURL.path
         while true {
-            if fm.fileExists(atPath: dir.appendingPathComponent(".git").path) { return dir }
-            let parent = dir.deletingLastPathComponent()
-            if parent.path == dir.path { return nil }
-            dir = parent
+            if fm.fileExists(atPath: (path as NSString).appendingPathComponent(".git")) {
+                return URL(fileURLWithPath: path, isDirectory: true)
+            }
+            let parent = (path as NSString).deletingLastPathComponent
+            if parent == path || parent.isEmpty { return nil }
+            path = parent
         }
     }
 

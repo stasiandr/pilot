@@ -3158,6 +3158,13 @@ check(OpenRequest(url: URL(string: "pilot://other?file=/p/A.cs")!) == nil, "не
 check(OpenRequest(url: URL(string: "https://open?file=/p/A.cs")!) == nil, "чужая схема")
 check(OpenRequest(url: URL(fileURLWithPath: "/p/./src/../A.cs"))?.path?.path == "/p/A.cs", "file:// от Finder")
 
+// Вне репозитория поиск .git доходит до / и останавливается (раньше крутился вечно).
+let noRepo = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pilot-norepo-\(getpid())/a/b")
+try? FileManager.default.createDirectory(at: noRepo, withIntermediateDirectories: true)
+check(Git.repositoryRoot(for: noRepo) == nil, "папка вне git-репозитория — корня нет")
+check(Git.repositoryRoot(for: URL(string: "file:///")!) == nil, "корень диска")
+try? FileManager.default.removeItem(at: noRepo.deletingLastPathComponent().deletingLastPathComponent())
+
 // Командная строка — так Pilot запускает Unity: `$(ProjectPath) $(File):$(Line):$(Column)`.
 let disk: [String: Bool] = ["/g": true, "/g/Assets/A.cs": false, "/g/Assets/b:c.cs": false, "/g/Assets/7:8": false]
 func launch(_ args: String...) -> OpenRequest? {
