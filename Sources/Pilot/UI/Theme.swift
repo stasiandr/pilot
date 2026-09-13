@@ -48,6 +48,9 @@ enum Theme {
     /// Полоса под строкой с курсором — как в Xcode, едва заметная.
     static var currentLine: NSColor { Macchiato.surface0.withAlphaComponent(0.55) }
 
+    /// Курсор по гайду Catppuccin — Rosewater.
+    static var caret: NSColor { Macchiato.rosewater }
+
     /// Фон хрома вокруг редактора: чуть темнее самого текста, чтобы
     /// стеклянный сайдбар и тулбар читались отдельными слоями.
     static var chromeBackground: NSColor { Macchiato.mantle }
@@ -171,6 +174,32 @@ enum Theme {
             }
         }
         return badge(for: kind)
+    }
+
+    /// Бейдж варианта дополнения по CompletionItemKind из LSP — те же буквы
+    /// и цвета, что у структуры файла, чтобы метод выглядел методом везде.
+    static func completionBadge(kind: Int) -> (letter: String, color: NSColor) {
+        switch kind {
+        case 2:      return ("M", Macchiato.blue)        // Method
+        case 3:      return ("F", Macchiato.green)       // Function
+        case 4:      return ("I", Macchiato.peach)       // Constructor
+        case 5:      return ("V", Macchiato.sky)         // Field
+        case 6:      return ("V", Macchiato.sky)         // Variable
+        case 7:      return ("C", Macchiato.mauve)       // Class
+        case 8:      return ("Pr", Macchiato.lavender)   // Interface
+        case 9:      return ("N", Macchiato.flamingo)    // Module
+        case 10:     return ("P", Macchiato.teal)        // Property
+        case 13:     return ("E", Macchiato.mauve)       // Enum
+        case 14:     return ("K", Macchiato.pink)        // Keyword
+        case 15:     return ("{}", Macchiato.overlay2)   // Snippet
+        case 20:     return ("E", Macchiato.yellow)      // EnumMember
+        case 21:     return ("K", Macchiato.peach)       // Constant
+        case 22:     return ("S", Macchiato.mauve)       // Struct
+        case 23:     return ("Ev", Macchiato.yellow)     // Event
+        case 24:     return ("Op", Macchiato.sky)        // Operator
+        case 25:     return ("T", Macchiato.lavender)    // TypeParameter
+        default:     return ("T", Macchiato.overlay2)    // Text и прочее
+        }
     }
 
     static var badgeText: NSColor { Macchiato.crust }

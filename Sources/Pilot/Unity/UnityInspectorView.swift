@@ -5,11 +5,10 @@ import AppKit
 /// вложенный префаб или ScriptableObject — в виде формы, как в редакторе Unity.
 ///
 /// Текст остаётся источником правды: инспектор — это другой взгляд на тот же
-/// файл. Правка точечно меняет значение в тексте и сразу пишется на диск;
-/// ⌘Z отменяет её так же точечно.
+/// файл. Правка точечно меняет значение в тексте редактора — как набор:
+/// файл становится несохранённым, ⌘Z в редакторе её отменяет.
 struct UnityInspectorView: View {
     @ObservedObject var workspace: Workspace
-    @Environment(\.undoManager) private var undoManager
     /// Режим отладки — как Debug-инспектор Unity: видны служебные поля.
     @AppStorage("pilot.inspectorDebug") private var debug = false
     /// Раскрытые структуры и списки, свёрнутые компоненты. Живут вне
@@ -33,7 +32,14 @@ struct UnityInspectorView: View {
                     }
                     .padding(12)
                 }
-                .disabled(workspace.isApplyingEdit)
+                // Текст правили, а разбор ещё не догнал: позиции полей
+                // устарели, писать по ним нельзя. Это доли секунды.
+                .disabled(!document.isSemanticsFresh)
+                .overlay(alignment: .topTrailing) {
+                    if !document.isSemanticsFresh {
+                        ProgressView().controlSize(.mini).padding(6)
+                    }
+                }
             } else {
                 VStack(spacing: 8) {
                     Image(systemName: "slider.horizontal.3").font(.system(size: 26, weight: .light))
@@ -224,7 +230,7 @@ struct UnityInspectorView: View {
 
     private func commit(_ edits: [UnityEdit], name: String) {
         guard !edits.isEmpty else { return }
-        workspace.applyUnityEdits(edits, undoManager: undoManager, actionName: name)
+        workspace.applyUnityEdits(edits, actionName: name)
     }
 
     private func toggleBinding(_ scalar: UnityScalar, name: String) -> Binding<Bool> {

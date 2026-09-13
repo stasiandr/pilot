@@ -98,7 +98,10 @@ final class UnityService: ObservableObject {
 
         switch found.reference {
         case .local(let fileID):
-            guard let file = document.unityFile, let object = file.object(fileID) else {
+            // Текст могли править после разбора — тогда разбираем заново:
+            // позиции объектов сдвинулись.
+            let file = document.isSemanticsFresh ? document.unityFile : UnityYAMLFile.parse(model.units)
+            guard let file, let object = file.object(fileID) else {
                 return .unavailable("Объекта &\(fileID) в этом файле нет")
             }
             let range = object.typeNameRange
@@ -260,7 +263,7 @@ final class UnityService: ObservableObject {
                 }
             }
 
-            if let file = document.unityFile {
+            if let file = document.unityFile, document.isSemanticsFresh {
                 let resolve: (UnityGUID) -> String? = { assets?.displayName(for: $0) }
                 for (refRange, fileID) in UnityYAMLFile.localReferences(in: units, visible) {
                     guard let index = file.index(ofFileID: fileID) else { continue }

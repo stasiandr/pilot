@@ -22,7 +22,14 @@ final class Workspace: ObservableObject {
     @Published var query = "" { didSet { queryChanged() } }
     @Published private(set) var results: [SearchHit] = []
     @Published private(set) var items: [PaletteItem] = []
-    @Published private(set) var document: LoadedDocument?
+    /// Открытый в редакторе файл: текст, история правок, синтаксическая модель.
+    @Published private(set) var buffer: TextBuffer?
+    /// Открытый документ. Модель в нём та же, что правит редактор.
+    var document: LoadedDocument? { buffer?.document }
+    /// Файлы с несохранёнными правками. Живут в памяти, пока смотрим другие:
+    /// вернулся — правки и история отмены на месте.
+    private var unsaved: [URL: TextBuffer] = [:]
+    @Published private(set) var unsavedCount = 0
     @Published private(set) var loadError: String?
     @Published var selection: Int = 0
     @Published var isPaletteOpen = false
@@ -220,8 +227,9 @@ final class Workspace: ObservableObject {
     }
 
     func open(root url: URL) {
+        guard confirmUnsavedChanges() else { return }
+        dropAllBuffers()
         root = url
-        document = nil
         loadError = nil
         query = ""
         results = []
@@ -360,6 +368,8 @@ final class Workspace: ObservableObject {
     /// Назад на стартовый экран. Индексация и языковой сервер
     /// старого проекта останавливаются.
     func closeProject() {
+        guard confirmUnsavedChanges() else { return }
+        dropAllBuffers()
         // Новое поколение отменяет обход ФС и загрузку файла, что ещё идут.
         _ = scanGeneration.bump()
         _ = loadGeneration.bump()
@@ -372,7 +382,6 @@ final class Workspace: ObservableObject {
         index = nil
         symbolIndex = nil
         fileTree = nil
-        document = nil
         loadError = nil
         isIndexing = false
         fileCount = 0
@@ -963,8 +972,10 @@ final class Workspace: ObservableObject {
         if let root, document.url.path.hasPrefix(root.path + "/") {
             relPath = String(document.url.path.dropFirst(root.path.count + 1))
         }
+        // Снимок, а не живая модель: навигатор работает и в фоне (поиск
+        // использований), а редактор тем временем правит модель на главном.
         return NavDocument(url: document.url, relPath: relPath,
-                           model: document.model, outline: document.outline)
+                           model: document.model.snapshot(), outline: document.outline)
     }
 
     /// ⌘B без сервера. Тип цели выяснен — прыгаем; не выяснен, а объявлений
@@ -1136,6 +1147,13 @@ final class Workspace: ObservableObject {
         let counter = loadGeneration
         let unityContext = unity.context
 
+        // Несохранённый буфер важнее файла на диске: там правки и ⌘Z.
+        if let cached = unsaved[url] {
+            let caret = cached.model.position(at: cached.lastCaret)
+            activate(cached, reveal: reveal ?? LSPRange(start: caret, end: caret))
+            return
+        }
+
         work.async { [weak self] in
             guard let self else { return }
             let result = Result { try LoadedDocument.load(url: url, unity: unityContext) }
@@ -1143,23 +1161,104 @@ final class Workspace: ObservableObject {
                 guard counter.isCurrent(generation) else { return }
                 switch result {
                 case .success(let doc):
-                    self.document = doc
-                    self.loadError = nil
-                    self.caretOffset = 0
-                    self.occurrences = []
-                    self.occurrenceWord = nil
-                    self.breadcrumb = ""
-                    self.currentOutlineItem = nil
-                    self.requestReveal(reveal)
-                    // Сервер поднимается здесь — лениво, при первом файле
-                    // подходящего языка, а не при запуске приложения.
-                    self.lsp.documentOpened(doc)
-                    self.git.documentOpened(doc)
+                    self.activate(TextBuffer(document: doc, fontSize: self.fontSize), reveal: reveal)
                 case .failure(let error):
-                    self.document = nil
+                    self.setBuffer(nil)
                     self.loadError = error.localizedDescription
                     self.git.documentOpened(nil)
                 }
+            }
+        }
+    }
+
+    // MARK: - Буферы и правки
+
+    private func activate(_ buffer: TextBuffer, reveal: LSPRange?) {
+        setBuffer(buffer)
+        loadError = nil
+        caretOffset = 0
+        occurrences = []
+        occurrenceWord = nil
+        breadcrumb = ""
+        currentOutlineItem = nil
+        requestReveal(reveal)
+        // Сервер поднимается здесь — лениво, при первом файле
+        // подходящего языка, а не при запуске приложения.
+        lsp.documentOpened(buffer.document)
+        git.documentOpened(buffer.document)
+    }
+
+    /// Смена открытого буфера. Уходящий остаётся в памяти, только если
+    /// в нём есть несохранённые правки.
+    private func setBuffer(_ new: TextBuffer?) {
+        if let old = buffer, old !== new {
+            old.lastCaret = caretOffset
+            if !old.isDirty {
+                unsaved[old.url] = nil
+                lsp.documentClosed(old.url)
+            }
+        }
+        buffer = new
+        guard let new else { return }
+        new.onEdit = { [weak self] buffer, range, text in self?.bufferEdited(buffer, range: range, text: text) }
+        new.onDirtyChange = { [weak self] buffer in self?.dirtyChanged(buffer) }
+    }
+
+    private func dropAllBuffers() {
+        setBuffer(nil)
+        unsaved.removeAll()
+        updateUnsavedCount()
+    }
+
+    private var outlineTask: Task<Void, Never>?
+    private var gitTask: Task<Void, Never>?
+
+    /// Правка в буфере. Модель уже обновлена — рассылаем тем, кому нужно.
+    private func bufferEdited(_ buffer: TextBuffer, range: LSPRange, text: String) {
+        lsp.documentEdited(buffer.document, range: range, text: text)
+        guard buffer === self.buffer else { return }
+
+        // Вхождения посчитаны по старому тексту; пересчитаются на следующем
+        // движении курсора, а оно после набора будет всегда.
+        occurrences = []
+        occurrenceWord = nil
+
+        // Структура и полоски git — с задержкой: пока печатаешь, незачем.
+        // Правку инспектора Unity разбираем сразу: он ждёт свежих позиций.
+        let delay: UInt64 = pendingInspectorEdit ? 0 : 300_000_000
+        pendingInspectorEdit = false
+        outlineTask?.cancel()
+        outlineTask = Task { [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard let self, !Task.isCancelled else { return }
+            self.rebuildOutline(buffer)
+        }
+        gitTask?.cancel()
+        gitTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard let self, !Task.isCancelled, buffer === self.buffer else { return }
+            self.git.documentEdited(buffer.document)
+        }
+    }
+
+    /// Структура строится по снимку модели в фоне и принимается, только
+    /// если за это время текст не менялся — иначе её диапазоны уже врут.
+    ///
+    /// Сцены и префабы разбираются здесь же: после правки — из инспектора
+    /// или руками — у объектов новые позиции, и старому разбору верить нельзя.
+    private func rebuildOutline(_ buffer: TextBuffer) {
+        let snapshot = buffer.model.snapshot()
+        let context = unity.context
+        work.async { [weak self] in
+            let outline = OutlineBuilder.build(model: snapshot)
+            let semantics = UnitySemantics.analyze(model: snapshot, lexicalOutline: outline, context: context)
+            Task { @MainActor in
+                guard let self, buffer === self.buffer,
+                      buffer.model.version == snapshot.version else { return }
+                self.objectWillChange.send()
+                buffer.setSemantics(outline: semantics?.outline ?? outline,
+                                    unityFile: semantics?.serialized, version: snapshot.version)
+                self.updateBreadcrumb()
             }
         }
     }
@@ -1169,17 +1268,8 @@ final class Workspace: ObservableObject {
     /// Индекс GUID дособрался: у скриптов в открытой сцене появились имена.
     /// Разбираем файл заново, не трогая ни текст, ни прокрутку.
     private func unityAssetsReady() {
-        guard let current = document else { return }
-        let context = unity.context
-        work.async { [weak self] in
-            let refreshed = current.reanalyzed(unity: context)
-            Task { @MainActor in
-                guard let self, self.document?.url == current.url,
-                      self.document?.revision == current.revision else { return }
-                self.document = refreshed
-                self.updateBreadcrumb()
-            }
-        }
+        guard let buffer else { return }
+        rebuildOutline(buffer)
     }
 
     /// ⇧⌘R: какие сцены, префабы и ассеты ссылаются на открытый файл.
@@ -1244,79 +1334,26 @@ final class Workspace: ObservableObject {
 
     // MARK: - Инспектор Unity: правки
 
-    /// Идёт запись и повторный разбор — инспектор на это время не правит.
-    @Published private(set) var isApplyingEdit = false
+    /// Правки инспектора, которые редактор применит к тексту.
+    @Published private(set) var editRequest: TextEditRequest?
+    private var editCounter = 0
+    /// Следующая правка буфера пришла из инспектора — разобрать без задержки.
+    private var pendingInspectorEdit = false
 
-    /// Записывает правки инспектора в файл.
-    ///
-    /// Меняются только значения — остальной текст остаётся байт в байт, и
-    /// дифф в git ровно на то, что поменяли. Перед записью сверяемся с диском:
-    /// если Unity успел пересохранить файл, правка поверх него испортила бы
-    /// чужие изменения, поэтому файл перечитывается, а правка отменяется.
-    /// Отмена — штатная, через ⌘Z: обратные правки регистрируются в `undoManager`.
-    func applyUnityEdits(_ edits: [UnityEdit], to url: URL? = nil, undoManager: UndoManager?,
-                         actionName: String) {
-        guard !edits.isEmpty, !isApplyingEdit else { return }
-        let target = url ?? document?.url
-        guard let target else { return }
-
-        // Правка может прийти из отмены, когда открыт уже другой файл.
-        let current = document?.url == target ? document : nil
-        let baseText: String
-        let baseDate: Date?
-        if let current {
-            baseText = current.text
-            baseDate = current.modificationDate
-        } else {
-            guard let text = try? String(contentsOf: target, encoding: .utf8) else { return }
-            baseText = text
-            baseDate = nil
-        }
-        if let baseDate, let onDisk = LoadedDocument.modificationDate(of: target), onDisk != baseDate {
-            showNotice("Файл изменился на диске — перечитал, повторите правку")
-            open(file: target, reveal: currentCaretRange())
+    /// Правка из инспектора Unity — такая же правка текста, как набор:
+    /// файл становится несохранённым (⌘S — записать, как сцену в Unity),
+    /// ⌘Z в редакторе её отменяет. Меняются только значения, поэтому в
+    /// `git diff` потом ровно изменённые строки. Разбор, по которому она
+    /// посчитана, должен совпадать с текстом — иначе позиции уже сдвинулись.
+    func applyUnityEdits(_ edits: [UnityEdit], actionName: String) {
+        guard !edits.isEmpty, let buffer, buffer.document.isSemanticsFresh else { return }
+        guard UnityEdits.validate(edits, in: buffer.storage.string as NSString) else {
+            showNotice("Текст уже другой — правка не применена")
             return
         }
-        guard let applied = UnityEdits.apply(edits, to: baseText) else {
-            showNotice("Правка не легла в файл — перечитайте его")
-            return
-        }
-        do {
-            try applied.text.write(to: target, atomically: true, encoding: .utf8)
-        } catch {
-            showNotice("Не удалось записать файл: \(error.localizedDescription)")
-            return
-        }
-
-        undoManager?.registerUndo(withTarget: self) { workspace in
-            workspace.applyUnityEdits(applied.inverse, to: target, undoManager: undoManager,
-                                      actionName: actionName)
-        }
-        undoManager?.setActionName(actionName)
-
-        guard let current else { return }
-        isApplyingEdit = true
-        let context = unity.context
-        let edition = current.edition + 1
-        let text = applied.text
-        work.async { [weak self] in
-            var reloaded = LoadedDocument.make(url: target, text: text, unity: context)
-            reloaded.edition = edition
-            reloaded.modificationDate = LoadedDocument.modificationDate(of: target)
-            Task { @MainActor in
-                guard let self else { return }
-                self.isApplyingEdit = false
-                guard self.document?.url == target else { return }
-                self.document = reloaded
-                self.updateBreadcrumb()
-            }
-        }
-    }
-
-    private func currentCaretRange() -> LSPRange? {
-        guard let document else { return nil }
-        let position = document.model.position(at: caretOffset)
-        return LSPRange(start: position, end: position)
+        editCounter += 1
+        pendingInspectorEdit = true
+        editRequest = TextEditRequest(seq: editCounter, buffer: buffer, edits: edits, actionName: actionName)
     }
 
     /// Перейти к объекту этого же файла — из хлебных крошек и ссылок инспектора.
@@ -1348,6 +1385,104 @@ final class Workspace: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.notice = nil
         }
+    }
+
+    private func dirtyChanged(_ buffer: TextBuffer) {
+        unsaved[buffer.url] = buffer.isDirty ? buffer : nil
+        updateUnsavedCount()
+    }
+
+    private func updateUnsavedCount() {
+        let count = unsaved.values.filter(\.isDirty).count
+        if unsavedCount != count { unsavedCount = count }
+        // Точка в красной кнопке окна — как у любого документа в macOS.
+        for window in NSApp.windows where !(window is NSPanel) {
+            window.isDocumentEdited = count > 0
+        }
+    }
+
+    var isCurrentDirty: Bool { buffer?.isDirty == true }
+
+    func isUnsaved(_ url: URL) -> Bool { unsaved[url]?.isDirty == true }
+
+    // MARK: - Сохранение
+
+    func save() {
+        guard let buffer else { return }
+        save(buffer)
+    }
+
+    func saveAll() {
+        for buffer in unsaved.values where buffer.isDirty { save(buffer) }
+    }
+
+    @discardableResult
+    private func save(_ buffer: TextBuffer) -> Bool {
+        do {
+            try buffer.save()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Не удалось сохранить «\(buffer.url.lastPathComponent)»"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+            return false
+        }
+        lsp.documentSaved(buffer.url)
+        git.refresh()
+        if buffer === self.buffer { git.documentEdited(buffer.document) }
+        return true
+    }
+
+    /// Перед сменой проекта и выходом. true — можно продолжать: всё
+    /// сохранено или правки решили выбросить.
+    func confirmUnsavedChanges() -> Bool {
+        let dirty = unsaved.values.filter(\.isDirty).sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
+        guard !dirty.isEmpty else { return true }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if dirty.count == 1 {
+            alert.messageText = "Сохранить изменения в «\(dirty[0].url.lastPathComponent)»?"
+        } else {
+            alert.messageText = "Сохранить изменения в \(Theme.count(dirty.count, "файле", "файлах", "файлах"))?"
+            alert.informativeText = dirty.prefix(8).map(\.url.lastPathComponent).joined(separator: ", ")
+                + (dirty.count > 8 ? "…" : "")
+        }
+        alert.informativeText += (alert.informativeText.isEmpty ? "" : "\n\n") + "Если не сохранить, правки пропадут."
+        alert.addButton(withTitle: dirty.count == 1 ? "Сохранить" : "Сохранить все")
+        alert.addButton(withTitle: "Отмена")
+        alert.addButton(withTitle: "Не сохранять")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return dirty.allSatisfy { save($0) }
+        case .alertThirdButtonReturn:
+            for buffer in dirty { unsaved[buffer.url] = nil }
+            updateUnsavedCount()
+            return true
+        default:
+            return false
+        }
+    }
+
+    // MARK: - Автодополнение
+
+    /// Варианты в позиции курсора: от языкового сервера, а если его нет
+    /// (или он не ответил) — слова файла и ключевые слова языка.
+    func completions(at offset: Int, trigger: String?, retrigger: Bool) async -> CompletionList? {
+        guard let buffer else { return nil }
+        let url = buffer.url
+        if lsp.providesCompletion(for: url) {
+            let position = buffer.model.position(at: offset)
+            if let list = await lsp.completion(url: url, position: position,
+                                               trigger: trigger, retrigger: retrigger) {
+                return list
+            }
+        }
+        // После точки нужны члены типа — словами файла тут не помочь.
+        guard trigger == nil, buffer === self.buffer else { return nil }
+        return CompletionList(items: WordCompletion.items(in: buffer.model, excluding: offset))
     }
 
     // MARK: - Навигация в палитре

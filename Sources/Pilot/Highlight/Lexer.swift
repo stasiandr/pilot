@@ -35,11 +35,16 @@ struct LexState: Equatable {
 ///
 /// Благодаря этому открытие файла на 500 000 строк не зависит от его размера
 /// в части подсветки: красится ровно один экран.
-final class SyntaxModel: @unchecked Sendable {   // неизменяем после init
-    let units: [UInt16]
+///
+/// Правки (`replace`) применяются инкрементально и только на главном потоке.
+/// Фоновой работе с моделью открытого документа нужен `snapshot()`.
+final class SyntaxModel: @unchecked Sendable {
+    private(set) var units: [UInt16]
     private(set) var lineStarts: [Int32] = []   // смещение начала каждой строки
     private(set) var lineStates: [UInt16] = []  // состояние лексера на входе в строку
     let spec: LanguageSpec?
+    /// Растёт с каждой правкой: фоновый результат по старой версии — выбрасываем.
+    private(set) var version = 0
 
     var lineCount: Int { lineStarts.count }
 
@@ -48,6 +53,20 @@ final class SyntaxModel: @unchecked Sendable {   // неизменяем пос�
         self.spec = spec
         build()
     }
+
+    private init(copying other: SyntaxModel) {
+        units = other.units
+        lineStarts = other.lineStarts
+        lineStates = other.lineStates
+        spec = other.spec
+        version = other.version
+    }
+
+    /// Неизменяемая копия для фоновой работы. Массивы копируются лениво
+    /// (copy-on-write), так что снимок стоит O(1), пока модель не правят.
+    func snapshot() -> SyntaxModel { SyntaxModel(copying: self) }
+
+    var text: String { String(decoding: units, as: UTF16.self) }
 
     func lineRange(_ line: Int) -> Range<Int> {
         let start = Int(lineStarts[line])
@@ -102,6 +121,69 @@ final class SyntaxModel: @unchecked Sendable {   // неизменяем пос�
                 i = step(u, n, i, &state, spec, sink: &sink)
             }
         }
+    }
+
+    // MARK: - Правка
+
+    /// Заменяет `range` (в координатах текста до правки) на `replacement`.
+    ///
+    /// Начала строк сдвигаются арифметикой, а лексер перезапускается только
+    /// с первой затронутой строки — и останавливается, как только состояние
+    /// на входе в очередную строку за правкой совпало с прежним: дальше всё
+    /// разобрано так же, как было. Открытый `/*` честно переразберёт файл
+    /// до конца, обычный набор — одну строку.
+    func replace(_ range: NSRange, with replacement: [UInt16]) {
+        let start = max(0, min(range.location, units.count))
+        let oldEnd = max(start, min(NSMaxRange(range), units.count))
+        let delta = Int32(replacement.count - (oldEnd - start))
+        version += 1
+
+        let firstLine = line(containing: start)
+        let lastLine = line(containing: oldEnd)
+
+        units.replaceSubrange(start..<oldEnd, with: replacement)
+
+        var inserted: [Int32] = []
+        for (k, u) in replacement.enumerated() where u == 0x0A {
+            inserted.append(Int32(start + k + 1))
+        }
+        // Строки, начинавшиеся внутри заменённого куска, исчезли вместе с его
+        // переводами строк; на их место встают строки из вставки.
+        let removed = (firstLine + 1)..<(lastLine + 1)
+        lineStarts.replaceSubrange(removed, with: inserted)
+        lineStates.replaceSubrange(removed, with: repeatElement(UInt16(0), count: inserted.count))
+        if delta != 0 {
+            for i in (firstLine + 1 + inserted.count)..<lineStarts.count { lineStarts[i] += delta }
+        }
+
+        guard let spec, !units.isEmpty else { return }
+        let editEndLine = firstLine + inserted.count
+        let n = units.count
+        var state = LexState(packed: lineStates[firstLine])
+        var line = firstLine
+        var i = Int(lineStarts[firstLine])
+        var sink: [Token]? = nil
+        let count = lineStarts.count
+
+        // Тот же цикл, что в build(), только с первой затронутой строки.
+        var states = lineStates
+        lineStates = []   // чтобы правка states не копировала массив (CoW)
+        units.withUnsafeBufferPointer { buf in
+            let u = buf.baseAddress!
+            while i < n {
+                if u[i] == 0x0A {
+                    i += 1
+                    line += 1
+                    guard line < count else { return }
+                    let packed = state.packed
+                    if line > editEndLine && states[line] == packed { return }
+                    states[line] = packed
+                    continue
+                }
+                i = step(u, n, i, &state, spec, sink: &sink)
+            }
+        }
+        lineStates = states
     }
 
     // MARK: - Проход 2: токены видимых строк

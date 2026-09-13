@@ -629,6 +629,18 @@ enum UnityEdits {
         return edits
     }
 
+    /// Правки ложатся в текст: не пересекаются, не выходят за край, и на
+    /// месте каждой лежит то, что она ожидает.
+    static func validate(_ edits: [UnityEdit], in text: NSString) -> Bool {
+        var previousEnd = 0
+        for edit in edits.sorted(by: { $0.range.location < $1.range.location }) {
+            guard edit.range.location >= previousEnd, NSMaxRange(edit.range) <= text.length else { return false }
+            if let expected = edit.expected, text.substring(with: edit.range) != expected { return false }
+            previousEnd = NSMaxRange(edit.range)
+        }
+        return true
+    }
+
     /// Применяет правки к тексту. Возвращает новый текст и обратные правки —
     /// для отмены.
     static func apply(_ edits: [UnityEdit], to text: String) -> (text: String, inverse: [UnityEdit])? {
