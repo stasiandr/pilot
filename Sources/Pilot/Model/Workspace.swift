@@ -48,7 +48,28 @@ final class Workspace: ObservableObject {
     }
     @Published private(set) var paletteMode: PaletteMode = .files
     @Published private(set) var paletteBusy = false
-    @Published var fontSize: CGFloat = 12.5
+    /// Размер шрифта редактора — общий на все проекты и переживает перезапуск.
+    @Published private(set) var fontSize: CGFloat = Workspace.loadFontSize()
+
+    static let defaultFontSize: CGFloat = 12.5
+    private static let fontSizeRange: ClosedRange<CGFloat> = 8...32
+    private static let fontSizeKey = "pilot.fontSize"
+
+    private static func loadFontSize() -> CGFloat {
+        guard let stored = UserDefaults.standard.object(forKey: fontSizeKey) as? Double else {
+            return defaultFontSize
+        }
+        return min(max(CGFloat(stored), fontSizeRange.lowerBound), fontSizeRange.upperBound)
+    }
+
+    /// Те же пределы, что у редактора: иначе ⌘+ за 32 копил бы невидимый
+    /// запас, и ⌘− потом несколько раз ничего не делал бы.
+    func setFontSize(_ size: CGFloat) {
+        let clamped = min(max(size, Self.fontSizeRange.lowerBound), Self.fontSizeRange.upperBound)
+        guard clamped != fontSize else { return }
+        fontSize = clamped
+        UserDefaults.standard.set(Double(clamped), forKey: Self.fontSizeKey)
+    }
 
     /// Куда проскроллить и что подсветить. Порядковый номер нужен, чтобы
     /// повторный переход в то же самое место всё равно сработал.
