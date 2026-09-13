@@ -99,6 +99,7 @@ struct RootView: View {
                      conflicts: workspace.conflicts,
                      conflictAction: workspace.conflictAction,
                      focusRequest: workspace.editorFocusRequest,
+                     findRequest: workspace.findRequest,
                      completionTriggers: workspace.lsp.completionTriggers,
                      decorator: workspace.unity.decorator(),
                      decorationsVersion: workspace.unity.decorationsVersion,

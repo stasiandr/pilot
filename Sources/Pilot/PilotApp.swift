@@ -84,6 +84,23 @@ struct PilotApp: App {
                 }
                 .keyboardShortcut(.escape, modifiers: .option)
             }
+            // Сама NSTextView ⌘F не ловит — ей нужен пункт меню, а в SwiftUI
+            // его нет. Без .disabled: доступность пунктов SwiftUI обновляет
+            // не сразу, и ⌘F после открытия файла мог остаться выключенным.
+            // Без редактора запрос просто некому выполнить.
+            CommandGroup(after: .textEditing) {
+                Divider()
+                Button("Найти…") { workspace.find(.showFindInterface) }
+                    .keyboardShortcut("f", modifiers: .command)
+                Button("Найти и заменить…") { workspace.find(.showReplaceInterface) }
+                    .keyboardShortcut("f", modifiers: [.command, .option])
+                Button("Найти далее") { workspace.find(.nextMatch) }
+                    .keyboardShortcut("g", modifiers: .command)
+                Button("Найти ранее") { workspace.find(.previousMatch) }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                Button("Искать выделенное") { workspace.find(.setSearchString) }
+                    .keyboardShortcut("e", modifiers: .command)
+            }
             CommandGroup(after: .toolbar) {
                 Button("Перейти к файлу…") { workspace.openPalette(mode: .files) }
                     .keyboardShortcut("p", modifiers: .command)

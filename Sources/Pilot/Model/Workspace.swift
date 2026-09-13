@@ -32,7 +32,11 @@ final class Workspace: ObservableObject {
     @Published private(set) var unsavedCount = 0
     @Published private(set) var loadError: String?
     @Published var selection: Int = 0
-    @Published var isPaletteOpen = false
+    /// Закрылась палитра — фокус возвращается в текст: иначе он остаётся
+    /// у окна, и до клика мышью ни набор, ни ⌘F никуда не попадают.
+    @Published var isPaletteOpen = false {
+        didSet { if oldValue && !isPaletteOpen { focusEditor() } }
+    }
     @Published private(set) var paletteMode: PaletteMode = .files
     @Published private(set) var paletteBusy = false
     @Published var fontSize: CGFloat = 12.5
@@ -54,6 +58,22 @@ final class Workspace: ObservableObject {
     @Published private(set) var editorFocusRequest = 0
 
     func focusEditor() { editorFocusRequest += 1 }
+
+    /// ⌘F и соседи — панель поиска над редактором. Идут запросом, а не
+    /// через цепочку ответчиков: фокус может быть в дереве файлов,
+    /// а панель всё равно должна открыться и забрать курсор.
+    struct FindRequest: Equatable {
+        var seq: Int
+        var action: NSTextFinder.Action
+    }
+    @Published private(set) var findRequest: FindRequest?
+    private var findCounter = 0
+
+    func find(_ action: NSTextFinder.Action) {
+        isPaletteOpen = false
+        findCounter += 1
+        findRequest = FindRequest(seq: findCounter, action: action)
+    }
 
     /// Позиция курсора в открытом документе — отсюда берутся запросы к LSP.
     @Published private(set) var caretOffset: Int = 0

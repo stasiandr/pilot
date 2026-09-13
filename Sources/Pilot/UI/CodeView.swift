@@ -587,6 +587,23 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         view.window?.makeFirstResponder(textView)
     }
 
+    /// Действие панели поиска. Показ панели сам отдаёт фокус её полю.
+    func performFind(_ action: NSTextFinder.Action) {
+        let clip = scrollView.contentView
+        let insetBefore = clip.contentInsets.top
+        let sender = NSMenuItem()
+        sender.tag = action.rawValue
+        textView.performTextFinderAction(sender)
+        // На macOS 26 панель не раздвигает текст, а ложится поверх него
+        // отступом клипа, и первая строка файла пряталась под ней. Сдвигаем
+        // текст на её высоту: видно ровно то же, что и до ⌘F.
+        let delta = clip.contentInsets.top - insetBefore
+        if delta > 0 {
+            clip.scroll(to: NSPoint(x: clip.bounds.minX, y: clip.bounds.minY - delta))
+            scrollView.reflectScrolledClipView(clip)
+        }
+    }
+
     // MARK: - Показ буфера
 
     /// У каждого буфера свой NSTextStorage: подменяем его под layout manager,
@@ -1479,6 +1496,7 @@ struct CodeView: NSViewControllerRepresentable {
     var conflicts: [MergeConflict] = []
     var conflictAction: Workspace.ConflictActionRequest? = nil
     let focusRequest: Int
+    var findRequest: Workspace.FindRequest? = nil
     let completionTriggers: [String]
     /// Смысловые украшения и их версия: сменилась — перекрашиваем.
     var decorator: CodeDecorator? = nil
@@ -1607,6 +1625,13 @@ struct CodeView: NSViewControllerRepresentable {
             // Вьюха могла только что появиться и ещё не попасть в окно.
             DispatchQueue.main.async { controller.focusText() }
         }
+
+        // После фокуса и тоже в следующем витке: ⌘F из палитры закрывает её,
+        // и фокус сперва уходит в текст, а уже потом — в поле поиска.
+        if let findRequest, findRequest.seq != context.coordinator.appliedFind {
+            context.coordinator.appliedFind = findRequest.seq
+            DispatchQueue.main.async { controller.performFind(findRequest.action) }
+        }
     }
 
     /// Дешёвая подпись набора вхождений: сравнивать массивы целиком
@@ -1619,7 +1644,13 @@ struct CodeView: NSViewControllerRepresentable {
         return hasher.finalize()
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator {
+        let coordinator = Coordinator()
+        // Редактор пересоздан (после экрана «нет файла») — старый ⌘F
+        // не должен открыть панель поиска сам по себе.
+        coordinator.appliedFind = findRequest?.seq ?? 0
+        return coordinator
+    }
 
     final class Coordinator {
         weak var shown: TextBuffer?
@@ -1633,6 +1664,7 @@ struct CodeView: NSViewControllerRepresentable {
         var appliedConflictAction = 0
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
+        var appliedFind = 0
         var decorationsVersion = 0
         var semanticsVersion = -1
         var appliedEdit = -1
