@@ -19,10 +19,14 @@ final class LSPClient: @unchecked Sendable {
     let root: URL
 
     private var process: Process?
-    private var stdin: FileHandle?
+    /// Сокет демона, если сервер не свой, а общий (см. LSPDaemon).
+    private var daemonSocket: FileHandle?
+    /// Куда писать: stdin своего процесса или сокет демона.
+    private var output: FileHandle?
     private var framer = MessageFramer()
 
     private let lock = NSLock()
+    private var connected = false
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<Any, Error>] = [:]
     private var openDocuments: Set<String> = []
@@ -48,16 +52,49 @@ final class LSPClient: @unchecked Sendable {
         withLock { pending[id] = continuation }
     }
 
-    private func discardPending(_ id: Int) {
-        withLock { pending[id] = nil }
+    /// Снимает запрос с ошибкой. Продолжение забирается из `pending` под
+    /// замком, поэтому ответ, таймаут и отмена не могут возобновить его дважды:
+    /// кто первый забрал, тот и закрыл. false — запрос уже закрыт.
+    @discardableResult
+    private func failPending(_ id: Int, _ error: Error) -> Bool {
+        guard let continuation = withLock({ pending.removeValue(forKey: id) }) else { return false }
+        continuation.resume(throwing: error)
+        return true
     }
+
+    private func failAllPending(_ error: Error) {
+        let waiting = withLock { () -> [Int: CheckedContinuation<Any, Error>] in
+            let all = pending
+            pending.removeAll()
+            return all
+        }
+        for (_, continuation) in waiting { continuation.resume(throwing: error) }
+    }
+
+    var isConnected: Bool { withLock { connected } }
+    private func setConnected(_ value: Bool) { withLock { connected = value } }
 
     /// Сообщения о прогрессе от сервера ($/progress, window/logMessage).
     var onStatus: (@Sendable (String) -> Void)?
     /// Сервер умер сам по себе.
     var onExit: (@Sendable (String) -> Void)?
+    /// Загружен ещё один проект — для счётчика в статус-строке.
+    var onProjectLoaded: (@Sendable () -> Void)?
+    /// Загружены все проекты: с этого момента у сервера есть семантика.
+    var onProjectsLoaded: (@Sendable () -> Void)?
+    /// Любое уведомление от сервера, как есть. Нужно демону: он пересылает
+    /// уведомления подключённым к нему Pilot.
+    var onNotification: (@Sendable (String, Any?) -> Void)?
+
+    /// PID процесса сервера — чтобы следить за его памятью.
+    var processIdentifier: Int32? { process?.processIdentifier }
 
     private(set) var capabilities = ServerCapabilities()
+    /// Ответ на initialize как есть — демон отдаёт его следующим клиентам.
+    private(set) var initializeResult: Any?
+    /// Сколько проектов сервер начал грузить после initialize. nil — ждать
+    /// нечего, сервер готов сразу; 0 — ждать надо, но сколько, неизвестно.
+    private(set) var projectsToLoad: Int?
 
     init(config: ServerConfig, root: URL) {
         self.config = config
@@ -101,34 +138,73 @@ final class LSPClient: @unchecked Sendable {
 
         try proc.run()
         self.process = proc
-        self.stdin = inPipe.fileHandleForWriting
+        self.output = inPipe.fileHandleForWriting
+        setConnected(true)
+    }
+
+    /// Вместо своего процесса — уже открытый сокет демона. Дальше по нему
+    /// идёт обычный LSP, только первым запросом — `attach`.
+    func connect(daemonSocket fd: Int32) {
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        handle.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil        // EOF: демон закрыл соединение
+                self?.handleDisconnect()
+                return
+            }
+            self?.consume(data)
+        }
+        daemonSocket = handle
+        output = handle
+        setConnected(true)
+    }
+
+    /// Просит демона подключить нас к серверу для этого проекта — уже
+    /// работающему или новому. true — сервер уже был запущен.
+    func attach(build: String) async throws -> Bool {
+        let result = try await request(LSPDaemon.attachMethod,
+                                       ["build": build, "root": root.path, "config": config.json],
+                                       timeout: 15)
+        return (result as? [String: Any])?["reused"] as? Bool ?? false
     }
 
     func stop() {
+        if let daemonSocket {
+            // Сервер принадлежит демону: просто отключаемся, а жить ли
+            // серверу дальше, демон решает сам.
+            setConnected(false)
+            daemonSocket.readabilityHandler = nil
+            try? daemonSocket.close()
+            self.daemonSocket = nil
+            output = nil
+            framer = MessageFramer()
+            failAllPending(RPCError.cancelled)
+            return
+        }
         // Корректное завершение: shutdown -> exit. Если сервер не отвечает,
         // всё равно убиваем процесс — висящий Roslyn ест гигабайт памяти.
         notify("exit", [:])
         writeQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.process?.terminate()
         }
-        lock.lock()
-        let waiting = pending
-        pending.removeAll()
-        lock.unlock()
-        for (_, continuation) in waiting { continuation.resume(throwing: RPCError.cancelled) }
+        failAllPending(RPCError.cancelled)
     }
 
     private func handleTermination(status: Int32) {
-        lock.lock()
-        let waiting = pending
-        pending.removeAll()
-        let tail = stderrTail.suffix(5).joined(separator: "\n")
-        lock.unlock()
-
-        for (_, continuation) in waiting { continuation.resume(throwing: RPCError.notRunning) }
+        setConnected(false)
+        let tail = withLock { stderrTail.suffix(5).joined(separator: "\n") }
+        failAllPending(RPCError.notRunning)
         if status != 0 {
             onExit?(tail.isEmpty ? "сервер завершился с кодом \(status)" : tail)
         }
+    }
+
+    private func handleDisconnect() {
+        guard isConnected else { return }                 // сами и отключились
+        setConnected(false)
+        failAllPending(RPCError.notRunning)
+        onExit?("демон языковых серверов закрыл соединение")
     }
 
     private func recordStderr(_ text: String) {
@@ -184,17 +260,33 @@ final class LSPClient: @unchecked Sendable {
         }
 
         let result = try await request("initialize", params, timeout: 120)
+        initializeResult = result
         capabilities = ServerCapabilities.parse(result)
         notify("initialized", [:])
 
         // Roslyn без этого молча не отдаёт ни одного символа:
         // rootUri ему недостаточно, нужен явный solution/open.
         if config.opensSolution, let solution = ServerRegistry.findSolution(root: root) {
+            if config.projectsLoadedNotification != nil {
+                projectsToLoad = ServerRegistry.projectCount(solution: solution) ?? 0
+            }
             if solution.pathExtension == "csproj" {
                 notify("project/open", ["projects": [solution.absoluteString]])
             } else {
                 notify("solution/open", ["solution": solution.absoluteString])
             }
+        }
+    }
+
+    /// Первые два `workspace/symbol` на большом solution дорогие: Roslyn строит
+    /// индекс в две стадии, и каждую запускает очередной запрос (на Unity-проекте
+    /// из 134 csproj — 35 с и 22 с), а дальше запросы идут доли секунды.
+    /// Прогреваем обе запросами, которые ни с чем не совпадают: нужен сам
+    /// индекс, а не результаты.
+    func warmUpSymbolIndex() async {
+        guard capabilities.workspaceSymbol else { return }
+        for query in ["PilotWarmUpFirstPass", "PilotWarmUpSecondPass"] {
+            guard (try? await request("workspace/symbol", ["query": query], timeout: 300)) != nil else { return }
         }
     }
 
@@ -257,31 +349,38 @@ final class LSPClient: @unchecked Sendable {
     // MARK: - Запросы
 
     func request(_ method: String, _ params: [String: Any], timeout: TimeInterval = 8) async throws -> Any {
-        guard process?.isRunning == true else { throw RPCError.notRunning }
+        guard isConnected else { throw RPCError.notRunning }
 
         let id = allocateRequestID()
         let body: [String: Any] = [
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         ]
 
-        return try await withThrowingTaskGroup(of: Any.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    self.storePending(id, continuation)
-                    self.send(body)
+        // Таймаут и отмена обязаны именно возобновить продолжение с ошибкой.
+        // Просто выкинуть его из `pending` нельзя: тот, кто ждёт ответа,
+        // так и остался бы висеть навсегда.
+        let timer = Task { [weak self] in
+            try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            // Ждать мы перестали — пусть и сервер бросит работу.
+            if self?.failPending(id, RPCError.timeout(method: method)) == true {
+                self?.notify("$/cancelRequest", ["id": id])
+            }
+        }
+        defer { timer.cancel() }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: RPCError.cancelled)
+                    return
                 }
+                self.storePending(id, continuation)
+                self.send(body)
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                throw RPCError.timeout(method: method)
-            }
-            defer {
-                group.cancelAll()
-                // Снимаем «повисший» запрос, если победил таймаут.
-                self.discardPending(id)
-            }
-            guard let first = try await group.next() else { throw RPCError.cancelled }
-            return first
+        } onCancel: {
+            // Ответ больше никому не нужен — пусть и сервер бросит работу.
+            self.failPending(id, RPCError.cancelled)
+            self.notify("$/cancelRequest", ["id": id])
         }
     }
 
@@ -293,7 +392,7 @@ final class LSPClient: @unchecked Sendable {
         guard let data = try? JSON.encode(body) else { return }
         let framed = MessageFramer.frame(data)
         writeQueue.async { [weak self] in
-            guard let handle = self?.stdin else { return }
+            guard let handle = self?.output else { return }
             // Сервер мог умереть между проверкой и записью — write бросит
             // SIGPIPE-исключение, которое здесь не должно ронять приложение.
             do { try handle.write(contentsOf: framed) } catch { }
@@ -318,12 +417,13 @@ final class LSPClient: @unchecked Sendable {
         // Roslyn ждёт ответа на workspace/configuration и без него
         // не завершает инициализацию.
         if let id, let method {
-            respondToServerRequest(id: id, method: method)
+            respondToServerRequest(id: id, method: method, params: message["params"])
             return
         }
         // Уведомление от сервера.
         if let method {
             handleNotification(method, message["params"])
+            onNotification?(method, message["params"])
             return
         }
         // Ответ на наш запрос.
@@ -342,11 +442,11 @@ final class LSPClient: @unchecked Sendable {
         }
     }
 
-    private func respondToServerRequest(id: Int, method: String) {
+    private func respondToServerRequest(id: Int, method: String, params: Any?) {
         let result: Any
         switch method {
         case "workspace/configuration":
-            result = [NSNull()]           // настроек не даём, но отвечаем
+            result = config.configurationResponse(params)
         case "client/registerCapability", "client/unregisterCapability",
              "window/workDoneProgress/create":
             result = NSNull()
@@ -359,6 +459,10 @@ final class LSPClient: @unchecked Sendable {
     }
 
     private func handleNotification(_ method: String, _ params: Any?) {
+        if method == config.projectsLoadedNotification {
+            onProjectsLoaded?()
+            return
+        }
         switch method {
         case "$/progress":
             // Именно отсюда Roslyn сообщает «загружаю solution» —
@@ -371,9 +475,13 @@ final class LSPClient: @unchecked Sendable {
 
         case "window/logMessage", "window/showMessage":
             guard let dict = params as? [String: Any],
-                  let type = dict["type"] as? Int, type <= 2,     // Error/Warning
+                  let type = dict["type"] as? Int,
                   let text = dict["message"] as? String else { return }
-            recordStderr(text)
+            if type <= 2 {                                        // Error/Warning
+                recordStderr(text)
+            } else if let marker = config.projectLoadedMessage, text.contains(marker) {
+                onProjectLoaded?()
+            }
 
         default:
             break
