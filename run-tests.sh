@@ -9,9 +9,9 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/Sources/coretests"
-cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Highlight/{Language,Lexer,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
-cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,LSPDaemon,UnixSocket}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,LSPDaemon,UnixSocket,Completion}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Git/{LineDiff,GitParsing,Git}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Nav/{SymbolIndex,LocalNavigator}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/GitLab/{GitLabRemote,GitLabModels,UnifiedDiff}.swift "$TMP/Sources/coretests/"

@@ -30,6 +30,8 @@ final class LSPClient: @unchecked Sendable {
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<Any, Error>] = [:]
     private var openDocuments: Set<String> = []
+    /// Версия каждого открытого документа: растёт с каждой правкой.
+    private var versions: [String: Int] = [:]
     private var stderrTail: [String] = []
 
     private let writeQueue = DispatchQueue(label: "pilot.lsp.write")
@@ -226,7 +228,20 @@ final class LSPClient: @unchecked Sendable {
                 // работает SyntaxModel, поэтому пересчёт смещений не нужен.
                 "general": ["positionEncodings": ["utf-16"]],
                 "textDocument": [
-                    "synchronization": ["dynamicRegistration": false, "didSave": false],
+                    "synchronization": ["dynamicRegistration": false, "didSave": true],
+                    // Сниппеты раскрываем сами (Snippet.expand): так сервер
+                    // присылает заглушки параметров, а не голое имя метода.
+                    "completion": [
+                        "dynamicRegistration": false,
+                        "contextSupport": true,
+                        "completionItem": [
+                            "snippetSupport": true,
+                            "insertReplaceSupport": true,
+                            "labelDetailsSupport": true,
+                            "documentationFormat": ["plaintext"],
+                        ],
+                        "completionList": ["itemDefaults": ["editRange", "insertTextFormat", "data"]],
+                    ],
                     "definition": ["linkSupport": true],
                     "hover": ["contentFormat": ["markdown", "plaintext"]],
                     "references": ["dynamicRegistration": false],
@@ -281,7 +296,7 @@ final class LSPClient: @unchecked Sendable {
         let uri = url.absoluteString
         lock.lock()
         let alreadyOpen = openDocuments.contains(uri)
-        if !alreadyOpen { openDocuments.insert(uri) }
+        if !alreadyOpen { openDocuments.insert(uri); versions[uri] = 1 }
         lock.unlock()
         guard !alreadyOpen else { return }
 
@@ -295,10 +310,37 @@ final class LSPClient: @unchecked Sendable {
         ])
     }
 
+    /// Правки документа. Без `range` — полный текст (TextDocumentSyncKind.Full).
+    /// Документ, которого сервер ещё не видел, пропускаем: при открытии он
+    /// всё равно получит текст целиком.
+    func didChange(url: URL, changes: [[String: Any]]) {
+        let uri = url.absoluteString
+        lock.lock()
+        let isOpen = openDocuments.contains(uri)
+        let version = (versions[uri] ?? 1) + 1
+        if isOpen { versions[uri] = version }
+        lock.unlock()
+        guard isOpen else { return }
+        notify("textDocument/didChange", [
+            "textDocument": ["uri": uri, "version": version],
+            "contentChanges": changes,
+        ])
+    }
+
+    func isOpen(_ url: URL) -> Bool {
+        withLock { openDocuments.contains(url.absoluteString) }
+    }
+
+    func didSave(url: URL) {
+        guard isOpen(url) else { return }
+        notify("textDocument/didSave", ["textDocument": ["uri": url.absoluteString]])
+    }
+
     func didClose(url: URL) {
         let uri = url.absoluteString
         lock.lock()
         let wasOpen = openDocuments.remove(uri) != nil
+        versions[uri] = nil
         lock.unlock()
         guard wasOpen else { return }
         notify("textDocument/didClose", ["textDocument": ["uri": uri]])

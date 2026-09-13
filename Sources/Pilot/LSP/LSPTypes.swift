@@ -151,8 +151,12 @@ struct ServerCapabilities {
     var references = false
     var workspaceSymbol = false
     var documentSymbol = false
-    /// Нужен ли серверу полный текст документа при открытии (TextDocumentSyncKind).
+    /// Как слать правки (TextDocumentSyncKind): 0 — никак, 1 — полный текст,
+    /// 2 — только изменённые куски.
     var syncKind = 1
+    var completion = false
+    /// Символы, после которых дополнение открывается само: «.», «::», «->»…
+    var completionTriggers: [String] = []
 
     static func parse(_ value: Any) -> ServerCapabilities {
         var caps = ServerCapabilities()
@@ -168,6 +172,11 @@ struct ServerCapabilities {
         caps.references = flag("referencesProvider")
         caps.workspaceSymbol = flag("workspaceSymbolProvider")
         caps.documentSymbol = flag("documentSymbolProvider")
+
+        if let provider = c["completionProvider"] as? [String: Any] {
+            caps.completion = true
+            caps.completionTriggers = provider["triggerCharacters"] as? [String] ?? []
+        }
 
         if let sync = c["textDocumentSync"] as? Int { caps.syncKind = sync }
         else if let sync = c["textDocumentSync"] as? [String: Any],

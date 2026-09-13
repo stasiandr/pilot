@@ -120,6 +120,13 @@ final class GitService: ObservableObject {
         recomputeDocument()
     }
 
+    /// Текст открытого файла поменялся: полоски пересчитываем по нему, но
+    /// старые не сбрасываем — пусть висят до ответа, а не мигают.
+    func documentEdited(_ document: LoadedDocument) {
+        self.document = document
+        recomputeDocument()
+    }
+
     private func recomputeDocument() {
         let generation = documentGeneration.bump()
         blameTask?.cancel()
