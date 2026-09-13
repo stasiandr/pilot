@@ -222,11 +222,11 @@ struct PilotApp: App {
                 Button("Недавняя вкладка  ⌃Tab") { workspace.selectPreviousRecentTab() }
                     .disabled(workspace.tabs.count < 2)
                 Divider()
-                Button("Крупнее") { workspace.fontSize += 1 }
+                Button("Крупнее") { workspace.setFontSize(workspace.fontSize + 1) }
                     .keyboardShortcut("=", modifiers: .command)   // ⌘+ без Shift
-                Button("Мельче") { workspace.fontSize -= 1 }
+                Button("Мельче") { workspace.setFontSize(workspace.fontSize - 1) }
                     .keyboardShortcut("-", modifiers: .command)
-                Button("Исходный размер") { workspace.fontSize = 12.5 }
+                Button("Исходный размер") { workspace.setFontSize(Workspace.defaultFontSize) }
                     .keyboardShortcut("0", modifiers: .command)
             }
         }
