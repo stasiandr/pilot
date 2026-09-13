@@ -212,6 +212,44 @@ final class FileIndex: @unchecked Sendable {
         return listing
     }
 
+    // MARK: - Фильтр навигатора
+
+    /// Файлы, в имени которых есть подстрока, — без fuzzy и без учёта
+    /// регистра, как фильтр навигатора в Xcode. Бежит по тому же буферу,
+    /// что и поиск, без аллокаций на файл. Порядок — порядок индекса.
+    func filter(name needle: String, limit: Int, shouldStop: () -> Bool) -> [Int32] {
+        let pattern = needle.utf8.map { ($0 >= 0x41 && $0 <= 0x5A) ? $0 + 32 : $0 }
+        guard !pattern.isEmpty else { return [] }
+
+        var found: [Int32] = []
+        bytes.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            pattern.withUnsafeBufferPointer { pat in
+                let first = pat[0]
+                let count = pat.count
+                for i in 0..<entries.count {
+                    if i & 0x3FF == 0 && shouldStop() { return }
+                    let e = entries[i]
+                    let end = Int(e.start + e.length)
+                    var p = Int(e.nameStart)
+                    let last = end - count
+                    while p <= last {
+                        if base[p] == first {
+                            var k = 1
+                            while k < count && base[p + k] == pat[k] { k += 1 }
+                            if k == count { break }
+                        }
+                        p += 1
+                    }
+                    guard p <= last else { continue }
+                    found.append(Int32(i))
+                    if found.count >= limit { return }
+                }
+            }
+        }
+        return found
+    }
+
     // MARK: - Поиск
 
     /// Возвращает до `limit` лучших совпадений. Прерывается по `shouldStop`.

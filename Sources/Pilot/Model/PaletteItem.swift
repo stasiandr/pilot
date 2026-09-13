@@ -9,8 +9,10 @@ enum PaletteMode: Equatable, CaseIterable {
     case files          // ⌘P  — fuzzy-поиск по именам файлов
     case classes        // ⇧⇧  — типы всего проекта, лексически, без LSP; следом файлы
     case outline        // ⌘⇧O — структура текущего файла, лексически, без LSP
-    case symbols        // ⌘T  — символы проекта, через LSP
+    case symbols        // ⌘T  — символы проекта: быстрый индекс, затем LSP
     case references     // ⌘R  — использования символа под курсором
+    case declarations   // ⌘B, когда тип цели неясен — выбор из одноимённых
+    case changes        // ⌃⇧G — файлы, изменённые относительно HEAD
 
     var placeholder: String {
         switch self {
@@ -19,6 +21,8 @@ enum PaletteMode: Equatable, CaseIterable {
         case .outline:    return "Метод, свойство, поле…"
         case .symbols:    return "Символ в проекте…"
         case .references: return "Использования"
+        case .declarations: return "Одноимённые объявления — уточните"
+        case .changes:    return "Изменённый файл…"
         }
     }
 
@@ -29,14 +33,8 @@ enum PaletteMode: Equatable, CaseIterable {
         case .outline:    return "list.bullet.indent"
         case .symbols:    return "number"
         case .references: return "arrow.triangle.branch"
-        }
-    }
-
-    /// Нужен ли для этого режима языковой сервер.
-    var requiresLanguageServer: Bool {
-        switch self {
-        case .files, .classes, .outline: return false
-        case .symbols, .references:      return true
+        case .declarations: return "arrow.down.right.and.arrow.up.left"
+        case .changes:    return "plusminus"
         }
     }
 }

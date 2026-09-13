@@ -6,6 +6,9 @@ import AppKit
 /// Молча открывать последний проект удобно, только пока он один. Когда
 /// переключаешься между двумя-тремя, выбор на старте стоит одно нажатие,
 /// а не поход в меню и ожидание индексации ненужного проекта.
+///
+/// Оформление — по мотивам окна «Welcome to Xcode»: слева иконка и главное
+/// действие, справа недавние проекты, всё на одной стеклянной панели.
 struct StartView: View {
     @ObservedObject var workspace: Workspace
     @State private var selection = 0
@@ -15,14 +18,21 @@ struct StartView: View {
     private var projects: [URL] { Array(workspace.recentRoots.prefix(9)) }
 
     var body: some View {
-        VStack(spacing: 28) {
-            header
+        HStack(spacing: 0) {
+            VStack(spacing: 20) {
+                header
+                footer
+            }
+            .frame(maxWidth: .infinity)
+
             if !projects.isEmpty {
                 projectList
             }
-            footer
         }
-        .padding(.vertical, 40)
+        .padding(24)
+        .frame(width: projects.isEmpty ? 380 : 760, height: 400)
+        .pilotGlass(cornerRadius: 30)
+        .shadow(color: .black.opacity(0.35), radius: 30, y: 14)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { selection = 0; installKeyMonitor() }
         .onDisappear { removeKeyMonitor() }
@@ -32,24 +42,46 @@ struct StartView: View {
     }
 
     private var header: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 38, weight: .medium))
-                .foregroundStyle(Color.accentColor)
+        VStack(spacing: 18) {
+            appIcon
             VStack(spacing: 5) {
-                Text("Pilot").font(.system(size: 26, weight: .semibold))
+                Text("Pilot").font(.system(size: 30, weight: .bold))
                 Text(projects.isEmpty ? "Откройте папку проекта, чтобы начать"
-                                      : "Выберите проект")
+                                      : "Мгновенный просмотрщик кода")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
             }
         }
     }
 
+    private var appIcon: some View {
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .fill(LinearGradient(colors: [Color(red: 0.54, green: 0.68, blue: 0.96),
+                                          Color(red: 0.78, green: 0.63, blue: 0.96)],
+                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+            .frame(width: 96, height: 96)
+            .overlay {
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 46, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .strokeBorder(.white.opacity(0.35), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.3), radius: 12, y: 6)
+    }
+
     // MARK: - Список проектов
 
     private var projectList: some View {
-        VStack(spacing: 1) {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("Недавние")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
             ForEach(Array(projects.enumerated()), id: \.element.path) { index, url in
                 ProjectRow(url: url, shortcut: index + 1, isSelected: index == selection)
                     .contentShape(Rectangle())
@@ -64,24 +96,26 @@ struct StartView: View {
                         Button("Убрать из списка") { workspace.forgetRecent(url) }
                     }
             }
+            Spacer(minLength: 0)
         }
-        .padding(6)
-        .frame(width: 520)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color.primary.opacity(0.035))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-        )
+        .padding(8)
+        .frame(width: 340)
+        .frame(maxHeight: .infinity)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .fill(Color.black.opacity(0.18)))
     }
 
     private var footer: some View {
         VStack(spacing: 10) {
-            Button("Открыть папку…") { workspace.promptForFolder() }
-                .controlSize(.large)
-            Text(projects.isEmpty ? "⌘O" : "↑↓ выбрать · ⏎ открыть · ⌘1–9 · ⌘O другая папка")
+            Button {
+                workspace.promptForFolder()
+            } label: {
+                Label("Открыть папку…", systemImage: "folder")
+                    .frame(minWidth: 180)
+            }
+            .pilotGlassButton(prominent: true)
+            .controlSize(.large)
+            Text(projects.isEmpty ? "⌘O" : "↑↓ выбрать · ⏎ открыть · ⌘1–9")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
         }
@@ -137,9 +171,10 @@ private struct ProjectRow: View {
     var body: some View {
         HStack(spacing: 11) {
             Image(systemName: "folder.fill")
-                .font(.system(size: 15))
-                .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(Color.accentColor))
-                .frame(width: 20)
+                .font(.system(size: 18))
+                .foregroundStyle(isSelected ? AnyShapeStyle(.white)
+                                            : AnyShapeStyle(Color(nsColor: Theme.folderIcon.color)))
+                .frame(width: 24)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(url.lastPathComponent)
