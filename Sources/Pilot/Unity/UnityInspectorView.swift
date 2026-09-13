@@ -132,7 +132,9 @@ struct UnityInspectorView: View {
                     }
                     .padding(.leading, 4)
                 } label: {
-                    Text("Дети · \(content.children.count)").font(.system(size: 11)).foregroundStyle(.secondary)
+                    DisclosureLabel(isExpanded: expansion(key)) {
+                        Text("Дети · \(content.children.count)").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -178,15 +180,19 @@ struct UnityInspectorView: View {
             expansion: { expansion($0) },
             isExpanded: { expanded.contains($0) })
 
+        let toggleCollapsed = {
+            if isCollapsed { collapsed.remove(section.fileID) } else { collapsed.insert(section.fileID) }
+        }
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Button {
-                    if isCollapsed { collapsed.remove(section.fileID) } else { collapsed.insert(section.fileID) }
-                } label: {
+                Button(action: toggleCollapsed) {
                     Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold)).frame(width: 10)
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(.horizontal, -4)
                 Image(systemName: section.script != nil ? "chevron.left.forwardslash.chevron.right"
                                                         : "puzzlepiece.extension")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -208,6 +214,9 @@ struct UnityInspectorView: View {
                     .help("Открыть скрипт")
                 }
             }
+            // Сворачивается кликом по пустому месту шапки, а не только по стрелке.
+            .contentShape(Rectangle())
+            .onTapGesture(perform: toggleCollapsed)
             if !isCollapsed {
                 let properties = debug ? section.allProperties : section.properties
                 if section.isTransform && !debug {
@@ -341,7 +350,9 @@ struct PropertyRow: View {
                     }
                 }
             } label: {
-                Text(title).font(.system(size: 11))
+                DisclosureLabel(isExpanded: context.expansion(key)) {
+                    Text(title).font(.system(size: 11))
+                }
             }
         case .sequence(let items):
             DisclosureGroup(isExpanded: context.expansion(key)) {
@@ -352,10 +363,12 @@ struct PropertyRow: View {
                     }
                 }
             } label: {
-                HStack {
-                    Text(title).font(.system(size: 11))
-                    Spacer()
-                    Text("\(items.count)").font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                DisclosureLabel(isExpanded: context.expansion(key)) {
+                    HStack {
+                        Text(title).font(.system(size: 11))
+                        Spacer()
+                        Text("\(items.count)").font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                    }
                 }
             }
         }
@@ -444,6 +457,22 @@ struct PropertyRow: View {
                 }
             }
         }
+    }
+}
+
+/// Подпись раскрывающейся группы, по которой можно щёлкнуть целиком:
+/// у DisclosureGroup на macOS раскрывает только стрелка, а она крошечная.
+struct DisclosureLabel<Label: View>: View {
+    @Binding var isExpanded: Bool
+    @ViewBuilder var label: Label
+
+    var body: some View {
+        Button { isExpanded.toggle() } label: {
+            label
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

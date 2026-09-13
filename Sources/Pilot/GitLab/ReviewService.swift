@@ -106,12 +106,21 @@ final class ReviewService: ObservableObject {
     @Published var actionError: String?
     @Published var isConnectSheetPresented = false
 
+    /// Строка поиска над списком MR.
+    @Published var searchQuery = "" {
+        didSet { if searchQuery != oldValue { searchChanged() } }
+    }
+    /// Что нашёл GitLab по запросу — в том числе слитые и закрытые MR.
+    @Published private(set) var searchResults: [GLMergeRequest] = []
+    @Published private(set) var isSearching = false
+
     private(set) var repository: URL?
     private var client: GitLabClient?
     private var activated = false
     /// Содержимое файлов по «ревизия:путь» — ревизии неизменны, кэш не устаревает.
     private var contents: [String: String] = [:]
     private var listTask: Task<Void, Never>?
+    private var searchTask: Task<Void, Never>?
 
     init() {
         // Вернулись в Pilot — возможно, в MR ответили или запушили.
@@ -126,11 +135,15 @@ final class ReviewService: ObservableObject {
 
     func workspaceChanged(to root: URL?) {
         listTask?.cancel()
+        searchTask?.cancel()
         remote = nil
         apiHost = nil
         client = nil
         me = nil
         mergeRequests = []
+        searchQuery = ""
+        searchResults = []
+        isSearching = false
         active = nil
         openingIID = nil
         actionError = nil
@@ -225,6 +238,9 @@ final class ReviewService: ObservableObject {
         me = nil
         mergeRequests = []
         active = nil
+        searchTask?.cancel()
+        searchResults = []
+        isSearching = false
         phase = remote == nil ? phase : .disconnected
     }
 
@@ -265,17 +281,92 @@ final class ReviewService: ObservableObject {
         }
     }
 
+    /// Что показать в панели: открытые MR по разделам, отфильтрованные
+    /// запросом, и то, что GitLab нашёл сверх них.
+    struct Listing {
+        var sections: [(title: String, items: [GLMergeRequest])]
+        var found: [GLMergeRequest]
+
+        var isEmpty: Bool { sections.isEmpty && found.isEmpty }
+        var first: GLMergeRequest? { sections.first?.items.first ?? found.first }
+    }
+
+    var listing: Listing {
+        let search = MergeRequestSearch(searchQuery)
+        let matched = search.filter(mergeRequests)
+        let shown = Set(matched.map(\.id))
+        return Listing(sections: sections(of: matched),
+                       found: search.isEmpty ? [] : searchResults.filter { !shown.contains($0.id) })
+    }
+
     /// Разбивка для списка: сначала то, что ждёт моего ревью.
-    var sections: [(title: String, items: [GLMergeRequest])] {
-        guard let me else { return [("Открытые", mergeRequests)] }
-        let mine = mergeRequests.filter { $0.author.id == me.id }
-        let toReview = mergeRequests.filter { mr in
+    private func sections(of list: [GLMergeRequest]) -> [(title: String, items: [GLMergeRequest])] {
+        guard let me else { return [("Открытые", list)].filter { !$0.items.isEmpty } }
+        let mine = list.filter { $0.author.id == me.id }
+        let toReview = list.filter { mr in
             mr.author.id != me.id && (mr.reviewers ?? []).contains { $0.id == me.id }
         }
-        let rest = mergeRequests.filter { mr in
+        let rest = list.filter { mr in
             !mine.contains(where: { $0.id == mr.id }) && !toReview.contains(where: { $0.id == mr.id })
         }
         return [("Жду моего ревью", toReview), ("Мои", mine), ("Остальные", rest)].filter { !$0.items.isEmpty }
+    }
+
+    // MARK: - Поиск
+
+    /// Загруженный список фильтруется сразу, а GitLab спрашиваем, когда
+    /// перестали печатать: там найдутся слитые, закрытые и совпавшие
+    /// по описанию. Старые результаты не показываем — они про другой запрос.
+    private func searchChanged() {
+        searchTask?.cancel()
+        searchResults = []
+        let search = MergeRequestSearch(searchQuery)
+        guard let client, let remote, search.wantsServer else {
+            isSearching = false
+            return
+        }
+        isSearching = true
+        let query = searchQuery
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            async let exact = Self.mergeRequest(client, remote, iid: search.iid)
+            async let byText = Self.search(client, remote, search)
+            do {
+                let number = await exact
+                let list = try await byText
+                guard let self, !Task.isCancelled, self.searchQuery == query else { return }
+                self.searchResults = (number.map { [$0] } ?? []) + list.filter { $0.id != number?.id }
+                self.isSearching = false
+            } catch {
+                guard let self, !Task.isCancelled, self.searchQuery == query else { return }
+                self.isSearching = false
+                if (error as? GitLabError) == .unauthorized { self.fail(error) }
+                else { self.actionError = error.localizedDescription }
+            }
+        }
+    }
+
+    /// MR по номеру: из того, что уже загружено, иначе из GitLab.
+    func mergeRequest(iid: Int) async -> GLMergeRequest? {
+        if let known = (mergeRequests + searchResults).first(where: { $0.iid == iid }) { return known }
+        guard let client, let remote else { return nil }
+        let mr = await Self.mergeRequest(client, remote, iid: iid)
+        if mr == nil { actionError = "MR !\(iid) не найден" }
+        return mr
+    }
+
+    /// MR по номеру; нет такого — `nil`, это не ошибка.
+    nonisolated private static func mergeRequest(_ client: GitLabClient, _ remote: GitLabRemote,
+                                                 iid: Int?) async -> GLMergeRequest? {
+        guard let iid else { return nil }
+        return try? await client.mergeRequest(remote, iid: iid)
+    }
+
+    nonisolated private static func search(_ client: GitLabClient, _ remote: GitLabRemote,
+                                           _ search: MergeRequestSearch) async throws -> [GLMergeRequest] {
+        guard !search.apiSearch.isEmpty || search.apiAuthor != nil else { return [] }
+        return try await client.searchMergeRequests(remote, text: search.apiSearch, author: search.apiAuthor)
     }
 
     // MARK: - Открытый MR
