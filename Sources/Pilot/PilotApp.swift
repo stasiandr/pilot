@@ -188,6 +188,8 @@ struct PilotApp: App {
                 Button("Отметить конфликт решённым") { workspace.markConflictsResolved() }
                     .disabled(!workspace.isConflictedFile || !workspace.conflicts.isEmpty)
                 Divider()
+                Button("Действия в контексте…") { workspace.showContextActions() }
+                    .keyboardShortcut(".", modifiers: .command)
                 // Не требует LSP: пока сервер не готов, отвечает быстрый
                 // навигатор по индексу объявлений проекта.
                 Button("Перейти к объявлению") {

@@ -1035,6 +1035,15 @@ let usage = occDoc.distance(from: occDoc.startIndex,
 check(!Occurrences.looksLikeDeclaration(NSRange(location: usage, length: 5), in: occModel),
       "'Log(count)' объявлением не считается")
 
+// символ для меню ⌘.: идентификатор в коде, но не ключевое слово и не текст
+check(Occurrences.symbol(in: occModel, at: classNameOffset)?.text == "Counter", "символ: имя класса")
+check(Occurrences.symbol(in: occModel, at: usage + 2)?.text == "count", "символ: использование поля")
+check(Occurrences.symbol(in: occModel, at: 2) == nil, "символ: ключевое слово public — не символ")
+check(Occurrences.symbol(in: occModel, at: commentOffset) == nil, "символ: слово в комментарии — не символ")
+check(Occurrences.symbol(in: occModel, at: stringOffset + 1) == nil, "символ: слово в строке — не символ")
+check(Occurrences.symbol(in: SyntaxModel(text: "alpha beta", spec: nil), at: 7)?.text == "beta",
+      "символ: без подсветки языка — любой идентификатор")
+
 check(Occurrences.find("", in: occModel).isEmpty, "пустое слово -> пусто")
 check(Occurrences.find("нетакого", in: occModel).isEmpty, "отсутствующее слово -> пусто")
 check(Occurrences.identifier(in: SyntaxModel(text: "", spec: nil), at: 0) == nil,

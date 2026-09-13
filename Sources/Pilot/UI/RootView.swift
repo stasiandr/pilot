@@ -132,6 +132,7 @@ struct RootView: View {
                          conflictAction: workspace.conflictAction,
                          focusRequest: workspace.editorFocusRequest,
                          findRequest: workspace.findRequest,
+                         contextActionsRequest: workspace.contextActionsRequest,
                          completionTriggers: workspace.lsp.completionTriggers,
                          decorator: workspace.unity.decorator(),
                          decorationsVersion: workspace.unity.decorationsVersion,
@@ -140,6 +141,7 @@ struct RootView: View {
                          onGoToDefinition: { workspace.goToDefinition(at: $0) },
                          onLineClick: { workspace.lineClicked($0) },
                          onCommentLine: workspace.isReviewDocument ? { workspace.commentOnLine($0) } : nil,
+                         contextActions: { workspace.contextActions(at: $0) },
                          requestCompletions: { offset, trigger, retrigger in
                              await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)
                          })

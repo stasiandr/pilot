@@ -434,6 +434,23 @@ final class CodeTextView: NSTextView {
     }
 }
 
+/// Пункт меню ⌘.: выполняет своё действие сам, без цепочки ответчиков.
+private final class ContextMenuItem: NSMenuItem {
+    private let handler: () -> Void
+
+    init(_ action: ContextAction) {
+        handler = action.perform
+        super.init(title: action.title, action: #selector(run), keyEquivalent: action.shortcut?.key ?? "")
+        target = self
+        keyEquivalentModifierMask = action.shortcut?.modifiers ?? []
+        image = NSImage(systemSymbolName: action.icon, accessibilityDescription: nil)
+    }
+
+    required init(coder: NSCoder) { fatalError("init(coder:) не нужен") }
+
+    @objc private func run() { handler() }
+}
+
 /// На macOS 26 NSScrollView кладёт клип-вью под вертикальную линейку —
 /// она «плавает» над текстом, и начало строк прячется за гаттером.
 /// Возвращаем классическую раскладку: текст начинается справа от линейки.
@@ -494,6 +511,9 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var onCommentLine: ((Int) -> Void)? {
         didSet { if isViewLoaded { applyLineHandlers() } }
     }
+    /// Что можно сделать в позиции — для меню ⌘. Правку текста
+    /// (комментарий, дополнение) меню добавляет само.
+    var contextActions: ((Int) -> [ContextActionGroup])?
 
     private let scrollView = CodeScrollView()
     private var textView: CodeTextView!
@@ -1017,6 +1037,71 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             return true
         }
         return false
+    }
+
+    // MARK: - Меню действий (⌘.)
+
+    /// Нативное меню прямо под курсором: на macOS 26 оно само стеклянное,
+    /// стрелки, Return, Esc и поиск по первым буквам — штатные.
+    func presentContextActions() {
+        guard let window = view.window, let buffer else { return }
+        hideCompletion()
+        let caret = textView.selectedRange().location
+        var groups = contextActions?(caret) ?? []
+        groups.append(ContextActionGroup(title: nil, actions: editingActions(readOnly: buffer.isReadOnly)))
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for group in groups where !group.actions.isEmpty {
+            if menu.numberOfItems > 0 { menu.addItem(.separator()) }
+            if let title = group.title { menu.addItem(.sectionHeader(title: title)) }
+            for action in group.actions { menu.addItem(ContextMenuItem(action)) }
+        }
+        guard menu.numberOfItems > 0 else { NSSound.beep(); return }
+
+        // Курсор мог уехать за край экрана — меню у невидимой строки ни к чему.
+        let caretRange = NSRange(location: caret, length: 0)
+        var rect = textView.convert(window.convertFromScreen(
+            textView.firstRect(forCharacterRange: caretRange, actualRange: nil)), from: nil)
+        if !textView.visibleRect.intersects(rect.insetBy(dx: 0, dy: -1)) {
+            textView.scrollRangeToVisible(caretRange)
+            rect = textView.convert(window.convertFromScreen(
+                textView.firstRect(forCharacterRange: caretRange, actualRange: nil)), from: nil)
+        }
+
+        // Меню, открытое с клавиатуры, встаёт без выделения — и Return
+        // ничего не делает. Стрелка вниз выделяет первый пункт; шлём её,
+        // когда меню уже ведёт клавиатуру, — иначе её может забрать текст.
+        let arrow = KeyShortcut(NSDownArrowFunctionKey, []).key
+        let windowNumber = window.windowNumber
+        let tracking = NotificationCenter.default.addObserver(
+            forName: NSMenu.didBeginTrackingNotification, object: menu, queue: nil) { _ in
+            guard let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                              timestamp: ProcessInfo.processInfo.systemUptime,
+                                              windowNumber: windowNumber, context: nil, characters: arrow,
+                                              charactersIgnoringModifiers: arrow, isARepeat: false,
+                                              keyCode: 125) else { return }
+            NSApp.postEvent(down, atStart: false)
+        }
+        defer { NotificationCenter.default.removeObserver(tracking) }
+        // Вьюха перевёрнутая: maxY — низ строки.
+        menu.popUp(positioning: nil, at: NSPoint(x: rect.minX, y: rect.maxY + 2), in: textView)
+    }
+
+    private func editingActions(readOnly: Bool) -> [ContextAction] {
+        guard !readOnly else { return [] }
+        var actions: [ContextAction] = []
+        if textView.lineCommentToken != nil {
+            actions.append(ContextAction(title: "Закомментировать строки", icon: "text.line.first.and.arrowtriangle.forward",
+                                         shortcut: KeyShortcut("/", .command)) { [weak self] in
+                self?.textView.toggleLineComment(nil)
+            })
+        }
+        actions.append(ContextAction(title: "Показать варианты", icon: "list.bullet.rectangle",
+                                     shortcut: KeyShortcut(KeyShortcut.escape, .option)) { [weak self] in
+            self?.requestCompletion(trigger: nil, manual: true)
+        })
+        return actions
     }
 
     // MARK: - Автодополнение
@@ -1731,6 +1816,8 @@ struct CodeView: NSViewControllerRepresentable {
     var conflictAction: Workspace.ConflictActionRequest? = nil
     let focusRequest: Int
     var findRequest: Workspace.FindRequest? = nil
+    /// ⌘. — номер запроса меню действий у курсора.
+    var contextActionsRequest = 0
     let completionTriggers: [String]
     /// Смысловые украшения и их версия: сменилась — перекрашиваем.
     var decorator: CodeDecorator? = nil
@@ -1741,6 +1828,7 @@ struct CodeView: NSViewControllerRepresentable {
     let onGoToDefinition: (Int) -> Void
     var onLineClick: ((Int) -> Void)? = nil
     var onCommentLine: ((Int) -> Void)? = nil
+    var contextActions: ((Int) -> [ContextActionGroup])? = nil
     let requestCompletions: (Int, String?, Bool) async -> CompletionList?
 
     func makeNSViewController(context: Context) -> CodeViewController {
@@ -1757,6 +1845,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.onGoToDefinition = onGoToDefinition
         controller.onLineClick = onLineClick
         controller.onCommentLine = onCommentLine
+        controller.contextActions = contextActions
         controller.requestCompletions = requestCompletions
         // «.» — всегда: и без сервера после точки ждёшь список членов.
         controller.completionTriggers = Set(completionTriggers).union(["."])
@@ -1866,6 +1955,16 @@ struct CodeView: NSViewControllerRepresentable {
             context.coordinator.appliedFind = findRequest.seq
             DispatchQueue.main.async { controller.performFind(findRequest.action) }
         }
+
+        // Меню модальное — не изнутри обновления вью. Фокус мог быть
+        // в дереве или палитре: меню всё равно о тексте, отдаём фокус ему.
+        if contextActionsRequest != context.coordinator.appliedContextActions {
+            context.coordinator.appliedContextActions = contextActionsRequest
+            DispatchQueue.main.async {
+                controller.focusText()
+                controller.presentContextActions()
+            }
+        }
     }
 
     /// Дешёвая подпись набора вхождений: сравнивать массивы целиком
@@ -1892,6 +1991,7 @@ struct CodeView: NSViewControllerRepresentable {
         // Редактор пересоздан (после экрана «нет файла») — старый ⌘F
         // не должен открыть панель поиска сам по себе.
         coordinator.appliedFind = findRequest?.seq ?? 0
+        coordinator.appliedContextActions = contextActionsRequest
         return coordinator
     }
 
@@ -1914,6 +2014,7 @@ struct CodeView: NSViewControllerRepresentable {
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
         var appliedFind = 0
+        var appliedContextActions = 0
         var decorationsVersion = 0
         var semanticsVersion = -1
         var appliedEdit = -1
