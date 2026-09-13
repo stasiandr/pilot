@@ -39,6 +39,12 @@ enum Theme {
 
     static var gutterTextCurrent: NSColor { Macchiato.lavender }
 
+    /// Unity: методы, которые вызывает движок, ссылки на ассеты по GUID
+    /// и ссылки, которым не нашлось ассета.
+    static var unityEvent: NSColor { Macchiato.teal }
+    static var assetLink: NSColor { Macchiato.sapphire }
+    static var brokenLink: NSColor { Macchiato.red }
+
     /// Полоса под строкой с курсором — как в Xcode, едва заметная.
     static var currentLine: NSColor { Macchiato.surface0.withAlphaComponent(0.55) }
 
@@ -72,7 +78,9 @@ enum Theme {
         case "Makefile", "CMakeLists.txt": return Icon(symbol: "hammer", color: Macchiato.subtext0)
         default: break
         }
-        switch (name as NSString).pathExtension.lowercased() {
+        let ext = (name as NSString).pathExtension.lowercased()
+        if let unity = unityIcon(forExtension: ext) { return unity }
+        switch ext {
         case "swift":                   return Icon(symbol: "swift", color: Macchiato.peach)
         case "cs", "csx":               return Icon(symbol: "number.square", color: Macchiato.mauve)
         case "c":                       return Icon(symbol: "c.square", color: Macchiato.blue)
@@ -107,6 +115,26 @@ enum Theme {
         }
     }
 
+    /// Unity-ассеты: сцены, префабы, материалы, шейдеры… Цвета — по роли,
+    /// как в окне Project у Unity: сцены и префабы заметнее остального.
+    private static func unityIcon(forExtension ext: String) -> Icon? {
+        guard let symbol = UnitySemantics.icon(forExtension: ext) else { return nil }
+        let color: NSColor
+        switch ext {
+        case "unity":                           color = Macchiato.lavender
+        case "prefab":                          color = Macchiato.sapphire
+        case "mat", "physicmaterial", "physicsmaterial2d": color = Macchiato.pink
+        case "shader", "hlsl", "cginc", "compute", "shadergraph", "shadersubgraph", "glsl", "vfx":
+                                                color = Macchiato.mauve
+        case "anim", "controller", "overridecontroller", "playable": color = Macchiato.peach
+        case "asset", "preset", "lighting":     color = Macchiato.teal
+        case "fbx", "obj", "blend", "dae", "3ds", "max": color = Macchiato.sky
+        case "wav", "mp3", "ogg", "aif", "aiff", "flac": color = Macchiato.green
+        default:                                color = Macchiato.subtext0
+        }
+        return Icon(symbol: symbol, color: color)
+    }
+
     // MARK: - Бейджи символов
 
     /// Буква в цветном квадратике — как у символов в Xcode.
@@ -122,6 +150,11 @@ enum Theme {
         case .namespace:   return ("N", Macchiato.flamingo)
         case .initializer: return ("I", Macchiato.peach)
         case .enumCase:    return ("E", Macchiato.yellow)
+        case .gameObject:      return ("GO", Macchiato.sapphire)
+        case .component:       return ("C", Macchiato.teal)
+        case .prefab:          return ("Pf", Macchiato.lavender)
+        case .unityMessage:    return ("U", Macchiato.teal)
+        case .serializedField: return ("SF", Macchiato.sky)
         }
     }
 

@@ -109,7 +109,7 @@ struct PaletteView: View {
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            TextField(workspace.paletteMode.placeholder, text: $workspace.query)
+            TextField(placeholder, text: $workspace.query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 19, weight: .regular))
                 .focused($focused)
@@ -131,12 +131,18 @@ struct PaletteView: View {
         .padding(.vertical, 15)
     }
 
+    private var placeholder: String {
+        workspace.paletteMode == .assetUsages && !workspace.usagesTitle.isEmpty
+            ? "Где используется \(workspace.usagesTitle)"
+            : workspace.paletteMode.placeholder
+    }
+
     private var isIndexingForMode: Bool {
         switch workspace.paletteMode {
         case .files:   return workspace.isIndexing
         case .classes: return workspace.isIndexing || workspace.isTypeIndexing
         case .symbols: return workspace.symbolIndex == nil && !workspace.lsp.isReady
-        case .outline, .references, .declarations, .changes: return false
+        case .outline, .references, .declarations, .changes, .assetUsages: return false
         }
     }
 
@@ -153,7 +159,7 @@ struct PaletteView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help("Типов в индексе")
-        case .symbols, .references, .declarations, .outline, .changes:
+        case .symbols, .references, .declarations, .outline, .changes, .assetUsages:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
                     .font(.system(size: 11, design: .monospaced))
@@ -201,6 +207,10 @@ struct PaletteView: View {
         case .changes:
             if workspace.git.repository == nil { return "Проект не под git" }
             return workspace.query.isEmpty ? "Изменений нет — всё закоммичено" : "Ничего не найдено"
+        case .assetUsages:
+            return workspace.query.isEmpty
+                ? "На \(workspace.usagesTitle) не ссылается ни одна сцена, префаб или ассет"
+                : "Ничего не найдено"
         }
     }
 

@@ -41,6 +41,8 @@ struct LanguageSpec {
     var contextualKeywords: Set<String> = []
     /// Блоки задаются отступом, а не скобками (Python).
     var indentBased = false
+    /// `ключ:` красится как имя (YAML).
+    var keysBeforeColon = false
 
     static func s(_ str: String) -> [UInt8] { Array(str.utf8) }
 }
@@ -81,6 +83,18 @@ enum Languages {
         for e in ["css", "scss", "less"] { m[e] = css }
         for e in ["sql"] { m[e] = sql }
         for e in ["md", "markdown"] { m[e] = markdown }
+        // Unity. Сериализованные ассеты — YAML со своими тегами; .meta — тоже.
+        for e in ["unity", "prefab", "asset", "mat", "anim", "controller", "overridecontroller",
+                  "playable", "mask", "physicmaterial", "physicsmaterial2d", "mixer", "rendertexture",
+                  "lighting", "spriteatlas", "spriteatlasv2", "terrainlayer", "signal", "preset",
+                  "guiskin", "fontsettings", "flare", "brush", "cubemap", "giparams", "scenetemplate",
+                  "vfxoperator", "vfxblock", "meta"] { m[e] = unityYAML }
+        for e in ["shader"] { m[e] = shaderLab }
+        for e in ["hlsl", "hlslinc", "cginc", "compute", "glsl", "glslinc", "raytrace", "fx"] { m[e] = hlsl }
+        for e in ["asmdef", "asmref", "inputactions", "shadergraph", "shadersubgraph", "index",
+                  "buildreport", "vfx"] where m[e] == nil { m[e] = json }
+        for e in ["uxml"] { m[e] = xml }
+        for e in ["uss", "tss"] { m[e] = css }
         return m
     }()
 
@@ -432,6 +446,72 @@ enum Languages {
         ]
         l.constants = ["true","false","null","yes","no","on","off","~"]
         l.capitalizedIsType = false
+        l.keysBeforeColon = true
+        return l
+    }()
+
+    /// Текстовая сериализация Unity: `--- !u!114 &123` в заголовках,
+    /// `{fileID: …, guid: …}` в ссылках. Переходы по ссылкам и структура
+    /// сцены — в `UnityYAMLFile`, здесь только подсветка.
+    static let unityYAML: LanguageSpec = {
+        var l = yaml
+        l.name = "Unity YAML"
+        l.preprocessorPrefix = 0x25   // %YAML, %TAG
+        l.attributePrefix = 0x21      // !u!114 — теги классов
+        return l
+    }()
+
+    /// ShaderLab — обёртка `.shader`, внутри которой HLSL. Разделять их
+    /// лексически незачем: блоки HLSL красятся тем же набором слов.
+    static let shaderLab: LanguageSpec = {
+        var l = hlsl
+        l.name = "ShaderLab"
+        l.keywords.formUnion([
+            "Shader", "Properties", "SubShader", "Pass", "Tags", "LOD", "Name", "Fallback",
+            "FallBack", "CustomEditor", "UsePass", "GrabPass", "Category", "Stencil",
+            "Cull", "ZWrite", "ZTest", "ZClip", "Blend", "BlendOp", "ColorMask", "Offset",
+            "AlphaToMask", "Conservative", "Lighting", "Fog", "Material", "SetTexture",
+            "CGPROGRAM", "ENDCG", "CGINCLUDE", "HLSLPROGRAM", "ENDHLSL", "HLSLINCLUDE",
+            "PackageRequirements", "Off", "On", "Back", "Front", "LEqual", "Less", "Greater",
+            "GEqual", "Equal", "NotEqual", "Always", "Never", "One", "Zero", "SrcAlpha",
+            "OneMinusSrcAlpha", "DstColor", "SrcColor", "OneMinusDstColor", "OneMinusSrcColor",
+            "Ref", "Comp", "ReadMask", "WriteMask", "Replace", "Keep",
+        ])
+        l.typeKeywords.formUnion(["Range", "Color", "Vector", "Cube", "Int", "Float", "Integer", "CubeArray"])
+        return l
+    }()
+
+    static let hlsl: LanguageSpec = {
+        var l = LanguageSpec(name: "HLSL")
+        l.lineComments = [LanguageSpec.s("//")]
+        l.blockComment = (LanguageSpec.s("/*"), LanguageSpec.s("*/"))
+        l.strings = [StringSpec(open: LanguageSpec.s("\""), close: LanguageSpec.s("\""), escapes: true, multiline: false)]
+        l.preprocessorPrefix = 0x23
+        l.keywords = ["break", "case", "cbuffer", "const", "continue", "default", "discard", "do",
+            "else", "extern", "for", "groupshared", "if", "in", "inline", "inout", "out", "nointerpolation",
+            "linear", "centroid", "noperspective", "sample", "precise", "return", "static", "struct",
+            "switch", "tbuffer", "typedef", "uniform", "volatile", "while", "register", "packoffset",
+            "unroll", "loop", "branch", "flatten", "numthreads", "row_major", "column_major"]
+        l.constants = ["true", "false", "NULL"]
+        var types: Set<String> = ["void", "bool", "int", "uint", "dword", "half", "float", "double",
+            "fixed", "min16float", "min10float", "min16int", "min12int", "min16uint", "real",
+            "sampler", "sampler1D", "sampler2D", "sampler3D", "samplerCUBE", "sampler2D_float",
+            "sampler_state", "SamplerState", "SamplerComparisonState",
+            "Texture1D", "Texture2D", "Texture3D", "TextureCube", "Texture2DArray", "TextureCubeArray",
+            "Texture2DMS", "RWTexture2D", "RWTexture3D", "RWTexture2DArray", "Buffer", "RWBuffer",
+            "StructuredBuffer", "RWStructuredBuffer", "ByteAddressBuffer", "RWByteAddressBuffer",
+            "AppendStructuredBuffer", "ConsumeStructuredBuffer", "string", "vector", "matrix"]
+        for base in ["bool", "int", "uint", "half", "float", "double", "fixed", "real", "min16float"] {
+            for n in 1...4 {
+                types.insert("\(base)\(n)")
+                for m in 1...4 { types.insert("\(base)\(n)x\(m)") }
+            }
+        }
+        l.typeKeywords = types
+        l.capitalizedIsType = false   // макросы SRP: TEXTURE2D, SAMPLE_TEXTURE2D — не типы
+        l.outline = .cFamily
+        l.declarationKeywords = ["struct": .type, "cbuffer": .type, "tbuffer": .type]
+        l.modifierKeywords = ["static", "inline", "uniform", "extern", "precise", "groupshared", "const"]
         return l
     }()
 

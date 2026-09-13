@@ -81,8 +81,9 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
 
     static func isMember(_ kind: OutlineKind) -> Bool {
         switch kind {
-        case .method, .property, .field, .enumCase, .initializer, .function, .variable: return true
-        case .type, .namespace: return false
+        case .method, .property, .field, .enumCase, .initializer, .function, .variable,
+             .unityMessage, .serializedField: return true
+        case .type, .namespace, .gameObject, .component, .prefab: return false
         }
     }
 
@@ -368,11 +369,12 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
         func rank(_ kind: OutlineKind) -> Int {
             switch kind {
             case .type: return 0
-            case .method, .function, .initializer: return 1
+            case .method, .function, .initializer, .unityMessage: return 1
             case .property: return 2
-            case .field, .variable: return 3
+            case .field, .variable, .serializedField: return 3
             case .enumCase: return 4
             case .namespace: return 5
+            case .gameObject, .component, .prefab: return 6
             }
         }
         results.sort {

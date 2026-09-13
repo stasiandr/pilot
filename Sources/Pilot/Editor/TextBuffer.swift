@@ -56,6 +56,14 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
         document.outline = outline
     }
 
+    /// Структура и разбор Unity вместе с версией модели, по которой они
+    /// построены: пока текст её не догнал, позициям разбора не верим.
+    func setSemantics(outline: [OutlineItem], unityFile: UnityYAMLFile?, version: Int) {
+        document.outline = outline
+        document.unityFile = unityFile
+        document.semanticsVersion = version
+    }
+
     // MARK: - Правки
 
     /// Сюда приходит любая правка текста: набор, вставка, ⌘Z, дополнение.

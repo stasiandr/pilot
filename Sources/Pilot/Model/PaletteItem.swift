@@ -13,6 +13,7 @@ enum PaletteMode: Equatable, CaseIterable {
     case references     // ⌘R  — использования символа под курсором
     case declarations   // ⌘B, когда тип цели неясен — выбор из одноимённых
     case changes        // ⌃⇧G — файлы, изменённые относительно HEAD
+    case assetUsages    // ⇧⌘R — где используется ассет Unity: поиск GUID, без LSP
 
     var placeholder: String {
         switch self {
@@ -23,6 +24,7 @@ enum PaletteMode: Equatable, CaseIterable {
         case .references: return "Использования"
         case .declarations: return "Одноимённые объявления — уточните"
         case .changes:    return "Изменённый файл…"
+        case .assetUsages: return "Где используется ассет"
         }
     }
 
@@ -35,6 +37,7 @@ enum PaletteMode: Equatable, CaseIterable {
         case .references: return "arrow.triangle.branch"
         case .declarations: return "arrow.down.right.and.arrow.up.left"
         case .changes:    return "plusminus"
+        case .assetUsages: return "link"
         }
     }
 }

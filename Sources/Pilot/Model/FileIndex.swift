@@ -131,17 +131,37 @@ final class FileIndex: @unchecked Sendable {
     ///
     /// `early` получает индекс из одних отслеживаемых файлов, как только git
     /// их отдал (десятые доли секунды), — до того, как он найдёт новые.
+    /// `exclude` — правила проекта поверх `.gitignore`: например, `.meta` в Unity.
     /// Синхронный — вызывать вне главного потока.
-    static func scan(root: URL, shouldStop: @escaping () -> Bool,
+    static func scan(root: URL, exclude: Exclusion? = nil, shouldStop: @escaping () -> Bool,
                      early: ((FileIndex) -> Void)? = nil) -> FileIndex {
         // Пустой ответ бывает, когда открыта папка, которую git игнорирует
         // или ещё не видел: тогда он ничего о ней не знает, и обходим сами.
         if let tracked = GitFiles.tracked(root: root), !tracked.isEmpty, !shouldStop() {
-            early?(FileIndex(root: root, paths: tracked))
+            let trackedPaths = filtered(tracked, exclude)
+            early?(FileIndex(root: root, paths: trackedPaths))
             let complete = shouldStop() ? nil : GitFiles.complete(root: root, tracked: tracked)
-            return FileIndex(root: root, paths: complete ?? tracked)
+            return FileIndex(root: root, paths: complete.map { filtered($0, exclude) } ?? trackedPaths)
         }
-        return build(root: root, shouldStop: shouldStop)
+        return build(root: root, exclude: exclude, shouldStop: shouldStop)
+    }
+
+    /// Правило исключения: путь от корня и папка ли это.
+    typealias Exclusion = (_ relPath: String, _ isDirectory: Bool) -> Bool
+
+    /// Список от git — плоский, папок в нём нет: исключённая папка
+    /// отсекается по любому из предков файла.
+    static func filtered(_ paths: [String], _ exclude: Exclusion?) -> [String] {
+        guard let exclude else { return paths }
+        return paths.filter { path in
+            if exclude(path, false) { return false }
+            var slash = path.firstIndex(of: "/")
+            while let s = slash {
+                if exclude(String(path[..<s]), true) { return false }
+                slash = path[path.index(after: s)...].firstIndex(of: "/")
+            }
+            return true
+        }
     }
 
     /// Рекурсивный обход. Синхронный — вызывающий обязан делать это вне главного потока.
@@ -150,7 +170,7 @@ final class FileIndex: @unchecked Sendable {
     /// Обход в ширину, по уровням: все папки одного уровня читаются
     /// параллельно, а результаты складываются в порядке папок — индекс
     /// получается тот же, что при последовательном обходе.
-    static func build(root: URL, shouldStop: @escaping () -> Bool) -> FileIndex {
+    static func build(root: URL, exclude: Exclusion? = nil, shouldStop: @escaping () -> Bool) -> FileIndex {
         let index = FileIndex(root: root)
         index.reserve(8192)
 
@@ -168,7 +188,7 @@ final class FileIndex: @unchecked Sendable {
             listings.withUnsafeMutableBufferPointer { out in
                 // Каждая итерация пишет только в свою ячейку.
                 DispatchQueue.concurrentPerform(iterations: frames.count) { i in
-                    out[i] = walk(frames[i], rootPath: rootPath)
+                    out[i] = walk(frames[i], rootPath: rootPath, exclude: exclude)
                 }
             }
             level = []
@@ -190,7 +210,7 @@ final class FileIndex: @unchecked Sendable {
         var dirs: [WalkFrame] = []
     }
 
-    private static func walk(_ frame: WalkFrame, rootPath: String) -> WalkListing {
+    private static func walk(_ frame: WalkFrame, rootPath: String, exclude: Exclusion?) -> WalkListing {
         let dirPath = frame.rel.isEmpty ? rootPath : rootPath + "/" + frame.rel
         var listing = WalkListing()
         guard let contents = DirectoryReader.read(dirPath) else { return listing }
@@ -203,6 +223,7 @@ final class FileIndex: @unchecked Sendable {
         for entry in contents.entries {
             let rel = frame.rel.isEmpty ? entry.name : frame.rel + "/" + entry.name
             if ignore.isIgnored(relPath: rel, name: entry.name, isDir: entry.isDirectory) { continue }
+            if let exclude, exclude(rel, entry.isDirectory) { continue }
             if entry.isDirectory {
                 listing.dirs.append(WalkFrame(rel: rel, inherited: ignore))
             } else {

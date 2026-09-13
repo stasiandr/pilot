@@ -16,6 +16,15 @@ struct LoadedDocument: Sendable {
     /// показывает файл в версии MR: она не совпадает с рабочей копией,
     /// поэтому такой документ только для чтения и никогда не сохраняется.
     var revision: String? = nil
+    /// Сцена, префаб или другой сериализованный ассет Unity — разобранный.
+    var unityFile: UnityYAMLFile? = nil
+    /// Версия модели, по которой построены структура и `unityFile`. Текст
+    /// правят, разбор догоняет с задержкой — пока версии не совпали,
+    /// позициям из разбора верить нельзя.
+    var semanticsVersion: Int = 0
+
+    /// Разбор соответствует тексту — по нему можно править и переходить.
+    var isSemanticsFresh: Bool { semanticsVersion == model.version }
 
     /// Текущий текст. Берётся из модели: она правится вместе с редактором.
     var text: String { model.text }
@@ -41,25 +50,28 @@ struct LoadedDocument: Sendable {
     /// любого исходника; такие файлы в репозитории почти всегда бинарные.
     static let maxBytes = 64 * 1024 * 1024
 
-    static func load(url: URL) throws -> LoadedDocument {
+    static func load(url: URL, unity: UnityContext? = nil) throws -> LoadedDocument {
         let (text, encoding) = try readTextAndEncoding(url: url, maxBytes: maxBytes)
-        return make(url: url, text: text, encoding: encoding, revision: nil)
+        return make(url: url, text: text, encoding: encoding, revision: nil, unity: unity)
     }
 
     /// Файл из коммита — для ревью MR: те же проверки, что и с диска.
     static func make(url: URL, data: Data, revision: String?) throws -> LoadedDocument {
         let (text, encoding) = try decodeText(data, maxBytes: maxBytes)
-        return make(url: url, text: text, encoding: encoding, revision: revision)
+        return make(url: url, text: text, encoding: encoding, revision: revision, unity: nil)
     }
 
     private static func make(url: URL, text: String, encoding: String.Encoding,
-                             revision: String?) -> LoadedDocument {
+                             revision: String?, unity: UnityContext?) -> LoadedDocument {
         let spec = Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
         let outline = OutlineBuilder.build(model: model)
+        let semantics = UnitySemantics.analyze(model: model, lexicalOutline: outline, context: unity)
         return LoadedDocument(url: url, model: model,
                               languageName: spec?.name ?? "Plain Text",
-                              outline: outline, encoding: encoding, revision: revision)
+                              outline: semantics?.outline ?? outline, encoding: encoding,
+                              revision: revision, unityFile: semantics?.serialized,
+                              semanticsVersion: model.version)
     }
 
     /// Текст файла с теми же проверками, что и при открытии: размер,
@@ -90,6 +102,30 @@ struct LoadedDocument: Sendable {
         if let s = String(data: data, encoding: .isoLatin1) { return (s, .isoLatin1) }
         throw LoadError.binary
     }
+}
+
+// MARK: - Украшения поверх подсветки
+
+/// Смысловая разметка поверх лексической подсветки: ссылка на ассет,
+/// битая ссылка, метод-сообщение Unity. Считается, как и подсветка,
+/// только для видимых строк.
+struct TextDecoration {
+    var range: NSRange
+    var color: NSColor? = nil
+    var underline = false
+    var toolTip: String? = nil
+}
+
+/// Документ и видимый диапазон → украшения.
+typealias CodeDecorator = (LoadedDocument, NSRange) -> [TextDecoration]
+
+/// Правки инспектора Unity, которые редактор должен применить к своему
+/// тексту. Номер — чтобы одну и ту же просьбу не выполнить дважды.
+struct TextEditRequest {
+    var seq: Int
+    weak var buffer: TextBuffer?
+    var edits: [UnityEdit]
+    var actionName: String
 }
 
 // MARK: - NSTextView с подсветкой только видимой области
@@ -442,6 +478,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     private var buffer: TextBuffer?
     private var model: SyntaxModel? { buffer?.model }
+    /// Смысловые украшения; перечитываются через `invalidateDecorations()`.
+    var decorator: CodeDecorator?
     private var fontSize: CGFloat = 12.5
     private var isApplying = false
     private var lastHighlighted: ClosedRange<Int>?
@@ -578,9 +616,50 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
         ruler?.model = buffer.model
         ruler?.currentLine = 0
+        ruler?.eventLines = Self.gutterMarkers(for: buffer.document)
         ruler?.invalidateWidth()
         highlightVisible()
         textView.updateCurrentLineHighlight()
+    }
+
+    /// Разбор файла обновился (правка, индекс ассетов) — перекрашиваем
+    /// ссылки и значки, текст не трогаем.
+    func invalidateDecorations() {
+        if let buffer { ruler?.eventLines = Self.gutterMarkers(for: buffer.document) }
+        ruler?.needsDisplay = true
+        lastHighlighted = nil
+        highlightVisible()
+    }
+
+    /// Значки в колонке номеров: методы, которые вызывает движок.
+    private static func gutterMarkers(for doc: LoadedDocument) -> Set<Int> {
+        Set(doc.outline.lazy.filter { $0.kind == .unityMessage }.map(\.line))
+    }
+
+    /// Правки инспектора — через текстовое поле, как если бы их набрали:
+    /// так они попадают в ту же историю ⌘Z, помечают файл несохранённым
+    /// и уходят языковому серверу обычным путём. Одна группа отмены на
+    /// всю правку: поворот — это семь чисел, а отменяется одним ⌘Z.
+    @discardableResult
+    func apply(_ request: TextEditRequest) -> Bool {
+        guard let buffer, request.buffer === buffer, let storage = textView.textStorage,
+              UnityEdits.validate(request.edits, in: storage.string as NSString) else { return false }
+        let undo = textView.undoManager
+        // Не набор: дополнение на `0.5` открываться не должно.
+        isApplyingCompletion = true
+        defer { isApplyingCompletion = false }
+        textView.breakUndoCoalescing()
+        undo?.beginUndoGrouping()
+        // С конца к началу: ранние диапазоны не сдвигаются от поздних правок.
+        for edit in request.edits.sorted(by: { $0.range.location > $1.range.location }) {
+            guard textView.shouldChangeText(in: edit.range, replacementString: edit.text) else { continue }
+            storage.replaceCharacters(in: edit.range, with: edit.text)
+            textView.didChangeText()
+        }
+        undo?.setActionName(request.actionName)
+        undo?.endUndoGrouping()
+        textView.breakUndoCoalescing()
+        return true
     }
 
     func showEmpty() {
@@ -592,6 +671,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         // в памяти с несохранёнными правками.
         textView.layoutManager?.replaceTextStorage(NSTextStorage())
         ruler?.model = nil
+        ruler?.eventLines = []
         ruler?.setChanges([])
         ruler?.setCommentMarks([:], column: false)
     }
@@ -1096,6 +1176,20 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             storage.addAttribute(.foregroundColor, value: Theme.color(t.kind), range: r)
         }
         storage.removeAttribute(.backgroundColor, range: range)
+        storage.removeAttribute(.underlineStyle, range: range)
+        storage.removeAttribute(.toolTip, range: range)
+        if let decorator, let document = buffer?.document {
+            for d in decorator(document, range) {
+                guard d.range.length > 0, NSMaxRange(d.range) <= storage.length else { continue }
+                if let color = d.color { storage.addAttribute(.foregroundColor, value: color, range: d.range) }
+                if d.underline {
+                    storage.addAttribute(.underlineStyle,
+                                         value: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
+                                         range: d.range)
+                }
+                if let tip = d.toolTip { storage.addAttribute(.toolTip, value: tip, range: d.range) }
+            }
+        }
         for occurrence in occurrences {
             guard NSIntersectionRange(occurrence, range).length > 0,
                   NSMaxRange(occurrence) <= storage.length else { continue }
@@ -1115,6 +1209,16 @@ final class LineNumberRuler: NSRulerView {
     weak var textView: NSTextView?
     var model: SyntaxModel?
     var font: NSFont = Theme.editorFont(size: 11)
+    /// Строки со значком слева от номера — методы-сообщения Unity.
+    var eventLines: Set<Int> = [] {
+        didSet { if eventLines != oldValue { needsDisplay = true } }
+    }
+    private lazy var markerImage: NSImage? = {
+        let config = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
+            .applying(.init(paletteColors: [Theme.unityEvent]))
+        return NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "Сообщение Unity")?
+            .withSymbolConfiguration(config)
+    }()
     /// Строка с курсором: её номер ярче, а полоса продолжается в гаттер.
     var currentLine = 0 {
         didSet { if currentLine != oldValue { needsDisplay = true } }
@@ -1273,6 +1377,13 @@ final class LineNumberRuler: NSRulerView {
             label.draw(at: NSPoint(x: ruleThickness - size.width - 8,
                                    y: y + (lineRect.height - size.height) / 2),
                        withAttributes: labelAttrs)
+            if eventLines.contains(line), let image = markerImage {
+                let side = image.size
+                // Правее колонки комментариев ревью, если она есть.
+                let x: CGFloat = (hasCommentColumn ? Self.commentColumn : 0) + 4
+                image.draw(in: NSRect(x: x, y: y + (lineRect.height - side.height) / 2,
+                                      width: side.width, height: side.height))
+            }
             if hasCommentColumn, let mark = commentMarks[line] {
                 drawCommentMark(mark, top: y, height: lineRect.height)
             }
@@ -1363,6 +1474,11 @@ struct CodeView: NSViewControllerRepresentable {
     var conflictAction: Workspace.ConflictActionRequest? = nil
     let focusRequest: Int
     let completionTriggers: [String]
+    /// Смысловые украшения и их версия: сменилась — перекрашиваем.
+    var decorator: CodeDecorator? = nil
+    var decorationsVersion: Int = 0
+    /// Правки инспектора Unity к применению.
+    var editRequest: TextEditRequest? = nil
     let onCaretChange: (Int) -> Void
     let onGoToDefinition: (Int) -> Void
     var onLineClick: ((Int) -> Void)? = nil
@@ -1386,6 +1502,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.requestCompletions = requestCompletions
         // «.» — всегда: и без сервера после точки ждёшь список членов.
         controller.completionTriggers = Set(completionTriggers).union(["."])
+        controller.decorator = decorator
 
         // Буфер сравниваем по идентичности: тот же файл, перечитанный
         // с диска, — уже другой буфер.
@@ -1404,6 +1521,20 @@ struct CodeView: NSViewControllerRepresentable {
         if context.coordinator.fontSize != fontSize {
             context.coordinator.fontSize = fontSize
             controller.setFontSize(fontSize)
+        }
+
+        // Разбор обновился — ссылки и значки перекрашиваются.
+        let semantics = buffer?.document.semanticsVersion ?? -1
+        if !documentChanged, context.coordinator.decorationsVersion != decorationsVersion
+            || context.coordinator.semanticsVersion != semantics {
+            controller.invalidateDecorations()
+        }
+        context.coordinator.decorationsVersion = decorationsVersion
+        context.coordinator.semanticsVersion = semantics
+
+        if let editRequest, editRequest.seq != context.coordinator.appliedEdit {
+            context.coordinator.appliedEdit = editRequest.seq
+            controller.apply(editRequest)
         }
 
         if documentChanged || context.coordinator.occurrenceSignature != occurrenceSignature {
@@ -1496,5 +1627,8 @@ struct CodeView: NSViewControllerRepresentable {
         var appliedConflictAction = 0
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
+        var decorationsVersion = 0
+        var semanticsVersion = -1
+        var appliedEdit = -1
     }
 }

@@ -10,6 +10,8 @@ struct RootView: View {
     @State private var paletteSpace: CGSize = .zero
     /// Видимость панели переживает перезапуск. ⌃⌘S и кнопка в тулбаре — штатные.
     @AppStorage("pilot.showsSidebar") private var showsSidebar = true
+    /// Инспектор Unity справа. Появляется только у сцен, префабов и ассетов.
+    @AppStorage("pilot.showsInspector") private var showsInspector = true
 
     var body: some View {
         NavigationSplitView(columnVisibility: columnVisibility) {
@@ -17,6 +19,10 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 480)
         } detail: {
             detail
+                .inspector(isPresented: inspectorVisibility) {
+                    UnityInspectorView(workspace: workspace)
+                        .inspectorColumnWidth(min: 260, ideal: 330, max: 600)
+                }
                 .toolbar { toolbar }
                 .pilotTransparentToolbar()
         }
@@ -28,6 +34,15 @@ struct RootView: View {
         .onAppear {
             doubleShift = DoubleShiftMonitor { [workspace] in workspace.openClassSearch() }
         }
+    }
+
+    private var hasUnityObjects: Bool { workspace.document?.unityFile != nil }
+
+    /// Выбор пользователя помним, но показываем инспектор только там, где
+    /// ему есть что показать.
+    private var inspectorVisibility: Binding<Bool> {
+        Binding(get: { showsInspector && hasUnityObjects },
+                set: { if hasUnityObjects { showsInspector = $0 } })
     }
 
     /// На стартовом экране навигатору показывать нечего — панель прячется,
@@ -62,7 +77,11 @@ struct RootView: View {
     @ViewBuilder
     private var content: some View {
         if let error = workspace.loadError {
-            notice(icon: "exclamationmark.triangle", title: error)
+            // Текстуру или модель не прочитать как текст, но в Unity-проекте
+            // про неё всё равно есть что узнать.
+            notice(icon: "exclamationmark.triangle", title: error,
+                   hint: workspace.unity.isActive
+                       ? "⇧⌘R — где используется этот ассет  ·  ⌃⌘M — открыть его .meta" : nil)
         } else if let buffer = workspace.buffer {
             CodeView(buffer: buffer,
                      fontSize: workspace.fontSize,
@@ -81,6 +100,9 @@ struct RootView: View {
                      conflictAction: workspace.conflictAction,
                      focusRequest: workspace.editorFocusRequest,
                      completionTriggers: workspace.lsp.completionTriggers,
+                     decorator: workspace.unity.decorator(),
+                     decorationsVersion: workspace.unity.decorationsVersion,
+                     editRequest: workspace.editRequest,
                      onCaretChange: { workspace.caretMoved(to: $0) },
                      onGoToDefinition: { workspace.goToDefinition(at: $0) },
                      onLineClick: { workspace.lineClicked($0) },
@@ -95,7 +117,7 @@ struct RootView: View {
         }
     }
 
-    private func notice(icon: String, title: String) -> some View {
+    private func notice(icon: String, title: String, hint: String? = nil) -> some View {
         VStack(spacing: 12) {
             Image(systemName: icon)
                 .font(.system(size: 34, weight: .light))
@@ -104,6 +126,11 @@ struct RootView: View {
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            if let hint {
+                Text(hint)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -167,6 +194,13 @@ struct RootView: View {
             }
             .help("Символ в проекте (⌘T)")
             .disabled(!workspace.canSearchSymbols)
+
+            if hasUnityObjects {
+                Button { showsInspector.toggle() } label: {
+                    Label("Инспектор Unity", systemImage: "sidebar.trailing")
+                }
+                .help("Инспектор Unity (⌥⌘0)")
+            }
         }
     }
 
@@ -215,6 +249,8 @@ struct RootView: View {
 
                 Spacer()
 
+                noticeLabel
+                unityChip
                 blameLabel
                 changesChip
                 let position = doc.model.position(at: workspace.caretOffset)
@@ -222,6 +258,8 @@ struct RootView: View {
                     .monospacedDigit()
             } else {
                 Spacer()
+                noticeLabel
+                unityChip
                 changesChip
             }
         }
@@ -233,6 +271,48 @@ struct RootView: View {
         .overlay(alignment: .top) {
             Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
         }
+    }
+
+    // MARK: - Unity
+
+    /// Короткое сообщение: «ссылка битая», «файл изменился на диске».
+    @ViewBuilder
+    private var noticeLabel: some View {
+        if let notice = workspace.notice {
+            HStack(spacing: 5) {
+                Image(systemName: "exclamationmark.circle")
+                Text(notice).lineLimit(1)
+            }
+            .foregroundStyle(.orange)
+            .transition(.opacity)
+        }
+    }
+
+    @ViewBuilder
+    private var unityChip: some View {
+        if let project = workspace.unity.project {
+            HStack(spacing: 5) {
+                if workspace.unity.isIndexingAssets {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "cube.fill").font(.system(size: 9))
+                        .foregroundStyle(Color(nsColor: Theme.unityEvent))
+                }
+                Text("Unity \(project.editorVersion ?? "")")
+            }
+            .help(unityHelp)
+        }
+    }
+
+    private var unityHelp: String {
+        let assets = workspace.unity.assets.map { "Ассетов с GUID: \($0.count)." } ?? "Собираю GUID ассетов…"
+        return """
+            \(assets)
+            ⌘B или ⌘+клик по GUID — открыть ассет, по fileID — перейти к объекту.
+            ⇧⌘R — где используется открытый ассет. ⌃⌘M — ассет ↔ .meta.
+            ⌥⌘0 — инспектор сцены, префаба или ассета.
+            .meta скрыты из поиска и дерева.
+            """
     }
 
     // MARK: - Git

@@ -117,6 +117,18 @@ final class Workspace: ObservableObject {
     private var occurrenceWord: String?
 
     let lsp = LSPService()
+    let unity = UnityService()
+
+    /// Короткое сообщение в статус-строке: «ссылка битая», «ничего не найдено».
+    @Published private(set) var notice: String?
+    private var noticeTask: Task<Void, Never>?
+    /// Последний файл, который просили открыть, — даже если он не открылся
+    /// (текстура, модель). Для «где используется ассет».
+    private(set) var requestedFile: URL?
+    /// Имя ассета, чьи использования сейчас в палитре.
+    @Published private(set) var usagesTitle: String = ""
+
+    private var unityChanges: AnyCancellable?
     let git = GitService()
     let review = ReviewService()
     private var observations: [AnyCancellable] = []
@@ -124,6 +136,9 @@ final class Workspace: ObservableObject {
     private var lspReadyObservation: AnyCancellable?
 
     init() {
+        unity.onAssetsReady = { [weak self] in self?.unityAssetsReady() }
+        // Статус-строка и меню смотрят на воркспейс — пусть видят и Unity.
+        unityChanges = unity.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
         // Статус-строка, полоски у номеров строк и панель ревью читают git
         // и GitLab через workspace: их изменения должны перерисовывать то же,
         // что и наши.
@@ -277,6 +292,9 @@ final class Workspace: ObservableObject {
         lsp.workspaceChanged(to: url)
         git.workspaceChanged(to: url)
         review.workspaceChanged(to: url)
+        unity.workspaceChanged(to: url)
+        requestedFile = nil
+        let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
 
         let generation = scanGeneration.bump()
         isIndexing = true
@@ -308,7 +326,7 @@ final class Workspace: ObservableObject {
         work.async { [weak self] in
             guard let self else { return }
             // 1. Кэш делает повторное открытие проекта мгновенным.
-            let cached = IndexCache.load(root: url)
+            let cached = IndexCache.load(root: url, exclude: exclude)
             if let cached {
                 let tree = FileTree.build(paths: cached.display)
                 Task { @MainActor in
@@ -319,7 +337,7 @@ final class Workspace: ObservableObject {
             // 2. Всё равно пересканируем — кэш мог устареть.
             let counter = self.scanGeneration
             var shown = cached?.display
-            let fresh = FileIndex.scan(root: url, shouldStop: { !counter.isCurrent(generation) },
+            let fresh = FileIndex.scan(root: url, exclude: exclude, shouldStop: { !counter.isCurrent(generation) },
                                        early: { early in
                 // Без кэша отслеживаемые файлы от git — первое, что можно
                 // показать: ⌘P начинает работать через доли секунды.
@@ -406,6 +424,8 @@ final class Workspace: ObservableObject {
         lsp.workspaceChanged(to: nil)
         git.workspaceChanged(to: nil)
         review.workspaceChanged(to: nil)
+        unity.workspaceChanged(to: nil)
+        requestedFile = nil
         root = nil
         index = nil
         symbolIndex = nil
@@ -479,7 +499,7 @@ final class Workspace: ObservableObject {
         case .symbols:    runSymbolSearch()
         case .outline:    buildOutlineItems()
         case .changes:    buildChangeItems()
-        case .references, .declarations: break   // наполняются переходом или findReferences()
+        case .references, .declarations, .assetUsages: break   // наполняются переходом, findReferences() и findAssetUsages()
         }
     }
 
@@ -495,7 +515,7 @@ final class Workspace: ObservableObject {
         case .files:      runFileSearch()
         case .classes:    runClassSearch()
         case .symbols:    runSymbolSearch()
-        case .references, .declarations: filterReferences()
+        case .references, .declarations, .assetUsages: filterReferences()
         case .outline:    buildOutlineItems()
         case .changes:    buildChangeItems()
         }
@@ -539,7 +559,7 @@ final class Workspace: ObservableObject {
         switch paletteMode {
         case .files:   runFileSearch()
         case .changes: buildChangeItems()
-        case .classes, .outline, .symbols, .references, .declarations: break
+        case .classes, .outline, .symbols, .references, .declarations, .assetUsages: break
         }
     }
 
@@ -952,6 +972,20 @@ final class Workspace: ObservableObject {
     func goToDefinition(at offset: Int) {
         guard let document else { return }
 
+        // Сцены, префабы, .asmdef: ссылка — это GUID и fileID, языковой
+        // сервер о них ничего не знает.
+        if unity.isReferenceFile(document) {
+            Task { [weak self] in
+                guard let self else { return }
+                switch await self.unity.definition(in: document, at: offset) {
+                case .target(let target):   self.navigate(to: target)
+                case .unavailable(let why): self.showNotice(why)
+                case .notReference:         self.jumpToLocalDeclaration(at: offset, in: document)
+                }
+            }
+            return
+        }
+
         // Файл из MR сервер не видел: у него на руках рабочая копия, и его
         // позиции указали бы не туда. Для версии MR — только свой навигатор.
         guard lsp.isReady, document.revision == nil else {
@@ -1163,8 +1197,10 @@ final class Workspace: ObservableObject {
     func open(file url: URL, reveal: LSPRange? = nil) {
         isPaletteOpen = false
         loadError = nil
+        requestedFile = url
         let generation = loadGeneration.bump()
         let counter = loadGeneration
+        let unityContext = unity.context
 
         // Несохранённый буфер важнее файла на диске: там правки и ⌘Z.
         if let cached = unsaved[url] {
@@ -1175,7 +1211,7 @@ final class Workspace: ObservableObject {
 
         work.async { [weak self] in
             guard let self else { return }
-            let result = Result { try LoadedDocument.load(url: url) }
+            let result = Result { try LoadedDocument.load(url: url, unity: unityContext) }
             Task { @MainActor in
                 guard counter.isCurrent(generation) else { return }
                 self.present(result, reveal: reveal)
@@ -1277,9 +1313,12 @@ final class Workspace: ObservableObject {
         occurrenceWord = nil
 
         // Структура и полоски git — с задержкой: пока печатаешь, незачем.
+        // Правку инспектора Unity разбираем сразу: он ждёт свежих позиций.
+        let delay: UInt64 = pendingInspectorEdit ? 0 : 300_000_000
+        pendingInspectorEdit = false
         outlineTask?.cancel()
         outlineTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
             guard let self, !Task.isCancelled else { return }
             self.rebuildOutline(buffer)
         }
@@ -1293,17 +1332,151 @@ final class Workspace: ObservableObject {
 
     /// Структура строится по снимку модели в фоне и принимается, только
     /// если за это время текст не менялся — иначе её диапазоны уже врут.
+    ///
+    /// Сцены и префабы разбираются здесь же: после правки — из инспектора
+    /// или руками — у объектов новые позиции, и старому разбору верить нельзя.
     private func rebuildOutline(_ buffer: TextBuffer) {
         let snapshot = buffer.model.snapshot()
+        let context = unity.context
         work.async { [weak self] in
             let outline = OutlineBuilder.build(model: snapshot)
+            let semantics = UnitySemantics.analyze(model: snapshot, lexicalOutline: outline, context: context)
             Task { @MainActor in
                 guard let self, buffer === self.buffer,
                       buffer.model.version == snapshot.version else { return }
                 self.objectWillChange.send()
-                buffer.setOutline(outline)
+                buffer.setSemantics(outline: semantics?.outline ?? outline,
+                                    unityFile: semantics?.serialized, version: snapshot.version)
                 self.updateBreadcrumb()
             }
+        }
+    }
+
+    // MARK: - Unity
+
+    /// Индекс GUID дособрался: у скриптов в открытой сцене появились имена.
+    /// Разбираем файл заново, не трогая ни текст, ни прокрутку.
+    private func unityAssetsReady() {
+        guard let buffer else { return }
+        rebuildOutline(buffer)
+    }
+
+    /// ⇧⌘R: какие сцены, префабы и ассеты ссылаются на открытый файл.
+    /// Работает и для файлов, которые не открываются как текст: текстур, моделей.
+    func findAssetUsages() {
+        guard unity.isActive else { return }
+        guard let url = document?.url ?? requestedFile,
+              let asset = unity.assetPath(for: url) else {
+            showNotice("Сначала откройте ассет")
+            return
+        }
+        let paths = index?.display ?? []
+
+        paletteMode = .assetUsages
+        query = ""
+        selection = 0
+        items = []
+        allReferences = []
+        paletteBusy = true
+        isPaletteOpen = true
+        usagesTitle = (asset as NSString).lastPathComponent
+
+        Task { [weak self] in
+            guard let self else { return }
+            let result = await self.unity.usages(ofAsset: asset, among: paths)
+            guard self.paletteMode == .assetUsages else { return }
+            self.paletteBusy = false
+            switch result {
+            case .failure(let error):
+                self.isPaletteOpen = false
+                self.showNotice(error.message)
+            case .success(let hits):
+                self.allReferences = hits.prefix(1000).enumerated().map { position, hit in
+                    let place = LSPPosition(line: hit.line, character: hit.column)
+                    return PaletteItem(
+                        id: position,
+                        icon: Self.icon(forPath: hit.relPath),
+                        primary: hit.context ?? (hit.relPath as NSString).lastPathComponent,
+                        secondary: hit.relPath,
+                        trailing: ":\(hit.line + 1)",
+                        target: NavTarget(url: self.unity.url(forAsset: hit.relPath) ?? url, range: LSPRange(
+                            start: place,
+                            end: LSPPosition(line: hit.line, character: hit.column + 32))))
+                }
+                self.items = self.allReferences
+            }
+        }
+    }
+
+    /// ⌃⌘M: из ассета в его `.meta` и обратно. В дереве и ⌘P `.meta`
+    /// спрятаны, а заглянуть в настройки импорта иногда нужно.
+    func toggleMetaFile() {
+        guard unity.isActive, let url = document?.url ?? requestedFile else { return }
+        let target = url.pathExtension == "meta" ? url.deletingPathExtension()
+                                                 : url.appendingPathExtension("meta")
+        guard FileManager.default.fileExists(atPath: target.path) else {
+            showNotice("Нет файла \(target.lastPathComponent)")
+            return
+        }
+        navigate(to: NavTarget(url: target, range: nil))
+    }
+
+    // MARK: - Инспектор Unity: правки
+
+    /// Правки инспектора, которые редактор применит к тексту.
+    @Published private(set) var editRequest: TextEditRequest?
+    private var editCounter = 0
+    /// Следующая правка буфера пришла из инспектора — разобрать без задержки.
+    private var pendingInspectorEdit = false
+
+    /// Правка из инспектора Unity — такая же правка текста, как набор:
+    /// файл становится несохранённым (⌘S — записать, как сцену в Unity),
+    /// ⌘Z в редакторе её отменяет. Меняются только значения, поэтому в
+    /// `git diff` потом ровно изменённые строки. Разбор, по которому она
+    /// посчитана, должен совпадать с текстом — иначе позиции уже сдвинулись.
+    func applyUnityEdits(_ edits: [UnityEdit], actionName: String) {
+        guard !edits.isEmpty, let buffer, buffer.document.isSemanticsFresh else { return }
+        guard buffer.document.revision == nil else {
+            showNotice("Это версия файла из мерж-реквеста — она только для чтения")
+            return
+        }
+        guard UnityEdits.validate(edits, in: buffer.storage.string as NSString) else {
+            showNotice("Текст уже другой — правка не применена")
+            return
+        }
+        editCounter += 1
+        pendingInspectorEdit = true
+        editRequest = TextEditRequest(seq: editCounter, buffer: buffer, edits: edits, actionName: actionName)
+    }
+
+    /// Перейти к объекту этого же файла — из хлебных крошек и ссылок инспектора.
+    func revealUnityObject(fileID: Int64) {
+        guard let document, let file = document.unityFile, let object = file.object(fileID) else { return }
+        let range = object.nameRange ?? object.typeNameRange
+        navigate(to: NavTarget(url: document.url, range: LSPRange(
+            start: document.model.position(at: range.location),
+            end: document.model.position(at: NSMaxRange(range)))))
+    }
+
+    /// Открыть ассет по GUID — ссылка в инспекторе.
+    func openUnityAsset(guid: UnityGUID, fileID: Int64? = nil) {
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.unity.target(forAsset: guid, fileID: fileID) {
+            case .target(let target):   self.navigate(to: target)
+            case .unavailable(let why): self.showNotice(why)
+            case .notReference:         break
+            }
+        }
+    }
+
+    func showNotice(_ text: String) {
+        notice = text
+        noticeTask?.cancel()
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard !Task.isCancelled else { return }
+            self?.notice = nil
         }
     }
 
@@ -1457,7 +1630,7 @@ enum IndexCache {
         try? payload.data(using: .utf8)?.write(to: url, options: .atomic)
     }
 
-    static func load(root: URL) -> FileIndex? {
+    static func load(root: URL, exclude: ((String, Bool) -> Bool)? = nil) -> FileIndex? {
         guard let url = fileURL(root: root),
               let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8),
@@ -1465,7 +1638,9 @@ enum IndexCache {
 
         let index = FileIndex(root: root)
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            index.appendCached(rel: String(line))
+            let rel = String(line)
+            if let exclude, exclude(rel, false) { continue }
+            index.appendCached(rel: rel)
         }
         return index.count > 0 ? index : nil
     }

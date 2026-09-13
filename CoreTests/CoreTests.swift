@@ -1856,10 +1856,559 @@ section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 7, "режимов палитры семь")
+check(PaletteMode.allCases.count == 8, "режимов палитры восемь")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
+}
+
+
+// ─────────────────────────────── Unity ───────────────────────────────
+section("Unity / GUID и проект")
+
+let guidText = "a79441f348de89743a2939f4d699eac1"
+let parsedGUID = UnityGUID(guidText)
+check(parsedGUID != nil, "GUID из 32 hex разбирается")
+check(parsedGUID?.description == guidText, "GUID печатается обратно так же (получено \(parsedGUID?.description ?? "nil"))")
+check(UnityGUID("A79441F348DE89743A2939F4D699EAC1") == parsedGUID, "регистр hex не важен")
+check(UnityGUID(guidText + "0") == nil, "33 символа — не GUID")
+check(UnityGUID("g79441f348de89743a2939f4d699eac1") == nil, "не-hex символ — не GUID")
+check(UnityGUID.parse(Array(guidText.utf8) + [0x30], at: 0) == nil,
+      "за GUID идёт ещё hex — это кусок чего-то длиннее")
+check(UnityGUID("0000000000000000e000000000000000")?.isBuiltin == true, "встроенный ресурс Unity распознан")
+check(parsedGUID?.isBuiltin == false, "обычный GUID — не встроенный")
+
+let metaText = "fileFormatVersion: 2\nguid: df5d7f677beac4272a9df58a6db968b3\nMonoImporter:\n  serializedVersion: 2\n"
+check(UnityAssetIndex.parseMeta(ArraySlice(Array(metaText.utf8)))?.description == "df5d7f677beac4272a9df58a6db968b3",
+      "GUID читается из .meta")
+check(UnityAssetIndex.parseMeta(ArraySlice(Array("fileFormatVersion: 2\n".utf8))) == nil, ".meta без GUID -> nil")
+
+check(UnityProjectInfo.parseEditorVersion("m_EditorVersion: 6000.3.14f1\r\nm_EditorVersionWithRevision: x\r\n") == "6000.3.14f1",
+      "версия редактора из ProjectVersion.txt (CRLF)")
+let rootProject = UnityProjectInfo(root: URL(fileURLWithPath: "/game"), editorVersion: nil)
+check(rootProject.excludedFromIndex(relPath: "Assets/Player.cs.meta", isDirectory: false), ".meta не попадает в индекс")
+check(!rootProject.excludedFromIndex(relPath: "Assets/Player.cs", isDirectory: false), "сам ассет попадает в индекс")
+check(rootProject.excludedFromIndex(relPath: "Library", isDirectory: true), "Library/ в корне не индексируется")
+check(!rootProject.excludedFromIndex(relPath: "Assets/Library", isDirectory: true), "Assets/Library — обычная папка")
+let nestedProject = UnityProjectInfo(root: URL(fileURLWithPath: "/repo/Game"), editorVersion: nil, workspacePrefix: "Game")
+check(nestedProject.excludedFromIndex(relPath: "Game/Library", isDirectory: true), "Library/ проекта в подпапке не индексируется")
+check(!nestedProject.excludedFromIndex(relPath: "Library", isDirectory: true), "а Library/ рядом с проектом — обычная папка")
+check(nestedProject.projectPath(fromWorkspace: "Game/Assets/A.cs") == "Assets/A.cs", "путь от корня воркспейса -> путь в проекте")
+check(nestedProject.projectPath(fromWorkspace: "Tools/x.py") == nil, "файл вне Unity-проекта")
+check(UnityProjectInfo.prettyPath("Library/PackageCache/com.unity.ugui@a1b2c3/Runtime/Button.cs") == "com.unity.ugui/Runtime/Button.cs",
+      "путь пакета без хэша версии")
+
+// Индекс ассетов и обход проекта на диске
+let unityRoot = FileManager.default.temporaryDirectory.appendingPathComponent("pilot-unity-\(getpid())")
+try? FileManager.default.removeItem(at: unityRoot)
+func put(_ rel: String, _ text: String) {
+    let url = unityRoot.appendingPathComponent(rel)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? text.data(using: .utf8)!.write(to: url)
+}
+let playerGUID = "11111111111111111111111111111111"
+let buttonPrefabGUID = "22222222222222222222222222222222"
+let packageScriptGUID = "33333333333333333333333333333333"
+put("ProjectSettings/ProjectVersion.txt", "m_EditorVersion: 2022.3.10f1\n")
+put("Assets/Scripts/Player.cs", "public class Player : MonoBehaviour { }\n")
+put("Assets/Scripts/Player.cs.meta", "fileFormatVersion: 2\nguid: \(playerGUID)\n")
+put("Assets/Scripts.meta", "fileFormatVersion: 2\nguid: 44444444444444444444444444444444\nfolderAsset: yes\n")
+put("Assets/UI/Button.prefab", "%YAML 1.1\n")
+put("Assets/UI/Button.prefab.meta", "fileFormatVersion: 2\nguid: \(buttonPrefabGUID)\n")
+put("Library/PackageCache/com.acme.tools@abc123/Runtime/Tool.cs.meta", "fileFormatVersion: 2\nguid: \(packageScriptGUID)\n")
+put("Library/junk.bin", "x")
+put("Temp/x.txt", "x")
+
+check(UnityProjectInfo.detect(root: unityRoot)?.editorVersion == "2022.3.10f1", "Unity-проект распознан по ProjectVersion.txt")
+check(UnityProjectInfo.detect(root: unityRoot.appendingPathComponent("Assets")) == nil, "папка без ProjectSettings — не Unity-проект")
+let repoRoot = unityRoot.deletingLastPathComponent().appendingPathComponent("pilot-repo-\(getpid())")
+for dir in ["docs", "Game/Assets", "Game/ProjectSettings"] {
+    try? FileManager.default.createDirectory(at: repoRoot.appendingPathComponent(dir), withIntermediateDirectories: true)
+}
+try? "m_EditorVersion: 6000.0.1f1\n".data(using: .utf8)!
+    .write(to: repoRoot.appendingPathComponent("Game/ProjectSettings/ProjectVersion.txt"))
+let nestedFound = UnityProjectInfo.find(inWorkspace: repoRoot)
+check(nestedFound?.workspacePrefix == "Game", "Unity-проект найден в подпапке репозитория (получено \(nestedFound?.workspacePrefix ?? "nil"))")
+try? FileManager.default.removeItem(at: repoRoot)
+
+let assetIndex = UnityAssetIndex.build(root: unityRoot)
+check(assetIndex.count == 4, "в индексе ассеты, папка и скрипт пакета (получено \(assetIndex.count))")
+check(assetIndex.path(for: UnityGUID(playerGUID)!) == "Assets/Scripts/Player.cs", "GUID -> путь скрипта")
+check(assetIndex.displayName(for: UnityGUID(playerGUID)!) == "Player", "имя скрипта = имя класса")
+check(assetIndex.path(for: UnityGUID(packageScriptGUID)!) == "Library/PackageCache/com.acme.tools@abc123/Runtime/Tool.cs",
+      "скрипты пакетов резолвятся из PackageCache")
+check(assetIndex.guid(forAsset: "Assets/UI/Button.prefab")?.description == buttonPrefabGUID, "путь -> GUID")
+check(assetIndex.path(for: UnityGUID("44444444444444444444444444444444")!) == "Assets/Scripts", "у папок тоже есть GUID")
+
+let unityFiles = FileIndex.build(root: unityRoot, exclude: rootProject.excludedFromIndex, shouldStop: { false })
+check(!unityFiles.display.contains { $0.hasSuffix(".meta") }, "в индексе файлов Unity-проекта нет .meta")
+check(!unityFiles.display.contains { $0.hasPrefix("Library/") || $0.hasPrefix("Temp/") },
+      "Library/ и Temp/ не индексируются даже без .gitignore")
+check(unityFiles.display.contains("Assets/Scripts/Player.cs"), "обычные ассеты в индексе есть")
+
+section("Unity / сцены и префабы")
+
+let sceneText = """
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100
+GameObject:
+  m_ObjectHideFlags: 0
+  m_Component:
+  - component: {fileID: 101}
+  m_Name: Canvas
+--- !u!224 &101
+RectTransform:
+  m_GameObject: {fileID: 100}
+  m_Children:
+  - {fileID: 201}
+  m_Father: {fileID: 0}
+--- !u!1 &200
+GameObject:
+  m_Name: 'Play Button'
+--- !u!4 &201
+Transform:
+  m_GameObject: {fileID: 200}
+  m_Father: {fileID: 101}
+--- !u!114 &202
+MonoBehaviour:
+  m_GameObject: {fileID: 200}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: \(playerGUID), type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::Game.Player
+  speed: 5
+--- !u!114 &203
+MonoBehaviour:
+  m_GameObject: {fileID: 200}
+  m_Script: {fileID: 11500000, guid: 99999999999999999999999999999999, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Unity.UI::UnityEngine.UI.Image
+--- !u!1001 &300
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  m_Modification:
+    serializedVersion: 3
+    m_TransformParent: {fileID: 201}
+    m_Modifications:
+    - target: {fileID: 555, guid: \(buttonPrefabGUID), type: 3}
+      propertyPath: m_LocalPosition.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 556, guid: \(buttonPrefabGUID), type: 3}
+      propertyPath: m_Name
+      value: Icon
+      objectReference: {fileID: 0}
+  m_SourcePrefab: {fileID: 100100000, guid: \(buttonPrefabGUID), type: 3}
+--- !u!4 &-301 stripped
+Transform:
+  m_CorrespondingSourceObject: {fileID: 557, guid: \(buttonPrefabGUID), type: 3}
+  m_PrefabInstance: {fileID: 300}
+--- !u!1 &400
+GameObject:
+  m_Name: Badge
+--- !u!4 &401
+Transform:
+  m_GameObject: {fileID: 400}
+  m_Father: {fileID: -301}
+"""
+let sceneModel = SyntaxModel(text: sceneText, spec: Languages.detect(filename: "Main.unity"))
+check(sceneModel.spec?.name == "Unity YAML", ".unity распознаётся как Unity YAML")
+check(Languages.detect(filename: "Player.prefab.meta")?.name == "Unity YAML", ".meta — тоже Unity YAML")
+check(Languages.detect(filename: "Water.shader")?.name == "ShaderLab", ".shader — ShaderLab")
+check(Languages.detect(filename: "Lighting.hlsl")?.name == "HLSL", ".hlsl — HLSL")
+check(Languages.detect(filename: "Game.asmdef")?.name == "JSON", ".asmdef — JSON")
+check(Languages.detect(filename: "Menu.uxml")?.name == "XML/HTML", ".uxml — XML")
+
+let sceneTokens = sceneModel.tokens(fromLine: 0, toLine: sceneModel.lineCount - 1)
+check(kindOf("m_Name", sceneModel, sceneTokens) == .function, "YAML: ключ перед двоеточием выделен")
+check(kindOf("GameObject", sceneModel, sceneTokens) == .function, "YAML: имя типа объекта выделено как ключ")
+checkTwoPassConsistency(sceneText, Languages.unityYAML, "Unity YAML")
+
+let scene = UnityYAMLFile.parse(sceneModel.units)
+check(scene?.objects.count == 10, "в сцене 10 объектов (получено \(scene?.objects.count ?? -1))")
+if let scene {
+    let behaviour = scene.object(202)
+    check(behaviour?.typeName == "MonoBehaviour", "имя типа объекта")
+    check(behaviour?.gameObject == 200, "m_GameObject разобран")
+    check(behaviour?.script?.description == playerGUID, "m_Script разобран")
+    check(scene.object(200)?.name == "Play Button", "m_Name без кавычек")
+    check(scene.object(-301)?.stripped == true, "stripped-объект с отрицательным fileID")
+    check(scene.object(300)?.modifiedName == "Icon", "переименование вложенного префаба")
+    check(scene.object(300)?.transformParent == 201, "m_TransformParent вложенного префаба")
+    check(scene.object(300)?.sourcePrefab?.description == buttonPrefabGUID, "m_SourcePrefab")
+
+    let resolve: (UnityGUID) -> String? = { assetIndex.displayName(for: $0) }
+    check(scene.path(ofGameObject: 200) == ["Canvas", "Play Button"], "иерархия через m_Father")
+    check(scene.path(ofGameObject: 400) == ["Canvas", "Play Button", "Icon", "Badge"],
+          "иерархия идёт через вложенный префаб (получено \(scene.path(ofGameObject: 400)))")
+
+    let sceneOutline = scene.outline(resolve: resolve)
+    let byName = Dictionary(sceneOutline.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+    check(byName["Canvas"]?.kind == .gameObject && byName["Canvas"]?.container == nil, "корневой GameObject в структуре")
+    check(byName["Play Button"]?.container == "Canvas", "контейнер GameObject'а — путь родителя")
+    check(byName["Player"]?.kind == .component && byName["Player"]?.container == "Canvas / Play Button",
+          "MonoBehaviour назван именем скрипта по GUID")
+    check(byName["Image"]?.kind == .component, "скрипт вне проекта назван по m_EditorClassIdentifier")
+    check(byName["RectTransform"]?.container == "Canvas", "встроенный компонент назван типом")
+    check(byName["Icon"]?.kind == .prefab && byName["Icon"]?.container == "Canvas / Play Button",
+          "вложенный префаб — под своим родителем")
+    check(!sceneOutline.contains { $0.name == "Transform" && $0.container == "Icon" },
+          "stripped-заглушки в структуру не попадают")
+    check(zip(sceneOutline, sceneOutline.dropFirst()).allSatisfy { $0.range.location < $1.range.location },
+          "структура сцены идёт в порядке файла")
+    if let player = byName["Player"] {
+        let text = String(decoding: sceneModel.units[player.range.location..<NSMaxRange(player.range)], as: UTF16.self)
+        check(text == "MonoBehaviour", "переход по компоненту ведёт к имени его типа")
+    }
+    let unnamed = scene.outline(resolve: { _ in nil })
+    check(unnamed.contains { $0.name == "Game" || $0.name == "Player" } == true,
+          "без индекса ассетов имя скрипта берётся из m_EditorClassIdentifier")
+    check(unnamed.contains { $0.name == "Icon" }, "имя вложенного префаба — из переопределённого m_Name")
+
+    check(scene.describe(objectAt: scene.index(ofFileID: 202)!, resolve: resolve) == "Canvas / Play Button › Player",
+          "описание компонента для списка использований")
+
+    // Ссылки под курсором
+    func refAt(_ needle: String, delta: Int = 0) -> UnityReference? {
+        let text = sceneModel.units
+        let n = Array(needle.utf16)
+        guard let start = (0...(text.count - n.count)).first(where: { Array(text[$0..<$0 + n.count]) == n }) else { return nil }
+        let offset = start + delta
+        let line = sceneModel.line(containing: offset)
+        return UnityYAMLFile.reference(in: text, line: sceneModel.lineRange(line), at: offset)?.reference
+    }
+    check(refAt("m_Father: {fileID: 101}", delta: 12) == .local(fileID: 101), "локальная ссылка под курсором")
+    check(refAt("  m_Script:", delta: 3) == .asset(guid: UnityGUID(playerGUID)!, fileID: 11500000),
+          "курсор на ключе — берётся единственная ссылка строки")
+    check(refAt("m_Father: {fileID: 0}", delta: 12) == nil, "нулевая ссылка — не ссылка")
+    check(refAt("m_Name: Canvas", delta: 2) == nil, "в строке без ссылок перехода нет")
+    let metaModel = SyntaxModel(text: metaText, spec: Languages.unityYAML)
+    check(UnityYAMLFile.reference(in: metaModel.units, line: metaModel.lineRange(1), at: 10)?.reference
+            == .asset(guid: UnityGUID("df5d7f677beac4272a9df58a6db968b3")!, fileID: nil),
+          "GUID в .meta — тоже ссылка")
+    let asmdef = SyntaxModel(text: "{ \"references\": [\"GUID:\(playerGUID)\"] }", spec: Languages.json)
+    check(UnityYAMLFile.reference(in: asmdef.units, line: asmdef.lineRange(0), at: 25)?.reference
+            == .asset(guid: UnityGUID(playerGUID)!, fileID: nil),
+          "GUID:… в .asmdef — ссылка на сборку")
+
+    let guids = UnityYAMLFile.guidRanges(in: sceneModel.units, 0..<sceneModel.units.count)
+    check(guids.count == 6, "все GUID сцены найдены (получено \(guids.count))")
+    let locals = UnityYAMLFile.localReferences(in: sceneModel.units, 0..<sceneModel.units.count)
+    check(locals.contains { $0.fileID == -301 } && !locals.contains { $0.fileID == 0 },
+          "локальные ссылки: отрицательные есть, нулевых нет")
+    check(!locals.contains { $0.fileID == 11500000 }, "ссылка с GUID — не локальная")
+
+    let sceneBytes = Array(sceneText.utf8)
+    sceneBytes.withUnsafeBytes { bytes in
+        check(UnityYAMLFile.anchorLine(fileID: 200, in: bytes) == 14, "заголовок &200 найден в сыром файле")
+        check(UnityYAMLFile.anchorLine(fileID: -301, in: bytes) == 51, "заголовок stripped-объекта найден")
+        check(UnityYAMLFile.anchorLine(fileID: 20, in: bytes) == nil, "&20 не совпадает с &200")
+    }
+
+    // Использования: попадания в одном объекте сворачиваются
+    let prefabHits = sceneBytes.withUnsafeBytes {
+        UnityUsages.hits(in: $0, needle: Array(buttonPrefabGUID.utf8), relPath: "Assets/Main.unity", resolve: resolve)
+    }
+    check(prefabHits.count == 2, "вложенный префаб: одно попадание на объект (получено \(prefabHits.count))")
+    check(prefabHits.first?.context == "Canvas / Play Button / Icon", "контекст — путь вложенного префаба (получено \(prefabHits.first?.context ?? "nil"))")
+    check(prefabHits.first?.line == 42, "строка первого попадания (получено \(prefabHits.first?.line ?? -1))")
+    let scriptHits = sceneBytes.withUnsafeBytes {
+        UnityUsages.hits(in: $0, needle: Array(playerGUID.utf8), relPath: "Assets/Main.unity", resolve: resolve)
+    }
+    check(scriptHits.count == 1 && scriptHits[0].context == "Canvas / Play Button › Player",
+          "скрипт используется на Play Button")
+    check(scriptHits.first?.column == 37, "колонка GUID в строке (получено \(scriptHits.first?.column ?? -1))")
+}
+
+put("Assets/Main.unity", sceneText)
+put("Assets/Game.asmdef", "{ \"references\": [\"GUID:\(playerGUID)\"] }")
+put("Assets/Notes.txt", playerGUID)
+let found = UnityUsages.find(guid: UnityGUID(playerGUID)!, root: unityRoot,
+                             paths: ["Assets/Main.unity", "Assets/Game.asmdef", "Assets/Notes.txt"],
+                             resolve: { assetIndex.displayName(for: $0) })
+check(found.map(\.relPath).sorted() == ["Assets/Game.asmdef", "Assets/Main.unity"],
+      "поиск GUID по проекту: сцена и asmdef, но не .txt")
+try? FileManager.default.removeItem(at: unityRoot)
+
+// Производительность: сцена на 50 000 объектов
+var bigScene = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+bigScene.reserveCapacity(12_000_000)
+for k in 0..<12_500 {
+    let go = 1000 + k * 4
+    bigScene += "--- !u!1 &\(go)\nGameObject:\n  m_ObjectHideFlags: 0\n  m_Name: Object\(k)\n  m_IsActive: 1\n"
+    bigScene += "--- !u!4 &\(go + 1)\nTransform:\n  m_GameObject: {fileID: \(go)}\n  m_LocalPosition: {x: 0, y: 0, z: 0}\n  m_Father: {fileID: \(k == 0 ? 0 : 1001 + (k - 1) / 10 * 4)}\n"
+    bigScene += "--- !u!114 &\(go + 2)\nMonoBehaviour:\n  m_GameObject: {fileID: \(go)}\n  m_Script: {fileID: 11500000, guid: \(playerGUID), type: 3}\n  m_Name: \n  value: 1\n"
+    bigScene += "--- !u!23 &\(go + 3)\nMeshRenderer:\n  m_GameObject: {fileID: \(go)}\n  m_Materials:\n  - {fileID: 2100000, guid: \(buttonPrefabGUID), type: 2}\n"
+}
+let sceneBigModel = SyntaxModel(text: bigScene, spec: Languages.unityYAML)
+let tParse = Date()
+let bigFile = UnityYAMLFile.parse(sceneBigModel.units)
+let bigOutline = bigFile?.outline(resolve: { assetIndex.displayName(for: $0) }) ?? []
+let parseMs = Date().timeIntervalSince(tParse) * 1000
+print(String(format: "  сцена на %d строк: разбор и структура за %.0f мс", sceneBigModel.lineCount, parseMs))
+check(bigFile?.objects.count == 50_000, "большая сцена: все 50 000 объектов")
+check(bigOutline.count == 50_000, "большая сцена: структура на все объекты")
+check(parseMs < 1500, "сцена на 50k объектов разбирается быстрее 1.5 с (получено \(Int(parseMs)) мс)")
+
+section("Unity / C#")
+
+let unityScript = """
+using UnityEngine;
+
+public class Player : MonoBehaviour
+{
+    [SerializeField] private float speed = 5f;
+    [Header("Refs"), SerializeField]
+    private Rigidbody body;
+    [field: SerializeField] public int Health { get; private set; }
+    public int score;
+    private int[] cache = new int[4];
+
+    private void Awake() { body = GetComponent<Rigidbody>(); }
+    void Update()
+    {
+        Move();
+    }
+    private void OnTriggerEnter(Collider other) { }
+    private void Move() { }
+}
+"""
+let scriptModel = SyntaxModel(text: unityScript, spec: Languages.csharp)
+let lexical = OutlineBuilder.build(model: scriptModel)
+let context = UnityContext(project: UnityProjectInfo(root: URL(fileURLWithPath: "/"), editorVersion: nil), assets: nil)
+let enriched = UnitySemantics.analyze(model: scriptModel, lexicalOutline: lexical, context: context)?.outline ?? []
+func kindIn(_ items: [OutlineItem], _ name: String) -> OutlineKind? { items.first { $0.name == name }?.kind }
+check(kindIn(enriched, "Awake") == .unityMessage, "Awake — сообщение Unity")
+check(kindIn(enriched, "Update") == .unityMessage, "Update — сообщение Unity")
+check(kindIn(enriched, "OnTriggerEnter") == .unityMessage, "OnTriggerEnter — сообщение Unity")
+check(kindIn(enriched, "Move") == .method, "Move — обычный метод")
+check(kindIn(enriched, "speed") == .serializedField, "[SerializeField] на той же строке")
+check(kindIn(enriched, "body") == .serializedField, "SerializeField в списке атрибутов строкой выше")
+check(kindIn(enriched, "Health") == .serializedField, "[field: SerializeField] у автосвойства")
+check(kindIn(enriched, "score") == .field, "поле без атрибута не помечается")
+check(kindIn(enriched, "cache") == .field, "квадратные скобки массива — не атрибут")
+check(UnitySemantics.analyze(model: scriptModel, lexicalOutline: lexical, context: nil) == nil,
+      "вне Unity-проекта C# остаётся как есть")
+
+let declaration = UnityCSharp.classDeclaration(named: "Player", in: unityScript)
+check(declaration?.line == 2 && declaration?.column == 13, "class Player найден для перехода со ссылки")
+check(UnityCSharp.classDeclaration(named: "Play", in: unityScript) == nil, "Play не совпадает с Player")
+check(UnityCSharp.classDeclaration(named: "Enemy", in: "// class Enemy\nsealed class Enemy {}\r\n")?.line == 1,
+      "закомментированное объявление пропускается")
+
+
+section("Unity / инспектор")
+
+let soText = """
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: \(playerGUID), type: 3}
+  m_Name: 2P_Host
+  m_Description: 
+  m_EnableEditors: 1
+  m_MainEditorInstance:
+    Name: Main Editor
+    <CorrespondingNodeId>k__BackingField: Main Editor|0_run
+    m_Nodes:
+    - Main Editor|0_run
+    - Main Editor|0_deploy
+    m_Role: 3
+  m_EditorInstances:
+  - Name: Player 2
+    m_Nodes:
+    - Player 2|1_run
+    m_AdvancedConfiguration:
+      StreamLogsToMainEditor: 1
+      LogsColor: {r: 0.3643, g: 0.581, b: 0.8679, a: 1}
+  - Name: 'Player: 3'
+    m_Nodes: []
+  m_LocalInstances: []
+  m_Title: 'D - GRAVITY RAMP
+
+    fires on Play'
+  m_Quote: "ROW \\xB7 rest"
+  'm_Metrics[0]': 15677.869
+  m_Tail: 5
+"""
+let soModel = SyntaxModel(text: soText, spec: Languages.unityYAML)
+let soFile = UnityYAMLFile.parse(soModel.units)!
+let soProps = soFile.properties(ofObjectAt: 0, in: soModel)
+func prop(_ path: String, in props: [UnityProperty]) -> UnityProperty? {
+    var current: UnityProperty? = nil
+    var list = props
+    for key in path.split(separator: ".").map(String.init) {
+        if let p = current { current = p.child(key) } else { current = list.first { $0.key == key } }
+        list = []
+    }
+    return current
+}
+func textAt(_ range: NSRange, _ model: SyntaxModel) -> String {
+    String(decoding: model.units[range.location..<NSMaxRange(range)], as: UTF16.self)
+}
+check(soProps.map(\.key) == ["m_ObjectHideFlags", "m_GameObject", "m_Enabled", "m_Script", "m_Name", "m_Description",
+                             "m_EnableEditors", "m_MainEditorInstance", "m_EditorInstances", "m_LocalInstances",
+                             "m_Title", "m_Quote", "m_Metrics[0]", "m_Tail"],
+      "поля верхнего уровня (получено \(soProps.map(\.key)))")
+check(prop("m_Name", in: soProps)?.value.scalar?.text == "2P_Host", "простой скаляр")
+check(prop("m_Description", in: soProps)?.value.scalar?.raw == "", "пустое значение")
+check(prop("m_MainEditorInstance.m_Role", in: soProps)?.value.scalar?.raw == "3", "вложенная структура")
+check(prop("m_MainEditorInstance.<CorrespondingNodeId>k__BackingField", in: soProps)?.value.scalar?.text == "Main Editor|0_run",
+      "backing-поле автосвойства")
+if case .sequence(let nodes)? = prop("m_MainEditorInstance.m_Nodes", in: soProps)?.value {
+    check(nodes.map { $0.value.scalar?.text ?? "?" } == ["Main Editor|0_run", "Main Editor|0_deploy"], "список скаляров")
+} else { check(false, "список скаляров") }
+if case .sequence(let instances)? = prop("m_EditorInstances", in: soProps)?.value {
+    check(instances.count == 2, "список структур без отступа (получено \(instances.count))")
+    check(instances.first?.child("Name")?.value.scalar?.text == "Player 2", "первое поле элемента — на строке с дефисом")
+    check(instances.first?.child("m_AdvancedConfiguration")?.child("LogsColor")?.value.flowFields?.map(\.key) == ["r", "g", "b", "a"],
+          "flow-структура цвета")
+    check(instances.last?.child("Name")?.value.scalar?.text == "Player: 3", "строка в одинарных кавычках")
+    if case .sequence(let empty)? = instances.last?.child("m_Nodes")?.value { check(empty.isEmpty, "[] — пустой список") }
+    else { check(false, "[] — пустой список") }
+} else { check(false, "список структур без отступа") }
+let title = prop("m_Title", in: soProps)?.value.scalar
+check(title?.multiline == true && title?.text == "D - GRAVITY RAMP\nfires on Play",
+      "многострочная строка склеивается (получено \(title?.text.debugDescription ?? "nil"))")
+check(prop("m_Quote", in: soProps)?.value.scalar?.text == "ROW · rest", "двойные кавычки с \\xB7")
+check(prop("m_Tail", in: soProps)?.value.scalar?.raw == "5", "после многострочной строки разбор продолжается")
+if let name = prop("m_Name", in: soProps)?.value.scalar { check(textAt(name.range, soModel) == "2P_Host", "диапазон значения точный") }
+
+// Правки: меняется только значение, остальной файл — байт в байт
+func edited(_ edits: [UnityEdit?]) -> String? { UnityEdits.apply(edits.compactMap { $0 }, to: soText)?.text }
+let renamed = edited([UnityEdits.scalar(prop("m_Name", in: soProps)!.value.scalar!, text: "Host")])
+check(renamed == soText.replacingOccurrences(of: "m_Name: 2P_Host", with: "m_Name: Host"), "правка имени — ровно одна замена")
+let described = edited([UnityEdits.scalar(prop("m_Description", in: soProps)!.value.scalar!, text: "a: b")])
+check(described?.contains("m_Description: 'a: b'\n") == true, "строка с `: ` берётся в кавычки")
+check(UnityEdits.scalar(prop("m_Tail", in: soProps)!.value.scalar!, text: "abc") == nil, "в числовое поле текст не пишется")
+check(edited([UnityEdits.scalar(prop("m_Tail", in: soProps)!.value.scalar!, text: "2,50")])?.hasSuffix("m_Tail: 2.50") == true,
+      "число с запятой")
+check(UnityEdits.scalar(title!, text: "x") == nil, "многострочную строку инспектор не правит")
+let quoted = UnityEdits.scalar(prop("m_EditorInstances.1.Name", in: soProps)?.value.scalar
+                               ?? (prop("m_EditorInstances", in: soProps)?.child("1")?.child("Name")?.value.scalar)!,
+                               text: "it's")
+check(quoted?.text == "'it''s'", "одинарные кавычки сохраняются, ' удваивается")
+if let color = prop("m_EditorInstances", in: soProps)?.child("0")?.child("m_AdvancedConfiguration")?.child("LogsColor")?
+    .value.flowFields?.first(where: { $0.key == "g" }) {
+    check(edited([UnityEdits.number(color, text: "0.5")])?.contains("{r: 0.3643, g: 0.5, b: 0.8679, a: 1}") == true,
+          "правка поля внутри {…}")
+}
+if let applied = UnityEdits.apply([UnityEdits.scalar(prop("m_Name", in: soProps)!.value.scalar!, text: "Very Long Name")!,
+                                   UnityEdits.scalar(prop("m_Tail", in: soProps)!.value.scalar!, text: "7")!], to: soText) {
+    check(UnityEdits.apply(applied.inverse, to: applied.text)?.text == soText, "обратные правки возвращают файл как был")
+}
+if let rename = UnityEdits.scalar(prop("m_Name", in: soProps)!.value.scalar!, text: "X"), let applied = edited([rename]) {
+    check(UnityEdits.apply([rename], to: applied) == nil, "правка по устаревшим позициям не применяется")
+}
+check(UnityEdits.apply([UnityEdit(range: NSRange(location: 5, length: 5), text: "x"),
+                        UnityEdit(range: NSRange(location: 8, length: 1), text: "y")], to: soText) == nil,
+      "пересекающиеся правки отвергаются")
+
+check(UnityScalarCodec.encode("plain", like: .plain) == "plain", "простая строка без кавычек")
+check(UnityScalarCodec.encode("#tag", like: .plain) == "'#tag'", "# в начале — в кавычках")
+check(UnityScalarCodec.encode("a\"b", like: .doubleQuoted) == "\"a\\\"b\"", "двойные кавычки экранируются")
+check(UnityScalarCodec.encode("line1\nline2", like: .plain) == "\"line1\\nline2\"", "перевод строки — через \\n")
+check(UnityNumber.format(1) == "1" && UnityNumber.format(0.5) == "0.5" && UnityNumber.format(0.00001) == "0.00001",
+      "числа в формате Unity (получено \(UnityNumber.format(0.00001)))")
+check(UnityNumber.format(0.70710677) == "0.70710677", "float печатается кратчайшим представлением")
+
+check(UnityNames.nicify("m_LocalPosition") == "Local Position", "m_LocalPosition → Local Position")
+check(UnityNames.nicify("<Health>k__BackingField") == "Health", "backing-поле → имя свойства")
+check(UnityNames.nicify("_moveSpeed") == "Move Speed", "_moveSpeed → Move Speed")
+check(UnityNames.nicify("m_HDR") == "HDR", "аббревиатура не разбивается")
+check(UnityNames.nicify("UIScale") == "UI Scale", "UIScale → UI Scale")
+check(UnityNames.nicify("near clip plane") == "Near clip plane", "ключ с пробелами")
+
+// Поворот: те же углы, что у Quaternion.Euler в Unity
+func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-4 }
+let qx = UnityRotation.quaternion(x: 90, y: 0, z: 0)
+check(near(qx.x, 0.70710678) && near(qx.w, 0.70710678), "Euler(90,0,0) = (0.7071, 0, 0, 0.7071)")
+let q30 = UnityRotation.quaternion(x: 30, y: 45, z: 60)
+check(near(q30.x, 0.3919) && near(q30.y, 0.2005) && near(q30.z, 0.3604) && near(q30.w, 0.8224),
+      "Euler(30,45,60) совпадает с Unity (получено \(q30))")
+for (x, y, z) in [(30.0, 45.0, 60.0), (10.0, 200.0, 350.0), (0.0, 90.0, 0.0), (270.0, 0.0, 0.0), (45.0, 0.0, 135.0)] {
+    let q = UnityRotation.quaternion(x: x, y: y, z: z)
+    let e = UnityRotation.euler(x: q.x, y: q.y, z: q.z, w: q.w)
+    let back = UnityRotation.quaternion(x: e.x, y: e.y, z: e.z)
+    let same = near(abs(q.x * back.x + q.y * back.y + q.z * back.z + q.w * back.w), 1)
+    check(same, "углы → кватернион → углы → тот же поворот (\(x), \(y), \(z)) → \(e)")
+}
+let e0 = UnityRotation.euler(x: 0, y: 0, z: 0, w: 1)
+check(e0.x == 0 && e0.y == 0 && e0.z == 0, "нулевой поворот — нули, без -0 и 360")
+
+// Типы полей из скрипта
+let typedScript = """
+using UnityEngine;
+public class Mover : MonoBehaviour {
+    [SerializeField] private bool loop = true;
+    [SerializeField, Range(0, 10)] float speed = 2f; // скорость
+    public Mode mode;
+    // public int commented;
+    [field: SerializeField] public Team Side { get; private set; }
+    public List<Vector3> points = new List<Vector3>();
+    void Update() { return; }
+    public enum Mode { Idle, Walk = 5, Run }
+}
+[System.Flags] enum Mask { A = 1, B = 2 }
+enum Team : byte { Red, [InspectorName("Синие")] Blue = 0x10 }
+"""
+let info = UnityCSharp.scriptInfo(from: typedScript)
+check(info.fieldTypes["loop"] == "bool", "тип поля с атрибутом")
+check(info.fieldTypes["speed"] == "float", "тип поля без модификатора")
+check(info.fieldTypes["mode"] == "Mode", "поле-enum")
+check(info.fieldTypes["commented"] == nil, "закомментированное поле не считается")
+check(info.fieldTypes["points"] == "List<Vector3>", "дженерик-тип (получено \(info.fieldTypes["points"] ?? "nil"))")
+check(info.type(ofKey: "<Side>k__BackingField") == "Team", "тип автосвойства по backing-полю")
+check(info.enums["Mode"] == [.init(name: "Idle", value: 0), .init(name: "Walk", value: 5), .init(name: "Run", value: 6)],
+      "значения enum с явным номером")
+check(info.enums["Team"]?.last == .init(name: "Blue", value: 16), "enum с атрибутом и hex-значением")
+check(info.enums["Mask"] == nil, "[Flags]-enum не показывается списком")
+
+// Модель инспектора на сцене из теста выше
+let inspectorScene = UnityYAMLFile.parse(sceneModel.units)!
+let resolveNames: (UnityGUID) -> String? = { assetIndex.displayName(for: $0) }
+func caretAt(_ needle: String) -> Int { (sceneText as NSString).range(of: needle).location }
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("speed: 5"),
+                                        resolve: resolveNames) {
+    check(content.kind == .gameObject && content.title == "Play Button", "курсор в компоненте — инспектор его GameObject'а")
+    check(content.sections.map(\.title) == ["Transform", "Player", "Image"],
+          "компоненты GameObject'а (получено \(content.sections.map(\.title)))")
+    check(content.focusedSection == 1, "подсвечен компонент под курсором")
+    check(content.path.map(\.name) == ["Canvas"], "предки в хлебных крошках")
+    check(content.sections[1].properties.map(\.key) == ["speed"], "служебные поля скрыты")
+    check(content.sections[1].enabled != nil, "у MonoBehaviour есть переключатель Enabled")
+    check(content.name?.value.scalar?.text == "Play Button", "имя GameObject'а — редактируемое поле")
+} else { check(false, "инспектор для компонента") }
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("m_Name: Canvas"),
+                                        resolve: resolveNames) {
+    check(content.children.map(\.name) == ["Play Button"], "дети — по m_Children (получено \(content.children.map(\.name)))")
+    check(content.path.isEmpty, "у корня предков нет")
+}
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("m_Name: Badge"),
+                                        resolve: resolveNames) {
+    check(content.path.map(\.name) == ["Canvas", "Play Button", "Icon"],
+          "предки идут через вложенный префаб (получено \(content.path.map(\.name)))")
+}
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("value: Icon"),
+                                        resolve: resolveNames) {
+    check(content.kind == .prefabInstance && content.title == "Icon", "вложенный префаб в инспекторе")
+    check(content.sections.first?.properties.map(\.key) == ["m_LocalPosition.x", "m_Name"],
+          "переопределения префаба (получено \(content.sections.first?.properties.map(\.key) ?? []))")
+    check(content.source?.description == buttonPrefabGUID, "ссылка на исходный префаб")
+}
+if let content = UnityInspector.content(file: inspectorScene, model: sceneModel, caret: caretAt("m_PrefabInstance: {fileID: 300}"),
+                                        resolve: resolveNames) {
+    check(content.kind == .prefabInstance, "stripped-заглушка ведёт к вложенному префабу")
+}
+if let so = UnityInspector.content(file: soFile, model: soModel, caret: 0, resolve: resolveNames) {
+    check(so.kind == .asset && so.title == "2P_Host", "ScriptableObject в инспекторе")
+    check(so.source?.description == playerGUID, "скрипт ScriptableObject'а")
+    check(so.sections.first?.properties.first?.key == "m_Description", "поля SO без служебных")
 }
 
 // ────────────────────────── Фильтр навигатора ──────────────────────────

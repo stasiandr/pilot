@@ -17,6 +17,7 @@ struct PilotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var workspace = Workspace()
     @AppStorage(Experimental.lspDaemonKey) private var lspDaemon = false
+    @AppStorage("pilot.showsInspector") private var showsInspector = true
 
     var body: some Scene {
         Window("Pilot", id: "main") {
@@ -159,6 +160,16 @@ struct PilotApp: App {
                 }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(workspace.document == nil)
+                // Unity: ссылки на ассеты — это GUID, языковой сервер тут не нужен.
+                Button("Где используется ассет") { workspace.findAssetUsages() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!workspace.unity.isActive)
+                Button("Ассет ↔ .meta") { workspace.toggleMetaFile() }
+                    .keyboardShortcut("m", modifiers: [.command, .control])
+                    .disabled(!workspace.unity.isActive)
+                Button(showsInspector ? "Скрыть инспектор" : "Показать инспектор") { showsInspector.toggle() }
+                    .keyboardShortcut("0", modifiers: [.command, .option])
+                    .disabled(workspace.document?.unityFile == nil)
                 Divider()
                 Button("Назад") { workspace.goBack() }
                     .keyboardShortcut("[", modifiers: .command)
