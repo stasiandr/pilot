@@ -193,6 +193,13 @@ enum Theme {
     /// Открытый тред ревью — значок у строки. Голубой не спорит ни с одной
     /// из полосок диффа.
     static var reviewThread: NSColor { Macchiato.sky }
+    /// Конфликт слияния: текущее (HEAD) — зелёным, входящее — синим,
+    /// общий предок — серым, строки маркеров — персиковым, как буква U.
+    static var conflictCurrent: NSColor { Macchiato.green.withAlphaComponent(0.10) }
+    static var conflictIncoming: NSColor { Macchiato.blue.withAlphaComponent(0.13) }
+    static var conflictBase: NSColor { Macchiato.overlay2.withAlphaComponent(0.10) }
+    static var conflictMarker: NSColor { Macchiato.peach.withAlphaComponent(0.16) }
+
     /// Фон удалённых строк во всплывающем окне.
     static var removedLineBackground: NSColor { Macchiato.red.withAlphaComponent(0.14) }
     static var removedLineText: NSColor { Macchiato.red }

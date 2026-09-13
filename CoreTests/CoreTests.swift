@@ -1624,7 +1624,118 @@ if Git.executable == nil {
     check(liveBlame?.commit(atLine: 0)?.summary == "Initial", "blame: сообщение коммита")
     check(liveBlame?.commit(atLine: 1)?.isUncommitted == true, "blame: изменённая строка не закоммичена")
     check(liveBlame?.commit(atLine: 3)?.isUncommitted == true, "blame: дописанная строка не закоммичена")
+
+    // Настоящий конфликт слияния: две ветки правят одну строку.
+    let mergeRepo = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pilot-merge-\(UUID().uuidString)")
+        .resolvingSymlinksInPath()
+    try? FileManager.default.createDirectory(at: mergeRepo, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: mergeRepo) }
+    func msh(_ args: [String]) -> Int32? { Git.run(isolated + args, in: mergeRepo)?.status }
+    func mwrite(_ text: String) {
+        try? text.write(to: mergeRepo.appendingPathComponent("app.txt"), atomically: true, encoding: .utf8)
+    }
+    _ = msh(["init", "-q", "--initial-branch=main"])
+    mwrite("one\ntwo\nthree\n")
+    _ = msh(["add", "."]); _ = msh(["commit", "-q", "-m", "base"])
+    _ = msh(["checkout", "-q", "-b", "feature"])
+    mwrite("one\nTWO from feature\nthree\n")
+    _ = msh(["commit", "-q", "-am", "feature"])
+    _ = msh(["checkout", "-q", "main"])
+    mwrite("one\nTWO from main\nthree\n")
+    _ = msh(["commit", "-q", "-am", "main"])
+    let mergeStatus = msh(["merge", "-q", "feature"])
+    check(mergeStatus != 0, "merge с конфликтом завершается ошибкой")
+    check(Git.status(in: mergeRepo)?.files["app.txt"] == .conflicted, "status: файл конфликтный")
+
+    let merged = (try? String(contentsOf: mergeRepo.appendingPathComponent("app.txt"), encoding: .utf8)) ?? ""
+    let mergedModel = SyntaxModel(text: merged, spec: nil)
+    let liveConflicts = MergeConflicts.find(in: mergedModel)
+    check(liveConflicts.count == 1 && liveConflicts.first?.currentLabel == "HEAD"
+            && liveConflicts.first?.incomingLabel == "feature",
+          "маркеры настоящего git: HEAD против feature (получено \(liveConflicts))")
+    if let conflict = liveConflicts.first {
+        let (range, text) = MergeConflicts.resolution(of: conflict, choice: .incoming, in: mergedModel)
+        mwrite((merged as NSString).replacingCharacters(in: range, with: text))
+        check((try? String(contentsOf: mergeRepo.appendingPathComponent("app.txt"), encoding: .utf8))
+                == "one\nTWO from feature\nthree\n", "после решения — ровно входящая версия")
+        _ = msh(["add", "--", "app.txt"])
+        check(Git.status(in: mergeRepo)?.files["app.txt"] != .conflicted, "после git add файл больше не конфликтный")
+    }
 }
+
+
+// ─────────────────────────── Git: конфликты слияния ───────────────────────────
+section("Git: конфликты слияния")
+
+func conflictModel(_ text: String) -> SyntaxModel { SyntaxModel(text: text, spec: nil) }
+func resolve(_ text: String, _ choice: ConflictChoice, index: Int = 0) -> String {
+    let model = conflictModel(text)
+    let conflict = MergeConflicts.find(in: model)[index]
+    let (range, replacement) = MergeConflicts.resolution(of: conflict, choice: choice, in: model)
+    return (text as NSString).replacingCharacters(in: range, with: replacement)
+}
+
+let simpleConflict = """
+before
+<<<<<<< HEAD
+mine
+=======
+theirs 1
+theirs 2
+>>>>>>> feature/login
+after
+
+"""
+let found = MergeConflicts.find(in: conflictModel(simpleConflict))
+check(found == [MergeConflict(start: 1, base: nil, separator: 3, end: 6,
+                              currentLabel: "HEAD", incomingLabel: "feature/login")],
+      "простой конфликт: строки маркеров и метки (получено \(found))")
+check(found.first?.current == 2..<3 && found.first?.incoming == 4..<6, "текущее и входящее")
+check(resolve(simpleConflict, .current) == "before\nmine\nafter\n", "принять текущее")
+check(resolve(simpleConflict, .incoming) == "before\ntheirs 1\ntheirs 2\nafter\n", "принять входящее")
+check(resolve(simpleConflict, .both) == "before\nmine\ntheirs 1\ntheirs 2\nafter\n", "принять оба")
+
+let diff3Conflict = "<<<<<<< ours\na = 1\n||||||| merged common ancestors\na = 0\n=======\na = 2\n>>>>>>> theirs\n"
+let diff3 = MergeConflicts.find(in: conflictModel(diff3Conflict))
+check(diff3.first?.base == 2 && diff3.first?.common == 3..<4, "diff3: строка базы и её содержимое")
+check(resolve(diff3Conflict, .base) == "a = 0\n", "принять базу")
+check(resolve(diff3Conflict, .current) == "a = 1\n", "diff3: текущее без базы")
+
+let twoConflicts = "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\nmid\n<<<<<<< HEAD\nc\n=======\nd\n>>>>>>> x\n"
+check(MergeConflicts.find(in: conflictModel(twoConflicts)).count == 2, "два конфликта в файле")
+check(resolve(twoConflicts, .incoming, index: 1) == "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\nmid\nd\n",
+      "решается только выбранный конфликт")
+
+let emptySide = "<<<<<<< HEAD\n=======\nadded\n>>>>>>> x\n"
+check(resolve(emptySide, .current) == "", "пустая сторона — блок исчезает целиком")
+
+let noTrailingNewline = "x\n<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x"
+check(resolve(noTrailingNewline, .incoming) == "x\nb", "в конце файла без перевода строки лишний не появляется")
+
+let crlf = "<<<<<<< HEAD\r\na\r\n=======\r\nb\r\n>>>>>>> x\r\nz\r\n"
+check(MergeConflicts.find(in: conflictModel(crlf)).first?.incomingLabel == "x", "CRLF: маркеры и метка без \\r")
+check(resolve(crlf, .current) == "a\r\nz\r\n", "CRLF: переводы строк сохраняются")
+
+check(MergeConflicts.find(in: conflictModel("<<<<<<< HEAD\na\n=======\nb\n")).isEmpty,
+      "незакрытый конфликт не считается")
+check(MergeConflicts.find(in: conflictModel("Title\n=======\ntext\n")).isEmpty,
+      "одинокий ======= (заголовок Markdown) — не конфликт")
+check(MergeConflicts.find(in: conflictModel("<<<<<<<< x\na\n=======\nb\n>>>>>>> y\n")).isEmpty,
+      "восемь символов — не маркер")
+check(MergeConflicts.find(in: conflictModel("<<<<<<< a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")).first?.start == 1,
+      "повторный <<<<<<< начинает конфликт заново")
+check(MergeConflicts.conflict(atLine: 4, in: found)?.start == 1, "конфликт под курсором находится по строке")
+check(MergeConflicts.conflict(atLine: 7, in: found) == nil, "строка после конфликта — вне его")
+
+let bigConflictText = String(repeating: "let value = compute()\n", count: 100_000)
+    + "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n"
+let bigConflictModel = conflictModel(bigConflictText)
+let tConflicts = Date()
+let bigConflicts = MergeConflicts.find(in: bigConflictModel)
+let conflictMs = Date().timeIntervalSince(tConflicts) * 1000
+print(String(format: "  поиск конфликтов в файле на 100k строк: %.1f мс", conflictMs))
+check(bigConflicts.count == 1 && conflictMs < 50, "поиск конфликтов на 100k строк быстрее 50 мс")
 
 
 // ─────────────────────────── GitLab: remote ───────────────────────────

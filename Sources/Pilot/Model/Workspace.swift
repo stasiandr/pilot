@@ -152,6 +152,31 @@ final class Workspace: ObservableObject {
         var compose: Bool
     }
     @Published private(set) var linePopover: LinePopoverRequest?
+
+    /// Конфликты слияния в открытом файле — пересчитываются на каждой правке.
+    @Published private(set) var conflicts: [MergeConflict] = []
+    /// Ошибка «отметить решённым» — показывается в полосе конфликтов.
+    @Published var conflictError: String?
+
+    /// Решить конфликт: правку делает редактор, чтобы она попала в ⌘Z.
+    /// `start` — строка `<<<<<<<`; nil — все конфликты файла разом.
+    struct ConflictActionRequest: Equatable {
+        var seq: Int
+        var start: Int?
+        var choice: ConflictChoice
+    }
+    @Published private(set) var conflictAction: ConflictActionRequest?
+    private var conflictActionCounter = 0
+
+    func requestConflictAction(start: Int?, choice: ConflictChoice) {
+        conflictActionCounter += 1
+        conflictAction = ConflictActionRequest(seq: conflictActionCounter, start: start, choice: choice)
+    }
+
+    private func updateConflicts() {
+        let fresh = buffer.map { MergeConflicts.find(in: $0.model) } ?? []
+        if fresh != conflicts { conflicts = fresh }
+    }
     private var popoverCounter = 0
 
     func requestLinePopover(line: Int, compose: Bool) {
@@ -485,7 +510,12 @@ final class Workspace: ObservableObject {
         guard let root else { items = []; return }
         let changed = git.changedFiles.filter { $0.value != .deleted }
         let index = FileIndex(root: root)
-        for path in changed.keys.sorted() { index.appendCached(rel: path) }
+        // Конфликты — первыми: пока они есть, слияние не закончить.
+        let ordered = changed.keys.sorted { a, b in
+            let aConflict = changed[a] == .conflicted, bConflict = changed[b] == .conflicted
+            return aConflict != bConflict ? aConflict : a < b
+        }
+        for path in ordered { index.appendCached(rel: path) }
 
         let hits = index.search(query, limit: 500, shouldStop: { false })
         items = hits.enumerated().map { position, hit in
@@ -1218,6 +1248,7 @@ final class Workspace: ObservableObject {
             }
         }
         buffer = new
+        updateConflicts()
         guard let new else { return }
         new.onEdit = { [weak self] buffer, range, text in self?.bufferEdited(buffer, range: range, text: text) }
         new.onDirtyChange = { [weak self] buffer in self?.dirtyChanged(buffer) }
@@ -1236,6 +1267,9 @@ final class Workspace: ObservableObject {
     private func bufferEdited(_ buffer: TextBuffer, range: LSPRange, text: String) {
         lsp.documentEdited(buffer.document, range: range, text: text)
         guard buffer === self.buffer else { return }
+        // Сразу, без задержки: проход по началам строк — доли миллисекунды,
+        // а кнопки «принять» должны стоять у своих маркеров после каждой правки.
+        updateConflicts()
 
         // Вхождения посчитаны по старому тексту; пересчитаются на следующем
         // движении курсора, а оно после набора будет всегда.

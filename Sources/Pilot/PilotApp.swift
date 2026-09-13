@@ -131,6 +131,23 @@ struct PilotApp: App {
                     .keyboardShortcut(.upArrow, modifiers: [.command, .option])
                     .disabled(workspace.review.active == nil)
                 Divider()
+                Button("Следующий конфликт") { workspace.jumpToConflict(1) }
+                    .keyboardShortcut(.downArrow, modifiers: [.control, .option, .command])
+                    .disabled(workspace.conflicts.isEmpty)
+                Button("Предыдущий конфликт") { workspace.jumpToConflict(-1) }
+                    .keyboardShortcut(.upArrow, modifiers: [.control, .option, .command])
+                    .disabled(workspace.conflicts.isEmpty)
+                Button("Принять текущее") { workspace.acceptConflict(.current) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.control, .option, .command])
+                    .disabled(workspace.conflicts.isEmpty)
+                Button("Принять входящее") { workspace.acceptConflict(.incoming) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.control, .option, .command])
+                    .disabled(workspace.conflicts.isEmpty)
+                Button("Принять оба") { workspace.acceptConflict(.both) }
+                    .disabled(workspace.conflicts.isEmpty)
+                Button("Отметить конфликт решённым") { workspace.markConflictsResolved() }
+                    .disabled(!workspace.isConflictedFile || !workspace.conflicts.isEmpty)
+                Divider()
                 // Не требует LSP: пока сервер не готов, отвечает быстрый
                 // навигатор по индексу объявлений проекта.
                 Button("Перейти к объявлению") {

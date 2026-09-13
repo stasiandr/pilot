@@ -48,6 +48,9 @@ struct RootView: View {
             if workspace.review.active != nil {
                 ReviewBar(workspace: workspace)
             }
+            if workspace.showsConflictBar {
+                ConflictBar(workspace: workspace)
+            }
             content
             if workspace.root != nil {
                 statusBar
@@ -74,6 +77,8 @@ struct RootView: View {
                                                compose: request.compose)
                             .preferredColorScheme(.dark))
                      },
+                     conflicts: workspace.conflicts,
+                     conflictAction: workspace.conflictAction,
                      focusRequest: workspace.editorFocusRequest,
                      completionTriggers: workspace.lsp.completionTriggers,
                      onCaretChange: { workspace.caretMoved(to: $0) },

@@ -174,12 +174,41 @@ final class CodeTextView: NSTextView {
     /// ленивая, и посчитанная заранее позиция строки бывает лишь оценкой,
     /// которая уезжает, когда строки выше раскладываются по-настоящему.
     override func draw(_ dirtyRect: NSRect) {
+        drawConflictBands(in: dirtyRect)
         currentLineRect = lineHighlightRect()
         if let line = currentLineRect, line.intersects(dirtyRect) {
             Theme.currentLine.setFill()
             line.intersection(dirtyRect).intersection(bounds).fill()
         }
         super.draw(dirtyRect)
+    }
+
+    // MARK: Конфликты слияния
+
+    /// Полосы под блоками конфликта: текущее, база, входящее, маркеры.
+    /// Диапазоны — в символах текста; на всю ширину, как текущая строка.
+    var conflictBands: [(range: NSRange, color: NSColor)] = [] {
+        didSet { needsDisplay = true }
+    }
+
+    private func drawConflictBands(in dirtyRect: NSRect) {
+        guard !conflictBands.isEmpty, let layout = layoutManager, let container = textContainer else { return }
+        // Только то, что видно: у файла-лога с сотней конфликтов считать
+        // прямоугольники для всех на каждой отрисовке незачем.
+        let visibleGlyphs = layout.glyphRange(forBoundingRect: visibleRect, in: container)
+        let visible = layout.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
+        for band in conflictBands where band.range.length > 0 {
+            guard NSIntersectionRange(band.range, visible).length > 0
+                    || NSLocationInRange(band.range.location, visible) else { continue }
+            let glyphs = layout.glyphRange(forCharacterRange: band.range, actualCharacterRange: nil)
+            var rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+            rect.origin.x = 0
+            rect.origin.y += textContainerOrigin.y
+            rect.size.width = max(bounds.width, visibleRect.maxX)
+            guard rect.intersects(dirtyRect) else { continue }
+            band.color.setFill()
+            rect.intersection(dirtyRect).fill()
+        }
     }
 
     // MARK: Контекстное меню
@@ -597,6 +626,108 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         popover = nil
     }
 
+    // MARK: - Конфликты слияния
+
+    private var conflicts: [MergeConflict] = []
+    /// Кнопки «принять» у строк `<<<<<<<`, по строке маркера.
+    private var conflictStrips: [Int: NSHostingView<ConflictStrip>] = [:]
+
+    func setConflicts(_ fresh: [MergeConflict]) {
+        conflicts = fresh
+        guard let model else {
+            textView.conflictBands = []
+            removeConflictStrips()
+            return
+        }
+        var bands: [(range: NSRange, color: NSColor)] = []
+        func band(_ lines: Range<Int>, _ color: NSColor) {
+            guard !lines.isEmpty, lines.upperBound <= model.lineCount else { return }
+            let from = model.lineRange(lines.lowerBound).lowerBound
+            let to = model.lineRange(lines.upperBound - 1).upperBound
+            bands.append((NSRange(location: from, length: to - from), color))
+        }
+        for conflict in fresh {
+            band(conflict.start..<(conflict.start + 1), Theme.conflictMarker)
+            band(conflict.current, Theme.conflictCurrent)
+            if let base = conflict.base {
+                band(base..<(base + 1), Theme.conflictMarker)
+                band(conflict.common ?? base..<base, Theme.conflictBase)
+            }
+            band(conflict.separator..<(conflict.separator + 1), Theme.conflictMarker)
+            band(conflict.incoming, Theme.conflictIncoming)
+            band(conflict.end..<(conflict.end + 1), Theme.conflictMarker)
+        }
+        textView.conflictBands = bands
+        layoutConflictStrips()
+    }
+
+    private func removeConflictStrips() {
+        conflictStrips.values.forEach { $0.removeFromSuperview() }
+        conflictStrips = [:]
+    }
+
+    /// Кнопки — подвиды текста: прокручиваются вместе с ним сами. Место
+    /// пересчитываем, когда могла сдвинуться раскладка: правка, шрифт,
+    /// прокрутка к ещё не разложенным строкам.
+    private func layoutConflictStrips() {
+        guard let buffer, !buffer.isReadOnly, let layout = textView.layoutManager else {
+            removeConflictStrips()
+            return
+        }
+        let model = buffer.model
+        let starts = Set(conflicts.map(\.start))
+        for (line, strip) in conflictStrips where !starts.contains(line) {
+            strip.removeFromSuperview()
+            conflictStrips[line] = nil
+        }
+        for conflict in conflicts where conflict.start < model.lineCount {
+            let lineStart = model.lineRange(conflict.start).lowerBound
+            guard lineStart < buffer.storage.length else { continue }
+            let glyph = layout.glyphIndexForCharacter(at: lineStart)
+            let used = layout.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
+            let fragment = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+
+            let content = ConflictStrip(conflict: conflict) { [weak self] choice in
+                self?.applyConflictAction(start: conflict.start, choice: choice)
+            }
+            let strip: NSHostingView<ConflictStrip>
+            if let existing = conflictStrips[conflict.start] {
+                strip = existing
+                strip.rootView = content
+            } else {
+                strip = NSHostingView(rootView: content)
+                textView.addSubview(strip)
+                conflictStrips[conflict.start] = strip
+            }
+            let size = strip.fittingSize
+            let origin = textView.textContainerOrigin
+            strip.frame = NSRect(x: origin.x + used.maxX + 16,
+                                 y: origin.y + fragment.minY + (fragment.height - size.height) / 2,
+                                 width: size.width, height: size.height)
+        }
+    }
+
+    /// Правка — через редактор, как если бы её набрали: попадает в ⌘Z,
+    /// модель и языковой сервер узнают о ней обычным путём. Конфликты
+    /// ищутся заново по текущему тексту — переданный номер строки мог
+    /// устареть на одну правку.
+    func applyConflictAction(start: Int?, choice: ConflictChoice) {
+        guard let buffer, !buffer.isReadOnly else { return }
+        let fresh = MergeConflicts.find(in: buffer.model)
+        let targets = start.map { line in fresh.filter { $0.start == line } } ?? fresh
+        guard !targets.isEmpty else { NSSound.beep(); return }
+        var caret = 0
+        // Снизу вверх: правка ниже не сдвигает строки выше.
+        for conflict in targets.sorted(by: { $0.start > $1.start }) {
+            let (range, text) = MergeConflicts.resolution(of: conflict, choice: choice, in: buffer.model)
+            textView.replace(range, with: text)
+            caret = range.location
+        }
+        textView.setSelectedRange(NSRange(location: caret, length: 0))
+        textView.scrollRangeToVisible(textView.selectedRange())
+        view.window?.makeFirstResponder(textView)
+    }
+
     private func scrollLineIntoView(_ line: Int) {
         guard let model, line < model.lineCount else { return }
         textView.scrollRangeToVisible(NSRange(location: Int(model.lineStarts[line]), length: 0))
@@ -892,6 +1023,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     @objc private func viewportChanged() {
         highlightVisible()
         ruler?.needsDisplay = true
+        if !conflicts.isEmpty { layoutConflictStrips() }
         if popup.isVisible { hideCompletion(keepSession: true) }
     }
 
@@ -923,6 +1055,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         ruler?.invalidateWidth()
         highlightVisible()
         textView.updateCurrentLineHighlight()
+        if !conflicts.isEmpty { layoutConflictStrips() }
     }
 
     /// Красит только те строки, что попали в видимую область (+ запас).
@@ -1226,6 +1359,8 @@ struct CodeView: NSViewControllerRepresentable {
     var isReview = false
     var popover: Workspace.LinePopoverRequest? = nil
     var popoverContent: (Workspace.LinePopoverRequest) -> AnyView? = { _ in nil }
+    var conflicts: [MergeConflict] = []
+    var conflictAction: Workspace.ConflictActionRequest? = nil
     let focusRequest: Int
     let completionTriggers: [String]
     let onCaretChange: (Int) -> Void
@@ -1289,6 +1424,20 @@ struct CodeView: NSViewControllerRepresentable {
             controller.setCommentMarks(commentMarks, column: isReview)
         }
 
+        if documentChanged || context.coordinator.conflicts != conflicts {
+            context.coordinator.conflicts = conflicts
+            controller.setConflicts(conflicts)
+        }
+
+        if let conflictAction, conflictAction.seq != context.coordinator.appliedConflictAction {
+            context.coordinator.appliedConflictAction = conflictAction.seq
+            // Правка тут же публикует новые конфликты и позицию курсора, а
+            // публиковать изнутри обновления вью SwiftUI не даёт.
+            DispatchQueue.main.async {
+                controller.applyConflictAction(start: conflictAction.start, choice: conflictAction.choice)
+            }
+        }
+
         // Окно у строки — тоже по номеру запроса, один раз. После смены
         // документа — на следующем витке, когда текст уже разложен.
         if let popover, popover.seq != context.coordinator.appliedPopover {
@@ -1343,6 +1492,8 @@ struct CodeView: NSViewControllerRepresentable {
         var commentMarks: [Int: CommentMark] = [:]
         var isReview = false
         var appliedPopover = 0
+        var conflicts: [MergeConflict] = []
+        var appliedConflictAction = 0
         var occurrenceSignature: Int = 0
         var appliedFocus: Int = 0
     }

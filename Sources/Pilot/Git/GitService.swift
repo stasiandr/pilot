@@ -61,6 +61,24 @@ final class GitService: ObservableObject {
     }
 
     var changedCount: Int { changedFiles.count }
+    var conflictedCount: Int { changedFiles.values.filter { $0 == .conflicted }.count }
+
+    /// `git add` — так git узнаёт, что конфликт в файле решён. nil — получилось,
+    /// иначе текст ошибки.
+    func markResolved(_ url: URL) async -> String? {
+        let fileURL = url.resolvingSymlinksInPath()
+        guard let repo = Git.repositoryRoot(for: fileURL.deletingLastPathComponent()) else {
+            return "Файл не в git-репозитории"
+        }
+        let path = String(fileURL.path.dropFirst(repo.path.count + 1))
+        let output = await Task.detached(priority: .userInitiated) {
+            Git.run(["add", "--", path], in: repo)
+        }.value
+        guard let output else { return "Не удалось запустить git" }
+        guard output.status == 0 else { return "git add завершился с кодом \(output.status)" }
+        refresh()
+        return nil
+    }
 
     // MARK: - Проект
 
