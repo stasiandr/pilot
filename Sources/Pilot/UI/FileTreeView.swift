@@ -41,6 +41,7 @@ struct FileTreeView: NSViewRepresentable {
         outline.delegate = coordinator
         outline.target = coordinator
         outline.action = #selector(Coordinator.rowClicked(_:))
+        outline.doubleAction = #selector(Coordinator.rowDoubleClicked(_:))
         outline.onReturn = { [weak coordinator] in coordinator?.openSelected() }
         outline.menu = coordinator.makeContextMenu()
 
@@ -71,6 +72,10 @@ struct FileTreeView: NSViewRepresentable {
 
         private var tree: FileTree?
         private var shownSelection: String?
+        /// Файл открыт из дерева и ещё грузится. Пока открыт прежний, дерево
+        /// обновляется с его путём — возвращать на него выделение не надо,
+        /// иначе оно прыгает: новый файл, старый, снова новый.
+        private var pendingOpen: (path: String, previous: String?)?
         private var gitFiles: [String: GitFileState] = [:]
         /// Папки, внутри которых что-то изменено, — чтобы изменение было
         /// видно и в свёрнутом дереве.
@@ -105,6 +110,10 @@ struct FileTreeView: NSViewRepresentable {
                 shownSelection = nil
             }
 
+            if let pending = pendingOpen {
+                if selectedPath == pending.previous, shownSelection == pending.path { return }
+                pendingOpen = nil
+            }
             if selectedPath != shownSelection {
                 shownSelection = selectedPath
                 reveal(selectedPath)
@@ -194,19 +203,24 @@ struct FileTreeView: NSViewRepresentable {
 
         // MARK: Действия
 
+        /// Клик по папке раскрывает её — стрелочка слишком мелкая мишень.
+        /// Файл по клику только выделяется: открывается двойным кликом.
         @objc func rowClicked(_ sender: NSOutlineView) {
             let row = sender.clickedRow
-            guard row >= 0, let node = sender.item(atRow: row) as? FileTree.Node else { return }
-            if node.isDirectory {
-                // Клик по папке раскрывает её — стрелочка слишком мелкая мишень.
-                if sender.isItemExpanded(node) {
-                    sender.animator().collapseItem(node)
-                } else {
-                    sender.animator().expandItem(node)
-                }
+            guard row >= 0, let node = sender.item(atRow: row) as? FileTree.Node, node.isDirectory else { return }
+            if sender.isItemExpanded(node) {
+                sender.animator().collapseItem(node)
             } else {
-                open(node, focusEditor: false)
+                sender.animator().expandItem(node)
             }
+        }
+
+        /// Двойной клик по файлу открывает его и уводит в текст, как Return.
+        /// Папку первый клик уже раскрыл — второй её не трогает.
+        @objc func rowDoubleClicked(_ sender: NSOutlineView) {
+            let row = sender.clickedRow
+            guard row >= 0, let node = sender.item(atRow: row) as? FileTree.Node, !node.isDirectory else { return }
+            open(node, focusEditor: true)
         }
 
         /// Return: папку раскрыть, файл открыть и уйти в текст.
@@ -223,6 +237,9 @@ struct FileTreeView: NSViewRepresentable {
         private func open(_ node: FileTree.Node, focusEditor: Bool) {
             // Отмечаем заранее: когда документ загрузится, дерево уже
             // выделило эту строку и прыгать никуда не должно.
+            if node.relPath != shownSelection {
+                pendingOpen = (node.relPath, shownSelection)
+            }
             shownSelection = node.relPath
             onOpen?(node.relPath, focusEditor)
         }

@@ -430,13 +430,19 @@ final class CodeScrollView: NSScrollView {
 }
 
 /// Вторая половина той же истории: система считает, что линейка всё ещё
-/// лежит поверх текста, и прокручивает клип-вью на её ширину влево
-/// (bounds.x = −44). Раз клип уже справа от линейки, левее нуля ему незачем.
+/// лежит поверх текста, и даёт клип-вью отступ слева на её ширину. С ним
+/// свайп трекпадом свободно уводит текст на 44 точки вправо, в пустоту,
+/// а программная прокрутка встаёт на bounds.x = −44. Раз клип уже справа
+/// от линейки, отступ слева ему не нужен; нижний и правый — под полосы
+/// прокрутки — остаются.
 final class CodeClipView: NSClipView {
-    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
-        var rect = super.constrainBoundsRect(proposedBounds)
-        if rect.origin.x < 0 { rect.origin.x = 0 }
-        return rect
+    override var contentInsets: NSEdgeInsets {
+        get { super.contentInsets }
+        set {
+            var insets = newValue
+            insets.left = 0
+            super.contentInsets = insets
+        }
     }
 }
 
