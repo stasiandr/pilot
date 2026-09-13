@@ -54,23 +54,13 @@ struct StartView: View {
         }
     }
 
+    /// Иконка бандла (Resources/Pilot.icon) — та же, что в Dock, со стеклом
+    /// и тенью от системы. Вокруг самой плашки в картинке есть прозрачное
+    /// поле, поэтому кадр больше, чем видимая иконка.
     private var appIcon: some View {
-        RoundedRectangle(cornerRadius: 22, style: .continuous)
-            .fill(LinearGradient(colors: [Color(red: 0.54, green: 0.68, blue: 0.96),
-                                          Color(red: 0.78, green: 0.63, blue: 0.96)],
-                                 startPoint: .topLeading, endPoint: .bottomTrailing))
-            .frame(width: 96, height: 96)
-            .overlay {
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 46, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(.white.opacity(0.35), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.3), radius: 12, y: 6)
+        Image(nsImage: NSApp.applicationIconImage)
+            .resizable()
+            .frame(width: 120, height: 120)
     }
 
     // MARK: - Список проектов

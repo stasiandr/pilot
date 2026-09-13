@@ -24,6 +24,10 @@
 проект тоже соберётся — стекло заменится штатным `NSVisualEffectView`.
 Само приложение работает начиная с macOS 14.
 
+Иконка — документ Icon Composer `Resources/Pilot.icon`: открывается и
+правится в Icon Composer из Xcode 26. `build.sh` собирает её через `actool`.
+Без Xcode 26 бандл соберётся без иконки.
+
 ```
 ./run-tests.sh      # тесты ядра: индекс, поиск, .gitignore, лексер
 ```

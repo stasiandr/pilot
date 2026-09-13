@@ -6,6 +6,8 @@
     <key>CFBundleDisplayName</key>          <string>Pilot</string>
     <key>CFBundleIdentifier</key>           <string>dev.local.pilot</string>
     <key>CFBundleExecutable</key>           <string>Pilot</string>
+    <key>CFBundleIconFile</key>             <string>Pilot</string>
+    <key>CFBundleIconName</key>             <string>Pilot</string>
     <key>CFBundlePackageType</key>          <string>APPL</string>
     <key>CFBundleShortVersionString</key>   <string>0.1.0</string>
     <key>CFBundleVersion</key>              <string>1</string>
