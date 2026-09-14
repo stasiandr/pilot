@@ -53,10 +53,15 @@ final class GitService: ObservableObject {
     init() {
         // Вернулись в Pilot из терминала — возможно, там закоммитили или
         // переключили ветку. Опрашивать git по таймеру ради этого незачем.
+        // Статуса ещё нет — первый опрос впереди: Pilot, которого Unity
+        // вызвала с файлом, запускает его после того, как файл показан.
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refresh() }
+            MainActor.assumeIsolated {
+                guard let self, self.status != nil else { return }
+                self.refresh()
+            }
         }
     }
 
@@ -82,6 +87,9 @@ final class GitService: ObservableObject {
 
     // MARK: - Проект
 
+    /// Статус проекта — отдельно, `refresh()`: на большом репозитории
+    /// `git status` идёт секунды, а полоски у файла, ради которого Pilot
+    /// открыли, должны прийти раньше.
     func workspaceChanged(to root: URL?) {
         _ = statusGeneration.bump()
         projectRoot = root?.resolvingSymlinksInPath()
@@ -89,7 +97,6 @@ final class GitService: ObservableObject {
         status = nil
         changedFiles = [:]
         documentOpened(nil)
-        refresh()
     }
 
     /// Перечитать ветку и список изменённых файлов. Если с прошлого раза

@@ -34,15 +34,21 @@ final class UnityService: ObservableObject {
 
     // MARK: - Жизненный цикл
 
+    /// Только распознаёт проект — это мгновенно, и файл уже можно разобрать
+    /// как Unity-файл. Индекс GUID — отдельно, `indexAssets()`: Pilot,
+    /// открытый ради файла, строит его после того, как файл показан.
     func workspaceChanged(to root: URL?) {
-        let current = generation.bump()
+        _ = generation.bump()
         assets = nil
         scriptInfos = [:]
         isIndexingAssets = false
         decorationsVersion += 1
         project = root.flatMap(UnityProjectInfo.find(inWorkspace:))
-        guard let project else { return }
+    }
 
+    func indexAssets() {
+        guard let project, assets == nil, !isIndexingAssets else { return }
+        let current = generation.bump()
         isIndexingAssets = true
         let counter = generation
         let started = Date()

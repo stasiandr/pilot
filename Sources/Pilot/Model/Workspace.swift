@@ -260,7 +260,11 @@ final class Workspace: ObservableObject {
 
     private var index: FileIndex?
     private var typeIndex: TypeIndex?
+    /// Короткое и срочное: чтение открываемого файла, поиск в палитре, структура.
     private let work = DispatchQueue(label: "pilot.index", qos: .userInitiated)
+    /// Обход проекта — секунды на крупном проекте. На `work` файл, открытый
+    /// в это время, и поиск ждали бы его конца.
+    private let scanWork = DispatchQueue(label: "pilot.scan", qos: .userInitiated)
     /// Отдельная очередь: на крупном проекте разбор всех исходников — секунды, и на `work`
     /// он задержал бы и поиск файлов, и открытие файла.
     private let typeWork = DispatchQueue(label: "pilot.types", qos: .utility)
@@ -307,14 +311,12 @@ final class Workspace: ObservableObject {
         guard let desired = request.project ?? (file.map(Self.projectRoot(containing:)) ?? request.path)
         else { return }
 
+        let target = file.map { NavTarget(url: $0, range: request.range) }
         if !OpenRequest.staysInRoot(root, file: file, desired: desired, repository: Git.repositoryRoot(for:)) {
-            open(root: desired)
-            // Не дали закрыть проект с несохранёнными правками — остаёмся.
-            guard root == desired else { return }
+            open(root: desired, first: target)
+            return
         }
-        if let file {
-            navigate(to: NavTarget(url: file, range: request.range))
-        }
+        if let target { navigate(to: target) }
     }
 
     private static func projectRoot(containing file: URL) -> URL {
@@ -334,7 +336,11 @@ final class Workspace: ObservableObject {
         }
     }
 
-    func open(root url: URL) {
+    /// `first` — файл, ради которого проект открывают (Unity, Finder).
+    /// Он читается первым, а обход проекта, индексы, git, языковой сервер
+    /// и прочие вкладки начинаются, когда файл уже показан: на проекте
+    /// в четверть миллиона файлов всё это — секунды работы на всех ядрах.
+    func open(root url: URL, first: NavTarget? = nil) {
         guard confirmUnsavedChanges() else { return }
         dropAllBuffers()
         root = url
@@ -342,6 +348,8 @@ final class Workspace: ObservableObject {
         query = ""
         results = []
         items = []
+        index = nil
+        fileCount = 0
         fileTree = nil
         history.removeAll()
         historyIndex = -1
@@ -351,20 +359,44 @@ final class Workspace: ObservableObject {
         filteredTree = nil
         rememberRecent(url)
         languageServerProven = false
-        lsp.workspaceChanged(to: url)
         git.workspaceChanged(to: url)
         review.workspaceChanged(to: url)
         unity.workspaceChanged(to: url)
         requestedFile = nil
-        restoreTabs(root: url)
-        let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
-
         let generation = scanGeneration.bump()
         isIndexing = true
         typeIndex = nil
         typeCount = 0
         isTypeIndexing = true
         symbolIndex = nil
+
+        guard let first else {
+            lsp.workspaceChanged(to: url)
+            restoreTabs(root: url)
+            startIndexing(root: url, generation: generation)
+            return
+        }
+        // Сервер старого проекта не должен увидеть файл нового,
+        // а новый поднимется вместе с остальным.
+        lsp.workspaceChanged(to: nil)
+        // Список вкладок не сохраняем, пока старые не дочитаны: иначе
+        // сохранился бы один этот файл.
+        isRestoringTabs = true
+        appendHistory(first)
+        open(file: first.url, reveal: first.range) { [weak self] in
+            guard let self, self.scanGeneration.isCurrent(generation) else { return }
+            self.lsp.workspaceChanged(to: url)
+            if let buffer = self.buffer, !buffer.isReadOnly { self.lsp.documentOpened(buffer.document) }
+            self.restoreTabs(root: url, takingFocus: false)
+            self.startIndexing(root: url, generation: generation)
+        }
+    }
+
+    /// Обход проекта и всё, что по нему строится; плюс git и Unity.
+    private func startIndexing(root url: URL, generation: Int) {
+        git.refresh()
+        unity.indexAssets()
+        let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
 
         typeWork.async { [weak self] in
             guard let cached = IndexCache.loadTypes(root: url) else { return }
@@ -386,7 +418,7 @@ final class Workspace: ObservableObject {
             }
         }
 
-        work.async { [weak self] in
+        scanWork.async { [weak self] in
             guard let self else { return }
             // 1. Кэш делает повторное открытие проекта мгновенным.
             let cached = IndexCache.load(root: url, exclude: exclude)
@@ -1265,7 +1297,10 @@ final class Workspace: ObservableObject {
     /// `preview` — во временную вкладку, на место прежней временной.
     /// Открыть файл явно (⌘P, двойной клик) — значит оставить его вкладку
     /// насовсем; переход к месту в файле (⌘B) её временность не трогает.
-    func open(file url: URL, reveal: LSPRange? = nil, preview: Bool = false) {
+    ///
+    /// `then` — когда файл показан, не открылся или его сменил другой.
+    func open(file url: URL, reveal: LSPRange? = nil, preview: Bool = false,
+              then: (() -> Void)? = nil) {
         isPaletteOpen = false
         requestedFile = url
         let generation = loadGeneration.bump()
@@ -1277,6 +1312,7 @@ final class Workspace: ObservableObject {
         if let tab = tab(for: url, revision: nil) {
             if !preview, reveal == nil { keepTabOpen(tab) }
             activate(tab, reveal: reveal)
+            then?()
             return
         }
         loadError = nil
@@ -1287,8 +1323,10 @@ final class Workspace: ObservableObject {
             guard let self else { return }
             let result = Result { try LoadedDocument.load(url: url, unity: unityContext) }
             Task { @MainActor in
-                guard counter.isCurrent(generation) else { return }
-                self.present(result, reveal: reveal, preview: preview, replacingPreview: replacingPreview)
+                if counter.isCurrent(generation) {
+                    self.present(result, reveal: reveal, preview: preview, replacingPreview: replacingPreview)
+                }
+                then?()
             }
         }
     }
@@ -1604,12 +1642,16 @@ final class Workspace: ObservableObject {
     }
 
     /// Сначала читается активная — она показывается сразу, — затем
-    /// остальные встают по местам, не отнимая фокус.
-    private func restoreTabs(root: URL) {
+    /// остальные встают по местам, не отнимая фокус. `takingFocus: false` —
+    /// уже открыт файл, ради которого открыли проект: остаётся он.
+    private func restoreTabs(root: URL, takingFocus: Bool = true) {
         persistedTabs = nil
         isRestoringTabs = false
         guard let entry = UserDefaults.standard.dictionary(forKey: Self.tabsKey)?[root.path] as? [String: Any],
-              let files = entry["files"] as? [String], !files.isEmpty else { return }
+              let files = entry["files"] as? [String], !files.isEmpty else {
+            persistTabs()
+            return
+        }
         persistedTabs = entry
         let active = entry["active"] as? String
         let preview = entry["preview"] as? String
@@ -1618,12 +1660,13 @@ final class Workspace: ObservableObject {
 
         let restore = restoreGeneration.bump()
         let restoreCounter = restoreGeneration
-        let load = loadGeneration.bump()
+        // Файл, который открывают в это время, важнее сохранённой активной.
+        let load = takingFocus ? loadGeneration.bump() : nil
         let loadCounter = loadGeneration
         let unityContext = unity.context
         isRestoringTabs = true
 
-        // Не на `work`: там сейчас встанет обход проекта, а ⌘P важнее вкладок.
+        // Не на `work`: он для срочного, а ⌘P важнее вкладок.
         restoreQueue.async { [weak self] in
             var documents: [URL: LoadedDocument] = [:]
             let ordered = (activeURL.map { [$0] } ?? []) + urls.filter { $0 != activeURL }
@@ -1635,7 +1678,7 @@ final class Workspace: ObservableObject {
                     Task { @MainActor in
                         guard let self, restoreCounter.isCurrent(restore) else { return }
                         self.adoptRestored([url], documents: [url: document], preview: preview,
-                                           activate: loadCounter.isCurrent(load) ? url : nil)
+                                           activate: load.map(loadCounter.isCurrent) == true ? url : nil)
                     }
                 }
             }
