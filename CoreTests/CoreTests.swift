@@ -3237,6 +3237,93 @@ check(inComment.declarations.isEmpty, "на ключевом слове ниче
 
 try? FileManager.default.removeItem(at: hierRoot)
 
+// ───────────────────── События файловой системы ────────────────
+section("События файловой системы")
+
+let fsRoot = URL(fileURLWithPath: "/tmp/pilot-fs")
+// Корневой .gitignore типового Unity-проекта: именно эти папки во время
+// компиляции и порождают шквал событий.
+let fsIgnore = IgnoreMatcher(
+    layers: [IgnoreLayer(rules: ["/[Ll]ibrary/", "/[Tt]emp/", "obj/", "*.csproj"]
+                            .compactMap { IgnoreRule(line: $0) }, base: "")],
+    useSoftSkip: false)
+/// Классификация пачки событий; `present` — что сейчас лежит на диске.
+func fsClassify(_ events: [(String, Bool)], present: Set<String>) -> FileChangeBatch {
+    FileChanges.classify(events.map { FileEvent(path: "/tmp/pilot-fs/" + $0.0, structural: $0.1) },
+                         root: fsRoot, ignore: fsIgnore,
+                         exists: { present.contains(String($0.dropFirst("/tmp/pilot-fs/".count))) })
+}
+
+// Правка существующего файла: перечитать его, но список файлов не трогать.
+let fsEdited = fsClassify([("Assets/Game/Player.cs", false)], present: ["Assets/Game/Player.cs"])
+check(fsEdited.changed == ["Assets/Game/Player.cs"] && !fsEdited.needsRescan && fsEdited.removed.isEmpty,
+      "правка файла: перечитать, список не пересобирать")
+
+// Новый файл: и перечитать, и пересобрать список.
+let fsCreated = fsClassify([("Assets/Game/Enemy.cs", true)], present: ["Assets/Game/Enemy.cs"])
+check(fsCreated.changed == ["Assets/Game/Enemy.cs"] && fsCreated.needsRescan,
+      "новый файл: и в индекс, и в список")
+
+// Исчез с диска — значит удалён, какой бы флаг ни пришёл.
+let fsRemoved = fsClassify([("Assets/Game/Old.cs", false)], present: [])
+check(fsRemoved.removed == ["Assets/Game/Old.cs"] && fsRemoved.changed.isEmpty && fsRemoved.needsRescan,
+      "пропавший файл считается удалённым по диску, а не по флагу")
+
+// Шум Unity: Library и Temp отсекаются целиком, даже структурные события.
+let fsNoise = fsClassify([("Library/ScriptAssemblies/Game.dll", true),
+                          ("Temp/build.txt", true),
+                          ("Assets/Game/obj/Debug/x.cs", true),
+                          ("Game.csproj", true),
+                          ("Assets/Game/Player.cs", false)],
+                         present: ["Library/ScriptAssemblies/Game.dll", "Temp/build.txt",
+                                   "Assets/Game/obj/Debug/x.cs", "Game.csproj", "Assets/Game/Player.cs"])
+check(fsNoise.changed == ["Assets/Game/Player.cs"] && !fsNoise.needsRescan,
+      "игнорируемые папки не будят ни индекс, ни пересканирование (получено: \(fsNoise))")
+
+// Своё же ⌘S пишет атомарно — через временный файл и переименование, — и
+// системе видно как создание. Перечитать файл надо, пересобирать список — нет.
+let fsOwn = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets/Game/Player.cs", structural: true)],
+    root: fsRoot, ignore: fsIgnore, ownWrites: ["Assets/Game/Player.cs"], exists: { _ in true })
+check(fsOwn.changed == ["Assets/Game/Player.cs"] && !fsOwn.needsRescan,
+      "своё сохранение не тянет пересканирование списка")
+// А чужой файл с тем же флагом — тянет.
+let fsForeign = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets/Game/Enemy.cs", structural: true)],
+    root: fsRoot, ignore: fsIgnore, ownWrites: ["Assets/Game/Player.cs"], exists: { _ in true })
+check(fsForeign.needsRescan, "чужое появление файла пересобирает список")
+
+// Правило про папку, а событие — про файл глубоко внутри неё.
+check(FileChanges.isIgnored("Library/a/b/c.dll", fsIgnore), "правило /Library/ ловит файл внутри")
+check(!FileChanges.isIgnored("Assets/Library.cs", fsIgnore), "похожее имя файла не считается той папкой")
+
+// Репозиторий: ветка и статус, но в индекс ничего не идёт.
+let fsGit = fsClassify([(".git/HEAD", false), (".git/index", false)], present: [".git/HEAD", ".git/index"])
+check(fsGit.gitTouched && fsGit.changed.isEmpty && !fsGit.needsRescan,
+      "внутренности .git обновляют git, но не индекс")
+
+// Событие вне корня — не наше; событие на самом корне — пересобрать всё.
+let fsOutside = FileChanges.classify([FileEvent(path: "/tmp/other/x.cs", structural: true)],
+                                     root: fsRoot, ignore: fsIgnore, exists: { _ in true })
+check(fsOutside.isEmpty, "чужой путь пропускается")
+let fsRootMoved = FileChanges.classify([FileEvent(path: "/tmp/pilot-fs", structural: true)],
+                                       root: fsRoot, ignore: fsIgnore, exists: { _ in true })
+check(fsRootMoved.needsRescan, "событие на самом корне пересобирает список")
+
+// Правила читаются из корневого .gitignore; без него — типовые мусорные папки.
+let fsDisk = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-fsrules-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.createDirectory(at: fsDisk, withIntermediateDirectories: true)
+check(FileChanges.isIgnored("node_modules/react/index.js", FileChanges.rootMatcher(root: fsDisk)),
+      "без .gitignore работают типовые мусорные папки")
+try? "/[Ll]ibrary/\n*.log\n".write(to: fsDisk.appendingPathComponent(".gitignore"),
+                                    atomically: true, encoding: .utf8)
+let fsFromDisk = FileChanges.rootMatcher(root: fsDisk)
+check(FileChanges.isIgnored("Library/x.dll", fsFromDisk) && FileChanges.isIgnored("a/b/c.log", fsFromDisk),
+      "правила подхватились из корневого .gitignore")
+check(!FileChanges.isIgnored("Assets/Player.cs", fsFromDisk), "исходник не игнорируется")
+try? FileManager.default.removeItem(at: fsDisk)
+
 // ─────────────────── Перегрузки и расширения ───────────────────
 section("Перегрузки и расширения")
 
@@ -3451,6 +3538,17 @@ check(updatedAll.files.map(\.path).sorted() == builtAll.files.map(\.path).sorted
 check(updatedAll.search("Alpha", limit: 10, shouldStop: { false }).count
         == builtAll.search("Alpha", limit: 10, shouldStop: { false }).count,
       "поиск ⌘T после обновления отвечает так же")
+
+// Папку удалили целиком: событий по её файлам система не пришлёт, придёт
+// один путь — значит, уходит и всё, что лежало под ним.
+let afterFolder = SymbolIndex.updating(updatedAll, changed: [], removed: ["Assets"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterFolder.count == 0 && afterFolder.files.isEmpty,
+      "удаление папки вычистило всё поддерево (осталось символов \(afterFolder.count))")
+// А похожее имя рядом не считается той же папкой.
+let afterLookalike = SymbolIndex.updating(updatedAll, changed: [], removed: ["Asset"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterLookalike.count == updatedAll.count, "папка с похожим именем ничего не задела")
 
 check(SymbolIndex.updating(liveBase, changed: ["Assets/A.cs"], shouldStop: { true }) == nil,
       "прерванное обновление возвращает nil, а не половину индекса")

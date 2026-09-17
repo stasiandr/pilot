@@ -311,6 +311,10 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     /// которых нет в `changed` и `removed`, переносятся как есть — ни чтения
     /// диска, ни лексера на них не тратится. Старый индекс не меняется, он
     /// неизменяем и продолжает отвечать из фона, пока новый строится.
+    ///
+    /// В `removed` может лежать и папка: удалённая целиком, она приходит одним
+    /// путём, а событий по своим файлам не присылает. Поэтому уходит и всё,
+    /// что лежало под ней.
     static func updating(_ base: SymbolIndex, changed: [String], removed: Set<String> = [],
                          shouldStop: @escaping () -> Bool) -> SymbolIndex? {
         let parsed = parse(root: base.root, files: changed.filter { !removed.contains($0) },
@@ -334,7 +338,9 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
         }
 
         let fresh = SymbolIndex(root: base.root)
-        for (i, file) in base.files.enumerated() where !handled.contains(file.path) {
+        for (i, file) in base.files.enumerated() {
+            if handled.contains(file.path) { continue }
+            if !removed.isEmpty, removed.contains(where: { file.path.hasPrefix($0 + "/") }) { continue }
             fresh.append(file: file, base.symbols[start[i]..<end[i]])
         }
         // Перепарсенные и новые — следом. Общий порядок путей сбивается,
