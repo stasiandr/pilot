@@ -3391,6 +3391,67 @@ check(AssemblySource.decompiledAssembly(inHeader: "using System;\n#region Assemb
 check(AssemblySource.decompiledAssembly(inHeader: "#region Assembly , Version=1\n") == nil,
       "пустое имя сборки — не признак")
 
+// Индекс типов по сборкам: им отвечает ⌘B, когда исходников нет, а сервер
+// ещё не готов (или ему нечего было грузить).
+let assemblyFile = FileManager.default.temporaryDirectory
+    .appendingPathComponent("pilot-tests-\(getpid())-Demo.dll")
+try? Data(demo).write(to: assemblyFile)
+let assemblies = AssemblyIndex.build(assemblies: [assemblyFile, assemblyFile])
+check(assemblies.assemblyCount == 1, "одна и та же сборка дважды считается один раз")
+check(assemblies.count == 1, "в индекс попал Greeter, но не <Module>")
+let greeter = assemblies.matching(name: "Greeter")
+check(greeter.count == 1, "тип находится по точному имени")
+if let id = greeter.first {
+    check(assemblies.entry(id).namespace == "Demo", "пространство имён типа")
+    check(assemblies.entry(id).full == "Demo.Greeter", "полное имя")
+    let target = assemblies.target(id)
+    check(target.url == assemblyFile && target.declaration == "Greeter" && target.range == nil,
+          "цель перехода — сборка и имя типа: строку узнаем, когда соберём текст")
+    check(assemblies.declaration(id).path == assemblyFile.lastPathComponent, "в списке видна сборка")
+}
+check(assemblies.matching(name: "greeter").isEmpty, "регистр важен, как и в C#")
+check(assemblies.search("gree", limit: 5, shouldStop: { false }).count == 1, "нечёткий поиск по типам сборок")
+check(assemblies.search("Demo.Gr", limit: 5, shouldStop: { false }).count == 1,
+      "запрос с точкой ищет вместе с пространством имён")
+check(assemblies.search("zzz", limit: 5, shouldStop: { false }).isEmpty, "чужой запрос — пусто")
+check(AssemblyIndex.Entry(assembly: 0, name: "Task", namespace: "System.Threading.Tasks", arity: 1)
+        .display == "Task<>",
+      "обобщённый тип виден как Task<>: иначе два Task в списке неотличимы")
+check(AssemblyIndex.Entry(assembly: 0, name: "Dictionary", namespace: "System.Collections.Generic", arity: 2)
+        .display == "Dictionary<,>", "число параметров видно по запятым")
+try? FileManager.default.removeItem(at: assemblyFile)
+
+// Проектные файлы Unity: их пишет пакет выбранного редактора, а не Unity,
+// поэтому их запросто может не быть или они отстают от последней компиляции.
+let fm = FileManager.default
+let fakeProject = fm.temporaryDirectory.appendingPathComponent("pilot-tests-\(getpid())-unity")
+try? fm.removeItem(at: fakeProject)
+try? fm.createDirectory(at: fakeProject.appendingPathComponent("Assets"), withIntermediateDirectories: true)
+try? fm.createDirectory(at: fakeProject.appendingPathComponent("ProjectSettings"),
+                        withIntermediateDirectories: true)
+try? "m_EditorVersion: 6000.3.14f1".write(
+    to: fakeProject.appendingPathComponent("ProjectSettings/ProjectVersion.txt"),
+    atomically: true, encoding: .utf8)
+let unityProject = UnityProjectInfo.detect(root: fakeProject)
+check(unityProject?.editorVersion == "6000.3.14f1", "версия редактора из ProjectVersion.txt")
+check(unityProject?.projectFiles == .missing, "без .csproj серверу нечего грузить")
+
+func touch(_ url: URL, _ date: Date) {
+    try? "x".write(to: url, atomically: true, encoding: .utf8)
+    try? fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+}
+let day: TimeInterval = 86_400
+touch(fakeProject.appendingPathComponent("Assembly-CSharp.csproj"), Date() - day)
+check(unityProject?.projectFiles == .ready, ".csproj есть, компиляций не было — годится")
+
+try? fm.createDirectory(at: fakeProject.appendingPathComponent("Library/ScriptAssemblies"),
+                        withIntermediateDirectories: true)
+touch(fakeProject.appendingPathComponent("Library/ScriptAssemblies/Assembly-CSharp.dll"), Date() - 2 * day)
+check(unityProject?.projectFiles == .ready, "сборки старше проектных файлов — те ещё свежие")
+touch(fakeProject.appendingPathComponent("Library/ScriptAssemblies/Assembly-CSharp.dll"), Date())
+check(unityProject?.projectFiles == .stale, "скрипты компилировались после генерации — файлы устарели")
+try? fm.removeItem(at: fakeProject)
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

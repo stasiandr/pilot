@@ -339,9 +339,21 @@ struct RootView: View {
     }
 
     private var unityHelp: String {
+        let projectFiles: String
+        switch workspace.unity.projectFiles {
+        case .ready:
+            projectFiles = ""
+        case .stale:
+            projectFiles = "\nПроектные файлы Unity устарели: скрипты компилировались позже, "
+                + "чем писались .csproj — языковой сервер видит проект не целиком."
+        case .missing:
+            projectFiles = "\nПроектные файлы Unity не сгенерированы: языковому серверу нечего "
+                + "читать. Их пишет пакет выбранного редактора — обновить можно, "
+                + "на минуту выбрав Rider или Visual Studio в External Script Editor."
+        }
         let assets = workspace.unity.assets.map { "Ассетов с GUID: \($0.count)." } ?? "Собираю GUID ассетов…"
         return """
-            \(assets)
+            \(assets)\(projectFiles)
             ⌘B или ⌘+клик по GUID — открыть ассет, по fileID — перейти к объекту.
             ⇧⌘R — где используется открытый ассет. ⌃⌘M — ассет ↔ .meta.
             ⌥⌘0 — инспектор сцены, префаба или ассета.

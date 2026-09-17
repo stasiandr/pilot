@@ -19,6 +19,10 @@ final class UnityAssetIndex: @unchecked Sendable {   // неизменяем п�
     /// Скрипты по имени файла: `Team` → `Assets/Scripts/Team.cs`. Так
     /// находится enum, объявленный в своём файле.
     private let scriptByName: [String: String]
+    /// Сборки проекта: плагины в `Assets`, библиотеки пакетов. Попадаются
+    /// здесь потому, что у каждой есть свой `.meta`, — отдельный обход
+    /// диска ради них не нужен.
+    private(set) var assemblyPaths: [String] = []
 
     var count: Int { pathByGUID.count }
 
@@ -36,6 +40,8 @@ final class UnityAssetIndex: @unchecked Sendable {   // неизменяем п�
             if path.hasSuffix(".cs") {
                 let name = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
                 if scripts[name] == nil { scripts[name] = path }
+            } else if path.hasSuffix(".dll") {
+                assemblyPaths.append(path)
             }
         }
         pathByGUID = byGUID

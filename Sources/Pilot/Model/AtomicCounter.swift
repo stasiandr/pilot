@@ -16,6 +16,13 @@ final class AtomicCounter: @unchecked Sendable {
         return value
     }
 
+    /// Текущее поколение — для того, кто обход не запускал, а лишь
+    /// пристраивает к нему свою фоновую работу.
+    var current: Int {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+
     /// Актуально ли ещё это поколение.
     func isCurrent(_ generation: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }

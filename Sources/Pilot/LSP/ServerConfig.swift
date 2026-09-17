@@ -192,13 +192,22 @@ enum ServerRegistry {
         return [executable]
     }
 
-    /// Ищет .sln в корне проекта: без него Roslyn и csharp-ls
-    /// сами угадывают, что грузить, и часто угадывают не то.
+    /// Ищет .sln в корне проекта, а если его там нет — в папке
+    /// Unity-проекта: без solution Roslyn и csharp-ls сами угадывают,
+    /// что грузить, и часто угадывают не то.
     static func findSolution(root: URL) -> URL? {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(at: root,
-                                                        includingPropertiesForKeys: nil,
-                                                        options: [.skipsHiddenFiles]) else { return nil }
+        if let found = solution(in: root) { return found }
+        // Unity-проект бывает в подпапке репозитория, а solution он пишет
+        // рядом с собой. Без этого сервер поднимался бы вообще без проектов.
+        if let unity = UnityProjectInfo.find(inWorkspace: root), unity.root.path != root.path {
+            return solution(in: unity.root)
+        }
+        return nil
+    }
+
+    private static func solution(in directory: URL) -> URL? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
         if let sln = entries.first(where: { $0.pathExtension == "sln" }) { return sln }
         if let slnx = entries.first(where: { $0.pathExtension == "slnx" }) { return slnx }
         return entries.first { $0.pathExtension == "csproj" }
