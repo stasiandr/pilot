@@ -16,6 +16,9 @@ struct LoadedDocument: Sendable {
     /// показывает файл в версии MR: она не совпадает с рабочей копией,
     /// поэтому такой документ только для чтения и никогда не сохраняется.
     var revision: String? = nil
+    /// Текст получен из сборки .NET, а не прочитан с диска: правки такому
+    /// документу некуда сохранить, и языковой сервер его не видел.
+    var isDecompiled = false
     /// Сцена, префаб или другой сериализованный ассет Unity — разобранный.
     var unityFile: UnityYAMLFile? = nil
     /// Её иерархия: GameObject'ы и вложенные префабы — для дерева проекта.
@@ -53,6 +56,13 @@ struct LoadedDocument: Sendable {
     static let maxBytes = 64 * 1024 * 1024
 
     static func load(url: URL, unity: UnityContext? = nil) throws -> LoadedDocument {
+        // Сборка .NET — не текст: вместо байтов показываем её объявления.
+        if AssemblySource.isAssembly(url) {
+            var document = make(url: url, text: try AssemblySource.text(of: url), encoding: .utf8,
+                                revision: nil, unity: nil, spec: Languages.csharp)
+            document.isDecompiled = true
+            return document
+        }
         let (text, encoding) = try readTextAndEncoding(url: url, maxBytes: maxBytes)
         return make(url: url, text: text, encoding: encoding, revision: nil, unity: unity)
     }
@@ -64,8 +74,9 @@ struct LoadedDocument: Sendable {
     }
 
     private static func make(url: URL, text: String, encoding: String.Encoding,
-                             revision: String?, unity: UnityContext?) -> LoadedDocument {
-        let spec = Languages.detect(filename: url.lastPathComponent)
+                             revision: String?, unity: UnityContext?,
+                             spec forced: LanguageSpec? = nil) -> LoadedDocument {
+        let spec = forced ?? Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
         let outline = OutlineBuilder.build(model: model)
         let semantics = UnitySemantics.analyze(model: model, lexicalOutline: outline, context: unity)

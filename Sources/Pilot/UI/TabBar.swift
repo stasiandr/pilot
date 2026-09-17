@@ -79,7 +79,7 @@ struct TabBar: View {
             .disabled(index == workspace.tabs.count - 1)
         Divider()
         Button("Показать в Finder") { NSWorkspace.shared.activateFileViewerSelecting([tab.url]) }
-            .disabled(tab.isReadOnly)
+            .disabled(tab.isReviewVersion)
         Button("Скопировать путь") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
@@ -121,11 +121,16 @@ private struct TabItem: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
             }
-            if tab.isReadOnly {
+            if tab.isReviewVersion {
                 Image(systemName: "arrow.triangle.pull")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Color(nsColor: Theme.reviewThread))
                     .help("Версия из мерж-реквеста — только для чтения")
+            } else if tab.document.isDecompiled {
+                Image(systemName: "shippingbox")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .help("Объявления из сборки — только для чтения")
             }
             closeSlot
         }

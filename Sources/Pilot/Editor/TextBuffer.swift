@@ -55,7 +55,9 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     var model: SyntaxModel { document.model }
     /// Версия файла из коммита (ревью MR): правок в ней не бывает,
     /// и сохранять её поверх рабочей копии нельзя.
-    var isReadOnly: Bool { document.revision != nil }
+    var isReviewVersion: Bool { document.revision != nil }
+    /// Править нечего: версия из MR или текст, собранный из сборки .NET.
+    var isReadOnly: Bool { isReviewVersion || document.isDecompiled }
 
     init(document: LoadedDocument, fontSize: CGFloat) {
         self.document = document

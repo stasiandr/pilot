@@ -1371,7 +1371,7 @@ final class Workspace: ObservableObject {
                 return
             }
             let buffer = TextBuffer(document: doc, fontSize: fontSize)
-            if replacingReviewTab, let current = self.buffer, current.isReadOnly,
+            if replacingReviewTab, let current = self.buffer, current.isReviewVersion,
                let index = tabs.firstIndex(where: { $0 === current }) {
                 // Версия из MR правок не знает — терять при замене нечего.
                 discard(current)
@@ -1579,6 +1579,7 @@ final class Workspace: ObservableObject {
             if buffer.isReadOnly {
                 // Версия из MR: полоски и треды даёт ревью, а не HEAD. Серверу
                 // её не показываем — у него на руках рабочая копия того же файла.
+                // Текст сборки тем более: на диске по этому пути не C#, а байты.
                 git.documentOpened(nil)
             } else {
                 // Сервер поднимается здесь — лениво, при первом файле
@@ -1624,8 +1625,10 @@ final class Workspace: ObservableObject {
 
     private func persistTabs() {
         guard let root, !isRestoringTabs else { return }
-        let files = tabs.filter { !$0.isReadOnly }.map(\.url.path)
-        let active = buffer.flatMap { $0.isReadOnly ? nil : $0.url.path } ?? ""
+        // Декомпилированные вкладки помнятся наравне с файлами: их текст
+        // соберётся заново из той же сборки. Версии из MR — нет: MR закрыт.
+        let files = tabs.filter { !$0.isReviewVersion }.map(\.url.path)
+        let active = buffer.flatMap { $0.isReviewVersion ? nil : $0.url.path } ?? ""
         let preview = previewTab?.url.path ?? ""
         let entry: [String: Any] = ["files": files, "active": active, "preview": preview]
         if let persistedTabs, persistedTabs["files"] as? [String] == files,
