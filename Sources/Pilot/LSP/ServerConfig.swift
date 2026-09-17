@@ -173,6 +173,16 @@ enum ServerRegistry {
         "csharp|background_analysis.dotnet_compiler_diagnostics_scope": "none",
         // ⌘T ищет по коду проекта, а не по UnityEngine.dll и прочим сборкам.
         "csharp|symbol_search.dotnet_search_reference_assemblies": false,
+        // ⌘B на типе из сборки без исходников: Roslyn декомпилирует его
+        // (внутри у него ILSpy), кладёт .cs в свой временный кэш и отдаёт
+        // путь к нему обычным Location. Второе — про сборки, у которых есть
+        // PDB с Source Link или вшитыми исходниками: тогда вместо
+        // декомпиляции приходит настоящий код. Обе секции идут без
+        // префикса `csharp|`: это глобальные настройки, язык у них не
+        // спрашивают. Значения по умолчанию у Roslyn те же, но полагаться
+        // на них не хочется — они его, а не наши.
+        "navigation.dotnet_navigate_to_decompiled_sources": true,
+        "navigation.dotnet_navigate_to_source_link_and_embedded_sources": true,
     ]
 
     private static func solutionArguments(root: URL, executable: String) -> [String] {

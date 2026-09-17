@@ -3379,6 +3379,18 @@ check(TypeName.withoutArity("Dictionary`2") == "Dictionary" && TypeName.arity("D
       "число параметров в имени типа")
 check(TypeName.withoutArity("Json`Name") == "Json`Name", "обратная кавычка без числа — часть имени")
 
+// Файл из кэша языкового сервера узнаётся по шапке, которую он сам и пишет.
+let roslynHeader = "\u{FEFF}#region Assembly UnityEngine.CoreModule, Version=0.0.0.0, Culture=neutral\n"
+    + "// /Applications/Unity/UnityEngine.CoreModule.dll\n#endregion\n\npublic struct Vector3 { }\n"
+check(AssemblySource.decompiledAssembly(inHeader: roslynHeader) == "UnityEngine.CoreModule",
+      "имя сборки из шапки Roslyn, BOM не мешает")
+check(AssemblySource.decompiledAssembly(inHeader: "#region Assembly UnityLike\nstruct V { }") == "UnityLike",
+      "шапка без версии")
+check(AssemblySource.decompiledAssembly(inHeader: "using System;\n#region Assembly Foo, Version=1\n") == nil,
+      "region не первой строкой — обычный исходник")
+check(AssemblySource.decompiledAssembly(inHeader: "#region Assembly , Version=1\n") == nil,
+      "пустое имя сборки — не признак")
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

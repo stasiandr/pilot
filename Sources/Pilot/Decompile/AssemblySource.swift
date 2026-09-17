@@ -17,6 +17,23 @@ enum AssemblySource {
         extensions.contains(url.pathExtension.lowercased())
     }
 
+    /// Имя сборки из шапки декомпилированного файла — или nil, если это
+    /// обычный исходник.
+    ///
+    /// Языковой сервер (Roslyn, а до него Visual Studio и Rider) начинает
+    /// такой файл строкой `#region Assembly UnityEngine.CoreModule,
+    /// Version=…`. По ней Pilot и узнаёт чужой код в своём кэше: где лежит
+    /// этот кэш, сервер нигде не объявляет, а шапку пишет всегда.
+    static func decompiledAssembly(inHeader text: String) -> String? {
+        var line = Substring(text.prefix { !$0.isNewline })
+        if line.first == "\u{FEFF}" { line = line.dropFirst() }      // Roslyn пишет файл с BOM
+        let marker = "#region Assembly "
+        guard line.hasPrefix(marker) else { return nil }
+        let name = line.dropFirst(marker.count).prefix { $0 != "," }
+            .trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? nil : name
+    }
+
     /// Текст сборки. Бросает, если это не .NET-библиотека, а нативная
     /// или битый файл. Синхронный и не из главного потока: на крупной
     /// сборке разбор идёт десятки миллисекунд.

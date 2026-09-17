@@ -1072,8 +1072,11 @@ final class Workspace: ObservableObject {
         }
 
         // Файл из MR сервер не видел: у него на руках рабочая копия, и его
-        // позиции указали бы не туда. Для версии MR — только свой навигатор.
-        guard lsp.isReady, document.revision == nil else {
+        // позиции указали бы не туда. Текст, собранный Pilot из метаданных
+        // .dll, — тем более: по этому пути у сервера лежит сборка, а не код.
+        // А вот файл из его собственного кэша (`.languageServer`) он знает,
+        // и ⌘B оттуда ведёт дальше, как из обычного исходника.
+        guard lsp.isReady, document.revision == nil, document.decompiled != .assembly else {
             jumpToLocalDeclaration(at: offset, in: document)
             return
         }
@@ -1122,11 +1125,29 @@ final class Workspace: ObservableObject {
     /// с таким именем несколько — показываем их списком, ближние первыми.
     private func jumpToLocalDeclaration(at offset: Int, in document: LoadedDocument) {
         let answer = LocalNavigator(index: symbolIndex, document: navDocument(document)).definition(at: offset)
-        guard let first = answer.declarations.first else { return }
+        guard let first = answer.declarations.first else {
+            explainMissingDefinition()
+            return
+        }
         if answer.isExact {
             navigate(to: first.target)
         } else {
             showDeclarations(answer.declarations)
+        }
+    }
+
+    /// ⌘B не нашёл ничего. Молчание в ответ выглядит как сломанная клавиша,
+    /// а чаще всего причина простая: объявление лежит в сборке, и знает о
+    /// нём только языковой сервер — который в этот момент ещё грузится.
+    private func explainMissingDefinition() {
+        switch lsp.state {
+        case .starting(let progress):
+            let detail = progress.isEmpty ? "" : " (\(progress))"
+            showNotice("Объявление знает языковой сервер — он ещё запускается\(detail)")
+        case .failed(let why):
+            showNotice("Объявление не найдено: языковой сервер не работает — \(why)")
+        case .stopped, .ready:
+            showNotice("Объявление не найдено")
         }
     }
 
@@ -1165,8 +1186,9 @@ final class Workspace: ObservableObject {
         paletteBusy = true
         isPaletteOpen = true
 
-        // Неполный ответ полузагруженного сервера хуже честного поиска по тексту.
-        guard lsp.isReady, languageServerProven else {
+        // Неполный ответ полузагруженного сервера хуже честного поиска по
+        // тексту. Про текст из метаданных .dll сервер вообще ничего не знает.
+        guard lsp.isReady, languageServerProven, document.decompiled != .assembly else {
             findLocalReferences(at: offset, in: document)
             return
         }
@@ -1426,7 +1448,8 @@ final class Workspace: ObservableObject {
         _ = loadGeneration.bump()
         rememberPosition()
         // Историю ведут по пути: версию из MR она открыла бы рабочей копией.
-        if !tab.isReadOnly { appendHistory(NavTarget(url: tab.url, range: nil)) }
+        // Сборка по своему пути откроется той же — её записать можно.
+        if !tab.isReviewVersion { appendHistory(NavTarget(url: tab.url, range: nil)) }
         requestedFile = tab.url
         activate(tab, reveal: nil)
     }
@@ -1472,7 +1495,7 @@ final class Workspace: ObservableObject {
         guard let current = buffer, current !== start else { return }
         activationCounter += 1
         current.lastActivated = activationCounter
-        if !current.isReadOnly { appendHistory(NavTarget(url: current.url, range: nil)) }
+        if !current.isReviewVersion { appendHistory(NavTarget(url: current.url, range: nil)) }
         persistTabs()
     }
 
@@ -1625,10 +1648,10 @@ final class Workspace: ObservableObject {
 
     private func persistTabs() {
         guard let root, !isRestoringTabs else { return }
-        // Декомпилированные вкладки помнятся наравне с файлами: их текст
-        // соберётся заново из той же сборки. Версии из MR — нет: MR закрыт.
-        let files = tabs.filter { !$0.isReviewVersion }.map(\.url.path)
-        let active = buffer.flatMap { $0.isReviewVersion ? nil : $0.url.path } ?? ""
+        // Вкладка со сборкой помнится наравне с файлом: её текст соберётся
+        // заново из той же .dll.
+        let files = tabs.filter(\.isRestorable).map(\.url.path)
+        let active = buffer.flatMap { $0.isRestorable ? $0.url.path : nil } ?? ""
         let preview = previewTab?.url.path ?? ""
         let entry: [String: Any] = ["files": files, "active": active, "preview": preview]
         if let persistedTabs, persistedTabs["files"] as? [String] == files,

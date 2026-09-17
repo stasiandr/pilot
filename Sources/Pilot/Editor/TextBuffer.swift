@@ -56,8 +56,16 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     /// Версия файла из коммита (ревью MR): правок в ней не бывает,
     /// и сохранять её поверх рабочей копии нельзя.
     var isReviewVersion: Bool { document.revision != nil }
-    /// Править нечего: версия из MR или текст, собранный из сборки .NET.
-    var isReadOnly: Bool { isReviewVersion || document.isDecompiled }
+    /// Править нечего: версия из MR или код, полученный из сборки.
+    var isReadOnly: Bool { isReviewVersion || document.decompiled != nil }
+    /// Вкладку можно вернуть после перезапуска: и файл, и сборка лежат на
+    /// своих местах. Кэш языкового сервера — нет: его временную папку
+    /// вычищают, и ссылку на неё хранить незачем.
+    var isRestorable: Bool {
+        if isReviewVersion { return false }
+        if case .languageServer = document.decompiled { return false }
+        return true
+    }
 
     init(document: LoadedDocument, fontSize: CGFloat) {
         self.document = document
