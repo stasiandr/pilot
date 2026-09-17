@@ -3237,6 +3237,97 @@ check(inComment.declarations.isEmpty, "на ключевом слове ниче
 
 try? FileManager.default.removeItem(at: hierRoot)
 
+// ────────────────────── Индекс: правка файла ───────────────────
+section("Индекс: правка файла")
+
+let liveRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-live-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: liveRoot)
+func liveWrite(_ path: String, _ text: String?) {
+    let url = liveRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if let text {
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+    } else {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+let livePaths = ["Assets/A.cs", "Assets/B.cs", "Assets/C.cs", "Assets/D.cs"]
+liveWrite("Assets/A.cs", "namespace Game { public class Alpha { public void Run() { } } }")
+liveWrite("Assets/B.cs", "using Game;\nnamespace Game { public class Beta : Alpha { } }")
+liveWrite("Assets/C.cs", "using Game;\nusing Vec = Game.Alpha;\n")   // только using, без объявлений
+liveWrite("Assets/D.cs", "namespace Game { public class Delta { } }")
+let liveBase = SymbolIndex.build(root: liveRoot, files: livePaths, shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(liveBase.typesByName["Alpha"]?.count == 1 && liveBase.typesByName["Delta"]?.count == 1,
+      "исходный индекс собран")
+
+/// Слепок индекса, не зависящий от порядка файлов внутри него.
+func liveShape(_ index: SymbolIndex) -> [String] {
+    (0..<index.count).map { i -> String in
+        let id = Int32(i)
+        let s = index[id]
+        return "\(index.relPath(id))|\(s.container ?? "")|\(s.name)|\(s.kind.rawValue)|\(s.line):\(s.column)"
+    }.sorted()
+}
+
+// Главное свойство: неизменившиеся файлы не перечитываются. Проверяем это
+// не таймингом, а буквально — убираем их с диска перед обновлением.
+liveWrite("Assets/A.cs", "namespace Game { public class Alpha { public void Walk() { } }\n"
+                       + "public class AlphaTwo { } }")
+for path in ["Assets/B.cs", "Assets/C.cs", "Assets/D.cs"] { liveWrite(path, nil) }
+let afterEdit = SymbolIndex.updating(liveBase, changed: ["Assets/A.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterEdit.typesByName["AlphaTwo"]?.count == 1, "новый класс из правленого файла попал в индекс")
+check(afterEdit.byName["Walk"] != nil && afterEdit.byName["Run"] == nil,
+      "переименованный метод заменён, старого имени не осталось")
+check(afterEdit.typesByName["Delta"]?.count == 1, "нетронутый файл уцелел, хотя его уже нет на диске")
+check(afterEdit.files.contains { $0.path == "Assets/C.cs" && $0.usings == ["Game"]
+                                 && $0.aliases["Vec"] == "Game.Alpha" },
+      "файл без объявлений сохранил свои using и псевдонимы")
+check(afterEdit.derivedByBase["Alpha"]?.count == 1, "таблица наследников пересобрана, Beta на месте")
+
+// Файл опустел: его символы уходят, сам он выпадает из индекса.
+liveWrite("Assets/D.cs", "// тут больше ничего нет\n")
+let afterEmpty = SymbolIndex.updating(afterEdit, changed: ["Assets/D.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterEmpty.typesByName["Delta"] == nil, "класс из опустевшего файла исчез")
+check(!afterEmpty.files.contains { $0.path == "Assets/D.cs" }, "пустой файл не держим")
+
+// Новый файл, которого в индексе не было вовсе.
+liveWrite("Assets/E.cs", "namespace Game { public class Epsilon : Alpha { } }")
+let afterNew = SymbolIndex.updating(afterEmpty, changed: ["Assets/E.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterNew.typesByName["Epsilon"]?.count == 1, "файл, которого в индексе не было, добавлен")
+check(afterNew.derivedByBase["Alpha"]?.count == 2, "у Alpha стало двое наследников")
+
+// Удаление: файла нет ни на диске, ни в индексе.
+let afterRemove = SymbolIndex.updating(afterNew, changed: [], removed: ["Assets/B.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterRemove.typesByName["Beta"] == nil, "удалённый файл вычищен из индекса")
+check(afterRemove.derivedByBase["Alpha"]?.count == 1, "наследник удалённого файла пропал из таблицы")
+
+// Обновить всё — то же, что собрать заново.
+liveWrite("Assets/B.cs", "using Game;\nnamespace Game { public class Beta : Alpha { } }")
+liveWrite("Assets/C.cs", "using Game;\nusing Vec = Game.Alpha;\n")
+liveWrite("Assets/D.cs", "namespace Game { public class Delta { } }")
+let allPaths = livePaths + ["Assets/E.cs"]
+let updatedAll = SymbolIndex.updating(afterRemove, changed: allPaths, shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+let builtAll = SymbolIndex.build(root: liveRoot, files: allPaths, shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(liveShape(updatedAll) == liveShape(builtAll), "обновление всех файлов совпало с полной сборкой")
+check(updatedAll.files.map(\.path).sorted() == builtAll.files.map(\.path).sorted(),
+      "список файлов совпал с полной сборкой")
+check(updatedAll.search("Alpha", limit: 10, shouldStop: { false }).count
+        == builtAll.search("Alpha", limit: 10, shouldStop: { false }).count,
+      "поиск ⌘T после обновления отвечает так же")
+
+check(SymbolIndex.updating(liveBase, changed: ["Assets/A.cs"], shouldStop: { true }) == nil,
+      "прерванное обновление возвращает nil, а не половину индекса")
+
+try? FileManager.default.removeItem(at: liveRoot)
+
 // ─────────────────────────── Вкладки ───────────────────────────
 section("Вкладки")
 check(Tabs.insertionIndex(active: 1, count: 4) == 2, "новая вкладка — сразу за активной")

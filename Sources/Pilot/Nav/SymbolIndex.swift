@@ -94,7 +94,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
 
     // MARK: - Наполнение
 
-    fileprivate func append(file: SourceFileInfo, _ found: [Symbol]) {
+    fileprivate func append(file: SourceFileInfo, _ found: some Sequence<Symbol>) {
         let fileID = Int32(files.count)
         files.append(file)
         for var s in found {
@@ -271,6 +271,65 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     /// Разбирает все исходники проекта на всех ядрах — вызывать только из фона.
     /// Если воркспейс сменился, возвращает nil, а не половину индекса.
     static func build(root: URL, files: [String], shouldStop: @escaping () -> Bool) -> SymbolIndex? {
+        let found = parse(root: root, files: files, shouldStop: shouldStop)
+        if shouldStop() { return nil }
+
+        let index = SymbolIndex(root: root)
+        // Файл без объявлений держим только ради его `using` — по ним
+        // разбираются одноимённые типы.
+        for (info, symbols) in found.sorted(by: { $0.0.path < $1.0.path })
+        where !symbols.isEmpty || !info.usings.isEmpty {
+            index.append(file: info, symbols)
+        }
+        index.finish()
+        return index
+    }
+
+    /// Те же исходники, но разобранные поверх готового индекса: символы файлов,
+    /// которых нет в `changed` и `removed`, переносятся как есть — ни чтения
+    /// диска, ни лексера на них не тратится. Старый индекс не меняется, он
+    /// неизменяем и продолжает отвечать из фона, пока новый строится.
+    static func updating(_ base: SymbolIndex, changed: [String], removed: Set<String> = [],
+                         shouldStop: @escaping () -> Bool) -> SymbolIndex? {
+        let parsed = parse(root: base.root, files: changed.filter { !removed.contains($0) },
+                           shouldStop: shouldStop)
+        if shouldStop() { return nil }
+
+        // Всё, что назвали, из старого индекса уходит: файл мог опустеть,
+        // мог перестать быть исходником, мог исчезнуть с диска.
+        let handled = Set(changed).union(removed)
+
+        // Символы каждого файла лежат подряд — и build, и deserialize пишут
+        // их пофайлово. Границы находим одним проходом, без копирования.
+        var end = [Int](repeating: 0, count: base.files.count)
+        for (i, s) in base.symbols.enumerated() { end[Int(s.file)] = i + 1 }
+        var cursor = 0
+        var start = [Int](repeating: 0, count: base.files.count)
+        for i in 0..<base.files.count {
+            start[i] = cursor
+            if end[i] < cursor { end[i] = cursor }   // файл без объявлений
+            cursor = end[i]
+        }
+
+        let fresh = SymbolIndex(root: base.root)
+        for (i, file) in base.files.enumerated() where !handled.contains(file.path) {
+            fresh.append(file: file, base.symbols[start[i]..<end[i]])
+        }
+        // Перепарсенные и новые — следом. Общий порядок путей сбивается,
+        // но на ответы он не влияет: сравнения путей везде явные.
+        for (info, symbols) in parsed.sorted(by: { $0.0.path < $1.0.path })
+        where !symbols.isEmpty || !info.usings.isEmpty {
+            fresh.append(file: info, symbols)
+        }
+        if shouldStop() { return nil }
+        fresh.finish()
+        return fresh
+    }
+
+    /// Разбор пачки файлов на всех ядрах. Возвращает и пустые результаты —
+    /// по ним видно, что файл разобран и объявлений в нём не осталось.
+    private static func parse(root: URL, files: [String],
+                              shouldStop: @escaping () -> Bool) -> [(SourceFileInfo, [Symbol])] {
         var specsByExtension: [String: LanguageSpec?] = [:]
         var candidates: [(path: String, spec: LanguageSpec)] = []
         for path in files {
@@ -306,21 +365,14 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
                 // прохода: на 26 000 файлов это гигабайты.
                 drainingAutoreleased {
                     guard let text = readSource(root.appendingPathComponent(path)) else { return }
-                    let entry = extract(text: text, spec: spec, path: path)
-                    if !entry.1.isEmpty || !entry.0.usings.isEmpty { local.append(entry) }
+                    local.append(extract(text: text, spec: spec, path: path))
                 }
             }
             lock.lock()
             found.append(contentsOf: local)
             lock.unlock()
         }
-        if shouldStop() { return nil }
-
-        found.sort { $0.0.path < $1.0.path }
-        let index = SymbolIndex(root: root)
-        for (info, symbols) in found { index.append(file: info, symbols) }
-        index.finish()
-        return index
+        return found
     }
 
     /// Файлы больше этого почти всегда сгенерированы, а разбор одного такого

@@ -271,6 +271,13 @@ final class Workspace: ObservableObject {
     /// ⌘R без сервера читает все исходники — не на `work`, чтобы в это время
     /// открывались файлы и работал поиск.
     private let referenceQueue = DispatchQueue(label: "pilot.references", qos: .userInitiated)
+
+    /// Сохранённые файлы, ждущие переиндексации, и поколение символов.
+    /// Поколение своё: полный разбор проекта и переиндексация по сохранению
+    /// идут по одному пути и не должны затирать друг друга задним числом.
+    private var pendingReindex: Set<String> = []
+    private var reindexScheduled = false
+    private let symbolGeneration = AtomicCounter()
     private let scanGeneration = AtomicCounter()
     private let searchGeneration = AtomicCounter()
     private let loadGeneration = AtomicCounter()
@@ -369,6 +376,8 @@ final class Workspace: ObservableObject {
         typeCount = 0
         isTypeIndexing = true
         symbolIndex = nil
+        pendingReindex.removeAll()
+        _ = symbolGeneration.bump()
 
         guard let first else {
             lsp.workspaceChanged(to: url)
@@ -479,13 +488,15 @@ final class Workspace: ObservableObject {
     /// быстрого навигатора, а типы для ⇧⇧ просто выбираются из них.
     private func rebuildTypeIndex(files: [String], root url: URL, generation: Int) {
         let counter = scanGeneration
+        let batch = symbolGeneration
+        let symbolBatch = symbolGeneration.bump()
         typeWork.async { [weak self] in
             guard let symbols = SymbolIndex.build(root: url, files: files,
                                                   shouldStop: { !counter.isCurrent(generation) })
             else { return }
             let fresh = TypeIndex.make(root: url, entries: symbols.typeEntries())
             Task { @MainActor in
-                guard let self, counter.isCurrent(generation) else { return }
+                guard let self, counter.isCurrent(generation), batch.isCurrent(symbolBatch) else { return }
                 self.symbolIndex = symbols
                 self.adoptTypes(fresh, indexing: false)
             }
@@ -499,6 +510,62 @@ final class Workspace: ObservableObject {
         typeCount = newIndex.count
         isTypeIndexing = indexing
         runClassSearch()
+        // Полный разбор закончился — можно применить сохранения, которые
+        // пришлись на него: ждать следующего было бы неоткуда.
+        if !indexing, !pendingReindex.isEmpty { scheduleReindexFlush() }
+    }
+
+    // MARK: - Переиндексация правленого файла
+
+    /// Файл сохранён — его объявления в индексе устарели. Пересобираем индекс,
+    /// перечитав с диска только его: символы остальных файлов переносятся из
+    /// старого индекса как есть. Полный разбор проекта стоил бы секунды.
+    private func reindexAfterSave(_ url: URL) {
+        guard let root, url.path.hasPrefix(root.path + "/") else { return }
+        let path = String(url.path.dropFirst(root.path.count + 1))
+        guard SymbolIndex.spec(forPath: path) != nil else { return }   // не исходник — нечего разбирать
+        pendingReindex.insert(path)
+        scheduleReindexFlush()
+    }
+
+    /// ⌥⌘S сохраняет пачкой — ждём, пока она уляжется, и пересобираем один раз.
+    private func scheduleReindexFlush() {
+        guard !reindexScheduled else { return }
+        reindexScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            self?.flushReindex()
+        }
+    }
+
+    private func flushReindex() {
+        reindexScheduled = false
+        guard !pendingReindex.isEmpty else { return }
+        guard let root, let base = symbolIndex else { pendingReindex.removeAll(); return }
+        // Полный разбор проекта всё равно прочитает эти файлы с диска. Не
+        // мешаем ему: он сам позовёт сюда снова, когда закончит.
+        guard !isTypeIndexing else { return }
+
+        let changed = Array(pendingReindex)
+        pendingReindex.removeAll()
+        // Поколение сканирования не трогаем — оно про обход диска, и его
+        // сдвиг отменил бы идущий разбор проекта.
+        let batch = symbolGeneration
+        let symbolBatch = symbolGeneration.bump()
+        typeWork.async { [weak self] in
+            guard let fresh = SymbolIndex.updating(base, changed: changed,
+                                                   shouldStop: { !batch.isCurrent(symbolBatch) })
+            else { return }
+            let types = TypeIndex.make(root: root, entries: fresh.typeEntries())
+            Task { @MainActor in
+                guard let self, batch.isCurrent(symbolBatch), self.root == root else { return }
+                self.symbolIndex = fresh
+                self.adoptTypes(types, indexing: false)
+            }
+            // Кэш на диске не трогаем: его переписывание стоит дороже самой
+            // пересборки, а при следующем открытии проекта полный разбор
+            // всё равно молча заменит его свежим.
+        }
     }
 
     /// Путь открытого файла относительно корня — чтобы найти его в дереве.
@@ -524,6 +591,8 @@ final class Workspace: ObservableObject {
         root = nil
         index = nil
         symbolIndex = nil
+        pendingReindex.removeAll()
+        _ = symbolGeneration.bump()
         fileTree = nil
         loadError = nil
         isIndexing = false
@@ -1969,6 +2038,7 @@ final class Workspace: ObservableObject {
             return false
         }
         lsp.documentSaved(buffer.url)
+        reindexAfterSave(buffer.url)
         git.refresh()
         if buffer === self.buffer { git.documentEdited(buffer.document) }
         return true
