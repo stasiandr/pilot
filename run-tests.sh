@@ -1,7 +1,7 @@
 #!/bin/bash
 # Тесты алгоритмического ядра: индекс файлов и типов, дерево файлов, fuzzy-поиск,
-# .gitignore, лексер, распознавание ⇧⇧, git, Unity: GUID, сцены, инспектор,
-# метаданные сборок .NET.
+# .gitignore, лексер, распознавание ⇧⇧, git, события ФС, Unity: GUID, сцены,
+# инспектор, метаданные сборок .NET.
 # AppKit здесь не нужен, поэтому они гоняются и на macOS, и на Linux.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -10,7 +10,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/Sources/coretests"
-cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,Tabs,OpenRequest}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,Tabs,OpenRequest,FileChanges}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Highlight/{Language,Lexer,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,LSPDaemon,UnixSocket,Completion}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Git/{LineDiff,GitParsing,Git,MergeConflicts}.swift "$TMP/Sources/coretests/"

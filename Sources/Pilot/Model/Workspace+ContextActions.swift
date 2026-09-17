@@ -47,6 +47,17 @@ extension Workspace {
                 self?.findReferences(at: offset)
             },
         ]
+        // Пункт появляется, только если реализации действительно есть: меню
+        // у курсора показывает доступное, а не весь список команд.
+        if let document, symbolIndex != nil,
+           !LocalNavigator(index: symbolIndex, document: navDocument(document))
+               .implementations(at: offset).declarations.isEmpty {
+            actions.append(ContextAction(title: "Перейти к реализациям",
+                                         icon: "point.3.connected.trianglepath.dotted",
+                                         shortcut: KeyShortcut("b", [.command, .option])) { [weak self] in
+                self?.findImplementations(at: offset)
+            })
+        }
         // Подсветка вхождений приходит с задержкой — считаем сами.
         if let document, Occurrences.find(name, in: document.model).count > 1 {
             actions.append(ContextAction(title: "Следующее вхождение", icon: "chevron.down",
