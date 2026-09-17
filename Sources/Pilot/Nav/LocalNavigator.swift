@@ -429,6 +429,127 @@ struct LocalNavigator {
         return resolveType(name, context: fileInfo)
     }
 
+    // MARK: - Иерархия вниз: наследники и переопределения
+
+    /// Ответ на ⌥⌘B. На типе — кто его наследует или реализует; на методе,
+    /// свойстве, поле — их переопределения в наследниках. Считается по
+    /// `derivedByBase`: это обратная сторона того же `bases`, по которому
+    /// ⌘B поднимается вверх, так что второго обхода проекта не нужно.
+    func implementations(at offset: Int) -> Answer {
+        guard index != nil else { return .none }
+        let model = document.model
+        guard let identifier = Occurrences.identifier(in: model, at: offset) else { return .none }
+        let tokens = tokensAround(identifier.range.location)
+        guard let k = tokens.firstIndex(where: { Int($0.start) == identifier.range.location }),
+              isWord(tokens[k]) else { return .none }   // внутри строки или комментария
+        let name = identifier.text
+        let position = model.position(at: identifier.range.location)
+
+        // Курсор на самом объявлении — что под ним, известно точно.
+        if let item = document.outline.first(where: { $0.range.location == identifier.range.location }) {
+            if item.kind == .type {
+                guard let type = resolveType(name, context: fileInfo) else { return .none }
+                return answer(derivedTypes(of: type).map(\.id), excluding: position)
+            }
+            guard SymbolIndex.isMember(item.kind), let owner = currentType(at: offset) else { return .none }
+            return answer(overrides(named: name, of: owner), excluding: position)
+        }
+
+        // `receiver.Member` — владельца даёт та же цепочка, что и у ⌘B.
+        if let dot = precedingDot(tokens, k) {
+            guard let segments = chainBackward(tokens, endingAt: dot), !segments.isEmpty,
+                  let value = evaluate(segments, at: identifier.range.location),
+                  let owner = typeOf(value) else { return .none }
+            if !members(named: name, of: owner).isEmpty {
+                return answer(overrides(named: name, of: owner), excluding: position)
+            }
+            guard let nested = nestedType(named: name, in: owner) else { return .none }
+            return answer(derivedTypes(of: ResolvedType(id: nested)).map(\.id), excluding: position)
+        }
+
+        // Голое имя: член текущего типа либо тип.
+        if !looksLikeTypePosition(tokens, k), let current = currentType(at: offset),
+           !members(named: name, of: current).isEmpty {
+            return answer(overrides(named: name, of: current), excluding: position)
+        }
+        guard let type = resolveType(name, context: fileInfo) else { return .none }
+        return answer(derivedTypes(of: type).map(\.id), excluding: position)
+    }
+
+    /// Все, кто наследует или реализует тип, — напрямую и через промежуточные
+    /// звенья. Сам тип в ответ не входит. Обход в ширину с общим списком
+    /// посещённых: у ромбовидных иерархий рекурсия разрасталась бы впустую.
+    func derivedTypes(of type: ResolvedType, limit: Int = 500) -> [ResolvedType] {
+        guard let index else { return [] }
+        var result: [ResolvedType] = []
+        var queue = partialParts(of: type.id)
+        var visited = Set(queue)
+        var head = 0
+        while head < queue.count, result.count < limit {
+            let current = queue[head]
+            head += 1
+            for candidate in index.derivedByBase[index[current].name] ?? [] {
+                guard !visited.contains(candidate), inherits(candidate, from: current) else { continue }
+                for part in partialParts(of: candidate) where visited.insert(part).inserted {
+                    queue.append(part)
+                }
+                result.append(ResolvedType(id: candidate))
+            }
+        }
+        return result
+    }
+
+    /// Ведёт ли `: Base` кандидата именно к этому типу, а не к одноимённому
+    /// из чужого namespace: ключ в `derivedByBase` — короткое имя, и `Base`
+    /// из двух разных namespace лежит там вместе.
+    private func inherits(_ candidate: Int32, from ownerID: Int32) -> Bool {
+        guard let index else { return false }
+        let parts = Set(partialParts(of: ownerID))
+        let context = index.fileInfo(candidate)
+        for base in index[candidate].bases where SymbolIndex.baseKey(base) == index[ownerID].name {
+            if let resolved = resolveType(base, context: context), parts.contains(resolved.id) { return true }
+        }
+        return false
+    }
+
+    /// Одноимённые члены в наследниках того типа, где член объявлен впервые.
+    /// `PlayerSystem.OnAwake` — сам override, и его реализации общие с
+    /// `BaseSystem.OnAwake`: искать среди наследников одного PlayerSystem
+    /// значило бы не найти ничего.
+    private func overrides(named name: String, of type: ResolvedType) -> [Int32] {
+        var root = type
+        var visited: Set<Int32> = []
+        while visited.insert(root.id).inserted, visited.count < 16 {
+            guard let above = baseTypes(of: root).first(where: { !ownMembers(named: name, of: $0.id).isEmpty })
+            else { break }
+            root = above
+        }
+        return derivedTypes(of: root).flatMap { ownMembers(named: name, of: $0.id) }
+    }
+
+    /// Ответ списком: сначала этот файл, дальше по алфавиту. Объявление под
+    /// самим курсором отбрасывается — ⌥⌘B показывает другие реализации,
+    /// а не ту, на которой стоишь. Сверяем позицию целиком, а не строку:
+    /// в `class Armor : IDamageable` тип и его база стоят на одной строке.
+    private func answer(_ ids: [Int32], excluding position: LSPPosition) -> Answer {
+        guard let index else { return .none }
+        var seen: Set<Int32> = []
+        let unique = ids.filter { seen.insert($0).inserted }
+            .filter { !(index.relPath($0) == fileInfo.path && Int(index[$0].line) == position.line
+                        && Int(index[$0].column) == position.character) }
+        guard !unique.isEmpty else { return .none }
+        let sorted = unique.sorted {
+            let a = index.relPath($0), b = index.relPath($1)
+            if a != b {
+                if a == fileInfo.path { return true }
+                if b == fileInfo.path { return false }
+                return a < b
+            }
+            return index[$0].line < index[$1].line
+        }
+        return Answer(declarations: sorted.prefix(500).map { declaration($0) }, isExact: sorted.count == 1)
+    }
+
     // MARK: - Локальные переменные
 
     /// Ближайшее объявление выше курсора, но не выше начала текущего метода.

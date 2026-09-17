@@ -1916,7 +1916,7 @@ section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 8, "режимов палитры восемь")
+check(PaletteMode.allCases.count == 9, "режимов палитры девять")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
@@ -3114,6 +3114,128 @@ let extractMs = Date().timeIntervalSince(tExtract) * 1000
 print(String(format: "  объявления из файла на %d строк: %.0f мс, найдено %d", 10_000, extractMs, perfExtract.1.count))
 check(perfExtract.1.count == 6000, "в синтетике по три объявления на класс (получено \(perfExtract.1.count))")
 check(extractMs < 400, "разбор 10 000 строк быстрее 400 мс")
+
+// ─────────────────────── Иерархия типов ────────────────────────
+section("Иерархия типов")
+
+// Наследники считаются по тому же `bases`, которым ⌘B поднимается вверх,
+// поэтому фикстура нарочно содержит два одноимённых интерфейса.
+let hierRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-hier-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: hierRoot)
+let hierFiles: [String: String] = [
+    "Assets/Game/Damageable.cs": """
+        namespace Game.Components
+        {
+            public interface IDamageable { void Damage(int amount); }
+        }
+        """,
+    "Assets/Game/Health.cs": """
+        namespace Game.Components
+        {
+            public struct Health : IDamageable
+            {
+                public void Damage(int amount) { }
+            }
+        }
+        """,
+    "Assets/Game/Armor.cs": """
+        using Game.Components;
+        namespace Game.Gear
+        {
+            public class Armor : IDamageable
+            {
+                public void Damage(int amount) { }
+            }
+        }
+        """,
+    "Other/Damageable.cs": """
+        namespace Other
+        {
+            public interface IDamageable { void Damage(int amount); }
+            public class Rock : IDamageable { public void Damage(int amount) { } }
+        }
+        """,
+    "Assets/Game/BaseSystem.cs": """
+        namespace Game.Systems
+        {
+            public abstract class BaseSystem { public virtual void OnAwake() { } }
+        }
+        """,
+    "Assets/Game/MidSystem.cs": """
+        namespace Game.Systems
+        {
+            public class MidSystem : BaseSystem { public override void OnAwake() { } }
+        }
+        """,
+    "Assets/Game/LeafSystem.cs": """
+        namespace Game.Systems
+        {
+            public class LeafSystem : MidSystem { public override void OnAwake() { } }
+        }
+        """,
+]
+for (path, text) in hierFiles {
+    let url = hierRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? text.write(to: url, atomically: true, encoding: .utf8)
+}
+let hierIndex = SymbolIndex.build(root: hierRoot, files: Array(hierFiles.keys), shouldStop: { false })
+    ?? SymbolIndex(root: hierRoot)
+check(hierIndex.derivedByBase["IDamageable"]?.count == 3, "в таблице наследников все три реализации обоих интерфейсов")
+check(SymbolIndex.baseKey("Game.Ecs.Base<T>") == "Base", "ключ наследования: без namespace и дженериков")
+
+func hierNavigator(_ path: String) -> LocalNavigator {
+    let model = SyntaxModel(text: hierFiles[path]!, spec: Languages.csharp)
+    return LocalNavigator(index: hierIndex, document: NavDocument(
+        url: hierRoot.appendingPathComponent(path), relPath: path, model: model,
+        outline: OutlineBuilder.build(model: model)))
+}
+/// ⌥⌘B на слове `word` внутри первого вхождения строки `context`.
+func hierImpl(_ path: String, _ context: String, _ word: String) -> LocalNavigator.Answer {
+    let outer = (hierFiles[path]! as NSString).range(of: context)
+    guard outer.location != NSNotFound else { return .none }
+    return hierNavigator(path).implementations(at: outer.location + (context as NSString).range(of: word).location)
+}
+func hierShape(_ answer: LocalNavigator.Answer) -> String {
+    answer.declarations.map { "\($0.container ?? "-").\($0.name)" }.sorted().joined(separator: ", ")
+}
+
+let onInterface = hierImpl("Assets/Game/Damageable.cs", "public interface IDamageable", "IDamageable")
+check(hierShape(onInterface) == "Game.Components.Health, Game.Gear.Armor",
+      "курсор на интерфейсе → его реализации (получено: \(hierShape(onInterface)))")
+
+let foreignInterface = hierImpl("Other/Damageable.cs", "public interface IDamageable", "IDamageable")
+check(hierShape(foreignInterface) == "Other.Rock",
+      "одноимённый интерфейс из чужого namespace не слипся (получено: \(hierShape(foreignInterface)))")
+
+let onBaseName = hierImpl("Assets/Game/Armor.cs", "public class Armor : IDamageable", "IDamageable")
+check(hierShape(onBaseName) == "Game.Components.Health, Game.Gear.Armor",
+      "имя базового в объявлении: сам Armor не отброшен вместе со строкой (получено: \(hierShape(onBaseName)))")
+
+let onInterfaceMethod = hierImpl("Assets/Game/Damageable.cs", "void Damage(int amount);", "Damage")
+check(hierShape(onInterfaceMethod) == "Armor.Damage, Health.Damage",
+      "курсор на методе интерфейса → его реализации (получено: \(hierShape(onInterfaceMethod)))")
+
+// MidSystem — сам override: реализации у него общие с BaseSystem.OnAwake,
+// а не в пустом поддереве самого MidSystem.
+let onOverride = hierImpl("Assets/Game/MidSystem.cs", "public override void OnAwake", "OnAwake")
+check(hierShape(onOverride) == "LeafSystem.OnAwake",
+      "на override поднялись к базе и нашли соседа (получено: \(hierShape(onOverride)))")
+check(onOverride.isExact, "единственная реализация — прыгаем сразу, без списка")
+
+let onLeaf = hierImpl("Assets/Game/LeafSystem.cs", "public class LeafSystem", "LeafSystem")
+check(onLeaf.declarations.isEmpty, "у листа иерархии наследников нет")
+
+// Наследование через звено: BaseSystem ← MidSystem ← LeafSystem.
+let onBase = hierImpl("Assets/Game/BaseSystem.cs", "public abstract class BaseSystem", "BaseSystem")
+check(hierShape(onBase) == "Game.Systems.LeafSystem, Game.Systems.MidSystem",
+      "наследники через промежуточное звено (получено: \(hierShape(onBase)))")
+
+let inComment = hierImpl("Assets/Game/Damageable.cs", "namespace Game.Components", "namespace")
+check(inComment.declarations.isEmpty, "на ключевом слове ничего не ищется")
+
+try? FileManager.default.removeItem(at: hierRoot)
 
 // ─────────────────────────── Вкладки ───────────────────────────
 section("Вкладки")

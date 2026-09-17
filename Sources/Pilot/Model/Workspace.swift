@@ -1107,7 +1107,7 @@ final class Workspace: ObservableObject {
         }
     }
 
-    private func navDocument(_ document: LoadedDocument) -> NavDocument {
+    func navDocument(_ document: LoadedDocument) -> NavDocument {
         var relPath: String?
         if let root, document.url.path.hasPrefix(root.path + "/") {
             relPath = String(document.url.path.dropFirst(root.path.count + 1))
@@ -1130,8 +1130,8 @@ final class Workspace: ObservableObject {
         }
     }
 
-    private func showDeclarations(_ declarations: [FoundDeclaration]) {
-        paletteMode = .declarations
+    private func showDeclarations(_ declarations: [FoundDeclaration], mode: PaletteMode = .declarations) {
+        paletteMode = mode
         query = ""
         selection = 0
         allReferences = declarations.enumerated().map { position, declaration in
@@ -1150,6 +1150,22 @@ final class Workspace: ObservableObject {
         items = allReferences
         paletteBusy = false
         isPaletteOpen = true
+    }
+
+    /// ⌥⌘B — кто наследует тип под курсором или переопределяет его метод.
+    /// Только свой индекс: `bases` он знает с первой секунды, а у LSP это
+    /// отдельный запрос `textDocument/implementation`, который здесь не
+    /// подключён. Единственная реализация — прыгаем сразу, иначе список.
+    func findImplementations(at offset: Int) {
+        guard let document else { return }
+        let answer = LocalNavigator(index: symbolIndex, document: navDocument(document)).implementations(at: offset)
+        if answer.isExact, let first = answer.declarations.first {
+            navigate(to: first.target)
+            return
+        }
+        // Пустой ответ тоже показываем палитрой: молчание в ответ на клавишу
+        // неотличимо от того, что она не сработала.
+        showDeclarations(answer.declarations, mode: .implementations)
     }
 
     func findReferences(at offset: Int) {

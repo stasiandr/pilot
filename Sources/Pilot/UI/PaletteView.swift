@@ -139,7 +139,7 @@ struct PaletteView: View {
         case .files:   return workspace.isIndexing
         case .classes: return workspace.isIndexing || workspace.isTypeIndexing
         case .symbols: return workspace.symbolIndex == nil && !workspace.lsp.isReady
-        case .outline, .references, .declarations, .changes, .assetUsages: return false
+        case .outline, .references, .declarations, .implementations, .changes, .assetUsages: return false
         }
     }
 
@@ -156,7 +156,7 @@ struct PaletteView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help("Типов в индексе")
-        case .symbols, .references, .declarations, .outline, .changes, .assetUsages:
+        case .symbols, .references, .declarations, .implementations, .outline, .changes, .assetUsages:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
                     .font(.system(size: 11, design: .monospaced))
@@ -197,6 +197,10 @@ struct PaletteView: View {
             return "Использований не найдено"
         case .declarations:
             return "Ничего не найдено"
+        case .implementations:
+            return workspace.symbolIndex == nil
+                ? "Собираю объявления проекта…"
+                : "Ни наследников, ни переопределений не нашлось"
         case .outline:
             return workspace.document == nil
                 ? "Сначала откройте файл"

@@ -54,6 +54,11 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     private(set) var typesByName: [String: [Int32]] = [:]
     /// Имя типа → члены, объявленные внутри него.
     private(set) var membersByOwner: [String: [Int32]] = [:]
+    /// Короткое имя базового типа → типы, назвавшие его в `: Base, IFoo`.
+    /// Обратная сторона `bases`: по ней навигатор идёт вниз по иерархии.
+    /// Ключ без namespace и дженериков, поэтому одноимённые базовые из разных
+    /// namespace попадают вместе — разбирается это уже резолвом типов.
+    private(set) var derivedByBase: [String: [Int32]] = [:]
 
     /// «контейнер.имя» в нижнем регистре подряд — для fuzzy-поиска без аллокаций.
     private var bytes: [UInt8] = []
@@ -105,7 +110,10 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
         for (i, s) in symbols.enumerated() {
             let id = Int32(i)
             byName[s.name, default: []].append(id)
-            if Self.isType(s.kind) { typesByName[s.name, default: []].append(id) }
+            if Self.isType(s.kind) {
+                typesByName[s.name, default: []].append(id)
+                for base in s.bases { derivedByBase[Self.baseKey(base), default: []].append(id) }
+            }
             if Self.isMember(s.kind), let owner = s.container { membersByOwner[owner, default: []].append(id) }
 
             let start = bytes.count
@@ -118,6 +126,15 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             for b in s.name.utf8 { bytes.append(Self.lower(b)) }
             spans.append((Int32(start), Int32(bytes.count - start), Int32(nameStart)))
         }
+    }
+
+    /// Ключ `derivedByBase`: имя базового типа без namespace и дженериков.
+    /// `Game.Ecs.Base<T>` → `Base`.
+    static func baseKey(_ text: String) -> String {
+        var name = text.trimmingCharacters(in: .whitespaces)
+        if let lt = name.firstIndex(of: "<") { name = String(name[..<lt]) }
+        if let dot = name.lastIndex(of: ".") { name = String(name[name.index(after: dot)...]) }
+        return name
     }
 
     @inline(__always) private static func lower(_ b: UInt8) -> UInt8 {

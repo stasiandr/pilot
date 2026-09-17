@@ -12,6 +12,7 @@ enum PaletteMode: Equatable, CaseIterable {
     case symbols        // ⌘T  — символы проекта: быстрый индекс, затем LSP
     case references     // ⌘R  — использования символа под курсором
     case declarations   // ⌘B, когда тип цели неясен — выбор из одноимённых
+    case implementations // ⌥⌘B — наследники типа, переопределения метода
     case changes        // ⌃⇧G — файлы, изменённые относительно HEAD
     case assetUsages    // ⇧⌘R — где используется ассет Unity: поиск GUID, без LSP
 
@@ -23,6 +24,7 @@ enum PaletteMode: Equatable, CaseIterable {
         case .symbols:    return "Символ в проекте…"
         case .references: return "Использования"
         case .declarations: return "Одноимённые объявления — уточните"
+        case .implementations: return "Реализации и наследники"
         case .changes:    return "Изменённый файл…"
         case .assetUsages: return "Где используется ассет"
         }
@@ -36,6 +38,7 @@ enum PaletteMode: Equatable, CaseIterable {
         case .symbols:    return "number"
         case .references: return "arrow.triangle.branch"
         case .declarations: return "arrow.down.right.and.arrow.up.left"
+        case .implementations: return "point.3.connected.trianglepath.dotted"
         case .changes:    return "plusminus"
         case .assetUsages: return "link"
         }
