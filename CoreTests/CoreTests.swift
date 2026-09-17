@@ -3666,6 +3666,232 @@ check(OpenRequest.staysInRoot(openRepo, file: nil, desired: openRepo, repository
 check(!OpenRequest.staysInRoot(openRepo, file: nil, desired: URL(fileURLWithPath: "/repo/client"), repository: openRepoOf),
       "просили открыть проект-подпапку — открываем её")
 
+// ──────────────────── Сборки .NET: чтение и декомпиляция ────────────────────
+//
+// Настоящей .dll в репозитории нет, поэтому сборка собирается прямо здесь:
+// PE с одной секцией, в ней — заголовок CLI и метаданные с горсткой строк
+// таблиц. Так проверяется весь путь: PE → потоки → таблицы → сигнатуры → текст.
+func demoAssembly() -> [UInt8] {
+    var strings: [UInt8] = [0]
+    var stringOffsets: [String: Int] = [:]
+    func text(_ value: String) -> Int {
+        if value.isEmpty { return 0 }
+        if let known = stringOffsets[value] { return known }
+        let offset = strings.count
+        strings += Array(value.utf8) + [0]
+        stringOffsets[value] = offset
+        return offset
+    }
+    var blobs: [UInt8] = [0]
+    func blob(_ bytes: [UInt8]) -> Int {
+        let offset = blobs.count
+        blobs += [UInt8(bytes.count)] + bytes
+        return offset
+    }
+
+    // Строки таблиц: один класс Demo.Greeter с константой, методом и конструктором.
+    var rows: [UInt8] = []
+    func put(_ value: Int, _ size: Int) {
+        for shift in 0..<size { rows.append(UInt8((value >> (8 * shift)) & 0xFF)) }
+    }
+    put(0, 2); put(text("Demo.dll"), 2); put(0, 2); put(0, 2); put(0, 2)      // Module
+    put((1 << 2) | 2, 2); put(text("Object"), 2); put(text("System"), 2)      // TypeRef → System.Object
+    put(0, 4); put(text("<Module>"), 2); put(0, 2); put(0, 2); put(1, 2); put(1, 2)
+    put(0x0010_0001, 4); put(text("Greeter"), 2); put(text("Demo"), 2)        // TypeDef: public class
+    put((1 << 2) | 1, 2); put(1, 2); put(1, 2)                                // extends TypeRef 1
+    put(0x8056, 2); put(text("Answer"), 2); put(blob([0x06, 0x08]), 2)        // Field: public const int
+    put(0x2100, 4); put(0, 2); put(0x0096, 2); put(text("Greet"), 2)          // MethodDef: public static
+    put(blob([0x00, 0x02, 0x0E, 0x0E, 0x08]), 2); put(1, 2)                   // string Greet(string, int)
+    put(0x2108, 4); put(0, 2); put(0x1886, 2); put(text(".ctor"), 2)
+    put(blob([0x20, 0x00, 0x01]), 2); put(3, 2)
+    put(0, 2); put(1, 2); put(text("name"), 2)                                // Param
+    put(0, 2); put(2, 2); put(text("times"), 2)
+    put(0x08, 1); put(0, 1); put((1 << 2) | 0, 2); put(blob([42, 0, 0, 0]), 2)  // Constant: = 42
+    put(0x8004, 4); put(1, 2); put(0, 2); put(0, 2); put(0, 2); put(0, 4)     // Assembly: Demo 1.0.0.0
+    put(0, 2); put(text("Demo"), 2); put(0, 2)
+    put(4, 2); put(0, 2); put(0, 2); put(0, 2); put(0, 4)                     // AssemblyRef: mscorlib
+    put(0, 2); put(text("mscorlib"), 2); put(0, 2); put(0, 2)
+
+    var valid: UInt64 = 0
+    for table in [0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x0B, 0x20, 0x23] { valid |= UInt64(1) << UInt64(table) }
+
+    var image: [UInt8] = []
+    func append(_ value: Int, _ size: Int) {
+        for shift in 0..<size { image.append(UInt8((value >> (8 * shift)) & 0xFF)) }
+    }
+    func pad(to size: Int) { image += [UInt8](repeating: 0, count: max(0, size - image.count)) }
+    func padded(_ bytes: [UInt8]) -> [UInt8] {
+        bytes + [UInt8](repeating: 0, count: (4 - bytes.count % 4) % 4)
+    }
+
+    // Поток таблиц: шапка, число строк в каждой таблице и сами строки.
+    var tables: [UInt8] = [0, 0, 0, 0, 2, 0, 0, 1]
+    for shift in 0..<8 { tables.append(UInt8((valid >> UInt64(8 * shift)) & 0xFF)) }
+    tables += [UInt8](repeating: 0, count: 8)
+    for count in [1, 1, 2, 1, 2, 2, 1, 1, 1] {
+        for shift in 0..<4 { tables.append(UInt8((count >> (8 * shift)) & 0xFF)) }
+    }
+    tables += rows
+
+    // Корень метаданных: версия рантайма и три потока.
+    let version = padded(Array("v4.0.30319\0".utf8))
+    let streams: [(String, [UInt8])] = [("#~", padded(tables)), ("#Strings", padded(strings)),
+                                        ("#Blob", padded(blobs))]
+    var rootSize = 20 + version.count
+    for (name, _) in streams { rootSize += 8 + padded(Array(name.utf8) + [0]).count }
+    var root: [UInt8] = Array("BSJB".utf8) + [1, 0, 1, 0, 0, 0, 0, 0]
+    root += [UInt8(version.count), 0, 0, 0] + version + [0, 0, 3, 0]
+    var data: [UInt8] = []
+    for (name, stream) in streams {
+        let offset = rootSize + data.count
+        for shift in 0..<4 { root.append(UInt8((offset >> (8 * shift)) & 0xFF)) }
+        for shift in 0..<4 { root.append(UInt8((stream.count >> (8 * shift)) & 0xFF)) }
+        root += padded(Array(name.utf8) + [0])
+        data += stream
+    }
+    root += data
+
+    // Заголовок CLI и секция, в которой он лежит.
+    var section: [UInt8] = []
+    for shift in 0..<4 { section.append(UInt8((72 >> (8 * shift)) & 0xFF)) }
+    section += [2, 0, 5, 0]
+    for shift in 0..<4 { section.append(UInt8(((0x2000 + 72) >> (8 * shift)) & 0xFF)) }
+    for shift in 0..<4 { section.append(UInt8((root.count >> (8 * shift)) & 0xFF)) }
+    section += [1, 0, 0, 0]
+    section += [UInt8](repeating: 0, count: 72 - section.count)
+    section += root
+    let sectionSize = (section.count + 0x1FF) & ~0x1FF
+
+    image = Array("MZ".utf8)
+    pad(to: 0x3C)
+    append(0x80, 4)
+    pad(to: 0x80)
+    image += Array("PE\0\0".utf8)
+    append(0x14C, 2); append(1, 2); append(0, 4); append(0, 4); append(0, 4)  // COFF
+    append(224, 2); append(0x2102, 2)
+    append(0x10B, 2)                                                          // PE32
+    pad(to: image.count + 94)
+    for directory in 0..<16 {                                                 // директории; CLI — пятнадцатая
+        append(directory == 14 ? 0x2000 : 0, 4)
+        append(directory == 14 ? 72 : 0, 4)
+    }
+    image += Array(".text".utf8) + [0, 0, 0]
+    append(section.count, 4); append(0x2000, 4); append(sectionSize, 4); append(0x200, 4)
+    pad(to: image.count + 16)
+    pad(to: 0x200)
+    image += section
+    pad(to: 0x200 + sectionSize)
+    return image
+}
+
+section("Сборки .NET")
+let demo = demoAssembly()
+check(AssemblySource.isAssembly(URL(fileURLWithPath: "/a/Plugin.dll"))
+      && AssemblySource.isAssembly(URL(fileURLWithPath: "/a/Tool.EXE"))
+      && !AssemblySource.isAssembly(URL(fileURLWithPath: "/a/Player.cs")),
+      "сборка узнаётся по расширению, регистр не важен")
+do {
+    let source = try AssemblySource.text(bytes: demo, fileName: "Demo.dll")
+    check(source.contains("// Demo, Version=1.0.0.0, Culture=neutral"), "шапка: имя и версия сборки")
+    check(source.contains("namespace Demo"), "пространство имён")
+    check(source.contains("public class Greeter"), "класс с доступностью")
+    check(source.contains("public const int Answer = 42;"), "константа вместе со значением")
+    check(source.contains("public static string Greet(string name, int times) { }"),
+          "метод: сигнатура и имена параметров")
+    check(source.contains("public Greeter() { }"), "конструктор назван именем типа")
+    check(!source.contains("<Module>"), "служебный тип компилятора не показывается")
+} catch {
+    check(false, "сборка разобралась (\(error))")
+}
+do {
+    _ = try AssemblySource.text(bytes: Array("не сборка, а текст".utf8), fileName: "x.dll")
+    check(false, "текст вместо сборки — ошибка")
+} catch {
+    check(true, "текст вместо сборки — ошибка")
+}
+do {
+    _ = try AssemblySource.text(bytes: Array(demo.prefix(300)), fileName: "Demo.dll")
+    check(false, "обрезанная сборка — ошибка, а не мусор")
+} catch {
+    check(true, "обрезанная сборка — ошибка, а не мусор")
+}
+check(TypeName.withoutArity("Dictionary`2") == "Dictionary" && TypeName.arity("Dictionary`2") == 2,
+      "число параметров в имени типа")
+check(TypeName.withoutArity("Json`Name") == "Json`Name", "обратная кавычка без числа — часть имени")
+
+// Файл из кэша языкового сервера узнаётся по шапке, которую он сам и пишет.
+let roslynHeader = "\u{FEFF}#region Assembly UnityEngine.CoreModule, Version=0.0.0.0, Culture=neutral\n"
+    + "// /Applications/Unity/UnityEngine.CoreModule.dll\n#endregion\n\npublic struct Vector3 { }\n"
+check(AssemblySource.decompiledAssembly(inHeader: roslynHeader) == "UnityEngine.CoreModule",
+      "имя сборки из шапки Roslyn, BOM не мешает")
+check(AssemblySource.decompiledAssembly(inHeader: "#region Assembly UnityLike\nstruct V { }") == "UnityLike",
+      "шапка без версии")
+check(AssemblySource.decompiledAssembly(inHeader: "using System;\n#region Assembly Foo, Version=1\n") == nil,
+      "region не первой строкой — обычный исходник")
+check(AssemblySource.decompiledAssembly(inHeader: "#region Assembly , Version=1\n") == nil,
+      "пустое имя сборки — не признак")
+
+// Индекс типов по сборкам: им отвечает ⌘B, когда исходников нет, а сервер
+// ещё не готов (или ему нечего было грузить).
+let assemblyFile = FileManager.default.temporaryDirectory
+    .appendingPathComponent("pilot-tests-\(getpid())-Demo.dll")
+try? Data(demo).write(to: assemblyFile)
+let assemblies = AssemblyIndex.build(assemblies: [assemblyFile, assemblyFile])
+check(assemblies.assemblyCount == 1, "одна и та же сборка дважды считается один раз")
+check(assemblies.count == 1, "в индекс попал Greeter, но не <Module>")
+let greeter = assemblies.matching(name: "Greeter")
+check(greeter.count == 1, "тип находится по точному имени")
+if let id = greeter.first {
+    check(assemblies.entry(id).namespace == "Demo", "пространство имён типа")
+    check(assemblies.entry(id).full == "Demo.Greeter", "полное имя")
+    let target = assemblies.target(id)
+    check(target.url == assemblyFile && target.declaration == "Greeter" && target.range == nil,
+          "цель перехода — сборка и имя типа: строку узнаем, когда соберём текст")
+    check(assemblies.declaration(id).path == assemblyFile.lastPathComponent, "в списке видна сборка")
+}
+check(assemblies.matching(name: "greeter").isEmpty, "регистр важен, как и в C#")
+check(assemblies.search("gree", limit: 5, shouldStop: { false }).count == 1, "нечёткий поиск по типам сборок")
+check(assemblies.search("Demo.Gr", limit: 5, shouldStop: { false }).count == 1,
+      "запрос с точкой ищет вместе с пространством имён")
+check(assemblies.search("zzz", limit: 5, shouldStop: { false }).isEmpty, "чужой запрос — пусто")
+check(AssemblyIndex.Entry(assembly: 0, name: "Task", namespace: "System.Threading.Tasks", arity: 1)
+        .display == "Task<>",
+      "обобщённый тип виден как Task<>: иначе два Task в списке неотличимы")
+check(AssemblyIndex.Entry(assembly: 0, name: "Dictionary", namespace: "System.Collections.Generic", arity: 2)
+        .display == "Dictionary<,>", "число параметров видно по запятым")
+try? FileManager.default.removeItem(at: assemblyFile)
+
+// Проектные файлы Unity: их пишет пакет выбранного редактора, а не Unity,
+// поэтому их запросто может не быть или они отстают от последней компиляции.
+let fm = FileManager.default
+let fakeProject = fm.temporaryDirectory.appendingPathComponent("pilot-tests-\(getpid())-unity")
+try? fm.removeItem(at: fakeProject)
+try? fm.createDirectory(at: fakeProject.appendingPathComponent("Assets"), withIntermediateDirectories: true)
+try? fm.createDirectory(at: fakeProject.appendingPathComponent("ProjectSettings"),
+                        withIntermediateDirectories: true)
+try? "m_EditorVersion: 6000.3.14f1".write(
+    to: fakeProject.appendingPathComponent("ProjectSettings/ProjectVersion.txt"),
+    atomically: true, encoding: .utf8)
+let unityProject = UnityProjectInfo.detect(root: fakeProject)
+check(unityProject?.editorVersion == "6000.3.14f1", "версия редактора из ProjectVersion.txt")
+check(unityProject?.projectFiles == .missing, "без .csproj серверу нечего грузить")
+
+func touch(_ url: URL, _ date: Date) {
+    try? "x".write(to: url, atomically: true, encoding: .utf8)
+    try? fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+}
+let day: TimeInterval = 86_400
+touch(fakeProject.appendingPathComponent("Assembly-CSharp.csproj"), Date() - day)
+check(unityProject?.projectFiles == .ready, ".csproj есть, компиляций не было — годится")
+
+try? fm.createDirectory(at: fakeProject.appendingPathComponent("Library/ScriptAssemblies"),
+                        withIntermediateDirectories: true)
+touch(fakeProject.appendingPathComponent("Library/ScriptAssemblies/Assembly-CSharp.dll"), Date() - 2 * day)
+check(unityProject?.projectFiles == .ready, "сборки старше проектных файлов — те ещё свежие")
+touch(fakeProject.appendingPathComponent("Library/ScriptAssemblies/Assembly-CSharp.dll"), Date())
+check(unityProject?.projectFiles == .stale, "скрипты компилировались после генерации — файлы устарели")
+try? fm.removeItem(at: fakeProject)
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

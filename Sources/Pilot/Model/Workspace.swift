@@ -13,6 +13,10 @@ final class Workspace: ObservableObject {
     /// Индекс объявлений проекта. На нём работает быстрый навигатор (⌘B, ⌘T,
     /// ⌘R), пока Roslyn греется; строится тем же проходом, что и индекс типов.
     @Published private(set) var symbolIndex: SymbolIndex?
+    /// Типы из сборок, к которым нет исходников: плагины проекта и сам
+    /// движок Unity. Отвечает на ⌘B и ⇧⇧ там, где ни исходников, ни
+    /// готового языкового сервера нет.
+    @Published private(set) var assemblyIndex: AssemblyIndex?
     /// Roslyn «готов» сразу после рукопожатия, а solution грузит ещё минуты:
     /// до тех пор его ответы пусты или неполны. Доверять ему начинаем, когда
     /// он впервые что-то нашёл; до этого первым отвечает быстрый навигатор.
@@ -268,6 +272,9 @@ final class Workspace: ObservableObject {
     /// Отдельная очередь: на крупном проекте разбор всех исходников — секунды, и на `work`
     /// он задержал бы и поиск файлов, и открытие файла.
     private let typeWork = DispatchQueue(label: "pilot.types", qos: .utility)
+    /// Чтение метаданных сборок: короче разбора исходников и не должно
+    /// стоять за ним в очереди.
+    private let assemblyWork = DispatchQueue(label: "pilot.assemblies", qos: .utility)
     /// ⌘R без сервера читает все исходники — не на `work`, чтобы в это время
     /// открывались файлы и работал поиск.
     private let referenceQueue = DispatchQueue(label: "pilot.references", qos: .userInitiated)
@@ -388,6 +395,7 @@ final class Workspace: ObservableObject {
         typeCount = 0
         isTypeIndexing = true
         symbolIndex = nil
+        assemblyIndex = nil
         pendingReindex.removeAll()
         pendingRemoved.removeAll()
         rescanPending = false
@@ -485,6 +493,7 @@ final class Workspace: ObservableObject {
                 guard self.scanGeneration.isCurrent(generation) else { return }
                 self.adopt(fresh, tree: tree, indexing: false)
                 self.rebuildTypeIndex(files: fresh.display, root: url, generation: generation)
+                self.rebuildAssemblyIndex(generation: generation)
             }
         }
     }
@@ -521,6 +530,43 @@ final class Workspace: ObservableObject {
             }
             IndexCache.saveTypes(fresh, root: url)
             IndexCache.saveSymbols(symbols, root: url)
+        }
+    }
+
+    /// Сборки, к которым у проекта нет исходников: плагины и библиотеки
+    /// пакетов (их видно по индексу ассетов Unity), обычные `.dll` из
+    /// индекса файлов и сборки самого редактора Unity. Собственные сборки
+    /// проекта (`Library/ScriptAssemblies`) сюда не идут: на них есть
+    /// исходники, и отвечать по ним должен индекс исходников.
+    private func rebuildAssemblyIndex(generation: Int) {
+        guard let root else { return }
+        var urls: [URL] = []
+        if let assets = unity.assets, let project = unity.project {
+            urls += assets.assemblyPaths.map { project.root.appendingPathComponent($0) }
+        }
+        if let index {
+            urls += index.display.filter { $0.hasSuffix(".dll") }.map { root.appendingPathComponent($0) }
+        }
+        let project = unity.project
+        let known = assemblyIndex?.sources.map(\.path)
+        let counter = scanGeneration
+        // Своя очередь: на `typeWork` сейчас разбираются исходники всего
+        // проекта, а ждать их ⌘B по `Vector3` незачем. Сборки редактора
+        // ищутся тоже здесь: это листинг чужой папки, не дело главного потока.
+        assemblyWork.async { [weak self] in
+            let all = urls + (project?.engineAssemblies ?? [])
+            // Тот же список — тот же индекс: пересобирать нечего.
+            guard !all.isEmpty, all.map(\.path) != known else { return }
+            let started = Date()
+            let fresh = AssemblyIndex.build(assemblies: all, shouldStop: { !counter.isCurrent(generation) })
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            Task { @MainActor in
+                guard let self, counter.isCurrent(generation), fresh.count > 0 else { return }
+                NSLog("[index] типы сборок: %d из %d сборок за %d мс",
+                      fresh.count, fresh.assemblyCount, ms)
+                self.assemblyIndex = fresh
+                self.runClassSearch()
+            }
         }
     }
 
@@ -660,6 +706,9 @@ final class Workspace: ObservableObject {
             Task { @MainActor in
                 guard let self, counter.isCurrent(generation), self.root == url else { return }
                 self.adopt(fresh, tree: tree, indexing: false)
+                // Плагин могли положить в проект только что; если список
+                // сборок не изменился, пересборка индекса и не начнётся.
+                self.rebuildAssemblyIndex(generation: generation)
             }
         }
     }
@@ -687,6 +736,7 @@ final class Workspace: ObservableObject {
         root = nil
         index = nil
         symbolIndex = nil
+        assemblyIndex = nil
         pendingReindex.removeAll()
         pendingRemoved.removeAll()
         rescanPending = false
@@ -1040,12 +1090,17 @@ final class Workspace: ObservableObject {
         }
         let types = typeIndex
         let files = index
+        let assemblies = assemblyIndex
 
         work.async { [weak self] in
             let stop = { !counter.isCurrent(generation) }
             let typeHits = types?.search(q, limit: 150, shouldStop: stop) ?? []
             // Файл, где объявлен уже найденный тип, — повтор той же строки.
             let typeFiles = Set(typeHits.lazy.compactMap { types?.relPath($0.id) })
+            // Типы из сборок — то, к чему нет исходников: движок Unity,
+            // плагины. Их меньше и они дальше от проекта, поэтому идут
+            // после своих типов и коротким списком.
+            let assemblyHits = assemblies?.search(q, limit: 10, shouldStop: stop) ?? []
             var fileHits: [SearchHit] = []
             if let files {
                 fileHits = Array(files.search(q, limit: 30, shouldStop: stop)
@@ -1056,7 +1111,7 @@ final class Workspace: ObservableObject {
             Task { @MainActor in
                 guard let self, counter.isCurrent(generation), self.paletteMode == .classes else { return }
                 var built: [PaletteItem] = []
-                built.reserveCapacity(typeHits.count + fileHits.count)
+                built.reserveCapacity(typeHits.count + assemblyHits.count + fileHits.count)
                 if let types {
                     for hit in typeHits {
                         let declaration = types.declaration(hit.id)
@@ -1073,6 +1128,21 @@ final class Workspace: ObservableObject {
                             secondary: secondary,
                             trailing: declaration.keyword,
                             target: types.target(hit.id)))
+                    }
+                }
+                if let assemblies {
+                    for hit in assemblyHits {
+                        let entry = assemblies.entry(hit.id)
+                        let assembly = assemblies.assembly(hit.id).lastPathComponent
+                        built.append(PaletteItem(
+                            id: built.count,
+                            icon: "shippingbox",
+                            primary: entry.display,
+                            positions: hit.positions,
+                            secondary: entry.namespace.isEmpty
+                                ? assembly : "\(entry.namespace) · \(assembly)",
+                            trailing: "сборка",
+                            target: assemblies.target(hit.id)))
                     }
                 }
                 if let files {
@@ -1241,8 +1311,11 @@ final class Workspace: ObservableObject {
         }
 
         // Файл из MR сервер не видел: у него на руках рабочая копия, и его
-        // позиции указали бы не туда. Для версии MR — только свой навигатор.
-        guard lsp.isReady, document.revision == nil else {
+        // позиции указали бы не туда. Текст, собранный Pilot из метаданных
+        // .dll, — тем более: по этому пути у сервера лежит сборка, а не код.
+        // А вот файл из его собственного кэша (`.languageServer`) он знает,
+        // и ⌘B оттуда ведёт дальше, как из обычного исходника.
+        guard lsp.isReady, document.revision == nil, document.decompiled != .assembly else {
             jumpToLocalDeclaration(at: offset, in: document)
             return
         }
@@ -1291,11 +1364,61 @@ final class Workspace: ObservableObject {
     /// с таким именем несколько — показываем их списком, ближние первыми.
     private func jumpToLocalDeclaration(at offset: Int, in document: LoadedDocument) {
         let answer = LocalNavigator(index: symbolIndex, document: navDocument(document)).definition(at: offset)
-        guard let first = answer.declarations.first else { return }
+        guard let first = answer.declarations.first else {
+            // Исходников с таким именем в проекте нет — может быть, это тип
+            // из сборки: `Vector3`, класс плагина, что угодно без исходников.
+            if !jumpToAssemblyType(at: offset, in: document) { explainMissingDefinition() }
+            return
+        }
         if answer.isExact {
             navigate(to: first.target)
         } else {
             showDeclarations(answer.declarations)
+        }
+    }
+
+    /// Имя под курсором — в индексе сборок. Одно совпадение — открываем
+    /// сборку на этом типе, несколько — показываем списком, как одноимённые
+    /// объявления. `false` — в сборках такого типа нет.
+    private func jumpToAssemblyType(at offset: Int, in document: LoadedDocument) -> Bool {
+        guard let assemblies = assemblyIndex,
+              let identifier = Occurrences.identifier(in: document.model, at: offset) else { return false }
+        let found = assemblies.matching(name: identifier.text)
+        guard let first = found.first else { return false }
+        if found.count == 1 {
+            navigate(to: assemblies.target(first))
+        } else {
+            showDeclarations(found.map { assemblies.declaration($0) })
+        }
+        return true
+    }
+
+    /// ⌘B не нашёл ничего. Молчание в ответ выглядит как сломанная клавиша,
+    /// а чаще всего причина простая: объявление лежит в сборке, и знает о
+    /// нём только языковой сервер — который в этот момент ещё грузится.
+    private func explainMissingDefinition() {
+        // Чаще всего дело не в сервере, а в том, что ему нечего было
+        // грузить: без .csproj Roslyn не знает о проекте ничего.
+        if unity.isActive {
+            switch unity.projectFiles {
+            case .missing:
+                showNotice("Проектные файлы Unity не сгенерированы — языковому серверу нечего читать")
+                return
+            case .stale:
+                showNotice("Проектные файлы Unity устарели — сервер видит проект не целиком")
+                return
+            case .ready:
+                break
+            }
+        }
+        switch lsp.state {
+        case .starting(let progress):
+            let detail = progress.isEmpty ? "" : " (\(progress))"
+            showNotice("Объявление знает языковой сервер — он ещё запускается\(detail)")
+        case .failed(let why):
+            showNotice("Объявление не найдено: языковой сервер не работает — \(why)")
+        case .stopped, .ready:
+            showNotice("Объявление не найдено")
         }
     }
 
@@ -1350,8 +1473,9 @@ final class Workspace: ObservableObject {
         paletteBusy = true
         isPaletteOpen = true
 
-        // Неполный ответ полузагруженного сервера хуже честного поиска по тексту.
-        guard lsp.isReady, languageServerProven else {
+        // Неполный ответ полузагруженного сервера хуже честного поиска по
+        // тексту. Про текст из метаданных .dll сервер вообще ничего не знает.
+        guard lsp.isReady, languageServerProven, document.decompiled != .assembly else {
             findLocalReferences(at: offset, in: document)
             return
         }
@@ -1460,9 +1584,23 @@ final class Workspace: ObservableObject {
         if document?.url == target.url {
             if !preview, target.range == nil, let buffer { keepTabOpen(buffer) }
             if let range = target.range { requestReveal(range) }
+            revealDeclaration(target)
         } else {
-            open(file: target.url, reveal: target.range, preview: preview)
+            open(file: target.url, reveal: target.range, preview: preview) { [weak self] in
+                self?.revealDeclaration(target)
+            }
         }
+    }
+
+    /// Цель, у которой вместо строки — имя объявления: так открывается тип
+    /// из сборки. Где он окажется в тексте, видно только после разбора,
+    /// поэтому ищем его в структуре уже открытого файла.
+    private func revealDeclaration(_ target: NavTarget) {
+        guard let name = target.declaration, let document,
+              document.url.standardizedFileURL == target.url.standardizedFileURL else { return }
+        let types = document.outline.filter { $0.kind == .type && $0.name == name }
+        guard let item = types.first ?? document.outline.first(where: { $0.name == name }) else { return }
+        requestReveal(rangeFor(item, in: document))
     }
 
     // MARK: - Открытие файла
@@ -1556,7 +1694,7 @@ final class Workspace: ObservableObject {
                 return
             }
             let buffer = TextBuffer(document: doc, fontSize: fontSize)
-            if replacingReviewTab, let current = self.buffer, current.isReadOnly,
+            if replacingReviewTab, let current = self.buffer, current.isReviewVersion,
                let index = tabs.firstIndex(where: { $0 === current }) {
                 // Версия из MR правок не знает — терять при замене нечего.
                 discard(current)
@@ -1611,7 +1749,8 @@ final class Workspace: ObservableObject {
         _ = loadGeneration.bump()
         rememberPosition()
         // Историю ведут по пути: версию из MR она открыла бы рабочей копией.
-        if !tab.isReadOnly { appendHistory(NavTarget(url: tab.url, range: nil)) }
+        // Сборка по своему пути откроется той же — её записать можно.
+        if !tab.isReviewVersion { appendHistory(NavTarget(url: tab.url, range: nil)) }
         requestedFile = tab.url
         activate(tab, reveal: nil)
     }
@@ -1657,7 +1796,7 @@ final class Workspace: ObservableObject {
         guard let current = buffer, current !== start else { return }
         activationCounter += 1
         current.lastActivated = activationCounter
-        if !current.isReadOnly { appendHistory(NavTarget(url: current.url, range: nil)) }
+        if !current.isReviewVersion { appendHistory(NavTarget(url: current.url, range: nil)) }
         persistTabs()
     }
 
@@ -1764,6 +1903,7 @@ final class Workspace: ObservableObject {
             if buffer.isReadOnly {
                 // Версия из MR: полоски и треды даёт ревью, а не HEAD. Серверу
                 // её не показываем — у него на руках рабочая копия того же файла.
+                // Текст сборки тем более: на диске по этому пути не C#, а байты.
                 git.documentOpened(nil)
             } else {
                 // Сервер поднимается здесь — лениво, при первом файле
@@ -1809,8 +1949,10 @@ final class Workspace: ObservableObject {
 
     private func persistTabs() {
         guard let root, !isRestoringTabs else { return }
-        let files = tabs.filter { !$0.isReadOnly }.map(\.url.path)
-        let active = buffer.flatMap { $0.isReadOnly ? nil : $0.url.path } ?? ""
+        // Вкладка со сборкой помнится наравне с файлом: её текст соберётся
+        // заново из той же .dll.
+        let files = tabs.filter(\.isRestorable).map(\.url.path)
+        let active = buffer.flatMap { $0.isRestorable ? $0.url.path : nil } ?? ""
         let preview = previewTab?.url.path ?? ""
         let entry: [String: Any] = ["files": files, "active": active, "preview": preview]
         if let persistedTabs, persistedTabs["files"] as? [String] == files,
@@ -1961,6 +2103,9 @@ final class Workspace: ObservableObject {
     /// Индекс GUID дособрался: у скриптов в открытой сцене появились имена.
     /// Разбираем файл заново, не трогая ни текст, ни прокрутку.
     private func unityAssetsReady() {
+        // В индексе ассетов видны и сборки пакетов — второй раз обходить
+        // кэш пакетов ради них не нужно.
+        rebuildAssemblyIndex(generation: scanGeneration.current)
         // Фоновые вкладки переразберутся, когда на них вернутся.
         for tab in tabs where tab !== buffer { tab.invalidateSemantics() }
         guard let buffer else { return }

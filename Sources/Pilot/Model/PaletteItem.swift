@@ -64,4 +64,7 @@ struct PaletteItem: Identifiable {
 struct NavTarget: Equatable {
     var url: URL
     var range: LSPRange?
+    /// Имя объявления, к которому прыгаем, когда строка заранее неизвестна:
+    /// тип из сборки ищут в её тексте уже после того, как он собран.
+    var declaration: String? = nil
 }

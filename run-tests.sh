@@ -1,6 +1,7 @@
 #!/bin/bash
 # Тесты алгоритмического ядра: индекс файлов и типов, дерево файлов, fuzzy-поиск,
-# .gitignore, лексер, распознавание ⇧⇧, git, события ФС, Unity: GUID, сцены, инспектор.
+# .gitignore, лексер, распознавание ⇧⇧, git, события ФС, Unity: GUID, сцены,
+# инспектор, метаданные сборок .NET.
 # AppKit здесь не нужен, поэтому они гоняются и на macOS, и на Linux.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -14,6 +15,7 @@ cp Sources/Pilot/Highlight/{Language,Lexer,Outline,Occurrences}.swift "$TMP/Sour
 cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,LSPDaemon,UnixSocket,Completion}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Git/{LineDiff,GitParsing,Git,MergeConflicts}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Nav/{SymbolIndex,LocalNavigator}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Decompile/{AssemblyMetadata,AssemblySignatures,AssemblySource,AssemblyIndex}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/GitLab/{GitLabRemote,GitLabModels,UnifiedDiff,MergeRequestSearch}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Unity/{UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector,UnityHierarchy}.swift "$TMP/Sources/coretests/"
 cp CoreTests/CoreTests.swift "$TMP/Sources/coretests/main.swift"

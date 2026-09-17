@@ -108,7 +108,7 @@ extension Workspace {
             guard let files = review.active?.files, review.active?.mr.iid == mr.iid else { return }
             // Файлы прошлого MR к этому не относятся: ни полосок, ни тредов.
             let ours = Set(files.compactMap { reviewTab(for: $0) }.map(ObjectIdentifier.init))
-            closeTabs(tabs.filter { $0.isReadOnly && !ours.contains(ObjectIdentifier($0)) })
+            closeTabs(tabs.filter { $0.isReviewVersion && !ours.contains(ObjectIdentifier($0)) })
             if let first = files.first(where: { !$0.raw.deletedFile }) ?? files.first {
                 open(reviewFile: first)
             }
@@ -126,7 +126,7 @@ extension Workspace {
     func closeReview() {
         let url = document?.revision != nil ? document?.url : nil
         review.close()
-        closeTabs(tabs.filter(\.isReadOnly))
+        closeTabs(tabs.filter(\.isReviewVersion))
         if let url, FileManager.default.fileExists(atPath: url.path) {
             open(file: url)
         }

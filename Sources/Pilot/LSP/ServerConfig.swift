@@ -173,6 +173,16 @@ enum ServerRegistry {
         "csharp|background_analysis.dotnet_compiler_diagnostics_scope": "none",
         // ⌘T ищет по коду проекта, а не по UnityEngine.dll и прочим сборкам.
         "csharp|symbol_search.dotnet_search_reference_assemblies": false,
+        // ⌘B на типе из сборки без исходников: Roslyn декомпилирует его
+        // (внутри у него ILSpy), кладёт .cs в свой временный кэш и отдаёт
+        // путь к нему обычным Location. Второе — про сборки, у которых есть
+        // PDB с Source Link или вшитыми исходниками: тогда вместо
+        // декомпиляции приходит настоящий код. Обе секции идут без
+        // префикса `csharp|`: это глобальные настройки, язык у них не
+        // спрашивают. Значения по умолчанию у Roslyn те же, но полагаться
+        // на них не хочется — они его, а не наши.
+        "navigation.dotnet_navigate_to_decompiled_sources": true,
+        "navigation.dotnet_navigate_to_source_link_and_embedded_sources": true,
     ]
 
     private static func solutionArguments(root: URL, executable: String) -> [String] {
@@ -182,13 +192,22 @@ enum ServerRegistry {
         return [executable]
     }
 
-    /// Ищет .sln в корне проекта: без него Roslyn и csharp-ls
-    /// сами угадывают, что грузить, и часто угадывают не то.
+    /// Ищет .sln в корне проекта, а если его там нет — в папке
+    /// Unity-проекта: без solution Roslyn и csharp-ls сами угадывают,
+    /// что грузить, и часто угадывают не то.
     static func findSolution(root: URL) -> URL? {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(at: root,
-                                                        includingPropertiesForKeys: nil,
-                                                        options: [.skipsHiddenFiles]) else { return nil }
+        if let found = solution(in: root) { return found }
+        // Unity-проект бывает в подпапке репозитория, а solution он пишет
+        // рядом с собой. Без этого сервер поднимался бы вообще без проектов.
+        if let unity = UnityProjectInfo.find(inWorkspace: root), unity.root.path != root.path {
+            return solution(in: unity.root)
+        }
+        return nil
+    }
+
+    private static func solution(in directory: URL) -> URL? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
         if let sln = entries.first(where: { $0.pathExtension == "sln" }) { return sln }
         if let slnx = entries.first(where: { $0.pathExtension == "slnx" }) { return slnx }
         return entries.first { $0.pathExtension == "csproj" }

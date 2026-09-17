@@ -16,6 +16,8 @@ struct LoadedDocument: Sendable {
     /// показывает файл в версии MR: она не совпадает с рабочей копией,
     /// поэтому такой документ только для чтения и никогда не сохраняется.
     var revision: String? = nil
+    /// Текст не из исходника, а из сборки; nil — обычный файл.
+    var decompiled: Decompiled? = nil
     /// Сцена, префаб или другой сериализованный ассет Unity — разобранный.
     var unityFile: UnityYAMLFile? = nil
     /// Её иерархия: GameObject'ы и вложенные префабы — для дерева проекта.
@@ -30,6 +32,18 @@ struct LoadedDocument: Sendable {
 
     /// Текущий текст. Берётся из модели: она правится вместе с редактором.
     var text: String { model.text }
+
+    /// Откуда взялся C#, которого в проекте нет.
+    enum Decompiled: Sendable, Equatable {
+        /// Объявления, собранные Pilot по метаданным открытой `.dll`.
+        /// Языковой сервер про такой текст не знает: на диске по этому
+        /// пути лежит сборка, а не код.
+        case assembly
+        /// Файл из кэша языкового сервера: Roslyn декомпилировал тип сам
+        /// и написал настоящий `.cs`. Сервер о нём знает, поэтому `⌘B`
+        /// изнутри работает дальше, как в обычном коде.
+        case languageServer(assembly: String?)
+    }
 
     enum LoadError: Error, LocalizedError {
         case tooLarge(Int)
@@ -53,8 +67,22 @@ struct LoadedDocument: Sendable {
     static let maxBytes = 64 * 1024 * 1024
 
     static func load(url: URL, unity: UnityContext? = nil) throws -> LoadedDocument {
+        // Сборка .NET — не текст: вместо байтов показываем её объявления.
+        if AssemblySource.isAssembly(url) {
+            var document = make(url: url, text: try AssemblySource.text(of: url), encoding: .utf8,
+                                revision: nil, unity: nil, spec: Languages.csharp)
+            document.decompiled = .assembly
+            return document
+        }
         let (text, encoding) = try readTextAndEncoding(url: url, maxBytes: maxBytes)
-        return make(url: url, text: text, encoding: encoding, revision: nil, unity: unity)
+        var document = make(url: url, text: text, encoding: encoding, revision: nil, unity: unity)
+        // Файл из кэша языкового сервера: он сам его декомпилировал, а нам
+        // остаётся не дать его править — на диске он только для чтения.
+        if document.languageName == Languages.csharp.name,
+           let assembly = AssemblySource.decompiledAssembly(inHeader: text) {
+            document.decompiled = .languageServer(assembly: assembly)
+        }
+        return document
     }
 
     /// Файл из коммита — для ревью MR: те же проверки, что и с диска.
@@ -64,8 +92,9 @@ struct LoadedDocument: Sendable {
     }
 
     private static func make(url: URL, text: String, encoding: String.Encoding,
-                             revision: String?, unity: UnityContext?) -> LoadedDocument {
-        let spec = Languages.detect(filename: url.lastPathComponent)
+                             revision: String?, unity: UnityContext?,
+                             spec forced: LanguageSpec? = nil) -> LoadedDocument {
+        let spec = forced ?? Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
         let outline = OutlineBuilder.build(model: model)
         let semantics = UnitySemantics.analyze(model: model, lexicalOutline: outline, context: unity)

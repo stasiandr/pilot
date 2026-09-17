@@ -79,7 +79,7 @@ struct TabBar: View {
             .disabled(index == workspace.tabs.count - 1)
         Divider()
         Button("Показать в Finder") { NSWorkspace.shared.activateFileViewerSelecting([tab.url]) }
-            .disabled(tab.isReadOnly)
+            .disabled(tab.isReviewVersion)
         Button("Скопировать путь") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
@@ -103,6 +103,17 @@ private struct TabItem: View {
     @State private var hovering = false
     @State private var hoveringClose = false
 
+    /// Подсказка у коробки: откуда взялся этот код и почему его не править.
+    static func assemblyHint(_ decompiled: LoadedDocument.Decompiled) -> String {
+        switch decompiled {
+        case .assembly:
+            return "Объявления из сборки — только для чтения"
+        case .languageServer(let assembly):
+            let name = assembly ?? "сборка"
+            return "\(name): декомпилировано языковым сервером — только для чтения"
+        }
+    }
+
     var body: some View {
         let name = tab.url.lastPathComponent
         let icon = Theme.fileIcon(forName: name)
@@ -121,11 +132,16 @@ private struct TabItem: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
             }
-            if tab.isReadOnly {
+            if tab.isReviewVersion {
                 Image(systemName: "arrow.triangle.pull")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Color(nsColor: Theme.reviewThread))
                     .help("Версия из мерж-реквеста — только для чтения")
+            } else if let decompiled = tab.document.decompiled {
+                Image(systemName: "shippingbox")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .help(Self.assemblyHint(decompiled))
             }
             closeSlot
         }

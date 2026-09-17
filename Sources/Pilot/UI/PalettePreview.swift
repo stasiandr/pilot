@@ -107,6 +107,10 @@ final class PreviewLoader: ObservableObject {
            let image = NSImage(contentsOf: url) {
             return .success(.image(image))
         }
+        // Сборку .NET показываем так же, как в редакторе: её объявлениями.
+        if AssemblySource.isAssembly(url) {
+            return Result { .model(SyntaxModel(text: try AssemblySource.text(of: url), spec: Languages.csharp)) }
+        }
         return Result {
             let text = try LoadedDocument.readText(url: url, maxBytes: maxBytes)
             return .model(SyntaxModel(text: text, spec: Languages.detect(filename: url.lastPathComponent)))

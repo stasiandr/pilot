@@ -127,6 +127,81 @@ struct UnityProjectInfo: Sendable, Equatable {
         return String(relPath.dropFirst(workspacePrefix.count + 1))
     }
 
+    // MARK: - Что лежит рядом с проектом
+
+    /// Состояние проектных файлов. Их пишет не Unity, а пакет выбранного
+    /// редактора, и у Pilot такого пакета нет — поэтому файлы легко
+    /// оказываются устаревшими или их нет вовсе (в git они не хранятся).
+    /// Без них языковому серверу нечего грузить, и молчит вся семантика
+    /// разом: ⌘B, ⌘T, ⌘R.
+    enum ProjectFiles: Equatable {
+        case ready
+        /// Скрипты компилировались позже, чем писались `.csproj`: новых
+        /// файлов и асмдефов сервер не увидит.
+        case stale
+        /// Ни `.sln`, ни `.csproj` — обычно свежий клон.
+        case missing
+    }
+
+    var projectFiles: ProjectFiles {
+        // `.sln` без `.csproj` не бывает: Unity пишет их вместе.
+        guard let projects = Self.newestModification(in: root, extensions: ["csproj"])
+        else { return .missing }
+        // Unity перезаписывает Library/ScriptAssemblies на каждой компиляции.
+        // Сборки новее проектных файлов — значит, скрипты с тех пор менялись.
+        guard let compiled = Self.newestModification(
+            in: root.appendingPathComponent("Library/ScriptAssemblies"), extensions: ["dll"])
+        else { return .ready }
+        return compiled > projects ? .stale : .ready
+    }
+
+    private static func newestModification(in directory: URL, extensions: Set<String>) -> Date? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]) else { return nil }
+        return entries
+            .filter { extensions.contains($0.pathExtension.lowercased()) }
+            .compactMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
+            .max()
+    }
+
+    /// Папка `Contents` установленного редактора — в ней лежат сборки
+    /// движка. Сначала спрашиваем сам Unity: запускаясь, он пишет путь в
+    /// `Library/EditorInstance.json`. Если проект ни разу не открывали —
+    /// обычное место установки Hub по версии из `ProjectVersion.txt`.
+    var editorContents: URL? {
+        let fm = FileManager.default
+        if let data = try? Data(contentsOf: root.appendingPathComponent("Library/EditorInstance.json")),
+           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            let contents = (json["app_contents_path"] as? String)
+                ?? (json["app_path"] as? String).map { $0 + "/Contents" }
+            if let contents, fm.fileExists(atPath: contents) { return URL(fileURLWithPath: contents) }
+        }
+        guard let version = editorVersion else { return nil }
+        let candidates = [
+            "/Applications/Unity/Hub/Editor/\(version)/Unity.app/Contents",
+            NSHomeDirectory() + "/Applications/Unity/Hub/Editor/\(version)/Unity.app/Contents",
+            "/Applications/Unity/Unity.app/Contents",
+        ]
+        return candidates.first { fm.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Сборки движка и редактора: `UnityEngine.CoreModule`, `UnityEditor` и
+    /// прочие модули. Исходников к ним нет ни у кого, так что читают их
+    /// всегда декомпилированными.
+    var engineAssemblies: [URL] {
+        guard let contents = editorContents else { return [] }
+        let managed = contents.appendingPathComponent("Managed")
+        return Self.assemblies(in: managed.appendingPathComponent("UnityEngine"))
+            + Self.assemblies(in: managed)
+    }
+
+    private static func assemblies(in directory: URL) -> [URL] {
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        return entries.filter { $0.pathExtension.lowercased() == "dll" }.sorted { $0.path < $1.path }
+    }
+
     /// `Library/PackageCache/com.unity.foo@1a2b3c/Runtime/X.cs` → `com.unity.foo/Runtime/X.cs`.
     /// Хэш версии в пути только мешает читать.
     static func prettyPath(_ relPath: String) -> String {

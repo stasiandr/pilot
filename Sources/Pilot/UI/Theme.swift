@@ -119,6 +119,7 @@ enum Theme {
         case "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "icns", "heic", "tiff":
                                         return Icon(symbol: "photo", color: Macchiato.teal)
         case "pdf":                     return Icon(symbol: "doc.richtext", color: Macchiato.red)
+        case "dll", "exe", "winmd":     return Icon(symbol: "shippingbox", color: Macchiato.mauve)
         case "lock", "resolved":        return Icon(symbol: "lock", color: Macchiato.overlay2)
         default:                        return Icon(symbol: "doc", color: Macchiato.overlay2)
         }

@@ -15,6 +15,12 @@ final class UnityService: ObservableObject {
     @Published private(set) var isIndexingAssets = false
     /// Растёт, когда меняется то, от чего зависит раскраска ссылок.
     @Published private(set) var decorationsVersion = 0
+    /// Есть ли у проекта свежие `.sln`/`.csproj`. Пишет их не Unity, а
+    /// пакет выбранного редактора, и у Pilot такого пакета нет — так что
+    /// проектные файлы легко оказываются устаревшими или отсутствуют
+    /// вовсе. Языковому серверу без них нечего читать, и лучше сказать
+    /// об этом, чем молчать в ответ на ⌘B.
+    @Published private(set) var projectFiles: UnityProjectInfo.ProjectFiles = .ready
 
     /// Индекс ассетов готов — пора заново разобрать открытый файл.
     var onAssetsReady: (() -> Void)?
@@ -24,6 +30,16 @@ final class UnityService: ObservableObject {
 
     private let generation = AtomicCounter()
     private let queue = DispatchQueue(label: "pilot.unity", qos: .utility)
+
+    init() {
+        // Вернулись в Pilot — в Unity за это время могли нажать
+        // «Open C# Project» или пересобрать скрипты.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshProjectFiles() }
+        }
+    }
 
     var isActive: Bool { project != nil }
 
@@ -44,6 +60,24 @@ final class UnityService: ObservableObject {
         isIndexingAssets = false
         decorationsVersion += 1
         project = root.flatMap(UnityProjectInfo.find(inWorkspace:))
+        projectFiles = .ready
+        refreshProjectFiles()
+    }
+
+    /// Перечитывает состояние проектных файлов: пара листингов папок,
+    /// поэтому в фоне и без таймера — при открытии проекта и при возврате
+    /// в приложение (в Unity за это время могли нажать «Open C# Project»).
+    func refreshProjectFiles() {
+        guard let project else { return }
+        let counter = generation
+        let current = generation.current
+        queue.async { [weak self] in
+            let state = project.projectFiles
+            Task { @MainActor in
+                guard let self, counter.isCurrent(current) else { return }
+                self.projectFiles = state
+            }
+        }
     }
 
     func indexAssets() {
