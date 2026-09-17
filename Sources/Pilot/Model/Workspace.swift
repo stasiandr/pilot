@@ -271,6 +271,25 @@ final class Workspace: ObservableObject {
     /// ⌘R без сервера читает все исходники — не на `work`, чтобы в это время
     /// открывались файлы и работал поиск.
     private let referenceQueue = DispatchQueue(label: "pilot.references", qos: .userInitiated)
+
+    /// Сохранённые файлы, ждущие переиндексации, и поколение символов.
+    /// Поколение своё: полный разбор проекта и переиндексация по сохранению
+    /// идут по одному пути и не должны затирать друг друга задним числом.
+    private var pendingReindex: Set<String> = []
+    private var pendingRemoved: Set<String> = []
+    private var reindexScheduled = false
+    private let symbolGeneration = AtomicCounter()
+
+    /// Слежение за диском: правки мимо Pilot, переключение ветки, новые файлы.
+    private let watcher = FileWatcher()
+    /// Правила отсева шума для событий — по корневому .gitignore проекта.
+    private var watchIgnore = IgnoreMatcher(layers: [], useSoftSkip: true)
+    private var rescanScheduled = false
+    private var rescanPending = false
+    /// Пути, которые Pilot записал сам. Запись атомарная — через временный файл
+    /// и переименование, — и системе видна как создание. Список файлов от
+    /// своего же сохранения не меняется, пересобирать его незачем.
+    private var ownWrites: Set<String> = []
     private let scanGeneration = AtomicCounter()
     private let searchGeneration = AtomicCounter()
     private let loadGeneration = AtomicCounter()
@@ -369,6 +388,11 @@ final class Workspace: ObservableObject {
         typeCount = 0
         isTypeIndexing = true
         symbolIndex = nil
+        pendingReindex.removeAll()
+        pendingRemoved.removeAll()
+        rescanPending = false
+        ownWrites.removeAll()
+        _ = symbolGeneration.bump()
 
         guard let first else {
             lsp.workspaceChanged(to: url)
@@ -397,6 +421,9 @@ final class Workspace: ObservableObject {
         git.refresh()
         unity.indexAssets()
         let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
+        watchIgnore = FileChanges.rootMatcher(root: url)
+        watcher.onChange = { [weak self] events in self?.fileSystemChanged(events) }
+        watcher.watch(root: url)
 
         typeWork.async { [weak self] in
             guard let cached = IndexCache.loadTypes(root: url) else { return }
@@ -472,6 +499,7 @@ final class Workspace: ObservableObject {
         runClassSearch()
         // Индекс сменился — отфильтрованное дерево собрано по старому.
         if !navigatorFilter.isEmpty { navigatorFilterChanged() }
+        if !indexing, rescanPending { scheduleRescan() }
     }
 
     /// Исходники разбираются по уже готовому списку файлов — второй раз
@@ -479,13 +507,15 @@ final class Workspace: ObservableObject {
     /// быстрого навигатора, а типы для ⇧⇧ просто выбираются из них.
     private func rebuildTypeIndex(files: [String], root url: URL, generation: Int) {
         let counter = scanGeneration
+        let batch = symbolGeneration
+        let symbolBatch = symbolGeneration.bump()
         typeWork.async { [weak self] in
             guard let symbols = SymbolIndex.build(root: url, files: files,
                                                   shouldStop: { !counter.isCurrent(generation) })
             else { return }
             let fresh = TypeIndex.make(root: url, entries: symbols.typeEntries())
             Task { @MainActor in
-                guard let self, counter.isCurrent(generation) else { return }
+                guard let self, counter.isCurrent(generation), batch.isCurrent(symbolBatch) else { return }
                 self.symbolIndex = symbols
                 self.adoptTypes(fresh, indexing: false)
             }
@@ -499,6 +529,139 @@ final class Workspace: ObservableObject {
         typeCount = newIndex.count
         isTypeIndexing = indexing
         runClassSearch()
+        // Полный разбор закончился — можно применить сохранения, которые
+        // пришлись на него: ждать следующего было бы неоткуда.
+        if !indexing, !pendingReindex.isEmpty || !pendingRemoved.isEmpty { scheduleReindexFlush() }
+        if !indexing, rescanPending { scheduleRescan() }
+    }
+
+    // MARK: - Переиндексация правленого файла
+
+    /// Файл сохранён — его объявления в индексе устарели. Пересобираем индекс,
+    /// перечитав с диска только его: символы остальных файлов переносятся из
+    /// старого индекса как есть. Полный разбор проекта стоил бы секунды.
+    private func reindexAfterSave(_ url: URL) {
+        guard let root, url.path.hasPrefix(root.path + "/") else { return }
+        let path = String(url.path.dropFirst(root.path.count + 1))
+        // Событие об этой записи придёт через полсекунды — к тому времени
+        // путь должен быть здесь, иначе своё же сохранение выглядит как
+        // появление файла и тянет полное пересканирование.
+        ownWrites.insert(path)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            self?.ownWrites.remove(path)
+        }
+        guard SymbolIndex.spec(forPath: path) != nil else { return }   // не исходник — нечего разбирать
+        pendingReindex.insert(path)
+        scheduleReindexFlush()
+    }
+
+    /// ⌥⌘S сохраняет пачкой — ждём, пока она уляжется, и пересобираем один раз.
+    private func scheduleReindexFlush() {
+        guard !reindexScheduled else { return }
+        reindexScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            self?.flushReindex()
+        }
+    }
+
+    private func flushReindex() {
+        reindexScheduled = false
+        guard !pendingReindex.isEmpty || !pendingRemoved.isEmpty else { return }
+        guard let root, let base = symbolIndex else {
+            pendingReindex.removeAll()
+            pendingRemoved.removeAll()
+            return
+        }
+        // Полный разбор проекта всё равно прочитает эти файлы с диска. Не
+        // мешаем ему: он сам позовёт сюда снова, когда закончит.
+        guard !isTypeIndexing else { return }
+
+        let changed = Array(pendingReindex)
+        let removed = pendingRemoved
+        pendingReindex.removeAll()
+        pendingRemoved.removeAll()
+        // Поколение сканирования не трогаем — оно про обход диска, и его
+        // сдвиг отменил бы идущий разбор проекта.
+        let batch = symbolGeneration
+        let symbolBatch = symbolGeneration.bump()
+        typeWork.async { [weak self] in
+            guard let fresh = SymbolIndex.updating(base, changed: changed, removed: removed,
+                                                   shouldStop: { !batch.isCurrent(symbolBatch) })
+            else { return }
+            let types = TypeIndex.make(root: root, entries: fresh.typeEntries())
+            Task { @MainActor in
+                guard let self, batch.isCurrent(symbolBatch), self.root == root else { return }
+                self.symbolIndex = fresh
+                self.adoptTypes(types, indexing: false)
+            }
+            // Кэш на диске не трогаем: его переписывание стоит дороже самой
+            // пересборки, а при следующем открытии проекта полный разбор
+            // всё равно молча заменит его свежим.
+        }
+    }
+
+    // MARK: - Изменения на диске
+
+    /// Пачка событий от FSEvents: что-то поменялось мимо Pilot — правка в другом
+    /// редакторе, переключение ветки, новый файл. Разбор в `FileChanges`,
+    /// здесь только развод по трём делам: git, символы, список файлов.
+    private func fileSystemChanged(_ events: [FileEvent]) {
+        guard let root else { return }
+        let batch = FileChanges.classify(events, root: root, ignore: watchIgnore, ownWrites: ownWrites)
+        guard !batch.isEmpty else { return }
+
+        if batch.gitTouched { git.refresh() }
+        // Разбирать заново стоит только исходники; остальное меняет лишь список.
+        for path in batch.changed where SymbolIndex.spec(forPath: path) != nil {
+            pendingReindex.insert(path)
+        }
+        // Удалённое проверять на язык нельзя — файла уже нет; лишний путь
+        // в `removed` просто ни с чем не совпадёт.
+        pendingRemoved.formUnion(batch.removed)
+        if !pendingReindex.isEmpty || !pendingRemoved.isEmpty { scheduleReindexFlush() }
+        if batch.needsRescan { scheduleRescan() }
+    }
+
+    /// Список файлов собирается заново целиком: правила игнорирования у git
+    /// свои, и повторить их один раз в конце дешевле и честнее, чем угадывать
+    /// по каждому событию. Отсюда и задержка побольше, чем у переиндексации, —
+    /// распаковка ветки или импорт ассетов идут пачками.
+    private func scheduleRescan() {
+        guard !rescanScheduled else { return }
+        rescanScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            self?.rescanFiles()
+        }
+    }
+
+    private func rescanFiles() {
+        rescanScheduled = false
+        guard let url = root else { return }
+        // Первый обход проекта ещё идёт — он и так принесёт свежий список,
+        // а сдвиг поколения его бы отменил. Позовут обратно, когда закончится.
+        guard !isIndexing, !isTypeIndexing else { rescanPending = true; return }
+        rescanPending = false
+
+        let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
+        let shown = index?.display
+        let counter = scanGeneration
+        let generation = counter.bump()
+        scanWork.async { [weak self] in
+            let fresh = FileIndex.scan(root: url, exclude: exclude,
+                                       shouldStop: { !counter.isCurrent(generation) })
+            guard counter.isCurrent(generation) else { return }
+            IndexCache.save(fresh, root: url)
+            // Список обычно совпадает с уже показанным — тогда дерево не
+            // пересобираем и панель не перерисовывается впустую.
+            let tree = shown == fresh.display ? nil : FileTree.build(paths: fresh.display)
+            Task { @MainActor in
+                guard let self, counter.isCurrent(generation), self.root == url else { return }
+                self.adopt(fresh, tree: tree, indexing: false)
+            }
+        }
     }
 
     /// Путь открытого файла относительно корня — чтобы найти его в дереве.
@@ -524,6 +687,12 @@ final class Workspace: ObservableObject {
         root = nil
         index = nil
         symbolIndex = nil
+        pendingReindex.removeAll()
+        pendingRemoved.removeAll()
+        rescanPending = false
+        ownWrites.removeAll()
+        _ = symbolGeneration.bump()
+        watcher.watch(root: nil)
         fileTree = nil
         loadError = nil
         isIndexing = false
@@ -1107,7 +1276,7 @@ final class Workspace: ObservableObject {
         }
     }
 
-    private func navDocument(_ document: LoadedDocument) -> NavDocument {
+    func navDocument(_ document: LoadedDocument) -> NavDocument {
         var relPath: String?
         if let root, document.url.path.hasPrefix(root.path + "/") {
             relPath = String(document.url.path.dropFirst(root.path.count + 1))
@@ -1130,8 +1299,8 @@ final class Workspace: ObservableObject {
         }
     }
 
-    private func showDeclarations(_ declarations: [FoundDeclaration]) {
-        paletteMode = .declarations
+    private func showDeclarations(_ declarations: [FoundDeclaration], mode: PaletteMode = .declarations) {
+        paletteMode = mode
         query = ""
         selection = 0
         allReferences = declarations.enumerated().map { position, declaration in
@@ -1150,6 +1319,22 @@ final class Workspace: ObservableObject {
         items = allReferences
         paletteBusy = false
         isPaletteOpen = true
+    }
+
+    /// ⌥⌘B — кто наследует тип под курсором или переопределяет его метод.
+    /// Только свой индекс: `bases` он знает с первой секунды, а у LSP это
+    /// отдельный запрос `textDocument/implementation`, который здесь не
+    /// подключён. Единственная реализация — прыгаем сразу, иначе список.
+    func findImplementations(at offset: Int) {
+        guard let document else { return }
+        let answer = LocalNavigator(index: symbolIndex, document: navDocument(document)).implementations(at: offset)
+        if answer.isExact, let first = answer.declarations.first {
+            navigate(to: first.target)
+            return
+        }
+        // Пустой ответ тоже показываем палитрой: молчание в ответ на клавишу
+        // неотличимо от того, что она не сработала.
+        showDeclarations(answer.declarations, mode: .implementations)
     }
 
     func findReferences(at offset: Int) {
@@ -1953,6 +2138,7 @@ final class Workspace: ObservableObject {
             return false
         }
         lsp.documentSaved(buffer.url)
+        reindexAfterSave(buffer.url)
         git.refresh()
         if buffer === self.buffer { git.documentEdited(buffer.document) }
         return true

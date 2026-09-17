@@ -20,6 +20,10 @@ struct Symbol: Equatable {
     var typeText: String?
     var bases: [String] = []
     var genericParams: [String] = []
+    /// У методов C-подобных языков: типы параметров, как записаны.
+    /// Даёт число параметров для выбора перегрузки и `this`-получателя
+    /// у методов-расширений.
+    var parameters: [String] = []
     var file: Int32
     var line: Int32
     var column: Int32      // UTF-16, как у LSP
@@ -54,6 +58,15 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     private(set) var typesByName: [String: [Int32]] = [:]
     /// Имя типа → члены, объявленные внутри него.
     private(set) var membersByOwner: [String: [Int32]] = [:]
+    /// Короткое имя базового типа → типы, назвавшие его в `: Base, IFoo`.
+    /// Обратная сторона `bases`: по ней навигатор идёт вниз по иерархии.
+    /// Ключ без namespace и дженериков, поэтому одноимённые базовые из разных
+    /// namespace попадают вместе — разбирается это уже резолвом типов.
+    private(set) var derivedByBase: [String: [Int32]] = [:]
+    /// Короткое имя расширяемого типа → методы-расширения для него.
+    /// `static void Say(this Player p)` зовётся как член Player, но лежит
+    /// в постороннем static-классе, и через `membersByOwner` его не найти.
+    private(set) var extensionsByReceiver: [String: [Int32]] = [:]
 
     /// «контейнер.имя» в нижнем регистре подряд — для fuzzy-поиска без аллокаций.
     private var bytes: [UInt8] = []
@@ -89,7 +102,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
 
     // MARK: - Наполнение
 
-    fileprivate func append(file: SourceFileInfo, _ found: [Symbol]) {
+    fileprivate func append(file: SourceFileInfo, _ found: some Sequence<Symbol>) {
         let fileID = Int32(files.count)
         files.append(file)
         for var s in found {
@@ -105,8 +118,12 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
         for (i, s) in symbols.enumerated() {
             let id = Int32(i)
             byName[s.name, default: []].append(id)
-            if Self.isType(s.kind) { typesByName[s.name, default: []].append(id) }
+            if Self.isType(s.kind) {
+                typesByName[s.name, default: []].append(id)
+                for base in s.bases { derivedByBase[Self.baseKey(base), default: []].append(id) }
+            }
             if Self.isMember(s.kind), let owner = s.container { membersByOwner[owner, default: []].append(id) }
+            if let receiver = Self.extensionReceiver(s) { extensionsByReceiver[receiver, default: []].append(id) }
 
             let start = bytes.count
             var nameStart = 0
@@ -118,6 +135,27 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             for b in s.name.utf8 { bytes.append(Self.lower(b)) }
             spans.append((Int32(start), Int32(bytes.count - start), Int32(nameStart)))
         }
+    }
+
+    /// Тип, который расширяет метод: `static void Say(this Player p)` → `Player`.
+    /// nil — обычный метод. Ключ такой же короткий, как у наследников:
+    /// одноимённые типы разбирает уже навигатор.
+    static func extensionReceiver(_ s: Symbol) -> String? {
+        guard s.kind == .method, let first = s.parameters.first,
+              first.hasPrefix(extensionMarker) else { return nil }
+        return baseKey(String(first.dropFirst(extensionMarker.count)))
+    }
+
+    /// Как записан получатель метода-расширения в C#.
+    static let extensionMarker = "this "
+
+    /// Ключ `derivedByBase`: имя базового типа без namespace и дженериков.
+    /// `Game.Ecs.Base<T>` → `Base`.
+    static func baseKey(_ text: String) -> String {
+        var name = text.trimmingCharacters(in: .whitespaces)
+        if let lt = name.firstIndex(of: "<") { name = String(name[..<lt]) }
+        if let dot = name.lastIndex(of: ".") { name = String(name[name.index(after: dot)...]) }
+        return name
     }
 
     @inline(__always) private static func lower(_ b: UInt8) -> UInt8 {
@@ -146,6 +184,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             found.append(Symbol(name: item.name, kind: item.kind, keyword: item.keyword,
                                 container: item.container, typeText: item.typeText,
                                 bases: item.bases, genericParams: item.genericParams,
+                                parameters: item.parameters,
                                 file: 0, line: Int32(position.line),
                                 column: Int32(position.character), length: Int32(item.range.length)))
         }
@@ -254,6 +293,71 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     /// Разбирает все исходники проекта на всех ядрах — вызывать только из фона.
     /// Если воркспейс сменился, возвращает nil, а не половину индекса.
     static func build(root: URL, files: [String], shouldStop: @escaping () -> Bool) -> SymbolIndex? {
+        let found = parse(root: root, files: files, shouldStop: shouldStop)
+        if shouldStop() { return nil }
+
+        let index = SymbolIndex(root: root)
+        // Файл без объявлений держим только ради его `using` — по ним
+        // разбираются одноимённые типы.
+        for (info, symbols) in found.sorted(by: { $0.0.path < $1.0.path })
+        where !symbols.isEmpty || !info.usings.isEmpty {
+            index.append(file: info, symbols)
+        }
+        index.finish()
+        return index
+    }
+
+    /// Те же исходники, но разобранные поверх готового индекса: символы файлов,
+    /// которых нет в `changed` и `removed`, переносятся как есть — ни чтения
+    /// диска, ни лексера на них не тратится. Старый индекс не меняется, он
+    /// неизменяем и продолжает отвечать из фона, пока новый строится.
+    ///
+    /// В `removed` может лежать и папка: удалённая целиком, она приходит одним
+    /// путём, а событий по своим файлам не присылает. Поэтому уходит и всё,
+    /// что лежало под ней.
+    static func updating(_ base: SymbolIndex, changed: [String], removed: Set<String> = [],
+                         shouldStop: @escaping () -> Bool) -> SymbolIndex? {
+        let parsed = parse(root: base.root, files: changed.filter { !removed.contains($0) },
+                           shouldStop: shouldStop)
+        if shouldStop() { return nil }
+
+        // Всё, что назвали, из старого индекса уходит: файл мог опустеть,
+        // мог перестать быть исходником, мог исчезнуть с диска.
+        let handled = Set(changed).union(removed)
+
+        // Символы каждого файла лежат подряд — и build, и deserialize пишут
+        // их пофайлово. Границы находим одним проходом, без копирования.
+        var end = [Int](repeating: 0, count: base.files.count)
+        for (i, s) in base.symbols.enumerated() { end[Int(s.file)] = i + 1 }
+        var cursor = 0
+        var start = [Int](repeating: 0, count: base.files.count)
+        for i in 0..<base.files.count {
+            start[i] = cursor
+            if end[i] < cursor { end[i] = cursor }   // файл без объявлений
+            cursor = end[i]
+        }
+
+        let fresh = SymbolIndex(root: base.root)
+        for (i, file) in base.files.enumerated() {
+            if handled.contains(file.path) { continue }
+            if !removed.isEmpty, removed.contains(where: { file.path.hasPrefix($0 + "/") }) { continue }
+            fresh.append(file: file, base.symbols[start[i]..<end[i]])
+        }
+        // Перепарсенные и новые — следом. Общий порядок путей сбивается,
+        // но на ответы он не влияет: сравнения путей везде явные.
+        for (info, symbols) in parsed.sorted(by: { $0.0.path < $1.0.path })
+        where !symbols.isEmpty || !info.usings.isEmpty {
+            fresh.append(file: info, symbols)
+        }
+        if shouldStop() { return nil }
+        fresh.finish()
+        return fresh
+    }
+
+    /// Разбор пачки файлов на всех ядрах. Возвращает и пустые результаты —
+    /// по ним видно, что файл разобран и объявлений в нём не осталось.
+    private static func parse(root: URL, files: [String],
+                              shouldStop: @escaping () -> Bool) -> [(SourceFileInfo, [Symbol])] {
         var specsByExtension: [String: LanguageSpec?] = [:]
         var candidates: [(path: String, spec: LanguageSpec)] = []
         for path in files {
@@ -289,21 +393,14 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
                 // прохода: на 26 000 файлов это гигабайты.
                 drainingAutoreleased {
                     guard let text = readSource(root.appendingPathComponent(path)) else { return }
-                    let entry = extract(text: text, spec: spec, path: path)
-                    if !entry.1.isEmpty || !entry.0.usings.isEmpty { local.append(entry) }
+                    local.append(extract(text: text, spec: spec, path: path))
                 }
             }
             lock.lock()
             found.append(contentsOf: local)
             lock.unlock()
         }
-        if shouldStop() { return nil }
-
-        found.sort { $0.0.path < $1.0.path }
-        let index = SymbolIndex(root: root)
-        for (info, symbols) in found { index.append(file: info, symbols) }
-        index.finish()
-        return index
+        return found
     }
 
     /// Файлы больше этого почти всегда сгенерированы, а разбор одного такого
@@ -393,7 +490,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     // Текстом. `F<tab>путь<tab>namespaces<tab>usings<tab>aliases` открывает файл,
     // дальше по строке на объявление. Списки — через `;`, псевдонимы — `имя=цель`.
 
-    private static let cacheHeader = "pilot-symbols 1"
+    private static let cacheHeader = "pilot-symbols 2"
 
     func serialized() -> String {
         var out = [Self.cacheHeader]
@@ -413,6 +510,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             out.append([String(s.kind.rawValue), s.name, s.keyword ?? "", s.container ?? "",
                         s.typeText ?? "", s.bases.joined(separator: ";"),
                         s.genericParams.joined(separator: ";"),
+                        s.parameters.joined(separator: ";"),
                         String(s.line), String(s.column), String(s.length)].joined(separator: "\t"))
         }
         // Файлы без объявлений (только using) тоже нужны — ради псевдонимов.
@@ -451,16 +549,17 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
                                       usings: list(fields[3]), aliases: aliases)
                 continue
             }
-            guard file != nil, fields.count == 10,
+            guard file != nil, fields.count == 11,
                   let raw = UInt8(fields[0]), let kind = OutlineKind(rawValue: raw),
-                  let row = Int32(fields[7]), let column = Int32(fields[8]),
-                  let length = Int32(fields[9]) else { return nil }
+                  let row = Int32(fields[8]), let column = Int32(fields[9]),
+                  let length = Int32(fields[10]) else { return nil }
             pending.append(Symbol(
                 name: String(fields[1]), kind: kind,
                 keyword: fields[2].isEmpty ? nil : String(fields[2]),
                 container: fields[3].isEmpty ? nil : String(fields[3]),
                 typeText: fields[4].isEmpty ? nil : String(fields[4]),
                 bases: list(fields[5]), genericParams: list(fields[6]),
+                parameters: list(fields[7]),
                 file: 0, line: row, column: column, length: length))
         }
         flush()

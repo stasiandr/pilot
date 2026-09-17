@@ -201,6 +201,13 @@ struct PilotApp: App {
                 }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(workspace.document == nil)
+                // Иерархия вниз: считается по индексу объявлений, серверу
+                // этот запрос не уходит вовсе.
+                Button("Перейти к реализациям") {
+                    workspace.findImplementations(at: workspace.caretOffset)
+                }
+                .keyboardShortcut("b", modifiers: [.command, .option])
+                .disabled(workspace.document == nil || workspace.symbolIndex == nil)
                 // Unity: ссылки на ассеты — это GUID, языковой сервер тут не нужен.
                 Button("Где используется ассет") { workspace.findAssetUsages() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])

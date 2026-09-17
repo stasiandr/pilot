@@ -1916,7 +1916,7 @@ section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 8, "режимов палитры восемь")
+check(PaletteMode.allCases.count == 9, "режимов палитры девять")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
@@ -3114,6 +3114,446 @@ let extractMs = Date().timeIntervalSince(tExtract) * 1000
 print(String(format: "  объявления из файла на %d строк: %.0f мс, найдено %d", 10_000, extractMs, perfExtract.1.count))
 check(perfExtract.1.count == 6000, "в синтетике по три объявления на класс (получено \(perfExtract.1.count))")
 check(extractMs < 400, "разбор 10 000 строк быстрее 400 мс")
+
+// ─────────────────────── Иерархия типов ────────────────────────
+section("Иерархия типов")
+
+// Наследники считаются по тому же `bases`, которым ⌘B поднимается вверх,
+// поэтому фикстура нарочно содержит два одноимённых интерфейса.
+let hierRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-hier-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: hierRoot)
+let hierFiles: [String: String] = [
+    "Assets/Game/Damageable.cs": """
+        namespace Game.Components
+        {
+            public interface IDamageable { void Damage(int amount); }
+        }
+        """,
+    "Assets/Game/Health.cs": """
+        namespace Game.Components
+        {
+            public struct Health : IDamageable
+            {
+                public void Damage(int amount) { }
+            }
+        }
+        """,
+    "Assets/Game/Armor.cs": """
+        using Game.Components;
+        namespace Game.Gear
+        {
+            public class Armor : IDamageable
+            {
+                public void Damage(int amount) { }
+            }
+        }
+        """,
+    "Other/Damageable.cs": """
+        namespace Other
+        {
+            public interface IDamageable { void Damage(int amount); }
+            public class Rock : IDamageable { public void Damage(int amount) { } }
+        }
+        """,
+    "Assets/Game/BaseSystem.cs": """
+        namespace Game.Systems
+        {
+            public abstract class BaseSystem { public virtual void OnAwake() { } }
+        }
+        """,
+    "Assets/Game/MidSystem.cs": """
+        namespace Game.Systems
+        {
+            public class MidSystem : BaseSystem { public override void OnAwake() { } }
+        }
+        """,
+    "Assets/Game/LeafSystem.cs": """
+        namespace Game.Systems
+        {
+            public class LeafSystem : MidSystem { public override void OnAwake() { } }
+        }
+        """,
+]
+for (path, text) in hierFiles {
+    let url = hierRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? text.write(to: url, atomically: true, encoding: .utf8)
+}
+let hierIndex = SymbolIndex.build(root: hierRoot, files: Array(hierFiles.keys), shouldStop: { false })
+    ?? SymbolIndex(root: hierRoot)
+check(hierIndex.derivedByBase["IDamageable"]?.count == 3, "в таблице наследников все три реализации обоих интерфейсов")
+check(SymbolIndex.baseKey("Game.Ecs.Base<T>") == "Base", "ключ наследования: без namespace и дженериков")
+
+func hierNavigator(_ path: String) -> LocalNavigator {
+    let model = SyntaxModel(text: hierFiles[path]!, spec: Languages.csharp)
+    return LocalNavigator(index: hierIndex, document: NavDocument(
+        url: hierRoot.appendingPathComponent(path), relPath: path, model: model,
+        outline: OutlineBuilder.build(model: model)))
+}
+/// ⌥⌘B на слове `word` внутри первого вхождения строки `context`.
+func hierImpl(_ path: String, _ context: String, _ word: String) -> LocalNavigator.Answer {
+    let outer = (hierFiles[path]! as NSString).range(of: context)
+    guard outer.location != NSNotFound else { return .none }
+    return hierNavigator(path).implementations(at: outer.location + (context as NSString).range(of: word).location)
+}
+func hierShape(_ answer: LocalNavigator.Answer) -> String {
+    answer.declarations.map { "\($0.container ?? "-").\($0.name)" }.sorted().joined(separator: ", ")
+}
+
+let onInterface = hierImpl("Assets/Game/Damageable.cs", "public interface IDamageable", "IDamageable")
+check(hierShape(onInterface) == "Game.Components.Health, Game.Gear.Armor",
+      "курсор на интерфейсе → его реализации (получено: \(hierShape(onInterface)))")
+
+let foreignInterface = hierImpl("Other/Damageable.cs", "public interface IDamageable", "IDamageable")
+check(hierShape(foreignInterface) == "Other.Rock",
+      "одноимённый интерфейс из чужого namespace не слипся (получено: \(hierShape(foreignInterface)))")
+
+let onBaseName = hierImpl("Assets/Game/Armor.cs", "public class Armor : IDamageable", "IDamageable")
+check(hierShape(onBaseName) == "Game.Components.Health, Game.Gear.Armor",
+      "имя базового в объявлении: сам Armor не отброшен вместе со строкой (получено: \(hierShape(onBaseName)))")
+
+let onInterfaceMethod = hierImpl("Assets/Game/Damageable.cs", "void Damage(int amount);", "Damage")
+check(hierShape(onInterfaceMethod) == "Armor.Damage, Health.Damage",
+      "курсор на методе интерфейса → его реализации (получено: \(hierShape(onInterfaceMethod)))")
+
+// MidSystem — сам override: реализации у него общие с BaseSystem.OnAwake,
+// а не в пустом поддереве самого MidSystem.
+let onOverride = hierImpl("Assets/Game/MidSystem.cs", "public override void OnAwake", "OnAwake")
+check(hierShape(onOverride) == "LeafSystem.OnAwake",
+      "на override поднялись к базе и нашли соседа (получено: \(hierShape(onOverride)))")
+check(onOverride.isExact, "единственная реализация — прыгаем сразу, без списка")
+
+let onLeaf = hierImpl("Assets/Game/LeafSystem.cs", "public class LeafSystem", "LeafSystem")
+check(onLeaf.declarations.isEmpty, "у листа иерархии наследников нет")
+
+// Наследование через звено: BaseSystem ← MidSystem ← LeafSystem.
+let onBase = hierImpl("Assets/Game/BaseSystem.cs", "public abstract class BaseSystem", "BaseSystem")
+check(hierShape(onBase) == "Game.Systems.LeafSystem, Game.Systems.MidSystem",
+      "наследники через промежуточное звено (получено: \(hierShape(onBase)))")
+
+let inComment = hierImpl("Assets/Game/Damageable.cs", "namespace Game.Components", "namespace")
+check(inComment.declarations.isEmpty, "на ключевом слове ничего не ищется")
+
+try? FileManager.default.removeItem(at: hierRoot)
+
+// ───────────────────── События файловой системы ────────────────
+section("События файловой системы")
+
+let fsRoot = URL(fileURLWithPath: "/tmp/pilot-fs")
+// Корневой .gitignore типового Unity-проекта: именно эти папки во время
+// компиляции и порождают шквал событий.
+let fsIgnore = IgnoreMatcher(
+    layers: [IgnoreLayer(rules: ["/[Ll]ibrary/", "/[Tt]emp/", "obj/", "*.csproj"]
+                            .compactMap { IgnoreRule(line: $0) }, base: "")],
+    useSoftSkip: false)
+/// Классификация пачки событий; `present` — что сейчас лежит на диске.
+func fsClassify(_ events: [(String, Bool)], present: Set<String>) -> FileChangeBatch {
+    FileChanges.classify(events.map { FileEvent(path: "/tmp/pilot-fs/" + $0.0, structural: $0.1) },
+                         root: fsRoot, ignore: fsIgnore,
+                         exists: { present.contains(String($0.dropFirst("/tmp/pilot-fs/".count))) })
+}
+
+// Правка существующего файла: перечитать его, но список файлов не трогать.
+let fsEdited = fsClassify([("Assets/Game/Player.cs", false)], present: ["Assets/Game/Player.cs"])
+check(fsEdited.changed == ["Assets/Game/Player.cs"] && !fsEdited.needsRescan && fsEdited.removed.isEmpty,
+      "правка файла: перечитать, список не пересобирать")
+
+// Новый файл: и перечитать, и пересобрать список.
+let fsCreated = fsClassify([("Assets/Game/Enemy.cs", true)], present: ["Assets/Game/Enemy.cs"])
+check(fsCreated.changed == ["Assets/Game/Enemy.cs"] && fsCreated.needsRescan,
+      "новый файл: и в индекс, и в список")
+
+// Исчез с диска — значит удалён, какой бы флаг ни пришёл.
+let fsRemoved = fsClassify([("Assets/Game/Old.cs", false)], present: [])
+check(fsRemoved.removed == ["Assets/Game/Old.cs"] && fsRemoved.changed.isEmpty && fsRemoved.needsRescan,
+      "пропавший файл считается удалённым по диску, а не по флагу")
+
+// Шум Unity: Library и Temp отсекаются целиком, даже структурные события.
+let fsNoise = fsClassify([("Library/ScriptAssemblies/Game.dll", true),
+                          ("Temp/build.txt", true),
+                          ("Assets/Game/obj/Debug/x.cs", true),
+                          ("Game.csproj", true),
+                          ("Assets/Game/Player.cs", false)],
+                         present: ["Library/ScriptAssemblies/Game.dll", "Temp/build.txt",
+                                   "Assets/Game/obj/Debug/x.cs", "Game.csproj", "Assets/Game/Player.cs"])
+check(fsNoise.changed == ["Assets/Game/Player.cs"] && !fsNoise.needsRescan,
+      "игнорируемые папки не будят ни индекс, ни пересканирование (получено: \(fsNoise))")
+
+// Своё же ⌘S пишет атомарно — через временный файл и переименование, — и
+// системе видно как создание. Перечитать файл надо, пересобирать список — нет.
+let fsOwn = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets/Game/Player.cs", structural: true)],
+    root: fsRoot, ignore: fsIgnore, ownWrites: ["Assets/Game/Player.cs"], exists: { _ in true })
+check(fsOwn.changed == ["Assets/Game/Player.cs"] && !fsOwn.needsRescan,
+      "своё сохранение не тянет пересканирование списка")
+// А чужой файл с тем же флагом — тянет.
+let fsForeign = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets/Game/Enemy.cs", structural: true)],
+    root: fsRoot, ignore: fsIgnore, ownWrites: ["Assets/Game/Player.cs"], exists: { _ in true })
+check(fsForeign.needsRescan, "чужое появление файла пересобирает список")
+
+// Правило про папку, а событие — про файл глубоко внутри неё.
+check(FileChanges.isIgnored("Library/a/b/c.dll", fsIgnore), "правило /Library/ ловит файл внутри")
+check(!FileChanges.isIgnored("Assets/Library.cs", fsIgnore), "похожее имя файла не считается той папкой")
+
+// Репозиторий: ветка и статус, но в индекс ничего не идёт.
+let fsGit = fsClassify([(".git/HEAD", false), (".git/index", false)], present: [".git/HEAD", ".git/index"])
+check(fsGit.gitTouched && fsGit.changed.isEmpty && !fsGit.needsRescan,
+      "внутренности .git обновляют git, но не индекс")
+
+// Событие вне корня — не наше; событие на самом корне — пересобрать всё.
+let fsOutside = FileChanges.classify([FileEvent(path: "/tmp/other/x.cs", structural: true)],
+                                     root: fsRoot, ignore: fsIgnore, exists: { _ in true })
+check(fsOutside.isEmpty, "чужой путь пропускается")
+let fsRootMoved = FileChanges.classify([FileEvent(path: "/tmp/pilot-fs", structural: true)],
+                                       root: fsRoot, ignore: fsIgnore, exists: { _ in true })
+check(fsRootMoved.needsRescan, "событие на самом корне пересобирает список")
+
+// Правила читаются из корневого .gitignore; без него — типовые мусорные папки.
+let fsDisk = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-fsrules-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.createDirectory(at: fsDisk, withIntermediateDirectories: true)
+check(FileChanges.isIgnored("node_modules/react/index.js", FileChanges.rootMatcher(root: fsDisk)),
+      "без .gitignore работают типовые мусорные папки")
+try? "/[Ll]ibrary/\n*.log\n".write(to: fsDisk.appendingPathComponent(".gitignore"),
+                                    atomically: true, encoding: .utf8)
+let fsFromDisk = FileChanges.rootMatcher(root: fsDisk)
+check(FileChanges.isIgnored("Library/x.dll", fsFromDisk) && FileChanges.isIgnored("a/b/c.log", fsFromDisk),
+      "правила подхватились из корневого .gitignore")
+check(!FileChanges.isIgnored("Assets/Player.cs", fsFromDisk), "исходник не игнорируется")
+try? FileManager.default.removeItem(at: fsDisk)
+
+// ─────────────────── Перегрузки и расширения ───────────────────
+section("Перегрузки и расширения")
+
+let ovlRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-ovl-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: ovlRoot)
+let callerSource = """
+using Game;
+using Game.Extras;
+namespace Game
+{
+    public class Caller
+    {
+        void Run()
+        {
+            var p = new Player();
+            p.Move(1);
+            p.Move(1, 2);
+            p.Move(Pick(1, 2), 3);
+            p.Say("hi");
+            p.Say();
+            p.Stop();
+        }
+        int Pick(int a, int b) { return a; }
+    }
+}
+"""
+let ovlFiles: [String: String] = [
+    "Assets/Game/Player.cs": """
+        namespace Game
+        {
+            public class Player
+            {
+                public void Move(int dx) { }
+                public void Move(int dx, int dy) { }
+                public void Stop() { }
+            }
+        }
+        """,
+    "Assets/Game/PlayerExtensions.cs": """
+        using Game;
+        namespace Game.Extras
+        {
+            public static class PlayerExtensions
+            {
+                public static void Say(this Player p, string message) { }
+                public static void Say(this Player p) { }
+            }
+        }
+        """,
+    // Одноимённый Player в чужом namespace со своим расширением: оно не должно
+    // подмешаться к Game.Player.
+    "Other/Player.cs": """
+        namespace Other
+        {
+            public class Player { }
+            public static class OtherExtensions
+            {
+                public static void Say(this Player p) { }
+            }
+        }
+        """,
+    "Assets/Game/Caller.cs": callerSource,
+]
+for (path, text) in ovlFiles {
+    let url = ovlRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? text.write(to: url, atomically: true, encoding: .utf8)
+}
+let ovlIndex = SymbolIndex.build(root: ovlRoot, files: Array(ovlFiles.keys), shouldStop: { false })
+    ?? SymbolIndex(root: ovlRoot)
+let callerModel = SyntaxModel(text: callerSource, spec: Languages.csharp)
+let ovlNavigator = LocalNavigator(index: ovlIndex, document: NavDocument(
+    url: ovlRoot.appendingPathComponent("Assets/Game/Caller.cs"), relPath: "Assets/Game/Caller.cs",
+    model: callerModel, outline: OutlineBuilder.build(model: callerModel)))
+
+/// ⌘B на слове `word` внутри строки `context` файла Caller.cs.
+func ovlJump(_ context: String, _ word: String) -> LocalNavigator.Answer {
+    let outer = (callerSource as NSString).range(of: context)
+    guard outer.location != NSNotFound else { return .none }
+    return ovlNavigator.definition(at: outer.location + (context as NSString).range(of: word).location)
+}
+/// Куда прыгнули: файл и строка однозначно определяют перегрузку.
+func ovlLanded(_ answer: LocalNavigator.Answer) -> String {
+    guard let first = answer.declarations.first, let range = first.target.range else { return "ничего" }
+    let where_ = "\(first.path):\(range.start.line + 1)"
+    return answer.isExact ? where_ : "\(where_) (кандидатов \(answer.declarations.count))"
+}
+
+check(ovlLanded(ovlJump("p.Move(1);", "Move")) == "Assets/Game/Player.cs:5",
+      "перегрузка по числу аргументов: один → Move(int) (получено: \(ovlLanded(ovlJump("p.Move(1);", "Move"))))")
+check(ovlLanded(ovlJump("p.Move(1, 2)", "Move")) == "Assets/Game/Player.cs:6",
+      "два аргумента → Move(int, int) (получено: \(ovlLanded(ovlJump("p.Move(1, 2)", "Move"))))")
+// Запятая внутри вложенного вызова не считается разделителем аргументов.
+check(ovlLanded(ovlJump("p.Move(Pick(1, 2), 3)", "Move")) == "Assets/Game/Player.cs:6",
+      "вложенный вызов не сбил счёт (получено: \(ovlLanded(ovlJump("p.Move(Pick(1, 2), 3)", "Move"))))")
+
+check(ovlLanded(ovlJump("p.Say(\"hi\")", "Say")) == "Assets/Game/PlayerExtensions.cs:6",
+      "метод-расширение найден, выбран по числу аргументов (получено: \(ovlLanded(ovlJump("p.Say(\"hi\")", "Say"))))")
+check(ovlLanded(ovlJump("p.Say();", "Say")) == "Assets/Game/PlayerExtensions.cs:7",
+      "расширение без аргументов (получено: \(ovlLanded(ovlJump("p.Say();", "Say"))))")
+check(ovlLanded(ovlJump("p.Stop();", "Stop")) == "Assets/Game/Player.cs:7", "обычный член на месте")
+
+// Расширение чужого Player в выдачу не попало: у Say ровно два кандидата.
+let sayIDs = ovlIndex.extensionsByReceiver["Player"] ?? []
+check(sayIDs.count == 3, "в таблице расширений все три Say, включая чужой (получено \(sayIDs.count))")
+check(ovlJump("p.Say(\"hi\")", "Say").declarations.allSatisfy { $0.path != "Other/Player.cs" },
+      "расширение одноимённого типа из чужого namespace не подмешалось")
+
+// Счёт аргументов отдельно.
+check(ovlNavigator.argumentCount(at: (callerSource as NSString).range(of: "Stop();").location) == 0,
+      "вызов без аргументов — ноль, а не один")
+check(ovlNavigator.argumentCount(at: (callerSource as NSString).range(of: "Pick(1, 2), 3").location) == 2,
+      "аргументы вложенного вызова считаются сами по себе")
+
+// Параметры доезжают до индекса и переживают кэш.
+let moveSymbols = (ovlIndex.byName["Move"] ?? []).map { ovlIndex[$0].parameters }
+check(moveSymbols.contains(["int"]) && moveSymbols.contains(["int", "int"]),
+      "типы параметров в индексе (получено: \(moveSymbols))")
+let ovlRoundTrip = SymbolIndex.deserialize(ovlIndex.serialized(), root: ovlRoot)
+check(ovlRoundTrip?.symbols == ovlIndex.symbols, "параметры пережили кэш")
+check(ovlRoundTrip?.extensionsByReceiver["Player"]?.count == 3, "таблица расширений собралась из кэша")
+// Кэш прошлой версии полей не досчитается — его надо отвергнуть, а не прочитать криво.
+check(SymbolIndex.deserialize("pilot-symbols 1\nF\ta\t\t\t\n0\tFoo\tclass\t\t\t\t\t1\t2\t3",
+                              root: ovlRoot) == nil,
+      "кэш прошлой версии отвергается")
+
+try? FileManager.default.removeItem(at: ovlRoot)
+
+// ────────────────────── Индекс: правка файла ───────────────────
+section("Индекс: правка файла")
+
+let liveRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-live-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: liveRoot)
+func liveWrite(_ path: String, _ text: String?) {
+    let url = liveRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if let text {
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+    } else {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+let livePaths = ["Assets/A.cs", "Assets/B.cs", "Assets/C.cs", "Assets/D.cs"]
+liveWrite("Assets/A.cs", "namespace Game { public class Alpha { public void Run() { } } }")
+liveWrite("Assets/B.cs", "using Game;\nnamespace Game { public class Beta : Alpha { } }")
+liveWrite("Assets/C.cs", "using Game;\nusing Vec = Game.Alpha;\n")   // только using, без объявлений
+liveWrite("Assets/D.cs", "namespace Game { public class Delta { } }")
+let liveBase = SymbolIndex.build(root: liveRoot, files: livePaths, shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(liveBase.typesByName["Alpha"]?.count == 1 && liveBase.typesByName["Delta"]?.count == 1,
+      "исходный индекс собран")
+
+/// Слепок индекса, не зависящий от порядка файлов внутри него.
+func liveShape(_ index: SymbolIndex) -> [String] {
+    (0..<index.count).map { i -> String in
+        let id = Int32(i)
+        let s = index[id]
+        return "\(index.relPath(id))|\(s.container ?? "")|\(s.name)|\(s.kind.rawValue)|\(s.line):\(s.column)"
+    }.sorted()
+}
+
+// Главное свойство: неизменившиеся файлы не перечитываются. Проверяем это
+// не таймингом, а буквально — убираем их с диска перед обновлением.
+liveWrite("Assets/A.cs", "namespace Game { public class Alpha { public void Walk() { } }\n"
+                       + "public class AlphaTwo { } }")
+for path in ["Assets/B.cs", "Assets/C.cs", "Assets/D.cs"] { liveWrite(path, nil) }
+let afterEdit = SymbolIndex.updating(liveBase, changed: ["Assets/A.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterEdit.typesByName["AlphaTwo"]?.count == 1, "новый класс из правленого файла попал в индекс")
+check(afterEdit.byName["Walk"] != nil && afterEdit.byName["Run"] == nil,
+      "переименованный метод заменён, старого имени не осталось")
+check(afterEdit.typesByName["Delta"]?.count == 1, "нетронутый файл уцелел, хотя его уже нет на диске")
+check(afterEdit.files.contains { $0.path == "Assets/C.cs" && $0.usings == ["Game"]
+                                 && $0.aliases["Vec"] == "Game.Alpha" },
+      "файл без объявлений сохранил свои using и псевдонимы")
+check(afterEdit.derivedByBase["Alpha"]?.count == 1, "таблица наследников пересобрана, Beta на месте")
+
+// Файл опустел: его символы уходят, сам он выпадает из индекса.
+liveWrite("Assets/D.cs", "// тут больше ничего нет\n")
+let afterEmpty = SymbolIndex.updating(afterEdit, changed: ["Assets/D.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterEmpty.typesByName["Delta"] == nil, "класс из опустевшего файла исчез")
+check(!afterEmpty.files.contains { $0.path == "Assets/D.cs" }, "пустой файл не держим")
+
+// Новый файл, которого в индексе не было вовсе.
+liveWrite("Assets/E.cs", "namespace Game { public class Epsilon : Alpha { } }")
+let afterNew = SymbolIndex.updating(afterEmpty, changed: ["Assets/E.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterNew.typesByName["Epsilon"]?.count == 1, "файл, которого в индексе не было, добавлен")
+check(afterNew.derivedByBase["Alpha"]?.count == 2, "у Alpha стало двое наследников")
+
+// Удаление: файла нет ни на диске, ни в индексе.
+let afterRemove = SymbolIndex.updating(afterNew, changed: [], removed: ["Assets/B.cs"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterRemove.typesByName["Beta"] == nil, "удалённый файл вычищен из индекса")
+check(afterRemove.derivedByBase["Alpha"]?.count == 1, "наследник удалённого файла пропал из таблицы")
+
+// Обновить всё — то же, что собрать заново.
+liveWrite("Assets/B.cs", "using Game;\nnamespace Game { public class Beta : Alpha { } }")
+liveWrite("Assets/C.cs", "using Game;\nusing Vec = Game.Alpha;\n")
+liveWrite("Assets/D.cs", "namespace Game { public class Delta { } }")
+let allPaths = livePaths + ["Assets/E.cs"]
+let updatedAll = SymbolIndex.updating(afterRemove, changed: allPaths, shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+let builtAll = SymbolIndex.build(root: liveRoot, files: allPaths, shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(liveShape(updatedAll) == liveShape(builtAll), "обновление всех файлов совпало с полной сборкой")
+check(updatedAll.files.map(\.path).sorted() == builtAll.files.map(\.path).sorted(),
+      "список файлов совпал с полной сборкой")
+check(updatedAll.search("Alpha", limit: 10, shouldStop: { false }).count
+        == builtAll.search("Alpha", limit: 10, shouldStop: { false }).count,
+      "поиск ⌘T после обновления отвечает так же")
+
+// Папку удалили целиком: событий по её файлам система не пришлёт, придёт
+// один путь — значит, уходит и всё, что лежало под ним.
+let afterFolder = SymbolIndex.updating(updatedAll, changed: [], removed: ["Assets"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterFolder.count == 0 && afterFolder.files.isEmpty,
+      "удаление папки вычистило всё поддерево (осталось символов \(afterFolder.count))")
+// А похожее имя рядом не считается той же папкой.
+let afterLookalike = SymbolIndex.updating(updatedAll, changed: [], removed: ["Asset"], shouldStop: { false })
+    ?? SymbolIndex(root: liveRoot)
+check(afterLookalike.count == updatedAll.count, "папка с похожим именем ничего не задела")
+
+check(SymbolIndex.updating(liveBase, changed: ["Assets/A.cs"], shouldStop: { true }) == nil,
+      "прерванное обновление возвращает nil, а не половину индекса")
+
+try? FileManager.default.removeItem(at: liveRoot)
 
 // ─────────────────────────── Вкладки ───────────────────────────
 section("Вкладки")
