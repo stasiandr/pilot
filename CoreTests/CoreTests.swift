@@ -3237,6 +3237,135 @@ check(inComment.declarations.isEmpty, "на ключевом слове ниче
 
 try? FileManager.default.removeItem(at: hierRoot)
 
+// ─────────────────── Перегрузки и расширения ───────────────────
+section("Перегрузки и расширения")
+
+let ovlRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("pilot-ovl-\(ProcessInfo.processInfo.processIdentifier)")
+try? FileManager.default.removeItem(at: ovlRoot)
+let callerSource = """
+using Game;
+using Game.Extras;
+namespace Game
+{
+    public class Caller
+    {
+        void Run()
+        {
+            var p = new Player();
+            p.Move(1);
+            p.Move(1, 2);
+            p.Move(Pick(1, 2), 3);
+            p.Say("hi");
+            p.Say();
+            p.Stop();
+        }
+        int Pick(int a, int b) { return a; }
+    }
+}
+"""
+let ovlFiles: [String: String] = [
+    "Assets/Game/Player.cs": """
+        namespace Game
+        {
+            public class Player
+            {
+                public void Move(int dx) { }
+                public void Move(int dx, int dy) { }
+                public void Stop() { }
+            }
+        }
+        """,
+    "Assets/Game/PlayerExtensions.cs": """
+        using Game;
+        namespace Game.Extras
+        {
+            public static class PlayerExtensions
+            {
+                public static void Say(this Player p, string message) { }
+                public static void Say(this Player p) { }
+            }
+        }
+        """,
+    // Одноимённый Player в чужом namespace со своим расширением: оно не должно
+    // подмешаться к Game.Player.
+    "Other/Player.cs": """
+        namespace Other
+        {
+            public class Player { }
+            public static class OtherExtensions
+            {
+                public static void Say(this Player p) { }
+            }
+        }
+        """,
+    "Assets/Game/Caller.cs": callerSource,
+]
+for (path, text) in ovlFiles {
+    let url = ovlRoot.appendingPathComponent(path)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? text.write(to: url, atomically: true, encoding: .utf8)
+}
+let ovlIndex = SymbolIndex.build(root: ovlRoot, files: Array(ovlFiles.keys), shouldStop: { false })
+    ?? SymbolIndex(root: ovlRoot)
+let callerModel = SyntaxModel(text: callerSource, spec: Languages.csharp)
+let ovlNavigator = LocalNavigator(index: ovlIndex, document: NavDocument(
+    url: ovlRoot.appendingPathComponent("Assets/Game/Caller.cs"), relPath: "Assets/Game/Caller.cs",
+    model: callerModel, outline: OutlineBuilder.build(model: callerModel)))
+
+/// ⌘B на слове `word` внутри строки `context` файла Caller.cs.
+func ovlJump(_ context: String, _ word: String) -> LocalNavigator.Answer {
+    let outer = (callerSource as NSString).range(of: context)
+    guard outer.location != NSNotFound else { return .none }
+    return ovlNavigator.definition(at: outer.location + (context as NSString).range(of: word).location)
+}
+/// Куда прыгнули: файл и строка однозначно определяют перегрузку.
+func ovlLanded(_ answer: LocalNavigator.Answer) -> String {
+    guard let first = answer.declarations.first, let range = first.target.range else { return "ничего" }
+    let where_ = "\(first.path):\(range.start.line + 1)"
+    return answer.isExact ? where_ : "\(where_) (кандидатов \(answer.declarations.count))"
+}
+
+check(ovlLanded(ovlJump("p.Move(1);", "Move")) == "Assets/Game/Player.cs:5",
+      "перегрузка по числу аргументов: один → Move(int) (получено: \(ovlLanded(ovlJump("p.Move(1);", "Move"))))")
+check(ovlLanded(ovlJump("p.Move(1, 2)", "Move")) == "Assets/Game/Player.cs:6",
+      "два аргумента → Move(int, int) (получено: \(ovlLanded(ovlJump("p.Move(1, 2)", "Move"))))")
+// Запятая внутри вложенного вызова не считается разделителем аргументов.
+check(ovlLanded(ovlJump("p.Move(Pick(1, 2), 3)", "Move")) == "Assets/Game/Player.cs:6",
+      "вложенный вызов не сбил счёт (получено: \(ovlLanded(ovlJump("p.Move(Pick(1, 2), 3)", "Move"))))")
+
+check(ovlLanded(ovlJump("p.Say(\"hi\")", "Say")) == "Assets/Game/PlayerExtensions.cs:6",
+      "метод-расширение найден, выбран по числу аргументов (получено: \(ovlLanded(ovlJump("p.Say(\"hi\")", "Say"))))")
+check(ovlLanded(ovlJump("p.Say();", "Say")) == "Assets/Game/PlayerExtensions.cs:7",
+      "расширение без аргументов (получено: \(ovlLanded(ovlJump("p.Say();", "Say"))))")
+check(ovlLanded(ovlJump("p.Stop();", "Stop")) == "Assets/Game/Player.cs:7", "обычный член на месте")
+
+// Расширение чужого Player в выдачу не попало: у Say ровно два кандидата.
+let sayIDs = ovlIndex.extensionsByReceiver["Player"] ?? []
+check(sayIDs.count == 3, "в таблице расширений все три Say, включая чужой (получено \(sayIDs.count))")
+check(ovlJump("p.Say(\"hi\")", "Say").declarations.allSatisfy { $0.path != "Other/Player.cs" },
+      "расширение одноимённого типа из чужого namespace не подмешалось")
+
+// Счёт аргументов отдельно.
+check(ovlNavigator.argumentCount(at: (callerSource as NSString).range(of: "Stop();").location) == 0,
+      "вызов без аргументов — ноль, а не один")
+check(ovlNavigator.argumentCount(at: (callerSource as NSString).range(of: "Pick(1, 2), 3").location) == 2,
+      "аргументы вложенного вызова считаются сами по себе")
+
+// Параметры доезжают до индекса и переживают кэш.
+let moveSymbols = (ovlIndex.byName["Move"] ?? []).map { ovlIndex[$0].parameters }
+check(moveSymbols.contains(["int"]) && moveSymbols.contains(["int", "int"]),
+      "типы параметров в индексе (получено: \(moveSymbols))")
+let ovlRoundTrip = SymbolIndex.deserialize(ovlIndex.serialized(), root: ovlRoot)
+check(ovlRoundTrip?.symbols == ovlIndex.symbols, "параметры пережили кэш")
+check(ovlRoundTrip?.extensionsByReceiver["Player"]?.count == 3, "таблица расширений собралась из кэша")
+// Кэш прошлой версии полей не досчитается — его надо отвергнуть, а не прочитать криво.
+check(SymbolIndex.deserialize("pilot-symbols 1\nF\ta\t\t\t\n0\tFoo\tclass\t\t\t\t\t1\t2\t3",
+                              root: ovlRoot) == nil,
+      "кэш прошлой версии отвергается")
+
+try? FileManager.default.removeItem(at: ovlRoot)
+
 // ────────────────────── Индекс: правка файла ───────────────────
 section("Индекс: правка файла")
 

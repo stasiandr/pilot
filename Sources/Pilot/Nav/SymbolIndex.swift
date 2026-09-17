@@ -20,6 +20,10 @@ struct Symbol: Equatable {
     var typeText: String?
     var bases: [String] = []
     var genericParams: [String] = []
+    /// У методов C-подобных языков: типы параметров, как записаны.
+    /// Даёт число параметров для выбора перегрузки и `this`-получателя
+    /// у методов-расширений.
+    var parameters: [String] = []
     var file: Int32
     var line: Int32
     var column: Int32      // UTF-16, как у LSP
@@ -59,6 +63,10 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     /// Ключ без namespace и дженериков, поэтому одноимённые базовые из разных
     /// namespace попадают вместе — разбирается это уже резолвом типов.
     private(set) var derivedByBase: [String: [Int32]] = [:]
+    /// Короткое имя расширяемого типа → методы-расширения для него.
+    /// `static void Say(this Player p)` зовётся как член Player, но лежит
+    /// в постороннем static-классе, и через `membersByOwner` его не найти.
+    private(set) var extensionsByReceiver: [String: [Int32]] = [:]
 
     /// «контейнер.имя» в нижнем регистре подряд — для fuzzy-поиска без аллокаций.
     private var bytes: [UInt8] = []
@@ -115,6 +123,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
                 for base in s.bases { derivedByBase[Self.baseKey(base), default: []].append(id) }
             }
             if Self.isMember(s.kind), let owner = s.container { membersByOwner[owner, default: []].append(id) }
+            if let receiver = Self.extensionReceiver(s) { extensionsByReceiver[receiver, default: []].append(id) }
 
             let start = bytes.count
             var nameStart = 0
@@ -127,6 +136,18 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             spans.append((Int32(start), Int32(bytes.count - start), Int32(nameStart)))
         }
     }
+
+    /// Тип, который расширяет метод: `static void Say(this Player p)` → `Player`.
+    /// nil — обычный метод. Ключ такой же короткий, как у наследников:
+    /// одноимённые типы разбирает уже навигатор.
+    static func extensionReceiver(_ s: Symbol) -> String? {
+        guard s.kind == .method, let first = s.parameters.first,
+              first.hasPrefix(extensionMarker) else { return nil }
+        return baseKey(String(first.dropFirst(extensionMarker.count)))
+    }
+
+    /// Как записан получатель метода-расширения в C#.
+    static let extensionMarker = "this "
 
     /// Ключ `derivedByBase`: имя базового типа без namespace и дженериков.
     /// `Game.Ecs.Base<T>` → `Base`.
@@ -163,6 +184,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             found.append(Symbol(name: item.name, kind: item.kind, keyword: item.keyword,
                                 container: item.container, typeText: item.typeText,
                                 bases: item.bases, genericParams: item.genericParams,
+                                parameters: item.parameters,
                                 file: 0, line: Int32(position.line),
                                 column: Int32(position.character), length: Int32(item.range.length)))
         }
@@ -462,7 +484,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     // Текстом. `F<tab>путь<tab>namespaces<tab>usings<tab>aliases` открывает файл,
     // дальше по строке на объявление. Списки — через `;`, псевдонимы — `имя=цель`.
 
-    private static let cacheHeader = "pilot-symbols 1"
+    private static let cacheHeader = "pilot-symbols 2"
 
     func serialized() -> String {
         var out = [Self.cacheHeader]
@@ -482,6 +504,7 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             out.append([String(s.kind.rawValue), s.name, s.keyword ?? "", s.container ?? "",
                         s.typeText ?? "", s.bases.joined(separator: ";"),
                         s.genericParams.joined(separator: ";"),
+                        s.parameters.joined(separator: ";"),
                         String(s.line), String(s.column), String(s.length)].joined(separator: "\t"))
         }
         // Файлы без объявлений (только using) тоже нужны — ради псевдонимов.
@@ -520,16 +543,17 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
                                       usings: list(fields[3]), aliases: aliases)
                 continue
             }
-            guard file != nil, fields.count == 10,
+            guard file != nil, fields.count == 11,
                   let raw = UInt8(fields[0]), let kind = OutlineKind(rawValue: raw),
-                  let row = Int32(fields[7]), let column = Int32(fields[8]),
-                  let length = Int32(fields[9]) else { return nil }
+                  let row = Int32(fields[8]), let column = Int32(fields[9]),
+                  let length = Int32(fields[10]) else { return nil }
             pending.append(Symbol(
                 name: String(fields[1]), kind: kind,
                 keyword: fields[2].isEmpty ? nil : String(fields[2]),
                 container: fields[3].isEmpty ? nil : String(fields[3]),
                 typeText: fields[4].isEmpty ? nil : String(fields[4]),
                 bases: list(fields[5]), genericParams: list(fields[6]),
+                parameters: list(fields[7]),
                 file: 0, line: row, column: column, length: length))
         }
         flush()

@@ -64,6 +64,10 @@ struct OutlineItem: Identifiable, Equatable {
     var bases: [String] = []
     /// У типов: параметры-дженерики, `Stash<T>` → `["T"]`.
     var genericParams: [String] = []
+    /// У методов C-подобных языков: типы параметров, как они записаны.
+    /// `Add<T>(this List<T> xs, int n = 0)` → `["this List<T>", "int"]`.
+    /// По длине видно число параметров, по `this` — метод-расширение.
+    var parameters: [String] = []
 }
 
 /// Как в этом языке опознаётся объявление.
@@ -138,7 +142,8 @@ enum OutlineBuilder {
         }
 
         func record(_ nameToken: Token, kind: OutlineKind, opensScope: Bool, keyword: String? = nil,
-                    typeText: String? = nil, bases: [String] = [], genericParams: [String] = []) {
+                    typeText: String? = nil, bases: [String] = [], genericParams: [String] = [],
+                    parameters: [String] = []) {
             let name = text(nameToken)
             guard !name.isEmpty else { return }
             let line = model.line(containing: Int(nameToken.start))
@@ -155,7 +160,8 @@ enum OutlineBuilder {
                 keyword: keyword,
                 typeText: typeText,
                 bases: bases,
-                genericParams: genericParams))
+                genericParams: genericParams,
+                parameters: parameters))
 
             if opensScope { scopes.append((name, braceDepth)) }
         }
@@ -299,7 +305,8 @@ enum OutlineBuilder {
                 let isDeclaration = looksLikeDeclaration(tokens: tokens, at: i,
                                                          units: units, spec: spec)
                 if isDeclaration {
-                    record(token, kind: .method, opensScope: false, typeText: declaredType(before: i))
+                    record(token, kind: .method, opensScope: false, typeText: declaredType(before: i),
+                           parameters: parameterTypes(tokens: tokens, after: i, units: units))
                 }
                 pendingBody = isDeclaration
                 i += 1
@@ -464,6 +471,82 @@ enum OutlineBuilder {
         guard token.kind == .plain || token.kind == .type || token.kind == .function else { return nil }
         let typeText = (start..<nameIndex).map { tokenText(tokens[$0], units) }.joined()
         return (nameIndex, typeText.isEmpty ? nil : typeText)
+    }
+
+    /// Типы параметров метода, как они записаны в объявлении:
+    /// `Add<T>(this List<T> xs, int n = 0)` → `["this List<T>", "int"]`.
+    /// Имя параметра и значение по умолчанию отбрасываются, а модификаторы
+    /// остаются: по `this` навигатор узнаёт метод-расширение, а `ref` и `out`
+    /// он и так снимает, когда резолвит тип.
+    private static func parameterTypes(tokens: [Token], after nameIndex: Int, units: [UInt16]) -> [String] {
+        var j = nameIndex + 1
+        func skipTrivia() {
+            while j < tokens.count, tokens[j].kind == .comment || tokens[j].kind == .docComment { j += 1 }
+        }
+        skipTrivia()
+        // `Get<T>(` — между именем и скобкой дженерик.
+        if j < tokens.count, char(tokens[j], units) == 0x3C {
+            var depth = 0
+            while j < tokens.count {
+                let c = char(tokens[j], units)
+                if c == 0x3C { depth += 1 } else if c == 0x3E { depth -= 1; if depth == 0 { j += 1; break } }
+                j += 1
+            }
+        }
+        skipTrivia()
+        guard j < tokens.count, char(tokens[j], units) == 0x28 else { return [] }
+
+        // Границы параметров: запятые на верхнем уровне скобок и угловых.
+        var ranges: [Range<Int>] = []
+        var start = j + 1
+        var k = j + 1
+        var parens = 1
+        var angle = 0
+        while k < tokens.count {
+            switch char(tokens[k], units) {
+            case 0x28, 0x5B: parens += 1                                  // ( [
+            case 0x5D: parens -= 1                                        // ]
+            case 0x29:                                                    // )
+                parens -= 1
+                if parens == 0 {
+                    if start < k { ranges.append(start..<k) }
+                    k = tokens.count
+                    continue
+                }
+            case 0x3C: angle += 1                                         // <
+            case 0x3E: angle = max(0, angle - 1)                          // >
+            case 0x2C where parens == 1 && angle == 0:                    // ,
+                if start < k { ranges.append(start..<k) }
+                start = k + 1
+            default: break
+            }
+            k += 1
+        }
+
+        var result: [String] = []
+        for range in ranges {
+            var end = range.upperBound
+            // Значение по умолчанию: `int n = 0`.
+            for p in range where char(tokens[p], units) == 0x3D { end = p; break }
+            // Имя параметра — последний идентификатор; тип это всё до него.
+            var last = end - 1
+            while last > range.lowerBound,
+                  tokens[last].kind == .comment || tokens[last].kind == .docComment { last -= 1 }
+            if last > range.lowerBound, isNameLike(tokens[last]) { end = last }
+            guard end > range.lowerBound else { continue }
+            let first = tokens[range.lowerBound], tail = tokens[end - 1]
+            let text = String(decoding: units[Int(first.start)..<Int(tail.start + tail.length)], as: UTF16.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { result.append(text) }
+        }
+        return result
+    }
+
+    private static func isNameLike(_ token: Token) -> Bool {
+        switch token.kind {
+        case .plain, .type, .function, .constant: return true
+        default: return false
+        }
     }
 
     /// Шапка типа после имени: `<T, U>` и `: Base, IFoo` (или `extends`/`implements`).
