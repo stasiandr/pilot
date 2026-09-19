@@ -63,6 +63,59 @@ struct UnityProjectInfo: Sendable, Equatable {
     /// `"Game"` — если открыт репозиторий, а проект лежит в `Game/`.
     var workspacePrefix: String = ""
 
+    /// Символы препроцессора, под которыми Unity компилирует скрипты.
+    ///
+    /// Без них половина `#if` в проекте читается как невзятая ветка, и код
+    /// внутри неё не попадает ни в подсветку, ни в структуру, ни в индекс —
+    /// то есть `⌘B` на `UNITY_EDITOR`-only методе никуда не ведёт.
+    ///
+    /// Набор Unity куда больше: у неё есть символы под платформу, под
+    /// бэкенд скриптов, под каждый установленный пакет. Здесь ровно те,
+    /// которые она ставит всегда и которые видно из самого проекта, —
+    /// угадывать остальные хуже, чем не ставить: лишний живой `#if` покажет
+    /// код, которого в сборке не будет.
+    ///
+    /// `UNITY_6000_3_OR_NEWER` и все версии ниже: Unity определяет их
+    /// лесенкой, поэтому `#if UNITY_2021_3_OR_NEWER` в проекте на 6000.3
+    /// истинно. Версии берутся из списка `majors` — годами до 2023-й, а
+    /// дальше 6000: диапазоном тут не обойтись.
+    var preprocessorSymbols: [String] {
+        // `DEBUG` и `TRACE` Unity ставит в Debug-конфигурации, а
+        // `UNITY_EDITOR` — во всём, что компилируется для редактора, то есть
+        // в том, что мы и читаем.
+        var symbols = ["UNITY_EDITOR", "UNITY_EDITOR_64", "DEBUG", "TRACE",
+                       "UNITY_64", "UNITY_ASSERTIONS", "ENABLE_MONO",
+                       "CSHARP_7_3_OR_NEWER", "NET_STANDARD_2_1", "NET_STANDARD"]
+        guard let editorVersion else { return symbols }
+
+        // `6000.3.14f1` — берём первые два числа.
+        let parts = editorVersion.split(separator: ".")
+        guard let major = parts.first.flatMap({ Int($0) }),
+              let minor = parts.count > 1 ? Int(parts[1]) : nil else { return symbols }
+        symbols.append("UNITY_\(major)")
+        symbols.append("UNITY_\(major)_\(minor)")
+
+        // Лесенка «или новее»: истинно всё, что не выше текущей версии.
+        //
+        // Перечнем, а не диапазоном: Unity нумеровалась годами до 2023-й, а
+        // потом прыгнула на 6000, и `2017...6000` породило бы четыре тысячи
+        // версий, которых не было. Лишний живой символ — это показанный код,
+        // которого в сборке нет, то есть ровно та ошибка, которой мы
+        // избегаем; поэтому список закрытый, и новую мажорную версию в него
+        // дописывают руками.
+        for release in Self.majors where release <= major {
+            for minorRelease in 1...4 {
+                if release == major && minorRelease > minor { break }
+                symbols.append("UNITY_\(release)_\(minorRelease)_OR_NEWER")
+            }
+            symbols.append("UNITY_\(release)_OR_NEWER")
+        }
+        return symbols
+    }
+
+    /// Мажорные версии Unity, по которым строится лесенка `_OR_NEWER`.
+    private static let majors = [2017, 2018, 2019, 2020, 2021, 2022, 2023, 6000]
+
     /// Unity-проект в корне воркспейса или в одной из его папок первого
     /// уровня — так обычно и выглядит репозиторий игры. Если проектов
     /// несколько, какой из них главный — не угадать, и Unity-режим не включается.

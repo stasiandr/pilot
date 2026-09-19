@@ -1,0 +1,11 @@
+// The Rustlyn library, as a module Swift can import.
+//
+// The header is not checked in: `build-rust.sh` copies it out of the Rustlyn
+// checkout next to the library it built, so the two can never disagree about
+// what is in that build. Run that script before `swift build` — `build.sh`
+// already does.
+module CRustlyn {
+    header "include/rustlyn.h"
+    link "rustlyn_ffi"
+    export *
+}

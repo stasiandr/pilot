@@ -96,6 +96,20 @@ enum OutlineBuilder {
         guard let spec = model.spec, spec.outline != .none else { return [] }
         guard model.lineCount <= maxLines else { return [] }
 
+        // C# разбирает настоящий парсер, и это не про красоту, а про то,
+        // что разбор ниже — эвристика по форме строки. `Helper(1);` имеет
+        // форму объявления метода, `Stash<Health>.Get()` — форму
+        // обобщённого, и обе попадают в структуру, откуда расходятся в
+        // индекс и в переходы. Парсер таких ошибок не делает.
+        //
+        // Промах (нет сессии, файл правят прямо сейчас, файл не открыт на
+        // той стороне) молча возвращает нас к разбору ниже: он неточен, но
+        // он всегда есть, а пустая структура — заметнее, чем неточная.
+        if let settledFile = model.settledFile, let rustlyn = Rustlyn.shared,
+           let outline = rustlyn.outline(settledFile) {
+            return outline.outlineItems()
+        }
+
         let tokens = model.tokens(fromLine: 0, toLine: model.lineCount - 1)
         guard !tokens.isEmpty else { return [] }
 

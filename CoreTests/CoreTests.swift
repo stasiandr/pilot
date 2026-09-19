@@ -3892,6 +3892,109 @@ touch(fakeProject.appendingPathComponent("Library/ScriptAssemblies/Assembly-CSha
 check(unityProject?.projectFiles == .stale, "скрипты компилировались после генерации — файлы устарели")
 try? fm.removeItem(at: fakeProject)
 
+// ───────────────────────── Rustlyn ─────────────────────────
+// Библиотеки здесь нет — пакет собирается без CRustlyn. Проверяется то,
+// что должно работать в любом случае: что Pilot без неё собирается и
+// отвечает сам, и что перевод её ответов в свои типы верен. Что делает
+// сама библиотека, проверяют её тесты (`cargo test` в rustlyn).
+section("Rustlyn")
+
+check(Rustlyn.shared == nil, "без библиотеки сессии нет")
+check(Rustlyn.start(root: URL(fileURLWithPath: "/tmp")) == nil, "и не поднимается")
+check(!Rustlyn.understands(URL(fileURLWithPath: "/a/B.cs")), "без библиотеки понимать нечего")
+check(Rustlyn.buildsAgree(), "сверять нечего — значит, расхождения нет")
+
+// Виды объявлений ложатся на виды структуры файла.
+check(RustlynDeclarationKind.class.outlineKind == .type, "класс — это тип")
+check(RustlynDeclarationKind.record.outlineKind == .type, "запись — тоже тип")
+check(RustlynDeclarationKind.constructor.outlineKind == .initializer, "конструктор — инициализатор")
+check(RustlynDeclarationKind.indexer.outlineKind == .method, "индексатор читается как метод")
+check(RustlynDeclarationKind.enumMember.outlineKind == .enumCase, "член перечисления")
+check(RustlynDeclarationKind.class.isType && !RustlynDeclarationKind.method.isType, "тип и не тип")
+check(RustlynDeclarationKind.allCases.count == 17, "видов столько же, сколько в библиотеке")
+check(TokenKind.allCases.count == 15, "цветов столько же, сколько в библиотеке")
+
+// Типы параметров отделяются от имён: по ним навигатор различает перегрузки.
+let withParams = RustlynDeclaration(
+    name: "Move", kind: .method, keyword: "void", container: "Game.Pawn", typeText: "void",
+    parameters: ["int steps", "System.Collections.Generic.List<int> path", "this Pawn self"],
+    nameRange: NSRange(location: 0, length: 4), fullRange: NSRange(location: 0, length: 10),
+    line: 0, depth: 1)
+check(withParams.parameterTypes == ["int", "System.Collections.Generic.List<int>", "this Pawn"],
+      "тип параметра — всё до последнего пробела")
+
+// `using Vec = UnityEngine.Vector3;` приходит одной строкой.
+check(RustlynUsing("System").alias == nil, "обычный using без псевдонима")
+check(RustlynUsing("Vec=UnityEngine.Vector3").alias == "Vec", "псевдоним разобран")
+check(RustlynUsing("Vec=UnityEngine.Vector3").name == "UnityEngine.Vector3", "и имя за ним")
+
+// Цель перехода: полное имя раскладывается на своё и объемлющее.
+let target = RustlynTarget(url: URL(fileURLWithPath: "/p/Pawn.cs"), name: "Game.Pawn.Health",
+                           line: 4, character: 15, length: 6, kind: .field)
+check(target.shortName == "Health", "короткое имя")
+check(target.container == "Game.Pawn", "и что его содержит")
+check(target.navTarget.range?.start.line == 4, "строка доходит до цели")
+check(target.navTarget.range?.end.character == 21, "и конец имени считается по длине")
+
+let single = RustlynTarget(url: URL(fileURLWithPath: "/p/A.cs"), name: "Pawn",
+                           line: 0, character: 0, length: 4, kind: .class)
+check(single.shortName == "Pawn" && single.container == nil, "имя без точки — само себе имя")
+
+// Структура файла: правила Unity применяются к разобранным атрибутам.
+var outline = RustlynOutline()
+outline.declarations = [
+    RustlynDeclaration(name: "Game", kind: .namespace, keyword: "namespace", container: nil,
+                       typeText: nil, nameRange: NSRange(location: 0, length: 4),
+                       fullRange: NSRange(location: 0, length: 100), line: 0, depth: 0),
+    RustlynDeclaration(name: "Pawn", kind: .class, keyword: "class", container: "Game",
+                       typeText: nil, bases: ["MonoBehaviour"],
+                       nameRange: NSRange(location: 10, length: 4),
+                       fullRange: NSRange(location: 5, length: 90), line: 1, depth: 1),
+    RustlynDeclaration(name: "Update", kind: .method, keyword: "void", container: "Game.Pawn",
+                       typeText: "void", nameRange: NSRange(location: 20, length: 6),
+                       fullRange: NSRange(location: 20, length: 20), line: 2, depth: 2),
+    RustlynDeclaration(name: "_speed", kind: .field, keyword: "float", container: "Game.Pawn",
+                       typeText: "float", attributes: ["SerializeField"],
+                       nameRange: NSRange(location: 50, length: 6),
+                       fullRange: NSRange(location: 45, length: 15), line: 3, depth: 2),
+    RustlynDeclaration(name: "_hidden", kind: .field, keyword: "int", container: "Game.Pawn",
+                       typeText: "int", nameRange: NSRange(location: 70, length: 7),
+                       fullRange: NSRange(location: 65, length: 15), line: 4, depth: 2),
+]
+let items = outline.outlineItems()
+check(items.count == 4, "пространство имён в структуру не идёт")
+check(items.first(where: { $0.name == "Pawn" })?.kind == .type, "класс — тип")
+check(items.first(where: { $0.name == "Pawn" })?.bases == ["MonoBehaviour"], "базовые доходят")
+check(items.first(where: { $0.name == "Update" })?.kind == .unityMessage,
+      "Update — сообщение движка")
+check(items.first(where: { $0.name == "_speed" })?.kind == .serializedField,
+      "[SerializeField] — поле инспектора")
+check(items.first(where: { $0.name == "_hidden" })?.kind == .field,
+      "поле без атрибута остаётся полем")
+check(items.first(where: { $0.name == "Update" })?.range.location == 20, "диапазон имени на месте")
+
+// Об отказе стоит говорить не всегда.
+check(!RustlynRefusal.notAName.worthSaying, "курсор не на имени — говорить нечего")
+check(!RustlynRefusal.none.worthSaying, "успех — тем более")
+check(RustlynRefusal.receiverUnknown.worthSaying, "а про невыводимый получатель — стоит")
+check(RustlynRefusal.notIndexed.worthSaying, "и про несобранный индекс")
+
+// Символы препроцессора Unity: без них половина `#if` читается как мёртвая.
+let unitySymbols = UnityProjectInfo(root: URL(fileURLWithPath: "/p"),
+                                    editorVersion: "6000.3.14f1").preprocessorSymbols
+check(unitySymbols.contains("UNITY_EDITOR"), "UNITY_EDITOR всегда")
+check(unitySymbols.contains("UNITY_6000"), "мажорная версия")
+check(unitySymbols.contains("UNITY_6000_3"), "мажорная с минорной")
+check(unitySymbols.contains("UNITY_2021_3_OR_NEWER"), "лесенка «или новее» вниз до 2017")
+check(unitySymbols.contains("UNITY_6000_3_OR_NEWER"), "и до самой версии включительно")
+check(!unitySymbols.contains("UNITY_6000_4_OR_NEWER"), "но не выше неё")
+check(Set(unitySymbols).count == unitySymbols.count, "без повторов")
+
+let noVersion = UnityProjectInfo(root: URL(fileURLWithPath: "/p"),
+                                 editorVersion: nil).preprocessorSymbols
+check(noVersion.contains("UNITY_EDITOR"), "без версии остаются общие символы")
+check(!noVersion.contains(where: { $0.hasSuffix("_OR_NEWER") }), "и ни одной выдуманной версии")
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

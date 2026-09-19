@@ -136,6 +136,20 @@ extension Workspace {
 
     private func fileActions(_ document: LoadedDocument, line: Int) -> [ContextAction] {
         var actions: [ContextAction] = []
+        // Сборка без исходников: у метода под курсором можно посмотреть IL.
+        // Пункт появляется, только если в этой строке действительно объявлен
+        // метод, — меню показывает доступное, а не весь список команд.
+        //
+        // Спрашивается по одному методу и только когда спросили: поверхность
+        // сборки — это проход по таблицам и ни одной инструкции, а тело
+        // читается у того метода, который открыли.
+        if document.decompiled == .assembly,
+           AssemblySource.methodBody(of: document.url, line: line) != nil {
+            actions.append(ContextAction(title: "Показать IL метода", icon: "chevron.left.forwardslash.chevron.right",
+                                         ) { [weak self] in
+                self?.showMethodBody(of: document.url, line: line)
+            })
+        }
         if !document.outline.isEmpty {
             actions.append(ContextAction(title: "Структура файла…", icon: "list.bullet.indent",
                                          shortcut: KeyShortcut("o", [.command, .shift])) { [weak self] in

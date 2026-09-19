@@ -111,6 +111,8 @@ private struct TabItem: View {
         case .languageServer(let assembly):
             let name = assembly ?? "сборка"
             return "\(name): декомпилировано языковым сервером — только для чтения"
+        case .methodBody(let name):
+            return "\(name): IL из метаданных — только для чтения"
         }
     }
 

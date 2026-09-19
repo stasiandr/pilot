@@ -23,6 +23,9 @@ enum Theme {
         case .attribute:    return Macchiato.rosewater
         case .constant:     return Macchiato.peach
         case .operatorTok:  return Macchiato.sky
+        // Приглушённо, но не как комментарий: код в невзятой ветке `#if`
+        // читают — просто помня, что собирается не он.
+        case .disabled:     return Macchiato.surface1
         }
     }
 

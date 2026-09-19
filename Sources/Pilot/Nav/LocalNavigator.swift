@@ -68,6 +68,13 @@ struct LocalNavigator {
     // MARK: - Переход к объявлению
 
     func definition(at offset: Int) -> Answer {
+        // Сначала Rustlyn: он разрешает имя областью видимости на месте
+        // обращения, а этот разбор — по индексу объявлений, и на двух
+        // одноимённых типах из разных namespace ошибается молча.
+        // `nil` — Rustlyn не ответил (нет сессии, файл правят, имя не из
+        // проекта), и дальше как раньше.
+        if let answer = rustlynDefinition(at: offset) { return answer }
+
         let model = document.model
         guard let identifier = Occurrences.identifier(in: model, at: offset) else { return .none }
         let tokens = tokensAround(identifier.range.location)
@@ -516,6 +523,8 @@ struct LocalNavigator {
     /// `derivedByBase`: это обратная сторона того же `bases`, по которому
     /// ⌘B поднимается вверх, так что второго обхода проекта не нужно.
     func implementations(at offset: Int) -> Answer {
+        if let answer = rustlynImplementations(at: offset) { return answer }
+
         guard index != nil else { return .none }
         let model = document.model
         guard let identifier = Occurrences.identifier(in: model, at: offset) else { return .none }

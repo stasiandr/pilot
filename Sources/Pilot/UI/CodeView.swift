@@ -43,6 +43,9 @@ struct LoadedDocument: Sendable {
         /// и написал настоящий `.cs`. Сервер о нём знает, поэтому `⌘B`
         /// изнутри работает дальше, как в обычном коде.
         case languageServer(assembly: String?)
+        /// IL одного метода, прочитанный Rustlyn по запросу. Не C# и не
+        /// притворяется им: это инструкции с разрешёнными именами.
+        case methodBody(name: String)
     }
 
     enum LoadError: Error, LocalizedError {
@@ -85,6 +88,22 @@ struct LoadedDocument: Sendable {
         return document
     }
 
+    /// Текст, которого нет ни на диске, ни в коммите: IL метода.
+    ///
+    /// `revision` здесь не версия из git, а то, что отличает эту вкладку от
+    /// вкладки самой сборки: у них один путь, и без него вторая нашлась бы
+    /// вместо первой. Языка нет намеренно — IL не C#, и красить его как C#
+    /// значило бы называть `ldfld` типом.
+    static func methodBody(assembly url: URL, token: UInt32, name: String,
+                           text: String) -> LoadedDocument {
+        let model = SyntaxModel(text: text, spec: nil)
+        var document = LoadedDocument(url: url, model: model, languageName: "IL",
+                                      outline: [], encoding: .utf8,
+                                      revision: "il:\(token)")
+        document.decompiled = .methodBody(name: name)
+        return document
+    }
+
     /// Файл из коммита — для ревью MR: те же проверки, что и с диска.
     static func make(url: URL, data: Data, revision: String?) throws -> LoadedDocument {
         let (text, encoding) = try decodeText(data, maxBytes: maxBytes)
@@ -96,6 +115,24 @@ struct LoadedDocument: Sendable {
                              spec forced: LanguageSpec? = nil) -> LoadedDocument {
         let spec = forced ?? Languages.detect(filename: url.lastPathComponent)
         let model = SyntaxModel(text: text, spec: spec)
+        // Файл только что прочитан, значит он совпадает с тем, что на диске,
+        // — и про C# дальше отвечает Rustlyn: подсветка, структура, переходы.
+        //
+        // Файл из коммита (ревью MR) сюда не попадает: `revision` говорит,
+        // что текст не с диска, а Rustlyn читает именно диск. Показывать
+        // структуру одной версии поверх текста другой — хуже, чем показать
+        // структуру от своего разбора.
+        if revision == nil, let rustlyn = Rustlyn.shared, Rustlyn.understands(url) {
+            if rustlyn.open(url) {
+                model.useRustlyn(for: url)
+                // Расставить точки возврата лексера по всему файлу, чтобы
+                // прыжок в конец стоил столько же, сколько прокрутка. Фоном:
+                // на файле в 200 000 строк это доли секунды, а первый экран
+                // уже нарисован.
+                let warming = url
+                DispatchQueue.global(qos: .utility).async { rustlyn.warm(warming) }
+            }
+        }
         let outline = OutlineBuilder.build(model: model)
         let semantics = UnitySemantics.analyze(model: model, lexicalOutline: outline, context: unity)
         return LoadedDocument(url: url, model: model,

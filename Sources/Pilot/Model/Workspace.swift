@@ -426,6 +426,11 @@ final class Workspace: ObservableObject {
 
     /// Обход проекта и всё, что по нему строится; плюс git и Unity.
     private func startIndexing(root url: URL, generation: Int) {
+        // Сессия Rustlyn живёт ровно столько, сколько открыт проект: её кэш
+        // и её индекс — про этот корень, и у другого проекта они другие.
+        // Символы препроцессора берутся у Unity, потому что от них зависит,
+        // какая ветка `#if` живая, а значит — что вообще попадёт в разбор.
+        Rustlyn.start(root: url, symbols: unity.project?.preprocessorSymbols ?? [])
         git.refresh()
         unity.indexAssets()
         let exclude: FileIndex.Exclusion? = unity.project.map { $0.excludedFromIndex }
@@ -518,6 +523,19 @@ final class Workspace: ObservableObject {
         let counter = scanGeneration
         let batch = symbolGeneration
         let symbolBatch = symbolGeneration.bump()
+        // Индекс Rustlyn собирается по тому же списку файлов и в том же
+        // фоне. Файлы, не изменившиеся с прошлого раза, он достаёт из кэша,
+        // а не разбирает заново, — поэтому после сохранения это работа над
+        // одним файлом, а не над проектом, и при повторном открытии проекта
+        // это чтение, а не разбор.
+        let sources = files.filter { Rustlyn.understands(url.appendingPathComponent($0)) }
+            .map { url.appendingPathComponent($0) }
+        if !sources.isEmpty, let rustlyn = Rustlyn.shared {
+            typeWork.async {
+                guard counter.isCurrent(generation) else { return }
+                rustlyn.reindex(sources)
+            }
+        }
         typeWork.async { [weak self] in
             guard let symbols = SymbolIndex.build(root: url, files: files,
                                                   shouldStop: { !counter.isCurrent(generation) })
@@ -586,6 +604,25 @@ final class Workspace: ObservableObject {
     /// Файл сохранён — его объявления в индексе устарели. Пересобираем индекс,
     /// перечитав с диска только его: символы остальных файлов переносятся из
     /// старого индекса как есть. Полный разбор проекта стоил бы секунды.
+    /// Файл сохранён — значит он снова совпадает с диском, и про C# опять
+    /// отвечает Rustlyn.
+    ///
+    /// Первая же правка сбросила `settledFile`, и с тех пор красил свой
+    /// лексер. Здесь связь восстанавливается: заново прочитать файл на той
+    /// стороне (его отпечаток изменился, кэш это увидит сам), пометить
+    /// модель и в фоне расставить точки возврата.
+    ///
+    /// Структура пересобирается тем же путём, что и всегда, — через
+    /// `reindexAfterSave` ниже; здесь только про подсветку и про то, кому
+    /// теперь верить.
+    private func settleWithRustlyn(_ buffer: TextBuffer) {
+        guard let rustlyn = Rustlyn.shared, Rustlyn.understands(buffer.url) else { return }
+        guard rustlyn.open(buffer.url) else { return }
+        buffer.model.useRustlyn(for: buffer.url)
+        let url = buffer.url
+        DispatchQueue.global(qos: .utility).async { rustlyn.warm(url) }
+    }
+
     private func reindexAfterSave(_ url: URL) {
         guard let root, url.path.hasPrefix(root.path + "/") else { return }
         let path = String(url.path.dropFirst(root.path.count + 1))
@@ -724,6 +761,7 @@ final class Workspace: ObservableObject {
     func closeProject() {
         guard confirmUnsavedChanges() else { return }
         dropAllBuffers()
+        Rustlyn.stop()
         // Новое поколение отменяет обход ФС и загрузку файла, что ещё идут.
         _ = scanGeneration.bump()
         _ = loadGeneration.bump()
@@ -1681,6 +1719,30 @@ final class Workspace: ObservableObject {
         }
     }
 
+    /// IL метода, объявленного в строке `line` открытой сборки — отдельной
+    /// вкладкой, только для чтения.
+    ///
+    /// Второй вопрос к сборке, задаваемый по одному: её поверхность — это
+    /// проход по таблицам метаданных и ни одной инструкции, а тело читается
+    /// у того метода, который открыли. На `System.Runtime` разница между
+    /// «показать объявления» и «показать всё» — это разница между кадром и
+    /// минутой.
+    func showMethodBody(of url: URL, line: Int) {
+        guard let rustlyn = Rustlyn.shared,
+              let token = rustlyn.methodToken(url, line: line) else { return }
+        guard let text = rustlyn.methodBody(url, token: token) else {
+            loadError = rustlyn.lastError
+            return
+        }
+        // Имя метода — первая строка ответа, комментарием: оно же годится
+        // заголовком вкладки.
+        let name = text.split(separator: "\n", maxSplits: 1).first
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")) } ?? ""
+        present(.success(CodeView.methodBody(assembly: url, token: token,
+                                             name: name, text: text)),
+                reveal: nil)
+    }
+
     private func present(_ result: Result<LoadedDocument, Error>, reveal: LSPRange?,
                          preview: Bool = false, replacingPreview: Bool = false,
                          replacingReviewTab: Bool = false) {
@@ -2283,6 +2345,7 @@ final class Workspace: ObservableObject {
             return false
         }
         lsp.documentSaved(buffer.url)
+        settleWithRustlyn(buffer)
         reindexAfterSave(buffer.url)
         git.refresh()
         if buffer === self.buffer { git.documentEdited(buffer.document) }

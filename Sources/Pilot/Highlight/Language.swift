@@ -1,8 +1,22 @@
 import Foundation
 
-enum TokenKind: UInt8 {
+enum TokenKind: UInt8, CaseIterable {
     case plain, keyword, type, string, escape, number, comment, docComment
     case function, punctuation, preprocessor, attribute, constant, operatorTok
+    /// Ветка `#if`, которую препроцессор не взял. Отдельно от комментария:
+    /// это код, просто не этой сборки, и выглядеть он должен приглушённо,
+    /// а не так, будто его закомментировали.
+    ///
+    /// Ставит только разбор C# из Rustlyn — свой лексер условий не считает
+    /// и про живость веток не знает.
+    case disabled
+
+    /// Вид из `RlnClass`. Значения совпадают по построению: обе таблицы
+    /// выписаны вручную, и что они не разъехались, проверяет
+    /// `Rustlyn.buildsAgree()` при запуске.
+    init(_ raw: UInt8) {
+        self = TokenKind(rawValue: raw) ?? .plain
+    }
 }
 
 struct StringSpec {

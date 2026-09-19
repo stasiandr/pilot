@@ -316,6 +316,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Таблицы видов и цветов Pilot повторяет за Rustlyn вручную — иначе
+        // пришлось бы тянуть их через границу на каждый токен. Расхождение
+        // на одно значение ничего не сломает и всё сдвинет: у полей появится
+        // иконка метода, у строк цвет числа. Дешевле сказать это в лог при
+        // запуске, чем искать потом.
+        if !Rustlyn.buildsAgree() {
+            NSLog("Pilot: таблицы видов разошлись с библиотекой Rustlyn — "
+                  + "пересоберите её: ./build-rust.sh")
+        }
+
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }

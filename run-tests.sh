@@ -3,6 +3,11 @@
 # .gitignore, лексер, распознавание ⇧⇧, git, события ФС, Unity: GUID, сцены,
 # инспектор, метаданные сборок .NET.
 # AppKit здесь не нужен, поэтому они гоняются и на macOS, и на Linux.
+#
+# Rustlyn здесь тоже нет: пакет собирается без CRustlyn, и `#if canImport`
+# подставляет заглушку. Это не пробел, а то, что проверять и надо, — что
+# Pilot без библиотеки собирается и отвечает сам. Что делает сама
+# библиотека, проверяют её собственные тесты (`cargo test` в rustlyn).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,6 +23,10 @@ cp Sources/Pilot/Nav/{SymbolIndex,LocalNavigator}.swift "$TMP/Sources/coretests/
 cp Sources/Pilot/Decompile/{AssemblyMetadata,AssemblySignatures,AssemblySource,AssemblyIndex}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/GitLab/{GitLabRemote,GitLabModels,UnifiedDiff,MergeRequestSearch}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Unity/{UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector,UnityHierarchy}.swift "$TMP/Sources/coretests/"
+# Типы Rustlyn и заглушка на случай, когда библиотеки нет. Здесь её нет
+# всегда: пакет собирается без CRustlyn, поэтому `#if canImport` выбирает
+# заглушку, и проверяется ровно то, что Pilot делает своими силами.
+cp Sources/Pilot/Rustlyn/{RustlynTypes,RustlynAbsent,RustlynNavigator}.swift "$TMP/Sources/coretests/"
 cp CoreTests/CoreTests.swift "$TMP/Sources/coretests/main.swift"
 
 cat > "$TMP/Package.swift" <<'MANIFEST'

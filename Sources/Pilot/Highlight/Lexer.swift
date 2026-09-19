@@ -46,6 +46,23 @@ final class SyntaxModel: @unchecked Sendable {
     /// Растёт с каждой правкой: фоновый результат по старой версии — выбрасываем.
     private(set) var version = 0
 
+    /// Файл, из которого модель построена, если он на диске и это C#.
+    ///
+    /// По нему подсветку спрашивают у Rustlyn: настоящий лексер C# знает
+    /// raw-строки, вложенную интерполяцию и мёртвые ветки `#if`, к которым
+    /// свой лексер только приближается.
+    ///
+    /// Сбрасывается первой же правкой и ставится заново, когда файл устоится
+    /// (сохранение, переоткрытие). Пока текст правят, свой лексер быстрее и
+    /// он инкрементальный: обычное нажатие клавиши перелексирует одну
+    /// строку, а Rustlyn пришлось бы отдавать весь текст заново.
+    private(set) var settledFile: URL?
+
+    /// Считать подсветку этого файла по Rustlyn, пока его не начали править.
+    func useRustlyn(for url: URL) {
+        settledFile = Rustlyn.understands(url) ? url : nil
+    }
+
     var lineCount: Int { lineStarts.count }
 
     init(text: String, spec: LanguageSpec?) {
@@ -60,6 +77,7 @@ final class SyntaxModel: @unchecked Sendable {
         lineStates = other.lineStates
         spec = other.spec
         version = other.version
+        settledFile = other.settledFile
     }
 
     /// Неизменяемая копия для фоновой работы. Массивы копируются лениво
@@ -141,6 +159,10 @@ final class SyntaxModel: @unchecked Sendable {
         let oldEnd = max(start, min(NSMaxRange(range), units.count))
         let delta = Int32(replacement.count - (oldEnd - start))
         version += 1
+        // Текст разошёлся с файлом на диске, а Rustlyn знает файл. Дальше
+        // красит свой лексер — он инкрементальный и правку уже применил, —
+        // пока сохранение не поставит `settledFile` обратно.
+        settledFile = nil
 
         let firstLine = line(containing: start)
         let lastLine = line(containing: oldEnd)
@@ -200,6 +222,16 @@ final class SyntaxModel: @unchecked Sendable {
         guard let spec, !lineStarts.isEmpty else { return [] }
         let first = max(0, min(fromLine, lineStarts.count - 1))
         let last = max(first, min(toLine, lineStarts.count - 1))
+
+        // Устоявшийся C# красит Rustlyn. Промах — не беда и не редкость:
+        // сессии может не быть вовсе, файл мог не открыться на той стороне,
+        // — и тогда работает свой лексер, как работал всегда. Поэтому
+        // ошибку здесь не показывают: подсветка не та причина, по которой
+        // стоит что-то говорить пользователю.
+        if let settledFile, let rustlyn = Rustlyn.shared,
+           let tokens = rustlyn.tokens(settledFile, lines: first...last) {
+            return tokens
+        }
 
         var state = LexState(packed: lineStates[first])
         let start = Int(lineStarts[first])
