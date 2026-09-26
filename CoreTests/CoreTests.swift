@@ -5986,6 +5986,9 @@ do {
     check(rhsText("new Health { Regen = 1, Value = x }", "Value") == "x", "последнее в инициализаторе — до }")
     check(access("Parse(s, out stats.Level);", "Level") == .write(rhs: nil, compound: false), "out — запись")
     check(rhsText("d.Name = \"a;b\";", "Name") == "\"a;b\"", "; в строке правую часть не рвёт")
+    check(rhsText("var map = new Dictionary<(Rarity r, Kind k), int>();", "map") == "new Dictionary<(Rarity r, Kind k), int>()",
+          "запятые в аргументах дженерика правую часть не рвут")
+    check(rhsText("int a = b < c, d = e;", "a") == "b < c", "сравнение — не дженерик")
 }
 
 section("Граф значения: источники")

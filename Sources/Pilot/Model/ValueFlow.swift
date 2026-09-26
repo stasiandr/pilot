@@ -98,6 +98,11 @@ enum ValueFlow {
                 while i < text.count, text[i] != newline { i += 1 }
                 continue
             }
+            // Запятые в аргументах дженерика (`Dictionary<(A a, B b), int>`) правую часть не рвут.
+            if c == lt, i > 0, isIdentPart(text[i - 1]), let after = typeArguments(text, from: i, limit: text.count) {
+                i = after
+                continue
+            }
             if c == openParen || c == openBracket || c == openBrace { depth += 1 }
             if c == closeParen || c == closeBracket || c == closeBrace {
                 if depth == 0 { break }
@@ -234,16 +239,7 @@ enum ValueFlow {
 
     /// Позиция сразу за `>`, закрывающей `<` в `start`.
     private static func genericEnd(_ text: [UInt16], from start: Int, limit: Int) -> Int {
-        var depth = 0
-        var i = start
-        while i < limit {
-            if text[i] == lt { depth += 1 } else if text[i] == gt {
-                depth -= 1
-                if depth == 0 { return i + 1 }
-            }
-            i += 1
-        }
-        return limit
+        typeArguments(text, from: start, limit: limit) ?? limit
     }
 
     /// `var x = …` / `T x = …` внутри метода до позиции `before`: правая
@@ -1064,24 +1060,29 @@ enum ValueFlow {
     ]
 
     private static func looksGeneric(_ text: [UInt16], from: Int, end: Int) -> Bool {
+        guard let after = typeArguments(text, from: from, limit: end) else { return false }
+        let next = skipSpace(text, from: after)
+        return next < end && text[next] == openParen
+    }
+
+    /// Если `<` в `from` открывает аргументы типа — позиция сразу за `>`.
+    /// Внутри — только то, из чего пишут типы: имена, точки, запятые,
+    /// кортежи, массивы и `?`: `Dictionary<(int a, T b), U[]?>`.
+    private static func typeArguments(_ text: [UInt16], from: Int, limit: Int) -> Int? {
         var depth = 0
         var i = from
-        while i < end {
+        while i < limit {
             let c = text[i]
             if c == lt { depth += 1 } else if c == gt {
                 depth -= 1
-                if depth == 0 {
-                    let next = skipSpace(text, from: i + 1)
-                    return next < end && text[next] == openParen
-                }
+                if depth == 0 { return i + 1 }
             } else if !(isIdentPart(c) || c == dot || c == comma || isSpace(c) || c == question
                         || c == openParen || c == closeParen || c == openBracket || c == closeBracket) {
-                // Кортежи, массивы и `?` в аргументах — тоже типы: `Dictionary<(int a, T b), U[]?>`.
-                return false
+                return nil
             }
             i += 1
         }
-        return false
+        return nil
     }
 
     private static func word(_ text: [UInt16], endingAt end: Int) -> String {
