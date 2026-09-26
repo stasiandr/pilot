@@ -1162,6 +1162,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var onBreakpointClick: ((Int) -> Void)? {
         didSet { if isViewLoaded { applyLineHandlers() } }
     }
+    /// Условие точки на строке (правый клик по номеру); nil — условий нет.
+    var onBreakpointCondition: ((Int, String?) -> Void)? {
+        didSet { if isViewLoaded { applyLineHandlers() } }
+    }
     /// Что можно сделать в позиции — для меню ⌘. Правку текста
     /// (комментарий, дополнение) меню добавляет само.
     var contextActions: ((Int) -> [ContextActionGroup])?
@@ -1184,6 +1188,9 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     private func applyLineHandlers() {
         ruler?.onLineClick = onLineClick
         ruler?.onBreakpointClick = onBreakpointClick
+        ruler?.onBreakpointContext = onBreakpointCondition == nil ? nil : { [weak self] line in
+            self?.editBreakpointCondition(line)
+        }
         textView.onCommentLine = onCommentLine.map { handler in
             { [weak self] offset in
                 guard let self, let model = self.model else { return }
@@ -1607,6 +1614,20 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     func closePopover() {
         popover?.close()
         popover = nil
+    }
+
+    /// Окно условия точки у номера строки. Точки ещё нет — встанет с условием.
+    private func editBreakpointCondition(_ line: Int) {
+        guard let onBreakpointCondition else { return }
+        let mark = ruler?.breakpoints[line]
+        let editor = BreakpointConditionEditor(
+            line: line, condition: mark?.condition ?? "", hasBreakpoint: mark != nil,
+            commit: { [weak self] text in
+                onBreakpointCondition(line, text)
+                self?.closePopover()
+            },
+            cancel: { [weak self] in self?.closePopover() })
+        presentPopover(line: line, content: AnyView(editor.preferredColorScheme(.dark)))
     }
 
     // MARK: - Конфликты слияния
@@ -3069,6 +3090,8 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
         didSet { if executionLine != oldValue { needsDisplay = true } }
     }
     var onBreakpointClick: ((Int) -> Void)?
+    /// Правый клик (или ⌃-клик) по номеру — условие точки.
+    var onBreakpointContext: ((Int) -> Void)?
 
     init(scrollView: NSScrollView, textView: NSTextView) {
         self.textView = textView
@@ -3180,6 +3203,15 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
         return NSRect(x: 0, y: y, width: ruleThickness, height: max(lineRect.height, 1))
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard point.x < ruleThickness - Self.foldColumn - 8, let onBreakpointContext, let line = line(at: point) else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        onBreakpointContext(line)
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         // Стрелка сворачивания — справа, у самого текста.
@@ -3190,9 +3222,15 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
         }
         // Сам номер — точка останова; полоска изменений у текста и всё,
         // что справа, — окно строки, как было.
-        if point.x < ruleThickness - Self.foldColumn - 8, let onBreakpointClick, let line = line(at: point) {
-            onBreakpointClick(line)
-            return
+        if point.x < ruleThickness - Self.foldColumn - 8, let line = line(at: point) {
+            if event.modifierFlags.contains(.control), let onBreakpointContext {
+                onBreakpointContext(line)
+                return
+            }
+            if let onBreakpointClick {
+                onBreakpointClick(line)
+                return
+            }
         }
         guard let onLineClick, let line = line(at: point) else {
             super.mouseDown(with: event)
@@ -3206,7 +3244,7 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
     /// а линейка нет.
     private func updateBreakpointTips() {
         removeAllToolTips()
-        if breakpoints.values.contains(where: { $0.message != nil }) {
+        if breakpoints.values.contains(where: { $0.message != nil || $0.condition != nil }) {
             addToolTip(bounds, owner: self, userData: nil)
         }
     }
@@ -3218,8 +3256,9 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
 
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint,
               userData data: UnsafeMutableRawPointer?) -> String {
-        guard let line = line(at: point) else { return "" }
-        return breakpoints[line]?.message ?? ""
+        guard let line = line(at: point), let mark = breakpoints[line] else { return "" }
+        let condition = mark.condition.map { L("Условие: \($0)") }
+        return [condition, mark.message].compactMap { $0 }.joined(separator: "\n")
     }
 
     /// Ярлык точки: прямоугольник со стрелкой вправо под номером строки.
@@ -3238,6 +3277,12 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
             Theme.breakpoint.setStroke()
             path.lineWidth = 1
             path.stroke()
+        }
+        // Условная — белая точка слева, как у Rider.
+        if mark.condition != nil {
+            let d = min(5, rect.height - 4)
+            Theme.breakpointText.setFill()
+            NSBezierPath(ovalIn: NSRect(x: rect.minX + 3, y: rect.midY - d / 2, width: d, height: d)).fill()
         }
     }
 
@@ -3474,6 +3519,7 @@ struct CodeView: NSViewControllerRepresentable {
     var breakpoints: [Int: BreakpointMark] = [:]
     var executionLine: Int? = nil
     var onBreakpointClick: ((Int) -> Void)? = nil
+    var onBreakpointCondition: ((Int, String?) -> Void)? = nil
     var contextActions: ((Int) -> [ContextActionGroup])? = nil
     let requestCompletions: (Int, String?, Bool) async -> CompletionList?
     /// Подсказка Copilot у курсора; nil — Copilot выключен.
@@ -3499,6 +3545,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.onLineClick = onLineClick
         controller.onCommentLine = onCommentLine
         controller.onBreakpointClick = onBreakpointClick
+        controller.onBreakpointCondition = onBreakpointCondition
         return controller
     }
 
@@ -3508,6 +3555,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.onLineClick = onLineClick
         controller.onCommentLine = onCommentLine
         controller.onBreakpointClick = onBreakpointClick
+        controller.onBreakpointCondition = onBreakpointCondition
         controller.contextActions = contextActions
         controller.requestCompletions = requestCompletions
         controller.requestSuggestion = requestSuggestion

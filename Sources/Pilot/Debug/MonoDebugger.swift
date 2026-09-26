@@ -30,6 +30,8 @@ actor MonoDebugger: DebugBackend {
         /// ставится ещё раз; тот же метод второй раз не нужен.
         var spots: Set<String> = []
         var status: BreakpointStatus
+        /// Условие считаем сами: агент Mono условий не знает.
+        var condition: String?
     }
     /// Точки по файлам (путь на диске) и строкам с нуля.
     private var breakpoints: [String: [Int: Placed]] = [:]
@@ -68,14 +70,30 @@ actor MonoDebugger: DebugBackend {
     private enum Handle {
         case object(Int)
         case array(Int)
-        case valueType(type: Int, fields: [SDBValue])
+        /// `slot` — куда записать структуру целиком, если поменяют её поле.
+        case valueType(type: Int, fields: [SDBValue], slot: Int?)
     }
     private var handles: [Int: Handle] = [:]
     private var nextHandle = 1
 
+    /// Куда пишется значение: переменная кадра, поле, элемент массива
+    /// или поле структуры (тогда переписывается вся структура в её слот).
+    private enum Slot {
+        case local(thread: Int, frame: Int, position: Int)
+        case field(object: Int, field: Int)
+        case element(array: Int, index: Int)
+        case structField(parent: Int, type: Int, fields: [SDBValue], index: Int)
+    }
+    private var slots: [Int: (slot: Slot, current: SDBValue)] = [:]
+    /// Кадр, чьи переменные показаны: в нём считается набранное значение.
+    private var shownFrame: (thread: Int, frame: Int)?
+    /// Значения, на которые ссылается вычисляемое выражение.
+    private var operands: [Int: SDBValue] = [:]
+    private var rootDomain: Int?
+
     // MARK: Запуск
 
-    func start(breakpoints initial: [URL: [Int]]) async throws {
+    func start(breakpoints initial: [URL: [BreakpointSpec]]) async throws {
         connection.onEvents = { [weak self] policy, events in
             guard let self else { return }
             Task { await self.enqueue(policy, events) }
@@ -97,8 +115,8 @@ actor MonoDebugger: DebugBackend {
         try await connection.connect(host: host, port: port)
         emit(.output("Подключён к \(connection.runtimeName), протокол \(connection.runtimeVersion) (работаем на \(version))\n",
                      category: "console"))
-        for (file, lines) in initial {
-            let statuses = await placeAll(file: file.path, lines: lines)
+        for (file, specs) in initial {
+            let statuses = await placeAll(file: file.path, specs)
             emit(.breakpoints(file: file, statuses))
         }
         try? await updateTypeLoadRequest()
@@ -238,18 +256,18 @@ actor MonoDebugger: DebugBackend {
 
     // MARK: Точки останова
 
-    func setBreakpoints(file: URL, lines: [Int]) async -> [BreakpointStatus] {
-        let statuses = await placeAll(file: file.path, lines: lines)
+    func setBreakpoints(file: URL, _ specs: [BreakpointSpec]) async -> [BreakpointStatus] {
+        let statuses = await placeAll(file: file.path, specs)
         try? await updateTypeLoadRequest()
         return statuses
     }
 
-    private func placeAll(file: String, lines: [Int]) async -> [BreakpointStatus] {
+    private func placeAll(file: String, _ specs: [BreakpointSpec]) async -> [BreakpointStatus] {
         for placed in (breakpoints[file] ?? [:]).values {
             for request in placed.requests { await clearEvent(.breakpoint, request) }
         }
         breakpoints[file] = [:]
-        guard !lines.isEmpty else {
+        guard !specs.isEmpty else {
             breakpoints[file] = nil
             return []
         }
@@ -266,9 +284,16 @@ actor MonoDebugger: DebugBackend {
             emit(.output("Типы для \(file): \(error.localizedDescription)\n", category: "stderr"))
         }
         var statuses: [BreakpointStatus] = []
-        for line in Set(lines).sorted() {
-            let placed = await place(file: file, line: line, types: types)
-            breakpoints[file, default: [:]][line] = placed
+        for spec in specs.sorted(by: { $0.line < $1.line }) where breakpoints[file]?[spec.line] == nil {
+            var placed = await place(file: file, line: spec.line, types: types)
+            placed.condition = spec.condition
+            // Ошибку в условии видно сразу, а не на первой остановке.
+            if let condition = spec.condition {
+                do { _ = try DebugExpression.parse(condition) } catch {
+                    placed.status.message = "Условие: \(error.localizedDescription)"
+                }
+            }
+            breakpoints[file, default: [:]][spec.line] = placed
             statuses.append(placed.status)
         }
         return statuses
@@ -355,12 +380,22 @@ actor MonoDebugger: DebugBackend {
             case .typeLoad:
                 await typeLoaded(event.id)
             case .breakpoint:
+                var text: String?
+                if let condition = condition(of: event.request) {
+                    do {
+                        guard try await holds(condition, thread: event.thread) else { continue }
+                    } catch {
+                        // Не посчиталось — встаём и говорим почему: молча
+                        // пропускать точку хуже.
+                        text = "условие «\(condition)»: \(error.localizedDescription)"
+                    }
+                }
                 if let step = stepRequest {
                     // Шаг «через» наткнулся на точку — шаг окончен.
                     await clearEvent(.step, step)
                     stepRequest = nil
                 }
-                stop = (event.thread, "breakpoint", nil)
+                stop = (event.thread, "breakpoint", text)
             case .step:
                 if let step = stepRequest {
                     await clearEvent(.step, step)
@@ -394,8 +429,30 @@ actor MonoDebugger: DebugBackend {
     private func invalidateStop() {
         frames = [:]
         handles = [:]
+        slots = [:]
+        operands = [:]
+        shownFrame = nil
         nextHandle = 1
     }
+
+    // MARK: Условия
+
+    private func condition(of request: Int32) -> String? {
+        for placed in breakpoints.values.lazy.flatMap(\.values) where placed.requests.contains(request) {
+            return placed.condition
+        }
+        return nil
+    }
+
+    private func holds(_ condition: String, thread: Int) async throws -> Bool {
+        let expression = try DebugExpression.parse(condition)
+        defer { operands = [:]; frames = [:] }
+        guard let top = try await rawFrames(thread: thread).first else { throw DebugError.message("у потока нет кадров") }
+        let value = try await expression.evaluate(in: MonoExpressionContext(debugger: self, thread: thread, frame: top.id))
+        guard case .bool(let result) = value else { throw DebugError.message("это не bool, а \(value.description)") }
+        return result
+    }
+
 
     // MARK: Управление
 
@@ -468,7 +525,9 @@ actor MonoDebugger: DebugBackend {
         return result
     }
 
-    func stackTrace(thread: Int) async throws -> [DebugFrame] {
+    /// Кадры потока без имён и строк — это отдельные запросы.
+    private func rawFrames(thread: Int) async throws -> [(id: Int, method: Int, offset: Int)] {
+        if let cached = frames[thread] { return cached }
         var r = try await send(.thread, SDB.Thread.getFrameInfo.rawValue) { w in
             w.id(thread); w.int(0); w.int(-1)
         }
@@ -482,6 +541,12 @@ actor MonoDebugger: DebugBackend {
             raw.append((id, method, offset))
         }
         frames[thread] = raw
+        return raw
+    }
+
+    func stackTrace(thread: Int) async throws -> [DebugFrame] {
+        frames[thread] = nil
+        let raw = try await rawFrames(thread: thread)
         var result: [DebugFrame] = []
         for frame in raw {
             let name = await name(ofMethod: frame.method)
@@ -498,16 +563,16 @@ actor MonoDebugger: DebugBackend {
 
     // MARK: Переменные
 
-    func variables(frame: Int, thread: Int) async throws -> [DebugVariable] {
-        if frames[thread] == nil { _ = try await stackTrace(thread: thread) }
-        guard let found = frames[thread]?.first(where: { $0.id == frame }) else {
+    /// `this`, параметры и живые локальные переменные кадра: имена и
+    /// позиции для GET/SET_VALUES.
+    private func frameLayout(thread: Int, frame: Int) async throws -> (this: SDBValue?, names: [String], positions: [Int]) {
+        guard let found = try await rawFrames(thread: thread).first(where: { $0.id == frame }) else {
             throw DebugError.message("Кадр больше недействителен")
         }
-        var result: [DebugVariable] = []
-
+        var this: SDBValue?
         if var r = try? await send(.stackFrame, SDB.StackFrame.getThis.rawValue, { w in w.id(thread); w.id(frame) }),
            let value = try? r.value(version), value != .null, value != .void {
-            result.append(await describe(value, name: "this", path: "this"))
+            this = value
         }
 
         // Параметры: номера позиций у Mono отрицательные.
@@ -548,13 +613,24 @@ actor MonoDebugger: DebugBackend {
 
         let positions = paramNames.indices.map { -$0 - 1 } + localNames.map(\.position)
         let names = paramNames + localNames.map(\.name)
-        let values = await frameValues(thread: thread, frame: frame, positions: positions)
-        for (i, name) in names.enumerated() {
+        return (this, names, positions)
+    }
+
+    func variables(frame: Int, thread: Int) async throws -> [DebugVariable] {
+        let layout = try await frameLayout(thread: thread, frame: frame)
+        shownFrame = (thread, frame)
+        var result: [DebugVariable] = []
+        if let this = layout.this {
+            result.append(await describe(this, name: "this", path: "this"))
+        }
+        let values = await frameValues(thread: thread, frame: frame, positions: layout.positions)
+        for (i, name) in layout.names.enumerated() {
             guard let value = values[i] else {
                 result.append(DebugVariable(id: name, name: name, value: "недоступно"))
                 continue
             }
-            result.append(await describe(value, name: name, path: name))
+            let slot = Slot.local(thread: thread, frame: frame, position: layout.positions[i])
+            result.append(await describe(value, name: name, path: name, slot: slot))
         }
         return result
     }
@@ -583,29 +659,11 @@ actor MonoDebugger: DebugBackend {
         }
         switch handle {
         case .object(let object):
-            var r = try await send(.objectRef, SDB.ObjectRef.getType.rawValue) { $0.id(object) }
-            var type = try r.id()
-            // Поля всей цепочки наследования: сначала свои, потом базовые.
-            var all: [Field] = []
-            var guardDepth = 0
-            while type != 0, guardDepth < 32 {
-                let info = try await info(ofType: type)
-                if info.fullName == "object" || info.fullName == "UnityEngine.Object" && !all.isEmpty { break }
-                all += try await fields(ofType: type).filter { !$0.isStatic }
-                type = info.baseType
-                guardDepth += 1
-            }
-            guard !all.isEmpty else { return [] }
-            let version = self.version
-            var vr = try await send(.objectRef, SDB.ObjectRef.getValues.rawValue) { w in
-                w.id(object); w.int(all.count)
-                for field in all { w.id(field.id) }
-            }
             var result: [DebugVariable] = []
-            for field in all {
-                let value = try vr.value(version)
+            for (field, value) in try await instanceFields(of: object) {
                 let name = SDBNames.field(field.name)
-                result.append(await describe(value, name: name, path: parent + "." + name))
+                result.append(await describe(value, name: name, path: parent + "." + name,
+                                             slot: .field(object: object, field: field.id)))
             }
             return result
 
@@ -622,22 +680,46 @@ actor MonoDebugger: DebugBackend {
             }
             var result: [DebugVariable] = []
             for i in 0..<shown {
-                result.append(await describe(try vr.value(version), name: "[\(i)]", path: parent + "[\(i)]"))
+                result.append(await describe(try vr.value(version), name: "[\(i)]", path: parent + "[\(i)]",
+                                             slot: .element(array: array, index: i)))
             }
             if length > shown {
                 result.append(DebugVariable(id: parent + "[…]", name: "…", value: "ещё \(length - shown)"))
             }
             return result
 
-        case .valueType(let type, let values):
+        case .valueType(let type, let values, let slot):
             let own = try await fields(ofType: type).filter { !$0.isStatic }
             var result: [DebugVariable] = []
-            for (field, value) in zip(own, values) {
+            for (index, (field, value)) in zip(own, values).enumerated() {
                 let name = SDBNames.field(field.name)
-                result.append(await describe(value, name: name, path: parent + "." + name))
+                let fieldSlot = slot.map { Slot.structField(parent: $0, type: type, fields: values, index: index) }
+                result.append(await describe(value, name: name, path: parent + "." + name, slot: fieldSlot))
             }
             return result
         }
+    }
+
+    /// Поля объекта по всей цепочке наследования: сначала свои, потом базовые.
+    private func instanceFields(of object: Int) async throws -> [(Field, SDBValue)] {
+        var r = try await send(.objectRef, SDB.ObjectRef.getType.rawValue) { $0.id(object) }
+        var type = try r.id()
+        var all: [Field] = []
+        var guardDepth = 0
+        while type != 0, guardDepth < 32 {
+            let info = try await info(ofType: type)
+            if info.fullName == "object" || info.fullName == "UnityEngine.Object" && !all.isEmpty { break }
+            all += try await fields(ofType: type).filter { !$0.isStatic }
+            type = info.baseType
+            guardDepth += 1
+        }
+        guard !all.isEmpty else { return [] }
+        let version = self.version
+        var vr = try await send(.objectRef, SDB.ObjectRef.getValues.rawValue) { w in
+            w.id(object); w.int(all.count)
+            for field in all { w.id(field.id) }
+        }
+        return try all.map { ($0, try vr.value(version)) }
     }
 
     private func handle(for handle: Handle) -> Int {
@@ -647,11 +729,24 @@ actor MonoDebugger: DebugBackend {
         return id
     }
 
-    private func describe(_ value: SDBValue, name: String, path: String) async -> DebugVariable {
+    /// Слот значения — номер для правки; без слота править нечего.
+    private func register(_ slot: Slot?, _ value: SDBValue) -> Int? {
+        guard let slot else { return nil }
+        let id = nextHandle
+        nextHandle += 1
+        slots[id] = (slot, value)
+        return id
+    }
+
+    private func describe(_ value: SDBValue, name: String, path: String, slot: Slot? = nil) async -> DebugVariable {
         var variable = DebugVariable(id: path, name: name, value: "")
         if let text = value.primitiveText {
             variable.value = text
             variable.type = value.primitiveTypeName ?? ""
+            switch value {
+            case .void, .pointer: break
+            default: variable.editRef = register(slot, value) ?? 0
+            }
             return variable
         }
         switch value {
@@ -662,6 +757,7 @@ actor MonoDebugger: DebugBackend {
                 let text = (utf16 ? try? r.utf16String() : try? r.string()) ?? "?"
                 variable.value = SDBNames.quote(text)
             }
+            variable.editRef = register(slot, value) ?? 0
         case .object(let object, let kind):
             var typeName = "object"
             if var r = try? await send(.objectRef, SDB.ObjectRef.getType.rawValue, { $0.id(object) }),
@@ -689,6 +785,7 @@ actor MonoDebugger: DebugBackend {
             if isEnum {
                 variable.value = fields.first?.primitiveText ?? "?"
                 if let name = info?.name { variable.value += " (\(name))" }
+                variable.editRef = register(slot, value) ?? 0
             } else {
                 // Небольшие структуры из чисел — Vector3, Color — видны сразу.
                 let parts = fields.compactMap(\.primitiveText)
@@ -697,7 +794,10 @@ actor MonoDebugger: DebugBackend {
                 } else {
                     variable.value = "{\(info?.name ?? "struct")}"
                 }
-                if !fields.isEmpty { variable.children = handle(for: .valueType(type: type, fields: fields)) }
+                if !fields.isEmpty {
+                    let own = register(slot, value)
+                    variable.children = handle(for: .valueType(type: type, fields: fields, slot: own))
+                }
             }
         case .fixedArray(let items):
             variable.value = "[" + items.compactMap(\.primitiveText).joined(separator: ", ") + "]"
@@ -707,5 +807,253 @@ actor MonoDebugger: DebugBackend {
             variable.value = "?"
         }
         return variable
+    }
+
+    // MARK: Правка значений
+
+    func setVariable(_ variable: DebugVariable, to text: String) async throws {
+        guard suspended, let entry = slots[variable.editRef], let shownFrame else {
+            throw DebugError.message("Значение больше недействительно — программа ушла дальше")
+        }
+        defer { operands = [:] }
+        // Набранное — выражение в кадре: `42`, `"имя"`, `count + 1`, `other`.
+        let expression = try DebugExpression.parse(text)
+        let context = MonoExpressionContext(debugger: self, thread: shownFrame.thread, frame: shownFrame.frame)
+        let fresh = try await sdbValue(try await expression.evaluate(in: context), like: entry.current)
+        try await write(fresh, to: entry.slot)
+    }
+
+    private func write(_ value: SDBValue, to slot: Slot) async throws {
+        var encoded = SDBWriter()
+        try encoded.value(value, version: version)
+        let payload = encoded.bytes
+        switch slot {
+        case .local(let thread, let frame, let position):
+            _ = try await send(.stackFrame, SDB.StackFrame.setValues.rawValue) { w in
+                w.id(thread); w.id(frame); w.int(1); w.int(position)
+                w.raw(payload)
+            }
+        case .field(let object, let field):
+            _ = try await send(.objectRef, SDB.ObjectRef.setValues.rawValue) { w in
+                w.id(object); w.int(1); w.id(field)
+                w.raw(payload)
+            }
+        case .element(let array, let index):
+            _ = try await send(.arrayRef, SDB.ArrayRef.setValues.rawValue) { w in
+                w.id(array); w.int(index); w.int(1)
+                w.raw(payload)
+            }
+        case .structField(let parent, let type, var fields, let index):
+            // Структура — значение: меняем поле в копии и кладём её целиком
+            // туда, где она лежит (а та, может, сама поле структуры).
+            guard let owner = slots[parent] else {
+                throw DebugError.message("Структура больше недействительна")
+            }
+            fields[index] = value
+            try await write(.valueType(type: type, isEnum: false, fields: fields), to: owner.slot)
+        }
+    }
+
+    /// Результат выражения — в значение того же типа, что лежит в слоте:
+    /// агент сверяет тип и чужой не примет.
+    private func sdbValue(_ operand: DebugOperand, like current: SDBValue) async throws -> SDBValue {
+        func mismatch() -> DebugError {
+            DebugError.message("Нужно \(Self.expected(current)), а получилось \(operand.description)")
+        }
+        switch current {
+        case .bool:
+            guard case .bool(let b) = operand else { throw mismatch() }
+            return .bool(b)
+        case .char:
+            guard let n = operand.integer, (0...Int64(UInt16.max)).contains(n) else { throw mismatch() }
+            return .char(UInt16(n))
+        case .int(_, let element):
+            guard let n = operand.integer else { throw mismatch() }
+            let range: ClosedRange<Int64>? = switch element {
+            case .i1: Int64(Int8.min)...Int64(Int8.max)
+            case .u1: 0...Int64(UInt8.max)
+            case .i2: Int64(Int16.min)...Int64(Int16.max)
+            case .u2: 0...Int64(UInt16.max)
+            case .i4: Int64(Int32.min)...Int64(Int32.max)
+            case .u4: 0...Int64(UInt32.max)
+            default: nil
+            }
+            if let range, !range.contains(n) {
+                throw DebugError.message("\(n) не влезает в \(current.primitiveTypeName ?? "это число")")
+            }
+            return .int(n, element)
+        case .uint(_, let element):
+            guard let n = operand.integer else { throw mismatch() }
+            return .uint(UInt64(bitPattern: n), element)
+        case .float:
+            guard let d = operand.real else { throw mismatch() }
+            return .float(d)
+        case .double:
+            guard let d = operand.real else { throw mismatch() }
+            return .double(d)
+        case .valueType(let type, true, let fields):
+            // Перечисление — его число; имена членов не разрешаем.
+            guard let n = operand.integer, let first = fields.first else { throw mismatch() }
+            let raw: SDBValue = switch first {
+            case .uint(_, let element): .uint(UInt64(bitPattern: n), element)
+            case .int(_, let element): .int(n, element)
+            default: .int(n, .i4)
+            }
+            return .valueType(type: type, isEnum: true, fields: [raw])
+        case .null, .object:
+            switch operand {
+            case .null:
+                return .null
+            case .string(let s):
+                return .object(try await createString(s), .string)
+            case .object(_, let handle):
+                guard let value = operands[handle], case .object = value else { throw mismatch() }
+                return value
+            default:
+                throw mismatch()
+            }
+        default:
+            throw DebugError.message("Такое значение менять не умею")
+        }
+    }
+
+    private static func expected(_ value: SDBValue) -> String {
+        switch value {
+        case .object(_, .string): return "строка"
+        case .valueType(_, true, _): return "число перечисления"
+        case .null, .object: return "объект или null"
+        default: return value.primitiveTypeName ?? "значение того же типа"
+        }
+    }
+
+    private func createString(_ text: String) async throws -> Int {
+        if rootDomain == nil {
+            var r = try await send(.appDomain, SDB.AppDomain.getRootDomain.rawValue)
+            rootDomain = try r.id()
+        }
+        let domain = rootDomain ?? 0
+        var r = try await send(.appDomain, SDB.AppDomain.createString.rawValue) { w in
+            w.id(domain); w.string(text)
+        }
+        return try r.id()
+    }
+
+    // MARK: Выражения
+
+    /// Значение Mono — в операнд выражения. Строки читаются сразу,
+    /// объекты и структуры остаются ссылкой.
+    private func operand(_ value: SDBValue) async throws -> DebugOperand {
+        switch value {
+        case .null: return .null
+        case .bool(let b): return .bool(b)
+        case .char(let c): return .char(c)
+        case .int(let n, _): return .int(n)
+        case .uint(let n, _): return .int(Int64(bitPattern: n))
+        case .float(let d), .double(let d): return .double(d)
+        case .object(let object, .string):
+            var r = try await send(.stringRef, SDB.StringRef.getValue.rawValue) { $0.id(object) }
+            var utf16 = false
+            if version.atLeast(2, 41) { utf16 = try r.byte() == 1 }
+            return .string(utf16 ? try r.utf16String() : try r.string())
+        case .object(let object, _):
+            let handle = nextHandle
+            nextHandle += 1
+            operands[handle] = value
+            return .object(identity: object, handle: handle)
+        case .valueType(_, true, let fields):
+            guard let first = fields.first else { throw DebugError.message("пустое перечисление") }
+            return try await operand(first)
+        case .valueType:
+            let handle = nextHandle
+            nextHandle += 1
+            operands[handle] = value
+            // У структур ссылки нет — сравнивать их по ссылке нельзя.
+            return .object(identity: -handle, handle: handle)
+        default:
+            throw DebugError.message("такое значение в выражении не читается")
+        }
+    }
+
+    fileprivate func lookup(_ name: String, thread: Int, frame: Int) async throws -> DebugOperand {
+        let layout = try await frameLayout(thread: thread, frame: frame)
+        if name == "this" {
+            guard let this = layout.this else { throw DebugError.message("в статическом методе нет this") }
+            return try await operand(this)
+        }
+        // Как в C#: последняя объявленная с этим именем — ближайшая.
+        if let i = layout.names.lastIndex(of: name) {
+            guard let value = await frameValues(thread: thread, frame: frame, positions: [layout.positions[i]]).first ?? nil else {
+                throw DebugError.message("\(name) недоступна")
+            }
+            return try await operand(value)
+        }
+        if let this = layout.this {
+            if let found = try? await member(of: try await operand(this), name) { return found }
+        }
+        throw DebugError.message("нет переменной \(name)")
+    }
+
+    fileprivate func member(of value: DebugOperand, _ name: String) async throws -> DebugOperand {
+        guard case .object(_, let handle) = value, let raw = operands[handle] else {
+            throw DebugError.message("у \(value.description) нет поля \(name)")
+        }
+        switch raw {
+        case .object(let array, .szArray), .object(let array, .array):
+            guard name == "Length" else { throw DebugError.message("у массива нет \(name)") }
+            var r = try await send(.arrayRef, SDB.ArrayRef.getLength.rawValue) { $0.id(array) }
+            let rank = try r.count()
+            var total: Int64 = 1
+            for _ in 0..<rank { total *= Int64(try r.int()); _ = try r.int() }
+            return .int(total)
+        case .object(let object, _):
+            for (field, fieldValue) in try await instanceFields(of: object)
+                where field.name == name || SDBNames.field(field.name) == name {
+                return try await operand(fieldValue)
+            }
+            throw DebugError.message("нет поля \(name) (свойства без поля не читаются)")
+        case .valueType(let type, _, let fields):
+            let own = try await self.fields(ofType: type).filter { !$0.isStatic }
+            for (field, fieldValue) in zip(own, fields) where field.name == name || SDBNames.field(field.name) == name {
+                return try await operand(fieldValue)
+            }
+            throw DebugError.message("нет поля \(name)")
+        default:
+            throw DebugError.message("у \(value.description) нет поля \(name)")
+        }
+    }
+
+    fileprivate func element(of value: DebugOperand, _ index: Int) async throws -> DebugOperand {
+        guard case .object(_, let handle) = value, let raw = operands[handle],
+              case .object(let array, let kind) = raw, kind == .szArray || kind == .array else {
+            throw DebugError.message("индексировать можно только массив (List — нельзя, это вызов)")
+        }
+        let version = self.version
+        do {
+            var r = try await send(.arrayRef, SDB.ArrayRef.getValues.rawValue) { w in
+                w.id(array); w.int(index); w.int(1)
+            }
+            return try await operand(try r.value(version))
+        } catch let error as SDBError where error.code == 102 {
+            throw DebugError.message("индекс \(index) вне массива")
+        }
+    }
+}
+
+/// Имена выражения — в кадре остановленного потока Unity.
+private struct MonoExpressionContext: DebugExpressionContext {
+    let debugger: MonoDebugger
+    let thread: Int
+    let frame: Int
+
+    func lookup(_ name: String) async throws -> DebugOperand {
+        try await debugger.lookup(name, thread: thread, frame: frame)
+    }
+
+    func member(of value: DebugOperand, _ name: String) async throws -> DebugOperand {
+        try await debugger.member(of: value, name)
+    }
+
+    func element(of value: DebugOperand, _ index: Int) async throws -> DebugOperand {
+        try await debugger.element(of: value, index)
     }
 }

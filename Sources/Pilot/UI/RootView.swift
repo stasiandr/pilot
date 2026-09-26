@@ -180,6 +180,8 @@ struct RootView: View {
                          breakpoints: workspace.editorBreakpoints,
                          executionLine: workspace.editorExecutionLine,
                          onBreakpointClick: { workspace.gutterNumberClicked($0) },
+                         onBreakpointCondition: workspace.canSetBreakpoints
+                             ? { workspace.setBreakpointCondition(line: $0, $1) } : nil,
                          contextActions: { workspace.contextActions(at: $0) },
                          requestCompletions: { offset, trigger, retrigger in
                              await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)

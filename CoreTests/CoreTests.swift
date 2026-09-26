@@ -5185,6 +5185,143 @@ do {
     check(BreakpointSet.load(root: root, defaults: defaults).lines(in: file) == [4, 9], "переживают перезапуск")
 }
 
+section("Отладка: условные точки")
+do {
+    let root = URL(fileURLWithPath: "/tmp/proj")
+    let file = root.appendingPathComponent("Assets/Player.cs")
+    var set = BreakpointSet()
+    set.setCondition(file, line: 7, "hp < 0")
+    check(set.lines(in: file) == [7] && set.condition(in: file, line: 7) == "hp < 0", "условие ставит и саму точку")
+    set.setCondition(file, line: 7, "  ")
+    check(set.lines(in: file) == [7] && set.condition(in: file, line: 7) == nil, "пустое условие — точка остаётся без него")
+    set.setCondition(file, line: 7, "i == 3")
+    set.toggle(file, line: 7)
+    set.toggle(file, line: 7)
+    check(set.condition(in: file, line: 7) == nil, "сняли точку — условие ушло с ней")
+
+    set.setCondition(file, line: 10, "a")
+    set.setCondition(file, line: 20, "b")
+    check(set.shift(file, start: (5, 0), endLine: 5, inserted: 2), "правка выше сдвигает")
+    check(set.lines(in: file) == [9, 12, 22] && set.condition(in: file, line: 12) == "a"
+            && set.condition(in: file, line: 22) == "b", "условия едут вместе со строками")
+    set.shift(file, start: (11, 0), endLine: 23, inserted: 0)
+    check(set.lines(in: file) == [9, 11] && set.condition(in: file, line: 11) == "a",
+          "слились в одну — условие верхней")
+    set.move(file, from: 11, to: 13)
+    check(set.lines(in: file) == [9, 13] && set.condition(in: file, line: 13) == "a", "отладчик перенёс точку — условие с ней")
+    check(set.specs(in: file) == [BreakpointSpec(line: 9, condition: nil), BreakpointSpec(line: 13, condition: "a")],
+          "отладчику — строки по порядку и условия")
+
+    let defaults = UserDefaults(suiteName: "pilot.coretests.\(UUID().uuidString)")!
+    set.save(root: root, defaults: defaults)
+    let loaded = BreakpointSet.load(root: root, defaults: defaults)
+    check(loaded == set, "условия переживают перезапуск")
+    set.removeAll()
+    set.save(root: root, defaults: defaults)
+    check(BreakpointSet.load(root: root, defaults: defaults).isEmpty, "сняли всё — в настройках пусто")
+    let old = BreakpointSet.deserialized(["Assets/Player.cs": [3]], root: root)
+    check(old.lines(in: file) == [3] && old.condition(in: file, line: 3) == nil, "старые настройки без условий читаются")
+}
+
+section("Отладка: выражения")
+do {
+    /// Кадр для проверки: переменные и объекты с полями, без сети.
+    struct Frame: DebugExpressionContext {
+        var names: [String: DebugOperand]
+        var fields: [Int: [String: DebugOperand]]
+        var arrays: [Int: [DebugOperand]]
+
+        func lookup(_ name: String) async throws -> DebugOperand {
+            guard let value = names[name] else { throw DebugError.message("нет переменной \(name)") }
+            return value
+        }
+        func member(of value: DebugOperand, _ name: String) async throws -> DebugOperand {
+            guard case .object(_, let handle) = value else { throw DebugError.message("не объект") }
+            if name == "Length", let items = arrays[handle] { return .int(Int64(items.count)) }
+            guard let field = fields[handle]?[name] else { throw DebugError.message("нет поля \(name)") }
+            return field
+        }
+        func element(of value: DebugOperand, _ index: Int) async throws -> DebugOperand {
+            guard case .object(_, let handle) = value, let items = arrays[handle], items.indices.contains(index) else {
+                throw DebugError.message("вне массива")
+            }
+            return items[index]
+        }
+    }
+    final class Box: @unchecked Sendable { var result: Result<DebugOperand, Error>? }
+    let frame = Frame(
+        names: ["i": .int(10), "speed": .double(2.5), "name": .string("Bob"), "enemy": .object(identity: 7, handle: 1),
+                "same": .object(identity: 7, handle: 3), "items": .object(identity: 8, handle: 2), "none": .null,
+                "alive": .bool(true), "c": .char(65)],
+        fields: [1: ["hp": .int(0), "target": .null, "title": .string("Orc")]],
+        arrays: [2: [.int(4), .int(5)]])
+    func eval(_ text: String) -> Result<DebugOperand, Error> {
+        let done = DispatchSemaphore(value: 0)
+        let box = Box()
+        Task.detached {
+            do { box.result = .success(try await DebugExpression.parse(text).evaluate(in: frame)) } catch { box.result = .failure(error) }
+            done.signal()
+        }
+        done.wait()
+        return box.result!
+    }
+    func value(_ text: String) -> DebugOperand? { try? eval(text).get() }
+    func failure(_ text: String) -> String? {
+        if case .failure(let error) = eval(text) { return error.localizedDescription }
+        return nil
+    }
+
+    check(value("i == 10") == .bool(true) && value("i != 10") == .bool(false), "сравнение целых")
+    check(value("i > 3 && i <= 10") == .bool(true), "&& и сравнения")
+    check(value("i + 2 * 3") == .int(16) && value("(i + 2) * 3") == .int(36), "приоритет как в C#")
+    check(value("i / 4") == .int(2) && value("i % 4") == .int(2) && value("-i") == .int(-10), "целочисленные / % и минус")
+    check(value("speed > 2") == .bool(true) && value("speed * 2") == .double(5), "дробные и целые вместе")
+    check(value("1.5f + 0.5") == .double(2) && value("0x10") == .int(16) && value("1_000") == .int(1000), "литералы C#")
+    check(value("name == \"Bob\"") == .bool(true) && value("name.Length") == .int(3) && value("name[0]") == .char(66),
+          "строки: равенство, Length, индекс")
+    check(value("\"a\\n\" + name") == .string("a\nBob") && value("name + i") == .string("Bob10"), "склейка строк")
+    check(value("enemy.hp == 0") == .bool(true) && value("enemy.target == null") == .bool(true), "поля объекта и null")
+    check(value("enemy.title == \"Orc\"") == .bool(true), "строковое поле")
+    check(value("enemy == same") == .bool(true) && value("enemy != null") == .bool(true), "объекты — по ссылке")
+    check(value("items.Length == 2 && items[1] == 5") == .bool(true), "массив: длина и элемент")
+    check(value("c == 'A'") == .bool(true) && value("!alive") == .bool(false), "символ и отрицание")
+    check(value("none == null || none.x == 1") == .bool(true), "|| не считает правую часть, если левая истинна")
+    check(value("alive && (i == 10)") == .bool(true), "скобки")
+    check(failure("i / 0")?.contains("ноль") == true, "деление на ноль — ошибка, а не падение")
+    check(failure("missing > 1")?.contains("missing") == true, "неизвестное имя называется")
+    check(failure("none.x")?.contains("null") == true, "поле у null")
+    check(failure("i == ") != nil && failure("i == 1)") != nil && failure("\"abc") != nil, "синтаксические ошибки")
+    check(failure("name < 1") != nil, "строку с числом не сравнить")
+    check((try? DebugExpression.parse("a.b[1].c")) == .member(.index(.member(.name("a"), "b"), .literal(.int(1))), "c"),
+          "цепочка полей и индексов")
+    check((try? DebugExpression.parse("@this")) == .name("this"), "@-имя")
+}
+
+section("Отладка: запись значений Mono")
+do {
+    let version = SDBVersion(major: 2, minor: 65)
+    let values: [SDBValue] = [
+        .bool(true), .char(65), .int(-5, .i1), .int(300, .u2), .int(-70000, .i4), .int(1 << 40, .i8),
+        .uint(UInt64.max, .u8), .float(1.5), .double(-2.25), .null, .object(42, .string),
+        .valueType(type: 9, isEnum: false, fields: [.float(1), .float(2), .float(3)]),
+        .valueType(type: 4, isEnum: true, fields: [.int(2, .i4)]),
+    ]
+    for old in [SDBVersion(major: 2, minor: 56), version] {
+        for original in values {
+            var w = SDBWriter()
+            try? w.value(original, version: old)
+            var r = SDBReader(w.bytes)
+            let back = try? r.value(old)
+            check(back == original && !r.hasMore, "туда и обратно (\(old)): \(original)")
+        }
+    }
+    var ptr = SDBWriter()
+    try? ptr.value(.int(77, .i), version: version)
+    check(ptr.bytes.first == SDB.Element.i8.rawValue, "IntPtr агенту — как I8, иначе он падает на assert")
+    var bad = SDBWriter()
+    check((try? bad.value(.void, version: version)) == nil, "void не записать")
+}
+
 section("Отладка: цели")
 do {
     let editor = "/Applications/Unity/Hub/Editor/2022.3.76f1/Unity.app/Contents/MacOS/Unity -projectpath /Users/me/work/my game -useHub -hubIPC -cloudEnvironment production"

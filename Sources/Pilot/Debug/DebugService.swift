@@ -97,6 +97,17 @@ final class DebugService: ObservableObject {
         syncBreakpoints(file)
     }
 
+    func condition(_ file: URL, line: Int) -> String? { breakpoints.condition(in: file, line: line) }
+
+    /// Условие точки; пустое — снять условие (точка остаётся). Точки не
+    /// было — ставится вместе с условием.
+    func setCondition(_ file: URL, line: Int, _ condition: String?) {
+        guard Self.canBreak(in: file) else { return }
+        breakpoints.setCondition(file, line: line, condition)
+        persist()
+        syncBreakpoints(file)
+    }
+
     func removeAllBreakpoints() {
         let files = Array(breakpoints.lines.keys)
         breakpoints.removeAll()
@@ -115,7 +126,8 @@ final class DebugService: ObservableObject {
             let status = known[line]
             // Пока сессии нет, точка просто стоит; в сессии — как решил отладчик.
             result[line] = BreakpointMark(verified: !isActive || status?.verified == true,
-                                          message: isActive ? status?.message : nil)
+                                          message: isActive ? status?.message : nil,
+                                          condition: breakpoints.condition(in: key, line: line))
         }
         return result
     }
@@ -124,12 +136,9 @@ final class DebugService: ObservableObject {
     /// строки уйдут, когда файл сохранят — код он видит скомпилированный.
     func textEdited(_ file: URL, start: (line: Int, character: Int), endLine: Int, text: String) {
         let key = file.standardizedFileURL
-        let lines = breakpoints.lines(in: key)
-        guard !lines.isEmpty else { return }
+        guard !breakpoints.lines(in: key).isEmpty else { return }
         let inserted = text.reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
-        let shifted = BreakpointSet.shift(lines, start: start, endLine: endLine, inserted: inserted)
-        guard shifted != lines else { return }
-        breakpoints.set(key, shifted)
+        guard breakpoints.shift(key, start: start, endLine: endLine, inserted: inserted) else { return }
         persist()
     }
 
@@ -142,9 +151,9 @@ final class DebugService: ObservableObject {
     private func syncBreakpoints(_ file: URL) {
         guard let backend, isActive else { return }
         let key = file.standardizedFileURL
-        let lines = Array(breakpoints.lines(in: key))
+        let specs = breakpoints.specs(in: key)
         Task { [weak self] in
-            let result = await backend.setBreakpoints(file: key, lines: lines)
+            let result = await backend.setBreakpoints(file: key, specs)
             self?.applyStatuses(key, result)
         }
     }
@@ -154,12 +163,11 @@ final class DebugService: ObservableObject {
         statuses[key] = Dictionary(list.map { ($0.line, $0) }, uniquingKeysWith: { a, _ in a })
         // Пустая строка: отладчик перенёс точку на следующую с кодом — так
         // и рисуем, чтобы не было двух разных «правд».
-        var lines = breakpoints.lines(in: key)
+        let lines = breakpoints.lines(in: key)
         var moved = false
         for status in list {
             if let actual = status.actualLine, actual != status.line, lines.contains(status.line) {
-                lines.remove(status.line)
-                lines.insert(actual)
+                breakpoints.move(key, from: status.line, to: actual)
                 statuses[key]?[status.line] = nil
                 var fixed = status
                 fixed.line = actual
@@ -167,10 +175,7 @@ final class DebugService: ObservableObject {
                 moved = true
             }
         }
-        if moved {
-            breakpoints.set(key, lines)
-            persist()
-        }
+        if moved { persist() }
     }
 
     // MARK: Цели
@@ -237,8 +242,8 @@ final class DebugService: ObservableObject {
                     return
                 }
                 self.attach(backend, session: session)
-                var initial: [URL: [Int]] = [:]
-                for (file, lines) in self.breakpoints.lines { initial[file] = Array(lines) }
+                var initial: [URL: [BreakpointSpec]] = [:]
+                for file in self.breakpoints.lines.keys { initial[file] = self.breakpoints.specs(in: file) }
                 self.state = .starting(target.isUnity ? "Подключаюсь…" : "Запускаю под отладчиком…")
                 try await backend.start(breakpoints: initial)
                 guard self.generation == session else { return }
@@ -394,7 +399,7 @@ final class DebugService: ObservableObject {
 
     private static func describe(reason: String, text: String?) -> String {
         switch reason {
-        case "breakpoint", "function breakpoint": return "Точка останова"
+        case "breakpoint", "function breakpoint": return "Точка останова" + (text.map { " — \($0)" } ?? "")
         case "step": return "Шаг"
         case "pause": return text ?? "Пауза"
         case "exception": return "Исключение" + (text.map { ": \($0)" } ?? "")
@@ -507,6 +512,17 @@ final class DebugService: ObservableObject {
         frameIndex = index
         let frame = frames[index]
         if let file = frame.file, let line = frame.line { onShowLocation?(file, line) }
+        loadVariables(frame: frame, index: index, thread: thread, backend: backend)
+    }
+
+    /// Переменные кадра заново — после правки значения: поменяться могло
+    /// не только оно (ссылка на тот же объект, поле структуры).
+    private func reloadVariables() {
+        guard let frameIndex, frameIndex < frames.count, let backend, let thread else { return }
+        loadVariables(frame: frames[frameIndex], index: frameIndex, thread: thread, backend: backend)
+    }
+
+    private func loadVariables(frame: DebugFrame, index: Int, thread: Int, backend: DebugBackend) {
         variablesTask?.cancel()
         let expanded = self.expanded
         variablesTask = Task { [weak self] in
@@ -532,6 +548,20 @@ final class DebugService: ObservableObject {
         }
     }
 
+    /// Записать набранное в переменную. Ответ — текст ошибки или nil.
+    func setVariable(_ variable: DebugVariable, to text: String) async -> String? {
+        guard isPaused, let backend else { return "Программа не стоит" }
+        let session = generation
+        do {
+            try await backend.setVariable(variable, to: text)
+        } catch {
+            return error.localizedDescription
+        }
+        guard generation == session, isPaused else { return nil }
+        reloadVariables()
+        return nil
+    }
+
     func toggleExpanded(_ variable: DebugVariable) {
         if expanded.contains(variable.id) {
             expanded.remove(variable.id)
@@ -555,6 +585,7 @@ final class DebugService: ObservableObject {
 struct BreakpointMark: Equatable {
     var verified: Bool
     var message: String?
+    var condition: String?
 }
 
 /// Вывод сессии. Копится и отдаётся интерфейсу не чаще раза в кадр:

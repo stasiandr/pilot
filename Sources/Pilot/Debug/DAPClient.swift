@@ -201,7 +201,7 @@ final class NetcoredbgDebugger: DebugBackend, @unchecked Sendable {
 
     // MARK: Запуск
 
-    func start(breakpoints: [URL: [Int]]) async throws {
+    func start(breakpoints: [URL: [BreakpointSpec]]) async throws {
         client.onEvent = { [weak self] name, body in self?.handle(event: name, body) }
         client.onExit = { [weak self] status, tail in
             guard let self, !self.lock.withLock({ self.stopping }) else { return }
@@ -246,8 +246,8 @@ final class NetcoredbgDebugger: DebugBackend, @unchecked Sendable {
             throw DebugError.message("netcoredbg не дождался инициализации")
         }
 
-        for (file, lines) in breakpoints where !lines.isEmpty {
-            let result = await setBreakpoints(file: file, lines: lines)
+        for (file, specs) in breakpoints where !specs.isEmpty {
+            let result = await setBreakpoints(file: file, specs)
             emit(.breakpoints(file: file, result))
         }
         _ = try? await client.request("setExceptionBreakpoints", ["filters": []])
@@ -304,12 +304,19 @@ final class NetcoredbgDebugger: DebugBackend, @unchecked Sendable {
 
     // MARK: Точки останова
 
-    func setBreakpoints(file: URL, lines: [Int]) async -> [BreakpointStatus] {
-        let sorted = Array(Set(lines)).sorted()
+    func setBreakpoints(file: URL, _ specs: [BreakpointSpec]) async -> [BreakpointStatus] {
+        var byLine: [Int: BreakpointSpec] = [:]
+        for spec in specs { byLine[spec.line] = spec }
+        let sorted = byLine.keys.sorted()
         do {
+            // Условие netcoredbg считает сам, полным C#.
             let body = try await client.request("setBreakpoints", [
                 "source": ["path": file.path, "name": file.lastPathComponent],
-                "breakpoints": sorted.map { ["line": $0 + 1] },
+                "breakpoints": sorted.map { line -> [String: Any] in
+                    var bp: [String: Any] = ["line": line + 1]
+                    if let condition = byLine[line]?.condition { bp["condition"] = condition }
+                    return bp
+                },
                 "lines": sorted.map { $0 + 1 },
             ])
             let list = body["breakpoints"] as? [[String: Any]] ?? []
@@ -365,14 +372,25 @@ final class NetcoredbgDebugger: DebugBackend, @unchecked Sendable {
         }
     }
 
+    /// Правка — по контейнеру и имени, поэтому номер правки у переменной —
+    /// номер её родителя.
     func children(of reference: Int, parent: String) async throws -> [DebugVariable] {
         let body = try await client.request("variables", ["variablesReference": reference])
         return (body["variables"] as? [[String: Any]] ?? []).map { v in
             let name = v["name"] as? String ?? "?"
+            let readOnly = ((v["presentationHint"] as? [String: Any])?["attributes"] as? [String])?.contains("readOnly") == true
             return DebugVariable(id: parent.isEmpty ? name : parent + "." + name, name: name,
                                  value: v["value"] as? String ?? "", type: v["type"] as? String ?? "",
-                                 children: v["variablesReference"] as? Int ?? 0)
+                                 children: v["variablesReference"] as? Int ?? 0,
+                                 editRef: readOnly ? 0 : reference)
         }
+    }
+
+    func setVariable(_ variable: DebugVariable, to value: String) async throws {
+        guard variable.isEditable else { throw DebugError.message("Это значение менять нельзя") }
+        _ = try await client.request("setVariable", [
+            "variablesReference": variable.editRef, "name": variable.name, "value": value,
+        ])
     }
 
     // MARK: Управление

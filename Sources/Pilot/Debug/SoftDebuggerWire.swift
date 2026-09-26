@@ -34,10 +34,11 @@ enum SDB {
         case getName = 1, getDeclaringType = 2, getDebugInfo = 3, getParamInfo = 4, getLocalsInfo = 5, getInfo = 6
     }
     enum TypeCmd: UInt8 { case getInfo = 1, getMethods = 2, getFields = 3, getValues = 4, getSourceFiles2 = 13 }
-    enum StackFrame: UInt8 { case getValues = 1, getThis = 2 }
-    enum ArrayRef: UInt8 { case getLength = 1, getValues = 2 }
+    enum StackFrame: UInt8 { case getValues = 1, getThis = 2, setValues = 3 }
+    enum ArrayRef: UInt8 { case getLength = 1, getValues = 2, setValues = 3 }
     enum StringRef: UInt8 { case getValue = 1 }
-    enum ObjectRef: UInt8 { case getType = 1, getValues = 2 }
+    enum ObjectRef: UInt8 { case getType = 1, getValues = 2, setValues = 6 }
+    enum AppDomain: UInt8 { case getRootDomain = 1, createString = 5 }
     static let compositeEvent: UInt8 = 100
 
     enum EventKind: UInt8 {
@@ -158,6 +159,9 @@ struct SDBWriter {
 
     @discardableResult mutating func bool(_ v: Bool) -> SDBWriter { byte(v ? 1 : 0) }
 
+    /// Уже закодированное — например, значение, собранное заранее.
+    @discardableResult mutating func raw(_ v: [UInt8]) -> SDBWriter { bytes += v; return self }
+
     @discardableResult mutating func string(_ s: String) -> SDBWriter {
         let utf8 = Array(s.utf8)
         int(utf8.count)
@@ -179,6 +183,52 @@ struct SDBWriter {
         case .sourceFiles(let files):
             byte(12); int(files.count)
             for file in files { string(file) }
+        }
+    }
+
+    /// Значение для SET_VALUES — зеркало `SDBReader.value`. Тип элемента
+    /// агент сверяет с объявленным, поэтому пишется тот, что пришёл при
+    /// чтении; разбор — `decode_value` в `debugger-agent.c`.
+    mutating func value(_ value: SDBValue, version: SDBVersion) throws {
+        switch value {
+        case .bool(let b):
+            byte(SDB.Element.boolean.rawValue); int(b ? 1 : 0)
+        case .char(let c):
+            byte(SDB.Element.char.rawValue); int(Int32(c))
+        case .int(let n, let element):
+            switch element {
+            case .i8:
+                byte(element.rawValue); long(n)
+            case .i, .u:
+                // IntPtr агент ждёт обратно как I8 — так он его и присылает.
+                byte(SDB.Element.i8.rawValue); long(n)
+            default:
+                byte(element.rawValue); int(Int32(truncatingIfNeeded: n))
+            }
+        case .uint(let n, let element):
+            byte(element == .u ? SDB.Element.i8.rawValue : element.rawValue)
+            long(Int64(bitPattern: n))
+        case .float(let d):
+            byte(SDB.Element.r4.rawValue); int(Int32(bitPattern: Float(d).bitPattern))
+        case .double(let d):
+            byte(SDB.Element.r8.rawValue); long(Int64(bitPattern: d.bitPattern))
+        case .pointer(let p):
+            byte(SDB.Element.i8.rawValue); long(p)
+        case .null:
+            byte(SDB.Element.null.rawValue)
+            if version.atLeast(2, 59) { byte(0); int(0) }
+        case .object(let object, let element):
+            byte(element.rawValue); id(object)
+        case .valueType(let type, let isEnum, let fields):
+            byte(SDB.Element.valueType.rawValue)
+            bool(isEnum)
+            if version.atLeast(2, 61) { byte(0) }                   // не упакована
+            id(type)
+            if version.atLeast(2, 65) { int(-1) }                   // не inline-массив
+            int(fields.count)
+            for field in fields { try self.value(field, version: version) }
+        case .void, .typeRef, .parentVType, .fixedArray:
+            throw SDBError.malformed("такое значение не записать")
         }
     }
 

@@ -156,6 +156,7 @@ extension English {
         ("нет использований", "no usages"),
         ("использование|использования|использований", "usage|usages"),
         ("Сообщение Unity", "Unity message"),
+        ("Условие: %@", "Condition: %@"),
         // InfoPopup.swift
         ("в %@", "in %@"),
         ("Возвращает: ", "Returns: "),

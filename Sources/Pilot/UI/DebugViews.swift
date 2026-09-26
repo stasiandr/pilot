@@ -382,9 +382,10 @@ struct DebugVariablesView: View {
                     ForEach(rows) { row in
                         VariableRow(variable: row.variable, depth: row.depth,
                                     expanded: debug.expanded.contains(row.variable.id),
-                                    loading: debug.expanded.contains(row.variable.id) && debug.children[row.variable.id] == nil) {
-                            debug.toggleExpanded(row.variable)
-                        }
+                                    loading: debug.expanded.contains(row.variable.id) && debug.children[row.variable.id] == nil,
+                                    canEdit: debug.isPaused && row.variable.isEditable,
+                                    toggle: { debug.toggleExpanded(row.variable) },
+                                    commit: { await debug.setVariable(row.variable, to: $0) })
                     }
                 }
                 .padding(.vertical, 2)
@@ -398,7 +399,15 @@ private struct VariableRow: View {
     let depth: Int
     let expanded: Bool
     let loading: Bool
+    let canEdit: Bool
     let toggle: () -> Void
+    /// Записать набранное; ответ — ошибка или nil.
+    let commit: (String) async -> String?
+
+    @State private var draft: String?
+    @State private var error: String?
+    @State private var saving = false
+    @FocusState private var focused: Bool
 
     var body: some View {
         HStack(spacing: 4) {
@@ -417,11 +426,32 @@ private struct VariableRow: View {
                     .foregroundStyle(Color(nsColor: Theme.color(.plain)))
                 Text("=").foregroundStyle(.tertiary)
             }
-            Text(variable.value)
-                .foregroundStyle(Color(nsColor: valueColor))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .textSelection(.enabled)
+            if draft != nil {
+                TextField("", text: Binding(get: { draft ?? "" }, set: { draft = $0; error = nil }))
+                    .textFieldStyle(.plain)
+                    .focused($focused)
+                    .onSubmit(save)
+                    .onExitCommand { draft = nil; error = nil }
+                    .padding(.horizontal, 3)
+                    .background(RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.08)))
+                    .overlay(RoundedRectangle(cornerRadius: 3)
+                        .stroke(error == nil ? Color.accentColor : Color(nsColor: Theme.diagnosticError), lineWidth: 1))
+                    .disabled(saving)
+                if saving { ProgressView().controlSize(.mini) }
+                if let error {
+                    Text(error)
+                        .foregroundStyle(Color(nsColor: Theme.diagnosticError))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(error)
+                }
+            } else {
+                Text(variable.value)
+                    .foregroundStyle(Color(nsColor: valueColor))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+            }
             if loading { ProgressView().controlSize(.mini) }
             Spacer(minLength: 8)
             if !variable.type.isEmpty {
@@ -437,12 +467,58 @@ private struct VariableRow: View {
         .padding(.trailing, 8)
         .frame(height: 19)
         .contentShape(Rectangle())
+        // Двойной клик — править, как в Rider и Xcode; одиночный — раскрыть.
+        .onTapGesture(count: 2) { if canEdit { beginEditing() } }
         .onTapGesture { if variable.children > 0 { toggle() } }
         .contextMenu {
+            if canEdit {
+                Button("Изменить значение") { beginEditing() }
+                Divider()
+            }
             Button("Скопировать значение") { copy(variable.value) }
             Button("Скопировать имя") { copy(variable.name) }
         }
-        .help(variable.value)
+        .help(canEdit ? variable.value + "\nДвойной клик — изменить" : variable.value)
+        .onChange(of: canEdit) { _, can in if !can { draft = nil; error = nil } }
+    }
+
+    private func beginEditing() {
+        draft = Self.editableText(variable.value)
+        error = nil
+        DispatchQueue.main.async { focused = true }
+    }
+
+    private func save() {
+        guard let text = draft, !saving else { return }
+        if text == Self.editableText(variable.value) {
+            draft = nil
+            return
+        }
+        saving = true
+        Task {
+            let failure = await commit(text)
+            saving = false
+            if let failure {
+                error = failure
+                focused = true
+            } else {
+                draft = nil
+            }
+        }
+    }
+
+    /// Показанное — в то, что можно отдать обратно как C#: у символа Mono
+    /// пишет код и сам знак (`97 'a'`), у перечисления — имя типа.
+    static func editableText(_ shown: String) -> String {
+        if let quote = shown.firstIndex(of: "'"), shown.hasSuffix("'"),
+           Int(shown[..<quote].trimmingCharacters(in: .whitespaces)) != nil {
+            return String(shown[quote...])
+        }
+        if let paren = shown.firstIndex(of: "("), shown.hasSuffix(")"),
+           let number = Int64(shown[..<paren].trimmingCharacters(in: .whitespaces)) {
+            return String(number)
+        }
+        return shown
     }
 
     private var valueColor: NSColor {
@@ -456,6 +532,58 @@ private struct VariableRow: View {
     private func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+// MARK: - Условие точки останова
+
+/// Окно у номера строки: условие точки на C#. Enter — сохранить,
+/// пустое — точка без условия.
+struct BreakpointConditionEditor: View {
+    let line: Int
+    let hasBreakpoint: Bool
+    let commit: (String?) -> Void
+    let cancel: () -> Void
+    @State private var text: String
+    @FocusState private var focused: Bool
+
+    init(line: Int, condition: String, hasBreakpoint: Bool,
+         commit: @escaping (String?) -> Void, cancel: @escaping () -> Void) {
+        self.line = line
+        self.hasBreakpoint = hasBreakpoint
+        self.commit = commit
+        self.cancel = cancel
+        _text = State(initialValue: condition)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(hasBreakpoint ? "Условие точки на строке \(line + 1)" : "Условная точка на строке \(line + 1)")
+                .font(.headline)
+            TextField("например: i == 10 && name != null", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .focused($focused)
+                .onSubmit { commit(text) }
+                .onExitCommand(perform: cancel)
+            Text("Остановится, только когда выражение истинно. У Unity его считает Pilot: переменные, поля, индексы, сравнения и арифметика — без вызовов методов и свойств.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if hasBreakpoint, !text.isEmpty {
+                    Button("Без условия") { commit(nil) }
+                }
+                Spacer()
+                Button("Отмена", action: cancel)
+                Button(hasBreakpoint ? "Готово" : "Поставить") { commit(text) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!hasBreakpoint && text.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(14)
+        .frame(width: 380)
+        .onAppear { DispatchQueue.main.async { focused = true } }
     }
 }
 

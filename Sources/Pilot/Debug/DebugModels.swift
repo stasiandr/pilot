@@ -28,6 +28,17 @@ struct DebugVariable: Identifiable, Equatable, Sendable {
     var type: String = ""
     /// Больше нуля — у узла есть дети, их спрашивают по этому номеру.
     var children: Int = 0
+    /// Больше нуля — значение можно поменять: бэкенд по этому номеру
+    /// знает, куда его записать. Ноль — только смотреть.
+    var editRef: Int = 0
+
+    var isEditable: Bool { editRef > 0 }
+}
+
+/// Точка останова, как её отдают отладчику: строка с нуля и условие на C#.
+struct BreakpointSpec: Equatable, Sendable {
+    var line: Int
+    var condition: String?
 }
 
 /// Что стало с точкой останова у отладчика.
@@ -66,14 +77,17 @@ protocol DebugBackend: AnyObject, Sendable {
 
     /// Подключиться или запустить. Точки останова приходят сюда же:
     /// их надо поставить до того, как программа побежит дальше.
-    func start(breakpoints: [URL: [Int]]) async throws
+    func start(breakpoints: [URL: [BreakpointSpec]]) async throws
 
-    func setBreakpoints(file: URL, lines: [Int]) async -> [BreakpointStatus]
+    func setBreakpoints(file: URL, _ breakpoints: [BreakpointSpec]) async -> [BreakpointStatus]
 
     func threads() async throws -> [DebugThread]
     func stackTrace(thread: Int) async throws -> [DebugFrame]
     func variables(frame: Int, thread: Int) async throws -> [DebugVariable]
     func children(of reference: Int, parent: String) async throws -> [DebugVariable]
+    /// Записать в переменную значение, набранное человеком как литерал C#.
+    /// Программа должна стоять.
+    func setVariable(_ variable: DebugVariable, to value: String) async throws
 
     func resume() async throws
     func pause() async throws

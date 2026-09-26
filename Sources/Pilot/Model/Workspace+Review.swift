@@ -69,6 +69,17 @@ extension Workspace {
         debug.toggleBreakpoint(document.url, line: line)
     }
 
+    /// В открытом файле можно ставить точки: C# с диска, не ревью.
+    var canSetBreakpoints: Bool {
+        guard let document, document.revision == nil else { return false }
+        return DebugService.canBreak(in: document.url) && !isReviewDocument
+    }
+
+    func setBreakpointCondition(line: Int, _ condition: String?) {
+        guard canSetBreakpoints, let document else { return }
+        debug.setCondition(document.url, line: line, condition)
+    }
+
     func commentOnLine(_ line: Int) {
         guard isReviewDocument else { return }
         requestLinePopover(line: line, compose: true)
