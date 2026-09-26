@@ -8,6 +8,11 @@ cd "$(dirname "$0")"
 CONFIG="${1:-release}"
 APP="Pilot.app"
 
+# Отпечаток исходников — до сборки: правка, сделанная, пока она идёт, в
+# бандл может не попасть, и лаунчер тогда соберёт ещё раз, а не решит, что
+# всё свежее.
+STAMP="$(bin/source-stamp "$CONFIG" 2> /dev/null || echo unknown)"
+
 # Библиотека Rustlyn: ею Pilot разбирает C#. Собирается первой, потому что
 # Swift компилируется против её заголовка и линкуется с ней самой.
 #
@@ -82,6 +87,10 @@ fi
 if [[ -f "$ICON_OUT/Assets.car" ]]; then
     cp "$ICON_OUT/Assets.car" "$ICON_OUT/Pilot.icns" "$APP/Contents/Resources/"
 fi
+
+# Из чего собрано — для лаунчера (Launcher/): он пересобирает, только
+# когда исходники на диске разошлись с этой строкой.
+echo "$STAMP" > "$APP/Contents/Resources/SourceStamp"
 
 # Подпись. SIGN_ID — сертификат Developer ID (его передаёт dist.sh): с ним
 # hardened runtime и метка времени, как требует нотаризация. Без него —

@@ -1,0 +1,39 @@
+#!/bin/bash
+# source-stamp — отпечаток исходников, из которых собирается Pilot.
+#
+#   bin/source-stamp          одна строка: конфигурация и хэши деревьев
+#
+# Сборка (build.sh) кладёт его в бандл, лаунчер (Launcher/) сравнивает с
+# текущим: совпало — открывает, нет — пересобирает. Отпечаток — это то, что
+# лежит на диске, а не последний коммит: несохранённые в git правки и новые
+# файлы тоже в счёт, игнорируемые (.build, target) — нет.
+#
+# Считает git: рабочее дерево добавляется во временный индекс, копию
+# настоящего, — git перечитывает только файлы, изменившиеся по stat, и
+# ничего в репозитории не трогает. В счёт идут только пути, из которых
+# что-то попадает в бандл: правка README или тестов пересборки не требует.
+set -euo pipefail
+
+repo="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)"
+rustlyn="${RUSTLYN_PATH:-$repo/../rustlyn}"
+config="${1:-release}"
+
+# tree <папка> <пути…> — хэш этих путей рабочего дерева.
+tree() {
+    local dir="$1"; shift
+    local paths=() path
+    for path in "$@"; do [[ -e "$dir/$path" ]] && paths+=("$path"); done
+    set -- "${paths[@]}"
+    local index
+    index="$(mktemp)"
+    cp "$(git -C "$dir" rev-parse --path-format=absolute --git-path index)" "$index" 2> /dev/null || true
+    GIT_INDEX_FILE="$index" git -C "$dir" add -A -- "$@" 2> /dev/null
+    local root
+    root="$(GIT_INDEX_FILE="$index" git -C "$dir" write-tree)"
+    rm -f "$index"
+    git -C "$dir" ls-tree "$root" -- "$@" | git hash-object --stdin
+}
+
+pilot="$(tree "$repo" Sources Resources Extensions Jadx Package.swift build.sh build-rust.sh fetch-netcoredbg.sh)"
+compiler="$(tree "$rustlyn" crates Cargo.toml Cargo.lock)"
+echo "$config pilot:$pilot rustlyn:$compiler"

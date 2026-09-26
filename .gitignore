@@ -7,3 +7,5 @@ Pilot.app/
 # билда, с которым Pilot слинкуется, а не из коммита, который мог отстать.
 Sources/CRustlyn/include/rustlyn.h
 dist/
+
+PilotLauncher.app/
