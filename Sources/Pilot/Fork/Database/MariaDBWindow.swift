@@ -36,6 +36,98 @@ private struct OpenWindowButton: View {
     }
 }
 
+// MARK: - Кнопка в тулбаре
+
+/// База в тулбаре окна проекта. Работает — открывает обозреватель,
+/// подключённый к контейнеру. Не работает — поднимает её (Colima,
+/// контейнер, проверка здоровья), показывая, на каком она шаге, и открывает
+/// обозреватель, когда база готова. Не вышло — окно контейнера с логом.
+struct DatabaseToolbarButton: View {
+    @ObservedObject private var container = MariaDBContainer.shared
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Group {
+            if let busy = container.busy {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(busy).font(.callout).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 6)
+                .help(L("MariaDB в Docker"))
+                .onTapGesture { openWindow(id: MariaDBWindow.sceneID) }
+            } else {
+                Button(action: click) {
+                    Label {
+                        Text(L("База данных"))
+                    } icon: {
+                        Image(systemName: "cylinder.split.1x2")
+                            .overlay(alignment: .bottomTrailing) {
+                                Circle()
+                                    .fill(dotColor)
+                                    .frame(width: 6, height: 6)
+                                    .offset(x: 3, y: 2)
+                            }
+                    }
+                }
+                .help(help)
+            }
+        }
+        .onAppear { container.appear() }
+        .onDisappear { container.disappear() }
+    }
+
+    private var isReady: Bool {
+        if case .running(let health) = container.state, health != "unhealthy" { return true }
+        return false
+    }
+
+    private func click() {
+        switch container.state {
+        case .noDocker:
+            openWindow(id: MariaDBWindow.sceneID)
+        case .running(let health) where health == "unhealthy":
+            openWindow(id: MariaDBWindow.sceneID)
+        case .running(let health) where health != "starting":
+            openBrowser()
+        default:
+            container.launch { ok in
+                if ok { openBrowser() } else { openWindow(id: MariaDBWindow.sceneID) }
+            }
+        }
+    }
+
+    /// Уже подключённый обозреватель не переподключаем — там может идти запрос.
+    private func openBrowser() {
+        let browser = DatabaseBrowser.shared
+        switch browser.state {
+        case .connected, .connecting: break
+        default: browser.connect(to: container.connectionOptions)
+        }
+        openWindow(id: DatabaseWindow.sceneID)
+    }
+
+    private var dotColor: Color {
+        switch container.state {
+        case .running(let health):
+            return health == "starting" ? .yellow : health == "unhealthy" ? .orange : .green
+        case .daemonDown, .noDocker: return .red
+        default: return .gray
+        }
+    }
+
+    private var help: String {
+        switch container.state {
+        case .running(let health) where health != "starting" && health != "unhealthy":
+            return L("Открыть обозреватель базы")
+        case .noDocker, .running:
+            return L("MariaDB в Docker")
+        default:
+            return L("Запустить MariaDB и открыть обозреватель")
+        }
+    }
+}
+
 // MARK: - Контейнер
 
 struct MariaDBWindow: View {
@@ -142,6 +234,7 @@ struct MariaDBWindow: View {
             if case .running = container.state {
                 Button(L("Перезапустить")) { container.restart() }
                 Button(L("Загрузить дамп…")) { container.chooseDump() }
+                Button(L("Создать пользователя из \(ServerEnvFile.displayPath)")) { container.createServerUser() }
                 Divider()
             }
             Button(container.followsLogs ? L("Не следить за логами") : L("Следить за логами")) { container.toggleLogs() }

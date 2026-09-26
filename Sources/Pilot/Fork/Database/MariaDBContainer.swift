@@ -74,14 +74,17 @@ final class MariaDBContainer: ObservableObject {
                                 password: settings.password, database: settings.database)
     }
 
-    /// Переменные окружения clm-server (`StartUp.cs`) для этой базы.
+    /// Переменные окружения clm-server (`StartUp.cs`) для этой базы:
+    /// пользователь и база — из `~/nrpm/.env`, если он там заведён.
     var serverEnvironment: String {
-        """
+        let env = ServerEnvFile.read()
+        let user = env["MYSQL_USER"].flatMap { $0.isEmpty ? nil : $0 }
+        return """
         MYSQL_HOST=127.0.0.1
         MYSQL_PORT=\(settings.port)
-        MYSQL_USER=root
-        MYSQL_PASSWORD=\(settings.password)
-        MYSQL_DATABASE=\(settings.database)
+        MYSQL_USER=\(user ?? "root")
+        MYSQL_PASSWORD=\(user != nil ? env["MYSQL_PASSWORD"] ?? "" : settings.password)
+        MYSQL_DATABASE=\(env["MYSQL_DATABASE"].flatMap { $0.isEmpty ? nil : $0 } ?? settings.database)
         """
     }
 
@@ -140,9 +143,14 @@ final class MariaDBContainer: ObservableObject {
     }
 
     /// Новый контейнер с томом для данных: пересоздание контейнера базу не теряет.
+    /// Создать, дождаться базы и завести в ней пользователя clm-server.
     func create() {
+        launch { _ in }
+    }
+
+    private var createArguments: [String] {
         let s = settings
-        perform(L("Создание контейнера…"), ["run", "-d",
+        return ["run", "-d",
             "--name", s.name,
             "-p", "\(s.port):3306",
             "-e", "MARIADB_ROOT_PASSWORD=\(s.password)",
@@ -152,10 +160,125 @@ final class MariaDBContainer: ObservableObject {
             "--health-cmd", "healthcheck.sh --connect --innodb_initialized",
             "--health-interval", "3s", "--health-retries", "40",
             "--restart", "unless-stopped",
-            s.image])
+            s.image]
     }
 
     func start() { perform(L("Запуск…"), ["start", settings.name]) }
+
+    /// Поднять базу, в каком бы состоянии она ни была — Docker лежит,
+    /// контейнера нет, он остановлен, — и дождаться, пока она примет
+    /// подключения. `ready(false)` — не вышло: что случилось, есть в логе.
+    func launch(ready: @escaping @MainActor (Bool) -> Void) {
+        guard busy == nil else { return }
+        busy = L("Проверка…")
+        Task {
+            await refresh()
+            var ok = true
+            var created = false
+            if case .daemonDown = state {
+                ok = await step(L("Запуск Colima…"), DockerCLI.colima, ["start"])
+                if ok { await refresh() }
+            }
+            if ok {
+                switch state {
+                case .absent:
+                    ok = await step(L("Создание контейнера…"), DockerCLI.docker, createArguments)
+                    created = ok
+                case .stopped: ok = await step(L("Запуск…"), DockerCLI.docker, ["start", settings.name])
+                case .running: break
+                case .unknown, .noDocker, .daemonDown: ok = false
+                }
+            }
+            if ok { ok = await waitUntilHealthy() }
+            if ok && created { ok = await provisionServerUser() }
+            busy = nil
+            await refresh()
+            ready(ok)
+        }
+    }
+
+    /// Завести пользователя из `.env` в работающем контейнере — для
+    /// контейнера, созданного раньше, чем Pilot научился делать это сам.
+    func createServerUser() {
+        guard busy == nil else { return }
+        busy = L("Создание пользователя…")
+        Task {
+            _ = await provisionServerUser()
+            busy = nil
+        }
+    }
+
+    /// clm-server ходит в базу пользователем из `~/nrpm/.env`, а не root:
+    /// на свежем контейнере его нет, и сервер не стартовал. Заводим его,
+    /// его базу и права на всё — база локальная, а регионы сервер создаёт
+    /// сам. Повторный запуск безвреден: пароль просто выставится заново.
+    ///
+    /// Пароли — через окружение и stdin, не аргументами: те видны в `ps`.
+    private func provisionServerUser() async -> Bool {
+        let env = ServerEnvFile.read()
+        guard let user = env["MYSQL_USER"], !user.isEmpty, user != "root" else {
+            log.append(L("В \(ServerEnvFile.displayPath) нет MYSQL_USER — пользователь не создан") + "\n\n")
+            return true
+        }
+        guard let docker = DockerCLI.docker else { return false }
+        busy = L("Создание пользователя…")
+        let account = "'\(Self.sqlString(user))'@'%'"
+        let password = Self.sqlString(env["MYSQL_PASSWORD"] ?? "")
+        var sql = ""
+        if let database = env["MYSQL_DATABASE"], !database.isEmpty {
+            sql += "CREATE DATABASE IF NOT EXISTS `\(database.replacingOccurrences(of: "`", with: "``"))`;\n"
+        }
+        sql += """
+        CREATE USER IF NOT EXISTS \(account) IDENTIFIED BY '\(password)';
+        ALTER USER \(account) IDENTIFIED BY '\(password)';
+        GRANT ALL PRIVILEGES ON *.* TO \(account) WITH GRANT OPTION;
+        FLUSH PRIVILEGES;
+        """
+        log.append("$ mariadb: CREATE USER \(account) (\(ServerEnvFile.displayPath))\n")
+        let ok = await stream(URL(fileURLWithPath: "/bin/bash"),
+                              ["-c", "printf '%s' \"$PILOT_SQL\" | \"$1\" exec -i -e MYSQL_PWD \"$2\" mariadb -uroot",
+                               "bash", docker.path, settings.name],
+                              environment: ["PILOT_SQL": sql, "MYSQL_PWD": settings.password],
+                              echo: false)
+        log.append(ok ? L("Готово") + "\n\n" : "\n")
+        return ok
+    }
+
+    /// Строка для SQL в одинарных кавычках.
+    private static func sqlString(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+    }
+
+    /// Одна команда запуска: её название — в `busy`, вывод — в лог.
+    private func step(_ title: String, _ tool: URL?, _ args: [String]) async -> Bool {
+        busy = title
+        let ok = await stream(tool, args)
+        log.append(ok ? L("Готово") + "\n\n" : "\n")
+        return ok
+    }
+
+    /// Контейнер запущен — но MariaDB в нём ещё минуту может разворачивать
+    /// базу, а подключение до этого получит отказ. Ждём проверку здоровья.
+    private func waitUntilHealthy() async -> Bool {
+        busy = L("База готовится…")
+        let deadline = Date().addingTimeInterval(180)
+        while Date() < deadline {
+            await refresh()
+            switch state {
+            case .running(let health) where health == "healthy" || health.isEmpty:
+                return true
+            case .running(let health) where health == "unhealthy":
+                return false
+            case .running:
+                break
+            default:
+                return false
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        return false
+    }
     func stop() { perform(L("Остановка…"), ["stop", settings.name]) }
     func restart() { perform(L("Перезапуск…"), ["restart", settings.name]) }
 
@@ -238,11 +361,12 @@ final class MariaDBContainer: ObservableObject {
     }
 
     /// Команда с выводом в лог окна; `true` — вышла с нулём.
-    private func stream(_ tool: URL?, _ args: [String], echo: Bool = true) async -> Bool {
+    private func stream(_ tool: URL?, _ args: [String], environment: [String: String] = [:],
+                        echo: Bool = true) async -> Bool {
         guard let tool else { return false }
         if echo { log.append("$ \(tool.lastPathComponent) \(args.joined(separator: " "))\n") }
         return await withCheckedContinuation { continuation in
-            let process = DockerCLI.spawn(tool, args) { [weak self] chunk in
+            let process = DockerCLI.spawn(tool, args, environment: environment) { [weak self] chunk in
                 self?.log.append(chunk)
             } exit: { [weak self] status in
                 if status != 0 { self?.log.append(L("Код выхода \(String(status))") + "\n") }
@@ -313,13 +437,13 @@ enum DockerCLI {
 
     /// Долгая команда: вывод (оба потока) приходит кусками на главном потоке.
     @MainActor
-    static func spawn(_ tool: URL, _ args: [String],
+    static func spawn(_ tool: URL, _ args: [String], environment extra: [String: String] = [:],
                       output: @escaping @MainActor (String) -> Void,
                       exit: @escaping @MainActor (Int32) -> Void) -> Process? {
         let process = Process()
         process.executableURL = tool
         process.arguments = args
-        process.environment = environment
+        process.environment = environment.merging(extra) { $1 }
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -347,5 +471,32 @@ enum DockerCLI {
             output(error.localizedDescription + "\n")
             return nil
         }
+    }
+}
+
+/// `~/nrpm/.env` — окружение, с которым запускается clm-server. Отсюда
+/// берётся пользователь базы, которого надо завести в контейнере.
+enum ServerEnvFile {
+    static let path = NSHomeDirectory() + "/nrpm/.env"
+    static let displayPath = "~/nrpm/.env"
+
+    /// `KEY=VALUE` построчно; комментарии, пустые строки и `export` — мимо,
+    /// кавычки вокруг значения снимаются.
+    static func read() -> [String: String] {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
+        var values: [String: String] = [:]
+        for raw in text.split(whereSeparator: \.isNewline) {
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            if line.hasPrefix("export ") { line.removeFirst("export ".count) }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            if value.count >= 2, let q = value.first, q == "\"" || q == "'", value.last == q {
+                value = String(value.dropFirst().dropLast())
+            }
+            values[key] = value
+        }
+        return values
     }
 }

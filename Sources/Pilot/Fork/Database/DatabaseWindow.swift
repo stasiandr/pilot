@@ -8,6 +8,7 @@ struct DatabaseWindow: View {
     @ObservedObject private var browser = DatabaseBrowser.shared
     @ObservedObject private var language = LanguageStore.shared
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @State private var editor = SQLEditorState()
 
     var body: some View {
@@ -83,6 +84,12 @@ struct DatabaseWindow: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help(L("Подставить подключение"))
+            Button {
+                openWindow(id: MariaDBWindow.sceneID)
+            } label: {
+                Label(L("MariaDB в Docker"), systemImage: "shippingbox")
+            }
+            .help(L("Контейнер с базой: запустить, остановить, залить дамп, логи"))
         }
         .textFieldStyle(.roundedBorder)
         .controlSize(.small)

@@ -326,9 +326,18 @@ struct RootView: View {
             }
         }
 
-        ToolbarItem(id: "debug", placement: .automatic) {
-            if workspace.root != nil {
-                DebugToolbarControls(debug: workspace.debug)
+        Group {
+            // Форк: MariaDB clm-server (Fork/Database).
+            ToolbarItem(id: "database", placement: .automatic) {
+                if workspace.root != nil {
+                    DatabaseToolbarButton()
+                }
+            }
+
+            ToolbarItem(id: "debug", placement: .automatic) {
+                if workspace.root != nil {
+                    DebugToolbarControls(debug: workspace.debug)
+                }
             }
         }
 
