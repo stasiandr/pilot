@@ -44,6 +44,14 @@ if [[ -f .build/jadx/engine.jar ]]; then
     # нотаризация не пропускает — убираем их из копии в бандле.
     zip -q -d "$APP/Contents/Resources/Jadx/jadx.jar" '*.dylib' '*.so' '*.jnilib' > /dev/null || true
 fi
+# Встроенные расширения (Extensions/<имя>/extension.json): соглашения
+# проектов, которые приносит эта сборка. В апстриме папки нет — её
+# заводит форк для своей команды.
+if [[ -d Extensions ]]; then
+    mkdir -p "$APP/Contents/Resources/Extensions"
+    rsync -a --exclude '.*' --include '*/' --include 'extension.json' --exclude '*' \
+        Extensions/ "$APP/Contents/Resources/Extensions/"
+fi
 # Отладчик .NET (netcoredbg): бинарник, его библиотеки и Roslyn для вычислений.
 if [[ -x .build/netcoredbg/netcoredbg ]]; then
     mkdir -p "$APP/Contents/Resources/netcoredbg"

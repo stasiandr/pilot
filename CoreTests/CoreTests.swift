@@ -5472,6 +5472,11 @@ do {
     check((try? ProjectRules.manifest(from: Data(#"{"datagrams": {}}"#.utf8))) == nil, "без имени — не расширение")
     check((try? ProjectRules.manifest(from: Data(#"{"name": "X", "datagrams": {}}"#.utf8))) == nil,
           "датаграммы без интерфейса — ошибка, а не молчаливое «ничего»")
+    let matched = try? ProjectRules.manifest(from: Data(#"{"name": "X", "match": {"remotes": ["git.example.com:game/"], "files": ["Game.sln"]}}"#.utf8))
+    check(matched?.match?.matches(remotes: ["git@git.example.com:game/client.git"], exists: { _ in false }) == true
+            && matched?.match?.matches(remotes: ["git@github.com:other/x.git"], exists: { $0 == "Game.sln" }) == true
+            && matched?.match?.matches(remotes: ["git@github.com:other/x.git"], exists: { _ in false }) == false,
+          "match: по адресу remote или по файлу в корне")
     let empty = try? ProjectRules.manifest(from: Data(#"{"name": "X"}"#.utf8))
     check(empty?.rules.isEmpty == true, "пустое расширение ничего не включает")
 
@@ -5524,6 +5529,24 @@ do {
     check(arm?.version == AppVersion("0.3.1") && arm?.archive?.absoluteString == "https://example.com/arm.zip",
           "релиз: версия из тега и архив своей архитектуры")
     check(ReleaseInfo.parse(json, arch: "riscv")?.archive == nil, "архива под архитектуру нет — только страница")
+    check(UpdateSource("github:acme/pilot") == .github(repository: "acme/pilot")
+            && UpdateSource("gitlab:git.example.com/tools/editors/pilot") == .gitlab(host: "git.example.com", project: "tools/editors/pilot")
+            && UpdateSource("gitlab:git.example.com") == nil && UpdateSource("svn:x/y") == nil,
+          "источник обновлений из Info.plist")
+    check(UpdateSource.gitlab(host: "git.example.com", project: "tools/pilot").latestURL.absoluteString
+            == "https://git.example.com/api/v4/projects/tools%2Fpilot/releases/permalink/latest",
+          "GitLab: путь проекта кодируется в id")
+    let gitlabJSON = """
+    {"tag_name": "v0.4.0", "description": "что нового", "upcoming_release": false,
+     "_links": {"self": "https://git.example.com/tools/pilot/-/releases/v0.4.0"},
+     "assets": {"links": [
+       {"name": "Pilot-0.4.0-abc-arm64.zip", "url": "https://git.example.com/a.zip", "direct_asset_url": "https://git.example.com/direct.zip"}
+     ]}}
+    """.data(using: .utf8)!
+    let fromGitLab = ReleaseInfo.parseGitLab(gitlabJSON, arch: "arm64")
+    check(fromGitLab?.version == AppVersion("0.4.0") && fromGitLab?.archive?.absoluteString == "https://git.example.com/direct.zip"
+            && fromGitLab?.page.absoluteString == "https://git.example.com/tools/pilot/-/releases/v0.4.0",
+          "релиз GitLab: версия, прямая ссылка на архив, страница")
     let pre = String(data: json, encoding: .utf8)!.replacingOccurrences(of: "\"prerelease\": false", with: "\"prerelease\": true")
     check(ReleaseInfo.parse(pre.data(using: .utf8)!) == nil, "пре-релиз не предлагается")
 }

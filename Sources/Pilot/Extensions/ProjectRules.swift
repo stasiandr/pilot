@@ -6,14 +6,21 @@ import Foundation
 /// графе значения. Без правил эти возможности выключены: сам Pilot ничего
 /// не знает ни о чьём протоколе и чьих конфигах.
 ///
-/// Расширение — папка `.pilot/extensions/<имя>/` в корне проекта с файлом
-/// `extension.json`. Оно живёт в репозитории того проекта, к которому
-/// относится, и обновляется вместе с ним. Код расширение не исполняет —
-/// только описывает, поэтому достаточно один раз согласиться его включить.
+/// Расширение — папка с файлом `extension.json`. Два места:
+///
+/// * `.pilot/extensions/<имя>/` в корне проекта — живёт в его репозитории и
+///   обновляется вместе с ним; включается с согласия;
+/// * `Extensions/<имя>/` в репозитории самого Pilot — попадает в бандл и
+///   действует без вопроса: его поставила сборка. Так сборка для своей
+///   команды (форк) приносит соглашения её проектов с собой. У встроенного
+///   расширения есть `match` — к каким проектам оно относится.
+///
+/// Код расширение не исполняет — только описывает.
 ///
 /// ```json
 /// {
 ///   "name": "Game",
+///   "match": { "remotes": ["git.example.com:game/"], "files": ["Configs/registry.json"] },
 ///   "pair": { "suffixes": [["-app", "-backend"]], "mirrors": ["docs/shared/"] },
 ///   "datagrams": { "interface": "IPacket", "write": ["Write"], "read": ["Read"],
 ///                  "send": ["Send"], "receive": ["PacketFilter"] },
@@ -116,7 +123,21 @@ extension ProjectRules {
     struct Manifest: Equatable, Sendable {
         var name: String
         var description: String?
+        var match: Match?
         var rules: ProjectRules
+    }
+
+    /// К каким проектам относится расширение: адрес git-remote содержит одну
+    /// из строк `remotes` или в корне есть один из файлов `files`. Без
+    /// `match` — к любому проекту, где оно лежит (или к любому вообще, если
+    /// оно встроенное).
+    struct Match: Equatable, Sendable {
+        var remotes: [String] = []
+        var files: [String] = []
+
+        func matches(remotes urls: [String], exists: (String) -> Bool) -> Bool {
+            remotes.contains { part in urls.contains { $0.contains(part) } } || files.contains(where: exists)
+        }
     }
 
     enum ManifestError: Error, Equatable {
@@ -169,7 +190,12 @@ extension ProjectRules {
             rules.configs = configs
         }
 
-        return Manifest(name: name, description: json["description"] as? String, rules: rules)
+        var match: Match?
+        if let section = json["match"] as? [String: Any] {
+            match = Match(remotes: section["remotes"] as? [String] ?? [], files: section["files"] as? [String] ?? [])
+        }
+
+        return Manifest(name: name, description: json["description"] as? String, match: match, rules: rules)
     }
 }
 
@@ -182,6 +208,16 @@ struct ProjectExtension: Equatable, Sendable {
     var manifest: ProjectRules.Manifest
     /// Отпечаток содержимого: расширение поменялось — спросить заново.
     var fingerprint: String
+    /// Из бандла Pilot, а не из проекта: действует без вопроса.
+    var builtIn = false
+
+    /// Относится ли к проекту: у расширения из самого проекта — всегда.
+    func applies(remotes: [String], root: URL) -> Bool {
+        guard let match = manifest.match else { return true }
+        return match.matches(remotes: remotes) {
+            FileManager.default.fileExists(atPath: root.appendingPathComponent($0).path)
+        }
+    }
 
     static let folder = ".pilot/extensions"
     static let manifestName = "extension.json"
@@ -189,7 +225,16 @@ struct ProjectExtension: Equatable, Sendable {
     /// Все расширения в `.pilot/extensions/` корня. Сломанные пропускаются —
     /// с причиной в `problems`.
     static func discover(in root: URL) -> (found: [ProjectExtension], problems: [String]) {
-        let base = root.appendingPathComponent(folder, isDirectory: true)
+        scan(root.appendingPathComponent(folder, isDirectory: true), label: folder, builtIn: false)
+    }
+
+    /// Встроенные: `<папка>/<имя>/extension.json` — `Extensions/` бандла.
+    static func builtIns(in directory: URL) -> (found: [ProjectExtension], problems: [String]) {
+        scan(directory, label: "Extensions", builtIn: true)
+    }
+
+    private static func scan(_ base: URL, label folder: String, builtIn: Bool)
+        -> (found: [ProjectExtension], problems: [String]) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: base.path) else { return ([], []) }
         var found: [ProjectExtension] = []
         var problems: [String] = []
@@ -200,7 +245,7 @@ struct ProjectExtension: Equatable, Sendable {
             do {
                 let manifest = try ProjectRules.manifest(from: data)
                 found.append(ProjectExtension(directory: directory, manifest: manifest,
-                                              fingerprint: fingerprint(of: data)))
+                                              fingerprint: fingerprint(of: data), builtIn: builtIn))
             } catch ProjectRules.ManifestError.missing(let key) {
                 problems.append(L("\(folder)/\(name)/\(manifestName): нет «\(key)»"))
             } catch {

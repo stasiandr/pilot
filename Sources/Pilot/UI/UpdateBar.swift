@@ -57,6 +57,8 @@ struct UpdateBar: View {
         case .failed(_, let why):
             Text(L("Не удалось обновить: \(why)"))
                 .help(why)
+        case .needsToken(let host):
+            Text(L("Обновления этой сборки — в GitLab \(host): нужен токен"))
         }
     }
 
@@ -93,6 +95,15 @@ struct UpdateBar: View {
             Button(L("Повторить")) { updater.install() }
                 .controlSize(.small)
             dismiss
+        case .needsToken(let host):
+            Button(L("Ввести токен…")) { updater.askForToken(host: host) }
+                .controlSize(.small)
+            Button { updater.dismissTokenPrompt() } label: {
+                Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help(L("Скрыть до следующего запуска"))
         }
     }
 

@@ -1,9 +1,10 @@
 import AppKit
 import Security
 
-/// Самообновление. Новая версия — релиз на GitHub, который выкладывает
+/// Самообновление. Новая версия — релиз, который выкладывает
 /// `./dist.sh --publish`: тег `vX.Y.Z` и zip с подписанным и нотаризованным
-/// бандлом. Pilot раз в несколько часов спрашивает последний релиз и, если он
+/// бандлом. Где релизы, говорит `PilotUpdateSource` в Info.plist
+/// (`UpdateSource`): у апстрима — GitHub, у форка для команды — её GitLab. Pilot раз в несколько часов спрашивает последний релиз и, если он
 /// новее, показывает плашку над редактором; «Обновить» скачивает архив,
 /// сверяет подпись и кладёт новый бандл на место текущего.
 ///
@@ -15,7 +16,10 @@ import Security
 final class Updater: ObservableObject {
     static let shared = Updater()
 
-    static let repository = "stasiandr/pilot"
+    /// Источник из Info.plist; не задан или не разобрался — апстрим.
+    static let source: UpdateSource =
+        (Bundle.main.object(forInfoDictionaryKey: "PilotUpdateSource") as? String).flatMap(UpdateSource.init)
+            ?? .github(repository: "stasiandr/pilot")
     private static let automaticKey = "pilot.update.automatic"
     private static let skippedKey = "pilot.update.skipped"
     private static let interval: TimeInterval = 6 * 60 * 60
@@ -28,6 +32,8 @@ final class Updater: ObservableObject {
         /// Новый бандл на месте, работает ещё старый — ждёт перезапуска.
         case installed(ReleaseInfo)
         case failed(ReleaseInfo, String)
+        /// Релизы в GitLab, а токена для этого хоста нет или он не подошёл.
+        case needsToken(host: String)
     }
 
     @Published private(set) var state: State = .idle
@@ -88,6 +94,11 @@ final class Updater: ObservableObject {
         let release: ReleaseInfo?
         do {
             release = try await Self.latestRelease()
+        } catch Failure.token(let host) {
+            // Фоном — плашкой, но не чаще раза за запуск: её могли закрыть.
+            if manual || !tokenPromptDismissed { state = .needsToken(host: host) }
+            if manual { askForToken(host: host) }
+            return
         } catch {
             if manual { alert(L("Не удалось проверить обновления"), error.localizedDescription) }
             return
@@ -109,20 +120,67 @@ final class Updater: ObservableObject {
     /// можно и `file://` с сохранённым ответом API: так плашку и установку
     /// проверяют, не выпуская настоящий релиз.
     private static var feed: URL {
-        ProcessInfo.processInfo.environment["PILOT_UPDATE_FEED"].flatMap(URL.init(string:))
-            ?? URL(string: "https://api.github.com/repos/\(repository)/releases/latest")!
+        ProcessInfo.processInfo.environment["PILOT_UPDATE_FEED"].flatMap(URL.init(string:)) ?? source.latestURL
+    }
+
+    /// Запрос к источнику: GitLab — с токеном его хоста.
+    private static func authorized(_ url: URL) throws -> URLRequest {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        if let host = source.tokenHost, url.host == host {
+            guard let token = TokenStore.token(for: host) else { throw Failure.token(host) }
+            request.setValue(token, forHTTPHeaderField: "PRIVATE-TOKEN")
+        }
+        return request
     }
 
     private static func latestRelease() async throws -> ReleaseInfo? {
-        var request = URLRequest(url: feed)
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 20
+        var request = try authorized(feed)
+        if case .github = source { request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept") }
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+        if status == 401, let host = source.tokenHost { throw Failure.token(host) }
         // 404 — релизов ещё нет: обновляться не на что, это не ошибка.
+        // (GitLab отвечает так же и без прав на проект.)
         if status == 404 { return nil }
         guard status == 200 else { throw Failure.http(status) }
-        return ReleaseInfo.parse(data)
+        switch source {
+        case .github: return ReleaseInfo.parse(data)
+        case .gitlab: return ReleaseInfo.parseGitLab(data)
+        }
+    }
+
+    // MARK: - Токен GitLab
+
+    private var tokenPromptDismissed = false
+
+    /// Токен GitLab для обновлений — тот же, что для ревью: хранится в
+    /// связке ключей по хосту API.
+    func askForToken(host: String) {
+        let alert = NSAlert()
+        alert.messageText = L("Токен GitLab для \(host)")
+        alert.informativeText = L("Обновления этой сборки Pilot лежат в GitLab. Нужен личный токен с правом read_api — тот же, что для ревью мерж-реквестов.")
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        alert.accessoryView = field
+        alert.addButton(withTitle: L("Сохранить"))
+        alert.addButton(withTitle: L("Отмена"))
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let token = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        do {
+            try TokenStore.save(token, for: host)
+        } catch {
+            self.alert(L("Не удалось сохранить токен"), error.localizedDescription)
+            return
+        }
+        state = .idle
+        checkNow()
+    }
+
+    func dismissTokenPrompt() {
+        tokenPromptDismissed = true
+        if case .needsToken = state { state = .idle }
     }
 
     /// Не напоминать об этой версии — до следующей.
@@ -139,8 +197,8 @@ final class Updater: ObservableObject {
         switch state {
         case .available(let r), .downloading(let r, _), .installing(let r), .installed(let r), .failed(let r, _):
             NSWorkspace.shared.open(r.page)
-        case .idle:
-            NSWorkspace.shared.open(URL(string: "https://github.com/\(Self.repository)/releases/latest")!)
+        case .idle, .needsToken:
+            NSWorkspace.shared.open(Self.source.releasesPage)
         }
     }
 
@@ -212,6 +270,7 @@ final class Updater: ObservableObject {
 
     enum Failure: LocalizedError {
         case http(Int)
+        case token(String)
         case download(String)
         case unpack
         case signature
@@ -219,7 +278,8 @@ final class Updater: ObservableObject {
 
         var errorDescription: String? {
             switch self {
-            case .http(let status): return L("GitHub ответил \(status)")
+            case .http(let status): return L("Сервер обновлений ответил \(status)")
+            case .token(let host): return L("Нужен токен GitLab для \(host)")
             case .download(let why): return L("Не удалось скачать обновление: \(why)")
             case .unpack: return L("Не удалось распаковать обновление")
             case .signature: return L("Подпись обновления не совпала с подписью Pilot — не устанавливаю")
@@ -232,7 +292,7 @@ final class Updater: ObservableObject {
         let delegate = ProgressDelegate(progress: progress)
         let (file, response): (URL, URLResponse)
         do {
-            (file, response) = try await URLSession.shared.download(from: url, delegate: delegate)
+            (file, response) = try await URLSession.shared.download(for: try authorized(url), delegate: delegate)
         } catch {
             throw Failure.download(error.localizedDescription)
         }

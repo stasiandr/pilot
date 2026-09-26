@@ -7,8 +7,9 @@ import Foundation
 ///           [--expect "Health.value <- DamageSystem.OnUpdate"]…
 ///
 /// Проект — ближайшая папка с `.git` над файлом, вторая половина пары — по
-/// тем же правилам, что у окна. Расширения из `.pilot/extensions/` обеих
-/// половин действуют без вопроса: скрипт запускают для этого проекта сознательно. Компиляция и индекс берутся из кэша: проект
+/// тем же правилам, что у окна. Встроенные расширения и расширения из
+/// `.pilot/extensions/` обеих половин действуют без вопроса: скрипт
+/// запускают для этого проекта сознательно. Компиляция и индекс берутся из кэша: проект
 /// должен хоть раз открываться в Pilot. `--expect` — цепочка названий узлов
 /// от значения к источникам (подстроки); код выхода 1, если какой-то нет.
 @MainActor
@@ -67,12 +68,14 @@ enum HeadlessGraph {
             log("над \(location.url.path) нет папки с .git — не понять, какой это проект")
             return 2
         }
-        let own = ProjectExtension.discover(in: root).found.map(\.manifest.rules)
+        let own = (Workspace.builtIns(for: root) + ProjectExtension.discover(in: root).found).map(\.manifest.rules)
         let partnerRoot = ProjectPair.partner(of: root, links: [:], extra: ProjectRules.merged(own).pair.suffixes) { path in
             var isDirectory: ObjCBool = false
             return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
         }
-        let theirs = partnerRoot.map { ProjectExtension.discover(in: $0).found.map(\.manifest.rules) } ?? []
+        let theirs = partnerRoot.map {
+            (Workspace.builtIns(for: $0) + ProjectExtension.discover(in: $0).found).map(\.manifest.rules)
+        } ?? []
         let rules = ProjectRules.merged(own + theirs)
         let home = Project(root: root, partner: partnerRoot, rules: rules)
         var projects: [String: Project] = [root.path: home]

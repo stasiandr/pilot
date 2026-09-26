@@ -20,4 +20,6 @@ if [[ ! -x "$BIN" ]]; then
 fi
 TARGET="$1"; shift
 # Строки NSLog (с датой) — шум для терминала; сообщения самого графа идут как "pilot: …".
+# Встроенные расширения — из репозитория: debug-бинарник живёт не в бандле.
+[[ -d "$ROOT/Extensions" ]] && export PILOT_EXTENSIONS="$ROOT/Extensions"
 exec "$BIN" --value-graph "$TARGET" "$@" 2> >(grep -v '^[0-9]\{4\}-' >&2)

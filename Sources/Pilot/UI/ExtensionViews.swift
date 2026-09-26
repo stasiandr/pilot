@@ -66,7 +66,7 @@ struct ExtensionSettingsView: View {
                 ProjectExtensionsSection(workspace: workspace)
             }
             Section {
-                Text(L("Расширение — папка .pilot/extensions/<имя>/ с extension.json в репозитории проекта. Оно описывает соглашения проекта: как узнать вторую половину пары, какие папки у половин одинаковые, как устроены сетевые структуры и конфиги. Код расширения не исполняют."))
+                Text(L("Расширение — папка .pilot/extensions/<имя>/ с extension.json в репозитории проекта (или встроенное в сборку Pilot). Оно описывает соглашения проекта: как узнать вторую половину пары, какие папки у половин одинаковые, как устроены сетевые структуры и конфиги. Код расширения не исполняют."))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -99,11 +99,11 @@ private struct ProjectExtensionsSection: View {
                 Toggle(isOn: Binding(get: { workspace.state(of: item) == .enabled },
                                      set: { workspace.setExtension(item, enabled: $0) })) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(item.manifest.name)
+                        Text(item.builtIn ? L("\(item.manifest.name) — встроено в эту сборку") : item.manifest.name)
                         Text(ExtensionSummary.text(item.manifest))
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
-                        Text((item.directory.path as NSString).abbreviatingWithTildeInPath)
+                        Text(item.builtIn ? "" : (item.directory.path as NSString).abbreviatingWithTildeInPath)
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }

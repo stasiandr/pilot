@@ -11,6 +11,10 @@
     <key>CFBundlePackageType</key>          <string>APPL</string>
     <key>CFBundleShortVersionString</key>   <string>0.1.0</string>
     <key>CFBundleVersion</key>              <string>1</string>
+    <!-- Откуда брать обновления (Updater, dist.sh --publish):
+         github:owner/repo или gitlab:host/group/project. Форк для своей
+         команды меняет эту строку — и обновляется из своих релизов. -->
+    <key>PilotUpdateSource</key>            <string>github:stasiandr/pilot</string>
     <key>LSMinimumSystemVersion</key>       <string>14.0</string>
     <key>NSPrincipalClass</key>             <string>NSApplication</string>
     <key>NSHighResolutionCapable</key>      <true/>
