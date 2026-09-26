@@ -97,6 +97,16 @@ enum HeadlessGraph {
         }
         let model = SyntaxModel(text: text, spec: nil)
         let offset = model.offset(at: LSPPosition(line: location.line - 1, character: location.column - 1))
+        // `--definition` — только что компилятор знает об имени: для разбора
+        // того, почему граф его не узнал.
+        if arguments.contains("--definition") {
+            let definition = rustlyn.definition(location.url, offset: offset)
+            for target in definition.targets {
+                print("\(target.name) [\(target.kind)] \(target.url.path):\(target.line + 1):\(target.character + 1)")
+            }
+            if definition.targets.isEmpty { print("компилятор не знает этого имени") }
+            return definition.targets.isEmpty ? 1 : 0
+        }
         guard let found = rustlyn.definition(location.url, offset: offset).targets.first else {
             log("под \(target) компилятор не нашёл имени")
             return 2
@@ -175,6 +185,8 @@ enum HeadlessGraph {
         var guessed = 0
         /// Узлы, которые можно раскрыть, но граф упёрся в предел.
         var unexplored = 0
+        /// Значения, которых код не пишет, с известным источником: база, конфиг, инспектор.
+        var origins: [String] = []
 
         @MainActor init(_ graph: ValueGraph) {
             for id in graph.order {
@@ -189,6 +201,7 @@ enum HeadlessGraph {
                     if id == graph.rootID { rootEmpty = true } else { empty.append(node) }
                 }
                 if node.state == .collapsed, node.isExpandable { unexplored += 1 }
+                if let origin = node.origin { origins.append(origin) }
             }
         }
 
@@ -213,6 +226,7 @@ enum HeadlessGraph {
         var graphs = 0, nodes = 0, unresolved = 0, rootEmpty = 0, guessed = 0, cut = 0, clean = 0
         var unknownNames: [String: [String: Int]] = [:]
         var emptyByKind: [String: Int] = [:]
+        var originCounts: [String: Int] = [:]
         var slowest: (title: String, seconds: Double)?
         var models: [URL: SyntaxModel] = [:]
         let started = Date()
@@ -244,6 +258,7 @@ enum HeadlessGraph {
             guessed += losses.guessed
             for unknown in losses.unknown { unknownNames[unknown.reason, default: [:]][unknown.name, default: 0] += 1 }
             for node in losses.empty { emptyByKind[kindName(node.kind), default: 0] += 1 }
+            for origin in losses.origins { originCounts[origin, default: 0] += 1 }
 
             var line = "\(graph.title) · \(graph.nodes.count) узл. · \(String(format: "%.1f", seconds)) с"
             if losses.rootEmpty { line += " · записей нет" }
@@ -282,6 +297,10 @@ enum HeadlessGraph {
         }
         if !emptyByKind.isEmpty {
             print("пустые раскрытия: " + emptyByKind.sorted { $0.value > $1.value }
+                .map { "\($0.key) \($0.value)" }.joined(separator: ", "))
+        }
+        if !originCounts.isEmpty {
+            print("код не пишет, но известно откуда: " + originCounts.sorted { $0.value > $1.value }
                 .map { "\($0.key) \($0.value)" }.joined(separator: ", "))
         }
         if guessed > 0 { print("найдено по имени: \(guessed)") }

@@ -91,6 +91,8 @@ final class ValueGraph: ObservableObject {
         var note: String?
         /// Компилятор имени не узнал — поле нашлось по индексу, по имени.
         var guessed = false
+        /// Код значение не пишет, и известно откуда оно: база, конфиг, инспектор.
+        var origin: String?
         var state: State = .collapsed
         /// Колонка: 0 — исходное значение (справа), дальше — к источникам.
         var depth: Int
@@ -232,30 +234,36 @@ final class ValueGraph: ObservableObject {
         }
         nodes[id]?.state = .loading
         let context = ValueGraphAnalysis.Context(root: project, rustlyn: rustlyn, texts: owner.openTexts(),
-                                                 index: owner.symbolIndex, network: owner.rules.datagrams)
+                                                 index: owner.symbolIndex, network: owner.rules.datagrams,
+                                                 configs: owner.rules.configs)
         let kind = node.kind
-        let analyze = { () -> [ValueGraphAnalysis.Site] in
+        // Места и, если их нет, — откуда значение, которое код не пишет.
+        let analyze = { () -> ([ValueGraphAnalysis.Site], String?) in
             switch kind {
-            case .value(let declaration): return context.writes(to: declaration)
-            case .component(let name): return context.componentChanges(of: name)
-            case .arrival(let datagram): return context.sends(of: datagram)
-            case .call(let method?): return context.returns(of: method)
-            case .parameter(let method?, let index): return context.callers(of: method, argument: index)
-            default: return []
+            case .value(let declaration):
+                let sites = context.writes(to: declaration)
+                return (sites, sites.isEmpty ? context.origin(of: declaration) : nil)
+            case .component(let name): return (context.componentChanges(of: name), nil)
+            case .arrival(let datagram): return (context.sends(of: datagram), nil)
+            case .call(let method?): return (context.returns(of: method), nil)
+            case .parameter(let method?, let index): return (context.callers(of: method, argument: index), nil)
+            default: return ([], nil)
             }
         }
         if synchronous {
-            adopt(analyze(), into: id, project: project, datagrams: context.datagrams)
+            let (sites, origin) = analyze()
+            adopt(sites, into: id, project: project, datagrams: context.datagrams, origin: origin)
             return
         }
         owner.referenceQueue.async { [weak self] in
-            let sites = analyze()
+            let (sites, origin) = analyze()
             let datagrams = context.datagrams
-            Task { @MainActor in self?.adopt(sites, into: id, project: project, datagrams: datagrams) }
+            Task { @MainActor in self?.adopt(sites, into: id, project: project, datagrams: datagrams, origin: origin) }
         }
     }
 
-    private func adopt(_ sites: [ValueGraphAnalysis.Site], into id: String, project: URL, datagrams: Set<String>) {
+    private func adopt(_ sites: [ValueGraphAnalysis.Site], into id: String, project: URL, datagrams: Set<String>,
+                       origin: String? = nil) {
         guard let node = nodes[id] else { return }
         let depth = node.depth
         var declaration: Declaration?
@@ -293,7 +301,14 @@ final class ValueGraph: ObservableObject {
             nodes[id]?.state = .expanded
             return
         }
-        nodes[id]?.state = shown == 0 ? .failed(emptyReason(for: node.kind)) : .expanded
+        if shown == 0, let origin {
+            // Код его не пишет, и это ответ: значение из базы, конфига, инспектора.
+            nodes[id]?.state = .expanded
+            nodes[id]?.origin = origin
+            nodes[id]?.note = [nodes[id]?.note, origin].compactMap { $0 }.joined(separator: " · ")
+        } else {
+            nodes[id]?.state = shown == 0 ? .failed(emptyReason(for: node.kind)) : .expanded
+        }
         autoExpand()
         if !settled, !nodes.values.contains(where: { $0.state == .loading }) { settled = true }
     }
@@ -306,7 +321,7 @@ final class ValueGraph: ObservableObject {
             guard let node = nodes[id], node.state == .collapsed, node.depth <= reach.depth else { continue }
             switch node.kind {
             case .value, .arrival: expand(id)
-            case .call, .parameter where reach.calls: expand(id)
+            case .call where reach.calls, .parameter where reach.calls: expand(id)
             default: break
             }
         }

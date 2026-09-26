@@ -184,6 +184,19 @@ enum ValueFlow {
             }
             var words = parts.map { string(text, $0) }
             let after = skipSpace(text, from: j)
+            // Цель присваивания (`{ A = x }` в инициализаторе) и имя аргумента
+            // или элемента кортежа (`M(radius: r)`) — не источники.
+            if after + 1 < end, text[after] == eq, text[after + 1] != eq, text[after + 1] != gt {
+                i = j
+                continue
+            }
+            if parts.count == 1, after < end, text[after] == colon, after + 1 >= end || text[after + 1] != colon {
+                let before = skipSpaceBackward(text, from: i)
+                if before > 0, text[before - 1] == openParen || text[before - 1] == comma {
+                    i = j
+                    continue
+                }
+            }
             let call = after < end && (text[after] == openParen || text[after] == lt && looksGeneric(text, from: after, end: end))
             // `this.x` — это `x`.
             if words.count > 1, words[0] == "this" || words[0] == "base" { words.removeFirst() }
@@ -258,7 +271,27 @@ enum ValueFlow {
     }
 
     /// Переменная цикла `foreach (var x in items)` в `name`: диапазон `items`.
+    /// И элемент разбора `foreach (var (key, x) in items)`.
     static func foreachCollection(in text: [UInt16], variable name: NSRange) -> NSRange? {
+        if let direct = foreachSource(in: text, variable: name) { return direct }
+        // В скобках разбора: `(key, x)` — как одна переменная цикла.
+        var depth = 0
+        var i = name.location - 1
+        while i >= 0 {
+            let c = text[i]
+            if c == closeParen { depth += 1 } else if c == openParen {
+                if depth == 0 { break }
+                depth -= 1
+            } else if c == semicolon || c == openBrace || c == closeBrace { return nil }
+            i -= 1
+        }
+        guard i > 0 else { return nil }
+        let close = matching(text, open: i)
+        guard close > name.location else { return nil }
+        return foreachSource(in: text, variable: NSRange(location: i, length: close - i + 1))
+    }
+
+    private static func foreachSource(in text: [UInt16], variable name: NSRange) -> NSRange? {
         let after = skipSpace(text, from: NSMaxRange(name))
         guard after + 2 < text.count, text[after] == 0x69, text[after + 1] == 0x6E, isSpace(text[after + 2]) else { return nil }
         guard let open = typeStart(text, before: name.location).flatMap({ openParenBefore(text, $0) }),
@@ -269,6 +302,89 @@ enum ValueFlow {
         var end = close
         while end > start, isSpace(text[end - 1]) { end -= 1 }
         return end > start ? NSRange(location: start, length: end - start) : nil
+    }
+
+    /// Переменная шаблона: `x is T name`, `x is not T name` — диапазон `x`.
+    static func patternSubject(in text: [UInt16], name: NSRange) -> NSRange? {
+        guard let type = typeStart(text, before: name.location) else { return nil }
+        var i = skipSpaceBackward(text, from: type)
+        if word(text, endingAt: i) == "not" { i = skipSpaceBackward(text, from: i - 3) }
+        guard word(text, endingAt: i) == "is" else { return nil }
+        let end = skipSpaceBackward(text, from: i - 2)
+        // Начало выражения слева от `is`: до скобки, запятой, `=`, `&&`, `||`, `!` своего уровня.
+        var start = end
+        var depth = 0
+        while start > 0 {
+            let c = text[start - 1]
+            if c == closeParen || c == closeBracket { depth += 1 } else if c == openParen || c == openBracket {
+                if depth == 0 { break }
+                depth -= 1
+            } else if depth == 0, c == comma || c == eq || c == amp || c == bar || c == semicolon || c == openBrace
+                        || c == question || c == colon || (c == 0x21 && (start >= text.count || text[start] != eq)) {
+                break
+            }
+            start -= 1
+        }
+        start = skipSpace(text, from: start)
+        return end > start ? NSRange(location: start, length: end - start) : nil
+    }
+
+    /// Параметр локальной функции `void Process(T a, U b) { … }` в `name`:
+    /// имя функции и номер параметра.
+    static func localFunctionParameter(in text: [UInt16], name: NSRange) -> (function: NSRange, index: Int)? {
+        var depth = 0
+        var commas = 0
+        var i = name.location - 1
+        while i >= 0 {
+            let c = text[i]
+            if c == closeParen || c == closeBracket || c == gt { depth += 1 } else if c == openParen || c == openBracket || c == lt {
+                if depth == 0 { break }
+                depth -= 1
+            } else if depth == 0, c == comma {
+                commas += 1
+            } else if c == semicolon || c == openBrace || c == closeBrace || c == eq {
+                return nil
+            }
+            i -= 1
+        }
+        guard i > 0, text[i] == openParen else { return nil }
+        let close = matching(text, open: i)
+        guard close > name.location else { return nil }
+        // После скобок — тело: `{`, `=>` или ограничения дженериков.
+        let after = skipSpace(text, from: close + 1)
+        guard after + 1 < text.count, text[after] == openBrace || (text[after] == eq && text[after + 1] == gt)
+                || word(text, endingAt: min(text.count, after + 5)) == "where" else { return nil }
+        // Перед скобкой — имя, а перед ним тип: это объявление, а не вызов.
+        let nameEnd = skipSpaceBackward(text, from: i)
+        var nameStart = nameEnd
+        while nameStart > 0, isIdentPart(text[nameStart - 1]) { nameStart -= 1 }
+        guard nameStart < nameEnd else { return nil }
+        let typeEnd = skipSpaceBackward(text, from: nameStart)
+        guard typeEnd > 0 else { return nil }
+        let before = text[typeEnd - 1]
+        let typeWord = word(text, endingAt: typeEnd)
+        guard before == gt || before == closeBracket || before == question
+                || (isIdentPart(before) && !["return", "await", "new", "else", "in", "is", "as", "case", "throw", "yield"].contains(typeWord))
+        else { return nil }
+        return (NSRange(location: nameStart, length: nameEnd - nameStart), commas)
+    }
+
+    /// Вызовы функции `function` в `range`, кроме её объявления: диапазоны имени.
+    static func calls(of function: String, in text: [UInt16], range: NSRange, except declaration: Int) -> [NSRange] {
+        let target = Array(function.utf16)
+        var result: [NSRange] = []
+        var i = range.location
+        let end = min(NSMaxRange(range), text.count)
+        while i + target.count < end {
+            if text[i] == quote || text[i] == apostrophe { i = skipLiteral(text, from: i); continue }
+            guard text[i] == target[0], Array(text[i..<(i + target.count)]) == target,
+                  i == 0 || (!isIdentPart(text[i - 1]) && text[i - 1] != dot),
+                  !isIdentPart(text[i + target.count]), i != declaration else { i += 1; continue }
+            let open = skipSpace(text, from: i + target.count)
+            if open < end, text[open] == openParen { result.append(NSRange(location: i, length: target.count)) }
+            i += target.count
+        }
+        return result
     }
 
     /// `out var x`, `out int x`, `out x`: значение в `name` положит вызов.
@@ -968,7 +1084,7 @@ enum ValueFlow {
     private static let percent: UInt16 = 0x25, amp: UInt16 = 0x26, bar: UInt16 = 0x7C, caret: UInt16 = 0x5E
     private static let question: UInt16 = 0x3F, dot: UInt16 = 0x2E, comma: UInt16 = 0x2C, semicolon: UInt16 = 0x3B
     private static let quote: UInt16 = 0x22, apostrophe: UInt16 = 0x27, backslash: UInt16 = 0x5C, dollar: UInt16 = 0x24
-    private static let newline: UInt16 = 0x0A
+    private static let newline: UInt16 = 0x0A, colon: UInt16 = 0x3A
     private static let openParen: UInt16 = 0x28, closeParen: UInt16 = 0x29
     private static let openBracket: UInt16 = 0x5B, closeBracket: UInt16 = 0x5D
     private static let openBrace: UInt16 = 0x7B, closeBrace: UInt16 = 0x7D

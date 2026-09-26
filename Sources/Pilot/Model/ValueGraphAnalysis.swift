@@ -57,16 +57,19 @@ enum ValueGraphAnalysis {
         let datagrams: Set<String>
         /// Сетевые правила расширения: без них граф через сеть не ходит.
         let network: DatagramRules?
+        /// Правила конфигов: чем помечены их модели — значения таких полей из JSON.
+        let configs: ConfigRules?
         private var models: [URL: SyntaxModel] = [:]
         private var outlines: [URL: RustlynOutline] = [:]
-        private var stashCache: [String: [(name: String, url: URL)]] = [:]
 
-        init(root: URL, rustlyn: Rustlyn, texts: [URL: String], index: SymbolIndex?, network: DatagramRules?) {
+        init(root: URL, rustlyn: Rustlyn, texts: [URL: String], index: SymbolIndex?, network: DatagramRules?,
+             configs: ConfigRules? = nil) {
             self.root = root
             self.rustlyn = rustlyn
             self.texts = texts
             self.index = index
             self.network = network
+            self.configs = configs
             if let index, let network {
                 datagrams = Set(PairQueries.datagrams(in: index, rules: network).keys)
             } else {
@@ -76,7 +79,8 @@ enum ValueGraphAnalysis {
 
         // MARK: Записи в поле
 
-        func writes(to declaration: ValueGraph.Declaration) -> [Site] {
+        func writes(to value: ValueGraph.Declaration, implementing: Bool = true) -> [Site] {
+            let declaration = named(value)
             guard let model = model(declaration.url) else { return [] }
             let offset = model.offset(at: LSPPosition(line: declaration.line, character: declaration.character))
             let references = rustlyn.references(declaration.url, offset: offset, text: texts[declaration.url])
@@ -102,11 +106,51 @@ enum ValueGraphAnalysis {
             }
             sites += declared(declaration, model: model)
             sites += stashWrites(to: declaration, skipping: Set(sites.map { "\($0.url.path)|\($0.offset)" }))
+            // Свойство интерфейса: значение дают реализации.
+            if sites.isEmpty, implementing {
+                sites = implementations(of: declaration).flatMap { writes(to: $0, implementing: false) }
+            }
             let unknown = sites.flatMap(\.sources).filter { if case .unknown = $0.kind { return true }; return false }.count
             NSLog("[graph] %@: упоминаний %d, записей %d, чтений %d, неразрешённых имён %d — %@",
                   declaration.name, references.targets.count, sites.count, reads, unknown,
                   sites.map { "\($0.title):\($0.line + 1)\($0.isNetworkRead ? " (из сети)" : "")" }.joined(separator: ", "))
             return sites
+        }
+
+        /// Откуда значение, которое код не пишет: колонка таблицы, поле
+        /// модели конфига или JSON, поле инспектора Unity. nil — не знаем.
+        func origin(of value: ValueGraph.Declaration) -> String? {
+            let declaration = named(value)
+            guard let model = model(declaration.url) else { return nil }
+            let offset = model.offset(at: LSPPosition(line: declaration.line, character: declaration.character))
+            let declarations = outline(declaration.url).declarations
+            guard let member = declarations.first(where: {
+                NSLocationInRange(offset, $0.nameRange) && [.field, .property].contains($0.kind)
+            }) else { return nil }
+            let owner = declarations.filter { $0.kind.isType && NSLocationInRange(member.fullRange.location, $0.fullRange) }
+                .min { $0.fullRange.length < $1.fullRange.length }
+            let own = Set(member.attributes.map { $0.split(separator: ".").last.map(String.init) ?? $0 })
+            let ownerAttributes = Set((owner?.attributes ?? []).map { $0.split(separator: ".").last.map(String.init) ?? $0 })
+            if !own.isDisjoint(with: ["Column", "Key", "ForeignKey"]) || ownerAttributes.contains("Table") {
+                return L("из базы данных")
+            }
+            if let configs, own.contains(configs.keyAttribute) || ownerAttributes.contains(configs.modelAttribute) {
+                return L("из конфига")
+            }
+            if !own.isDisjoint(with: ["JsonProperty", "JsonPropertyName", "DataMember", "JsonRequired"]) {
+                return L("из JSON")
+            }
+            let unityObject = (owner?.bases ?? []).contains { base in
+                ["MonoBehaviour", "ScriptableObject", "NetworkBehaviour"].contains(SymbolIndex.baseKey(base))
+            }
+            let isPublicField = member.kind == .field
+                && ValueFlow.string(model.units, NSRange(location: member.fullRange.location,
+                                                         length: max(0, member.nameRange.location - member.fullRange.location)))
+                    .split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains("public")
+            if own.contains("SerializeField") || own.contains("SerializeReference") || (unityObject && isPublicField) {
+                return L("из инспектора Unity")
+            }
+            return nil
         }
 
         /// Что даёт само объявление: начальное значение поля, константа,
@@ -145,6 +189,27 @@ enum ValueGraphAnalysis {
             return sites
         }
 
+        /// Объявление с позицией на имени. Свойство и метод Rustlyn отдаёт
+        /// началом объявления (атрибуты, `public`), а ссылки на них он ищет
+        /// только от имени — от `public` не находилось ни одной записи.
+        private func named(_ declaration: ValueGraph.Declaration) -> ValueGraph.Declaration {
+            guard !Self.isAssembly(declaration.url), let model = model(declaration.url) else { return declaration }
+            let offset = model.offset(at: LSPPosition(line: declaration.line, character: declaration.character))
+            let name = declaration.shortName
+            let units = model.units
+            if offset + name.utf16.count <= units.count,
+               ValueFlow.string(units, NSRange(location: offset, length: name.utf16.count)) == name { return declaration }
+            guard let member = outline(declaration.url).declarations
+                .filter({ $0.name == name && NSLocationInRange(offset, $0.fullRange) && $0.nameRange.location >= offset })
+                .min(by: { $0.fullRange.length < $1.fullRange.length }) else { return declaration }
+            var fixed = declaration
+            let position = model.position(at: member.nameRange.location)
+            fixed.line = position.line
+            fixed.character = position.character
+            fixed.length = member.nameRange.length
+            return fixed
+        }
+
         // MARK: Стэши Morpeh
 
         /// Записи в поле компонента через стэш, которых компилятор не видит:
@@ -178,24 +243,13 @@ enum ValueGraphAnalysis {
 
         /// Поля-стэши компонента: объявленные и дописанные генератором.
         private func stashes(of component: String) -> [(name: String, url: URL)] {
-            if let known = stashCache[component] { return known }
             guard let index else { return [] }
             var found: [(name: String, url: URL)] = []
-            for id in 0..<Int32(index.count) where index[id].kind == .field {
-                let symbol = index[id]
-                guard let type = symbol.typeText?.replacingOccurrences(of: " ", with: ""),
-                      Self.stashComponent(type) == component else { continue }
+            for id in index.stashesByComponent[component] ?? [] {
                 let url = root.appendingPathComponent(index.relPath(id))
-                if !found.contains(where: { $0.name == symbol.name && $0.url == url }) { found.append((symbol.name, url)) }
+                if !found.contains(where: { $0.name == index[id].name && $0.url == url }) { found.append((index[id].name, url)) }
             }
-            stashCache[component] = found
             return found
-        }
-
-        /// `Stash<Ns.Health>` → `Health`.
-        static func stashComponent(_ type: String) -> String? {
-            guard type.hasPrefix("Stash<"), type.hasSuffix(">") else { return nil }
-            return type.dropFirst(6).dropLast().split(separator: ".").last.map(String.init)
         }
 
         /// Поле компонента, взятое через стэш, которого компилятор не видит:
@@ -208,7 +262,7 @@ enum ValueGraphAnalysis {
                 if parts.count == 2, parts[1] == "Get" || parts[1] == "Add" { stash = String(parts[0]) }
             } else if !source.member, let method {
                 let parts = source.chain.split(separator: ".")
-                if parts.count == 2 {
+                if parts.count >= 2 {
                     stash = ValueFlow.stashOfLocal(in: model.units, local: String(parts[0]), method: method.fullRange,
                                                    before: source.range.location)
                 }
@@ -241,7 +295,7 @@ enum ValueGraphAnalysis {
             let owner = method?.container?.split(separator: ".").last.map(String.init)
             var component: String?
             for id in index.byName[name] ?? [] where index[id].kind == .field {
-                guard let found = index[id].typeText.flatMap({ Self.stashComponent($0.replacingOccurrences(of: " ", with: "")) })
+                guard let found = index[id].typeText.flatMap(SymbolIndex.stashComponent)
                 else { continue }
                 if index.relPath(id) == path { return found }
                 if let owner, index[id].container?.split(separator: ".").last.map(String.init) == owner { component = found }
@@ -279,18 +333,7 @@ enum ValueGraphAnalysis {
 
         /// `stash.Set(e)`, `.Add(`, `.Remove(` — где компонент появляется и где его убирают.
         func componentChanges(of component: String) -> [Site] {
-            guard let index else { return [] }
-            let stashType = "Stash<\(component)>"
-            var stashes: [(name: String, url: URL)] = []
-            for id in 0..<Int32(index.count) {
-                let symbol = index[id]
-                guard symbol.kind == .field,
-                      symbol.typeText?.replacingOccurrences(of: " ", with: "") == stashType else { continue }
-                let url = root.appendingPathComponent(index.relPath(id))
-                if !stashes.contains(where: { $0.name == symbol.name && $0.url == url }) {
-                    stashes.append((symbol.name, url))
-                }
-            }
+            let stashes = stashes(of: component)
             var sites: [Site] = []
             for stash in stashes {
                 guard let model = model(stash.url) else { continue }
@@ -344,21 +387,37 @@ enum ValueGraphAnalysis {
         // MARK: Вызовы и параметры
 
         /// Что метод возвращает: каждое `return` — место со своими источниками.
-        func returns(of method: ValueGraph.Declaration) -> [Site] {
+        func returns(of declared: ValueGraph.Declaration, implementing: Bool = true) -> [Site] {
+            let method = named(declared)
             guard let model = model(method.url) else { return [] }
             let offset = model.offset(at: LSPPosition(line: method.line, character: method.character))
             guard let declaration = enclosingMember(method.url, at: offset) else { return [] }
-            return ValueFlow.returnedExpressions(in: model.units, method: declaration.fullRange).map { expression in
+            let sites = ValueFlow.returnedExpressions(in: model.units, method: declaration.fullRange).map { expression in
                 var site = makeSite(method.url, model: model, at: expression.location, method: declaration)
                 site.note = L("возвращает")
                 site.sources = resolve(ValueFlow.sources(in: model.units, range: expression), url: method.url,
                                        model: model, method: declaration, via: [], depth: 0)
                 return site
             }
+            // Метод интерфейса или абстрактный: тела нет — return в реализациях.
+            guard sites.isEmpty, implementing else { return sites }
+            return implementations(of: method).flatMap { returns(of: $0, implementing: false) }
+        }
+
+        /// Реализации и переопределения члена в проекте (не больше восьми:
+        /// у интерфейса на всё подряд их бывают сотни).
+        private func implementations(of member: ValueGraph.Declaration) -> [ValueGraph.Declaration] {
+            guard !Self.isAssembly(member.url), let model = model(member.url) else { return [] }
+            let offset = model.offset(at: LSPPosition(line: member.line, character: member.character))
+            return rustlyn.implementations(member.url, offset: offset).targets
+                .filter { !Self.isAssembly($0.url) && !($0.url == member.url && $0.line == member.line) }
+                .prefix(8)
+                .map { named(declarationOf($0)) }
         }
 
         /// Аргумент номер `argument` во всех вызовах метода.
-        func callers(of method: ValueGraph.Declaration, argument: Int) -> [Site] {
+        func callers(of declared: ValueGraph.Declaration, argument: Int) -> [Site] {
+            let method = named(declared)
             guard let model = model(method.url) else { return [] }
             let offset = model.offset(at: LSPPosition(line: method.line, character: method.character))
             let references = rustlyn.references(method.url, offset: offset, text: texts[method.url])
@@ -403,10 +462,22 @@ enum ValueGraphAnalysis {
                 let target = definition.targets.first
                 if source.call {
                     let declaration = target.flatMap { [.method, .constructor].contains($0.kind) ? declarationOf($0) : nil }
-                    // Стэш, которого компилятор не видит: `_health.Get(e)`, `.Has(e)` — это компонент.
-                    if declaration == nil, !source.member, let component = stashCall(source.chain, url: url, method: method) {
-                        result.append(Source(kind: .component(component), via: via))
-                        continue
+                    if declaration == nil, !source.member {
+                        // Стэш, которого компилятор не видит: `_health.Get(e)`, `.Has(e)` — это компонент.
+                        if let component = stashCall(source.chain, url: url, method: method) {
+                            result.append(Source(kind: .component(component), via: via))
+                            continue
+                        }
+                        // `c.Value.ToObject<T>()` у ref-локальной из стэша — из поля `Value`.
+                        if let typed = stashMember(source, name: name, url: url, model: model, method: method) {
+                            result.append(Source(kind: .value(typed), via: via))
+                            continue
+                        }
+                        // Вызов у локальной, чьего типа компилятор не знает, — из того, что в ней.
+                        if let local = headLocal(source, url: url, model: model, method: method, via: via, depth: depth) {
+                            result += local
+                            continue
+                        }
                     }
                     var call = Source(kind: .call(source.chain, declaration), via: via)
                     if let declaration, Self.isAssembly(declaration.url) { call.terminal = Self.assemblyNote(declaration.url) }
@@ -446,11 +517,7 @@ enum ValueGraphAnalysis {
                 // Хвоста цепочки компилятор не узнал (`v.x` у `var v = …` без
                 // известного типа) — значение всё равно из её головы: локальной
                 // или параметра.
-                if !source.member, let method, let head = source.head, head != source.range,
-                   let target = rustlyn.definition(url, offset: head.location, text: texts[url]).targets.first,
-                   target.kind == .field,
-                   let local = local(target, name: ValueFlow.string(units, head), method: method, url: url, model: model,
-                                     via: via, depth: depth) {
+                if !source.member, let local = headLocal(source, url: url, model: model, method: method, via: via, depth: depth) {
                     result += local
                     continue
                 }
@@ -476,6 +543,16 @@ enum ValueGraphAnalysis {
                 }
             }
             return result
+        }
+
+        /// Голова цепочки `a.b.c`, если это локальная или параметр: то, откуда они.
+        private func headLocal(_ source: ValueFlow.Source, url: URL, model: SyntaxModel, method: RustlynDeclaration?,
+                               via: [String], depth: Int) -> [Source]? {
+            guard let method, let head = source.head, head != source.range,
+                  let target = rustlyn.definition(url, offset: head.location, text: texts[url]).targets.first,
+                  target.kind == .field else { return nil }
+            return local(target, name: ValueFlow.string(model.units, head), method: method, url: url, model: model,
+                         via: via, depth: depth)
         }
 
         /// Локальная переменная или параметр `target` — если его объявление
@@ -517,6 +594,15 @@ enum ValueGraphAnalysis {
                         found = ValueFlow.sources(in: units, range: collection)
                     } else if offset == at, let value = ValueFlow.deconstruction(in: units, name: range) {
                         found = ValueFlow.sources(in: units, range: value)
+                    } else if offset == at, let subject = ValueFlow.patternSubject(in: units, name: range) {
+                        found = ValueFlow.sources(in: units, range: subject)
+                    } else if offset == at, let parameter = ValueFlow.localFunctionParameter(in: units, name: range) {
+                        // Параметр локальной функции — аргументы её вызовов в этом методе.
+                        let function = ValueFlow.string(units, parameter.function)
+                        found = ValueFlow.calls(of: function, in: units, range: method.fullRange,
+                                                except: parameter.function.location)
+                            .compactMap { ValueFlow.argument(in: units, after: $0, index: parameter.index) }
+                            .flatMap { ValueFlow.sources(in: units, range: $0) }
                     }
                 }
                 guard let found else { continue }

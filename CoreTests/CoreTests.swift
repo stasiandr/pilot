@@ -6076,6 +6076,10 @@ do {
     check(chains("state switch { State.Idle => idle, _ => busy }") == ["state", "idle", "busy"],
           "ветки switch — источники, шаблоны — нет")
     check(chains("this.speed * base.Scale") == ["speed", "Scale"], "this. и base. отброшены")
+    check(chains("new Health { Value = max, Regen = rate }") == ["Health", "max", "rate"],
+          "цели в инициализаторе — не источники")
+    check(chains("Spawn(model: m, radius: alive ? r : 0)") == ["Spawn()", "m", "alive", "r"],
+          "имена аргументов — не источники, ветки ?: — да")
     check(sources("new Vector3(x, 0)").first?.constructs == true, "new T(…) помечен")
     let member = sources("_hp.Get(e).Value")
     check(member.map(\.chain) == ["e", "Value"] && member.last?.receiver == "_hp.Get" && member.last?.member == true,
@@ -6118,6 +6122,25 @@ do {
     check(ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "a,", 1)), "(a, b) =>")
     check(ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "x =>", 1)), "x =>")
     check(!ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "a, b)", 1, from: 24)), "аргумент — не параметр")
+
+    let pattern = "if (item.Parameters is not WeaponParameters weapon) return;"
+    check(text(units(pattern), ValueFlow.patternSubject(in: units(pattern), name: range(pattern, "weapon)")
+                .intersection(range(pattern, "weapon"))!)) == "item.Parameters", "x is not T name — из x")
+    let pairLoop = "foreach (var (key, count) in _stock) { }"
+    check(text(units(pairLoop), ValueFlow.foreachCollection(in: units(pairLoop), variable: range(pairLoop, "count"))) == "_stock",
+          "разбор кортежа в foreach — из коллекции")
+    let localFunction = "void Run() { void Add(int id, Item item) { Use(item); } Add(1, first); Add(2, second); }"
+    let lu = units(localFunction)
+    if let parameter = ValueFlow.localFunctionParameter(in: lu, name: range(localFunction, "item)")
+        .intersection(range(localFunction, "item"))!) {
+        check(ValueFlow.string(lu, parameter.function) == "Add" && parameter.index == 1, "параметр локальной функции: имя и номер")
+        let calls = ValueFlow.calls(of: "Add", in: lu, range: NSRange(location: 0, length: lu.count), except: parameter.function.location)
+        check(calls.compactMap { ValueFlow.argument(in: lu, after: $0, index: 1) }.map { ValueFlow.string(lu, $0) } == ["first", "second"],
+              "аргументы вызовов локальной функции")
+    } else {
+        check(false, "параметр локальной функции: имя и номер")
+    }
+    check(ValueFlow.localFunctionParameter(in: lu, name: range(localFunction, "first")) == nil, "аргумент вызова — не параметр")
 
     let tuple = "var (hp, mana) = LoadStats(id);"
     check(text(units(tuple), ValueFlow.deconstruction(in: units(tuple), name: range(tuple, "mana"))) == "LoadStats(id)",
