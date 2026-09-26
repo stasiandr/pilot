@@ -1,0 +1,26 @@
+{
+  "name": "OneState",
+  "description": "Соглашения clm-client и clm-server",
+  "match": {
+    "remotes": ["gitlab.chillgaming.org:clm-project/", "gitlab.chillgaming.org/clm-project/"]
+  },
+  "pair": {
+    "mirrors": ["docs/conventions/", ".claude/skills/"]
+  },
+  "datagrams": {
+    "interface": "INetworkDatagram",
+    "write": ["Write", "Serialize"],
+    "read": ["Read", "Deserialize"],
+    "send": ["Send"],
+    "receive": ["NetworkFilter"]
+  },
+  "configs": {
+    "folder": "Configs",
+    "registry": "meta.json",
+    "folderConfig": "folder.json",
+    "generated": "Generated",
+    "aliases": "ConfigAliases",
+    "modelAttribute": "JsonType",
+    "keyAttribute": "JsonProperty"
+  }
+}

@@ -1,0 +1,9 @@
+# Эталоны графа значения на clm-client и clm-server (лежат рядом в ~/work).
+# Формат: Файл.cs:строка:столбец | цепочка от значения к источникам | …
+# Узлы «сеть» и «условие» в цепочке можно не называть.
+
+# Поле компонента на клиенте — через датаграмму к серверу, где его заполняют.
+/Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedsFeature/Components/States/PedCuff.cs:13:30 | PedCuff.policemanId <- PedCuffSyncSystem.OnUpdate <- PedCuffDatagram.ByPolicemanId <- PedCuffDatagram.ByPolicemanId <- PedCuffReactiveSyncSystem.OnUpdate <- PedCuffComponent.ById <- PoliceInteractionsSystem
+
+# Компонент целиком: где его ставят и снимают.
+/Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedsFeature/Components/States/PedCuff.cs:11:28 | PedCuff <- PedCuffSyncSystem.OnUpdate
