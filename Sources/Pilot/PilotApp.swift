@@ -456,6 +456,8 @@ struct PilotApp: App {
             }
         }
         .commands { pairCommands }
+        // Форк: окна MariaDB в Docker и обозревателя базы (Fork/Database).
+        .commands { DatabaseCommands() }
         // «Вид → Настроить панель инструментов…», как в Finder.
         .commands { ToolbarCommands() }
         // Окно NuGet — своё у каждого проекта: значение сцены — путь корня,
@@ -469,6 +471,7 @@ struct PilotApp: App {
             CommitWindow(rootPath: rootPath)
         }
         .defaultSize(width: 1100, height: 700)
+        DatabaseScenes()
         // ⌘, — настройки: язык, оформление и сочетания клавиш.
         Settings {
             TabView {
