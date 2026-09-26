@@ -4120,7 +4120,7 @@ check(!RustlynProjectKind.isProjectFile("Assets/Pawn.cs") && !RustlynProjectKind
       "исходник и чужой JSON — не проектные файлы")
 
 // Дополнение: виды ложатся на значки LSP, порядок Rustlyn'а сохраняется.
-check(RustlynCompletionKind.allCases.count == 16, "видов дополнения столько же, сколько в библиотеке")
+check(RustlynCompletionKind.allCases.count == 17, "видов дополнения столько же, сколько в библиотеке")
 check(RustlynCompletionKind.method.lspKind == 2 && RustlynCompletionKind.local.lspKind == 6
         && RustlynCompletionKind.keyword.lspKind == 14 && RustlynCompletionKind.enumMember.lspKind == 20,
       "значки дополнения — по видам LSP")
