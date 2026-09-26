@@ -150,10 +150,29 @@ struct ServerLogParser {
 
     private static func isLineBreak(_ c: Character) -> Bool { c == "\n" || c == "\r\n" }
 
+    /// Откуда открытая запись — от этого зависит, что к ней ещё прилипает.
+    private enum OpenKind {
+        /// `[12:34:56 ERR] …` — Serilog текстом: исключение идёт следующими строками.
+        case serilogText
+        /// `fail: Category[0]` — Microsoft.Extensions.Logging: всё с отступом — его.
+        case extensionsLogging
+        /// Строка вывода: станет заголовком исключения, если под ней пойдёт стек.
+        case output
+    }
+    private var openKind: OpenKind = .output
+
     private mutating func consume(_ line: String, into out: inout [ServerLogEntry]) {
-        if var entry = open, Self.continuesException(line, of: entry) {
-            entry.exception = (entry.exception.map { $0 + "\n" } ?? "") + line
-            if let frame = Self.frame(line) { entry.frames.append(frame) }
+        if var entry = open, let part = continuation(line, of: entry) {
+            switch part {
+            case .message:
+                entry.message += "\n" + line.trimmingCharacters(in: .whitespaces)
+            case .exception:
+                entry.exception = (entry.exception.map { $0 + "\n" } ?? "") + line
+                if let frame = Self.frame(line) { entry.frames.append(frame) }
+                // Под строкой вывода пошёл стек — это было исключение:
+                // `Console.WriteLine(e)`, `MySqlException (0x80004005): …`.
+                if entry.level == .output { entry.level = .error }
+            }
             open = entry
             return
         }
@@ -161,45 +180,105 @@ struct ServerLogParser {
         open = nil
         guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return }
 
-        if var entry = Self.parseJSON(line, timeZone: timeZone) ?? Self.parseText(line) {
+        if var entry = Self.parseJSON(line, timeZone: timeZone) {
             entry.id = nextID
             nextID += 1
-            // Текстовое событие ещё может получить стек следующими строками.
-            if entry.exception == nil, !line.hasPrefix("{") { open = entry } else { out.append(entry) }
+            out.append(entry)
             return
         }
-        // `Unhandled exception. System.X: …` от рантайма или `Console.WriteLine(e)`:
-        // стек следующими строками — одним событием с ним.
-        if Self.isExceptionHeader(line) {
-            open = ServerLogEntry(id: nextID, level: line.hasPrefix("Unhandled exception.") ? .fatal : .error, message: line)
+        if var entry = Self.parseText(line) {
+            entry.id = nextID
             nextID += 1
+            open = entry
+            openKind = .serilogText
             return
         }
-        out.append(ServerLogEntry(id: nextID, level: .output, message: line))
-        nextID += 1
-    }
-
-    /// `System.InvalidOperationException: …`, в том числе после `Unhandled exception. `.
-    static func isExceptionHeader(_ line: String) -> Bool {
-        var text = Substring(line)
-        if text.hasPrefix("Unhandled exception. ") { text = text.dropFirst("Unhandled exception. ".count) }
-        guard let colon = text.firstIndex(of: ":") else { return false }
-        let type = text[..<colon]
-        return type.contains(".") && !type.contains(" ") && (type.hasSuffix("Exception") || type.hasSuffix("Error"))
-    }
-
-    /// Строки исключения под текстовым событием: заголовок сразу под ним,
-    /// дальше кадры `at …`, `---> Inner`, `--- End of …`.
-    private static func continuesException(_ line: String, of entry: ServerLogEntry) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("at ") && line.first == " " { return true }
-        if trimmed.hasPrefix("--->") || (trimmed.hasPrefix("--- ") && trimmed.hasSuffix("---")) { return true }
-        // `System.InvalidOperationException: …` — только первой строкой после события.
-        if entry.exception == nil, let colon = trimmed.firstIndex(of: ":") {
-            let type = trimmed[..<colon]
-            return !type.contains(" ") && (type.hasSuffix("Exception") || type.hasSuffix("Error"))
+        if var entry = Self.parseExtensionsLogging(line) {
+            entry.id = nextID
+            nextID += 1
+            open = entry
+            openKind = .extensionsLogging
+            return
         }
-        return false
+        var entry = ServerLogEntry(id: nextID, level: .output, message: line)
+        nextID += 1
+        if Self.isExceptionHeader(line) {
+            // `Unhandled exception. System.X: …` от рантайма, `Console.WriteLine(e)`.
+            entry.level = line.hasPrefix("Unhandled exception.") ? .fatal : .error
+        } else if Self.isStackLine(line) {
+            // Стек без заголовка: хотя бы одним событием, а не строкой на кадр.
+            entry.level = .error
+            entry.message = line.trimmingCharacters(in: .whitespaces)
+            entry.exception = line
+            entry.frames = Self.frame(line).map { [$0] } ?? []
+        }
+        open = entry
+        openKind = .output
+    }
+
+    private enum Part { case message, exception }
+
+    /// Что эта строка для открытой записи: продолжение сообщения, часть
+    /// исключения или ничего — тогда запись закрывается.
+    private func continuation(_ line: String, of entry: ServerLogEntry) -> Part? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        // Кадры и разделители стека ни с чем не спутать — прилипают к любой записи.
+        if Self.isStackLine(line) { return .exception }
+        let hasFrames = !entry.frames.isEmpty
+        switch openKind {
+        case .serilogText:
+            if Self.parseText(line) != nil || line.hasPrefix("{") { return nil }
+            // Заголовок исключения — у предупреждений и ошибок; у Information
+            // это скорее чужой `Console.WriteLine`.
+            if entry.exception == nil {
+                return entry.level <= .warning && Self.isExceptionHeader(trimmed) ? .exception : nil
+            }
+            // Сообщение исключения бывает в несколько строк — до первого кадра.
+            return hasFrames ? nil : .exception
+        case .extensionsLogging:
+            guard line.first == " " || line.first == "\t" else { return nil }
+            if entry.exception != nil || Self.isExceptionHeader(trimmed) { return .exception }
+            return .message
+        case .output:
+            // Под строкой вывода прилипает только стек (выше): что строка без
+            // отступа — продолжение, а не следующий `Console.WriteLine`, не узнать.
+            return nil
+        }
+    }
+
+    /// `   at …`, ` ---> Inner`, `--- End of … ---`, `<---` (`AggregateException`).
+    static func isStackLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("at ") && (line.first == " " || line.first == "\t") { return true }
+        return trimmed.hasPrefix("--->") || trimmed == "<---" || (trimmed.hasPrefix("--- ") && trimmed.hasSuffix("---"))
+    }
+
+    /// Заголовок исключения: `System.InvalidOperationException: …`,
+    /// `MySqlConnector.MySqlException (0x80004005): …`, в том числе после
+    /// `Unhandled exception. `.
+    static func isExceptionHeader(_ line: String) -> Bool {
+        var text = Substring(line.trimmingCharacters(in: .whitespaces))
+        if text.hasPrefix("Unhandled exception. ") { text = text.dropFirst("Unhandled exception. ".count) }
+        if text.hasPrefix("---> ") { text = text.dropFirst(5) }
+        guard let colon = text.range(of: ":") else { return false }
+        var type = text[..<colon.lowerBound]
+        if let code = type.range(of: " (0x"), type.hasSuffix(")") { type = type[..<code.lowerBound] }
+        if let generic = type.firstIndex(of: "`") { type = type[..<generic] }
+        guard let first = type.first, first.isLetter, !type.contains(" ") else { return false }
+        return type.hasSuffix("Exception") || type.hasSuffix("Error")
+    }
+
+    // MARK: - Microsoft.Extensions.Logging: `fail: Category[0]`
+
+    private static let extensionsLevels: [String: ServerLogEntry.Level] = [
+        "trce": .verbose, "dbug": .debug, "info": .info, "warn": .warning, "fail": .error, "crit": .fatal,
+    ]
+
+    static func parseExtensionsLogging(_ line: String) -> ServerLogEntry? {
+        guard line.count > 6, line.dropFirst(4).hasPrefix(": "),
+              let level = extensionsLevels[String(line.prefix(4))] else { return nil }
+        return ServerLogEntry(id: 0, level: level, message: String(line.dropFirst(6)))
     }
 
     // MARK: - Текст: `[12:34:56 INF] Сообщение`

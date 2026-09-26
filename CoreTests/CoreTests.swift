@@ -5724,6 +5724,80 @@ do {
           "Unhandled exception — одно событие со стеком и вложенным исключением")
 }
 
+// ───────────────────────────── Лог сервера: исключения одним событием ─────────────────────────────
+section("Лог сервера: исключения одним событием")
+do {
+    func parse(_ text: String) -> [ServerLogEntry] {
+        var parser = ServerLogParser()
+        var entries: [ServerLogEntry] = []
+        for e in parser.feed(text) + parser.finish() {
+            if entries.last?.id == e.id { entries[entries.count - 1] = e } else { entries.append(e) }
+        }
+        return entries
+    }
+
+    // Console.WriteLine(e) у MySqlConnector: HResult в заголовке, async-кадры.
+    let mysql = parse("""
+    MySqlConnector.MySqlException (0x80004005): Access denied for user 'admin'@'172.17.0.1' (using password: YES)
+       at MySqlConnector.Core.ServerSession.ConnectAsync(ConnectionSettings cs) in /_/src/MySqlConnector/Core/ServerSession.cs:line 523
+       at MySqlConnector.MySqlConnection.OpenAsync(Nullable`1 ioBehavior) in /_/src/MySqlConnector/MySqlConnection.cs:line 405
+    --- End of stack trace from previous location ---
+       at Server.Database.Db.Connect() in /src/Server/Database/Db.cs:line 42
+    Next plain line
+
+    """)
+    check(mysql.count == 2 && mysql[0].level == .error && mysql[0].frames.count == 3 && mysql[0].location?.line == 42
+            && mysql[1].message == "Next plain line",
+          "исключение с (0x80004005) — одно событие, ведёт в свой код (\(mysql.map { "\($0.level):\($0.frames.count)" }))")
+
+    // Заголовок неизвестной формы — стек всё равно прилипает к строке над ним.
+    let odd = parse("Something broke in weapon attack\n   at Server.Weapons.Attack() in /src/W.cs:line 7\n   at Server.Loop.Tick()\n")
+    check(odd.count == 1 && odd[0].level == .error && odd[0].message == "Something broke in weapon attack" && odd[0].frames.count == 2,
+          "строка вывода со стеком под ней — ошибка одним событием")
+
+    // Стек сам по себе — одним событием, а не строкой на кадр.
+    let orphan = parse(#"{"@t":"2026-09-26T20:15:03Z","@m":"Tick"}"# + "\n   at Server.A.B() in /src/A.cs:line 1\n   at Server.C.D()\n")
+    check(orphan.count == 2 && orphan[1].frames.count == 2, "стек без заголовка после JSON-события — одно событие (\(orphan.count))")
+
+    // Serilog текстом: многострочное сообщение исключения, AggregateException.
+    let aggregate = parse("""
+    [12:00:01 ERR] Tick failed
+    System.AggregateException: One or more errors occurred. (bad)
+     ---> System.InvalidOperationException: bad
+    second line of the message
+       at Server.A.B() in /src/A.cs:line 3
+       --- End of inner exception stack trace ---
+       at Server.Loop.Run() in /src/Loop.cs:line 9
+    ---> (Inner Exception #0) System.InvalidOperationException: bad
+       at Server.A.B() in /src/A.cs:line 3<---
+
+    [12:00:02 INF] Next
+    System.Exception: printed by someone else
+
+    """)
+    check(aggregate.map(\.level) == [.error, .info, .error] && aggregate[0].frames.count == 3
+            && aggregate[0].exception?.contains("second line of the message") == true,
+          "AggregateException со всеми частями — одно событие; заголовок под Information — не его (\(aggregate.map(\.level)))")
+
+    // Microsoft.Extensions.Logging.
+    let mel = parse("""
+    fail: Microsoft.AspNetCore.Server.Kestrel[13]
+          Connection id "0HN" failed.
+          System.IO.IOException: broken pipe
+             at Server.Http.Handle() in /src/Http.cs:line 5
+    info: Microsoft.Hosting.Lifetime[0]
+
+    """)
+    check(mel.map(\.level) == [.error, .info] && mel[0].message.hasSuffix("failed.") && mel[0].frames.first?.line == 5,
+          "fail: … с отступом — одно событие с исключением")
+
+    check(ServerLogParser.isExceptionHeader("Npgsql.PostgresException (0x80004005): 42P01: relation missing")
+            && ServerLogParser.isExceptionHeader("Unhandled exception. System.Exception: x")
+            && !ServerLogParser.isExceptionHeader("Startup: Error handling enabled")
+            && !ServerLogParser.isExceptionHeader("Waiting for configs: 3 left"),
+          "заголовки исключений и обычные строки с двоеточием")
+}
+
 // ───────────────────────────── Перевод ─────────────────────────────
 section("Перевод")
 Localization.current = .en
