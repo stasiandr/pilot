@@ -6076,6 +6076,9 @@ do {
     check(chains("state switch { State.Idle => idle, _ => busy }") == ["state", "idle", "busy"],
           "ветки switch — источники, шаблоны — нет")
     check(chains("this.speed * base.Scale") == ["speed", "Scale"], "this. и base. отброшены")
+    check(chains("TryGet(key, out _) ? hit : _ + miss") == ["TryGet()", "key", "hit", "miss"], "_ — не источник")
+    check(chains("new Dictionary<(Rarity rarity, int size), int>(capacity)") == ["Dictionary()", "capacity"],
+          "аргументы дженерика — типы, не источники")
     check(chains("new Health { Value = max, Regen = rate }") == ["Health", "max", "rate"],
           "цели в инициализаторе — не источники")
     check(chains("Spawn(model: m, radius: alive ? r : 0)") == ["Spawn()", "m", "alive", "r"],
@@ -6141,6 +6144,16 @@ do {
         check(false, "параметр локальной функции: имя и номер")
     }
     check(ValueFlow.localFunctionParameter(in: lu, name: range(localFunction, "first")) == nil, "аргумент вызова — не параметр")
+
+    let optional = "void Update(Model m, List<string> variants = null, int n = Max(1, 2)) { }"
+    let ou = units(optional)
+    let update = range(optional, "Update")
+    check(ValueFlow.argument(in: ou, after: update, index: 1).flatMap { ValueFlow.defaultValue(in: ou, parameter: $0) }
+            .map { ValueFlow.string(ou, $0) } == "null", "значение по умолчанию")
+    check(ValueFlow.argument(in: ou, after: update, index: 2).flatMap { ValueFlow.defaultValue(in: ou, parameter: $0) }
+            .map { ValueFlow.string(ou, $0) } == "Max(1, 2)", "умолчание с вызовом")
+    check(ValueFlow.argument(in: ou, after: update, index: 0).flatMap { ValueFlow.defaultValue(in: ou, parameter: $0) } == nil,
+          "без умолчания")
 
     let tuple = "var (hp, mana) = LoadStats(id);"
     check(text(units(tuple), ValueFlow.deconstruction(in: units(tuple), name: range(tuple, "mana"))) == "LoadStats(id)",

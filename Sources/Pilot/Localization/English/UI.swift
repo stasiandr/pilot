@@ -251,6 +251,8 @@ extension English {
         ("из базы данных", "from the database"),
         ("из конфига", "from a config"),
         ("из JSON", "from JSON"),
+        ("из контейнера зависимостей", "from the dependency container"),
+        ("по умолчанию — вызовов без аргумента: %@", "default — calls without the argument: %@"),
         ("из инспектора Unity", "from the Unity Inspector"),
         ("локальная — откуда значение, не понять", "local — where its value comes from is unclear"),
         ("компонент · %@", "component · %@"),

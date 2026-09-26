@@ -140,6 +140,9 @@ enum ValueGraphAnalysis {
             if !own.isDisjoint(with: ["JsonProperty", "JsonPropertyName", "DataMember", "JsonRequired"]) {
                 return L("из JSON")
             }
+            if !own.isDisjoint(with: ["Injectable", "Inject"]) {
+                return L("из контейнера зависимостей")
+            }
             let unityObject = (owner?.bases ?? []).contains { base in
                 ["MonoBehaviour", "ScriptableObject", "NetworkBehaviour"].contains(SymbolIndex.baseKey(base))
             }
@@ -422,17 +425,33 @@ enum ValueGraphAnalysis {
             let offset = model.offset(at: LSPPosition(line: method.line, character: method.character))
             let references = rustlyn.references(method.url, offset: offset, text: texts[method.url])
             var sites: [Site] = []
+            var omitted = 0
             for target in references.targets {
                 if target.url == method.url, target.line == method.line, target.character == method.character { continue }
                 guard let model = self.model(target.url) else { continue }
                 let at = model.offset(at: LSPPosition(line: target.line, character: target.character))
-                guard let expression = ValueFlow.argument(in: model.units, after: NSRange(location: at, length: target.length),
-                                                          index: argument) else { continue }
+                let name = NSRange(location: at, length: target.length)
+                guard let expression = ValueFlow.argument(in: model.units, after: name, index: argument) else {
+                    // Вызов без этого аргумента: значение по умолчанию.
+                    if ValueFlow.parameterList(in: model.units, after: name) != nil { omitted += 1 }
+                    continue
+                }
                 let caller = enclosingMember(target.url, at: at)
                 var site = makeSite(target.url, model: model, at: at, method: caller)
                 site.note = L("вызывает \(method.shortName)")
                 site.sources = resolve(ValueFlow.sources(in: model.units, range: expression), url: target.url,
                                        model: model, method: caller, via: [], depth: 0)
+                sites.append(site)
+            }
+            // `M(int a, List<T> b = null)` — те, кто `b` не передал, получают умолчание.
+            if omitted > 0, let parameter = ValueFlow.argument(in: model.units, after: NSRange(location: offset, length: method.length),
+                                                               index: argument),
+               let value = ValueFlow.defaultValue(in: model.units, parameter: parameter) {
+                let declaration = enclosingMember(method.url, at: offset)
+                var site = makeSite(method.url, model: model, at: value.location, method: declaration)
+                site.note = L("по умолчанию — вызовов без аргумента: \(omitted)")
+                site.sources = resolve(ValueFlow.sources(in: model.units, range: value), url: method.url,
+                                       model: model, method: nil, via: [], depth: 0)
                 sites.append(site)
             }
             return sites

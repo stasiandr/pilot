@@ -200,6 +200,11 @@ enum ValueFlow {
             let call = after < end && (text[after] == openParen || text[after] == lt && looksGeneric(text, from: after, end: end))
             // `this.x` — это `x`.
             if words.count > 1, words[0] == "this" || words[0] == "base" { words.removeFirst() }
+            // `_` — отброшенное значение: `out _`, `_ = …`.
+            if words == ["_"] {
+                i = j
+                continue
+            }
             if let first = words.first, !keywords.contains(first) {
                 var source = Source(range: parts.last!, chain: words.joined(separator: "."), call: call)
                 source.head = parts[parts.count - words.count]
@@ -221,9 +226,24 @@ enum ValueFlow {
                 }
                 result.append(source)
             }
-            i = j
+            // Аргументы дженерика (`new Dictionary<(Rarity rarity, int n), T>()`) — типы, не значения.
+            i = call && after < end && text[after] == lt ? genericEnd(text, from: after, limit: end) : j
         }
         return result
+    }
+
+    /// Позиция сразу за `>`, закрывающей `<` в `start`.
+    private static func genericEnd(_ text: [UInt16], from start: Int, limit: Int) -> Int {
+        var depth = 0
+        var i = start
+        while i < limit {
+            if text[i] == lt { depth += 1 } else if text[i] == gt {
+                depth -= 1
+                if depth == 0 { return i + 1 }
+            }
+            i += 1
+        }
+        return limit
     }
 
     /// `var x = …` / `T x = …` внутри метода до позиции `before`: правая
@@ -699,6 +719,25 @@ enum ValueFlow {
         return argument.length > 0 ? argument : nil
     }
 
+    /// Значение по умолчанию у параметра `int n = 5` (диапазон всего параметра).
+    static func defaultValue(in text: [UInt16], parameter: NSRange) -> NSRange? {
+        var depth = 0
+        var i = parameter.location
+        while i < NSMaxRange(parameter) {
+            let c = text[i]
+            if c == lt || c == openParen || c == openBracket { depth += 1 } else if c == gt || c == closeParen || c == closeBracket {
+                depth -= 1
+            } else if depth == 0, c == eq, i + 1 < text.count, text[i + 1] != eq, text[i + 1] != gt {
+                let start = skipSpace(text, from: i + 1)
+                var end = NSMaxRange(parameter)
+                while end > start, isSpace(text[end - 1]) { end -= 1 }
+                return end > start ? NSRange(location: start, length: end - start) : nil
+            }
+            i += 1
+        }
+        return nil
+    }
+
     /// Выражения `return …;` в теле метода и тело-выражение `=> …;`.
     static func returnedExpressions(in text: [UInt16], method: NSRange) -> [NSRange] {
         var result: [NSRange] = []
@@ -1031,8 +1070,13 @@ enum ValueFlow {
             let c = text[i]
             if c == lt { depth += 1 } else if c == gt {
                 depth -= 1
-                if depth == 0 { return i + 1 < end && text[skipSpace(text, from: i + 1)] == openParen }
-            } else if !(isIdentPart(c) || c == dot || c == comma || isSpace(c)) {
+                if depth == 0 {
+                    let next = skipSpace(text, from: i + 1)
+                    return next < end && text[next] == openParen
+                }
+            } else if !(isIdentPart(c) || c == dot || c == comma || isSpace(c) || c == question
+                        || c == openParen || c == closeParen || c == openBracket || c == closeBracket) {
+                // Кортежи, массивы и `?` в аргументах — тоже типы: `Dictionary<(int a, T b), U[]?>`.
                 return false
             }
             i += 1
