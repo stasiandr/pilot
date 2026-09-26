@@ -98,6 +98,7 @@ extension Workspace {
             rules = .none
             partner = nil
             configCatalogs.warm(root: nil, rules: nil)
+            nuget.suggestedSources = []
             return
         }
         let own = ProjectExtension.discover(in: root)
@@ -125,6 +126,7 @@ extension Workspace {
             if buffer != nil { schedulePairChecks(delay: 0) }
         }
         configCatalogs.warm(root: root, rules: rules.configs)
+        if nuget.suggestedSources != rules.nugetSources { nuget.suggestedSources = rules.nugetSources }
         for problem in problems { NSLog("[extensions] %@", problem) }
     }
 

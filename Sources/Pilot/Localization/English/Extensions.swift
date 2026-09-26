@@ -9,6 +9,7 @@ extension English {
         ("зеркальные папки", "mirrored folders"),
         ("сетевые структуры", "network structures"),
         ("конфиги", "configs"),
+        ("источники NuGet", "NuGet sources"),
         ("ничего не описывает", "describes nothing"),
         ("Откройте проект — здесь появятся его расширения.", "Open a project to see its extensions here."),
         ("%@ — встроено в эту сборку", "%@ — built into this build"),

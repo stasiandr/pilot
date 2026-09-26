@@ -1,4 +1,4 @@
-/// Окно NuGet: пакеты проектов, поиск на nuget.org, установка через dotnet.
+/// Окно NuGet: пакеты проектов, поиск по лентам, установка через dotnet, ленты.
 extension English {
     static let nuget: [(String, String)] = [
         // Числа
@@ -13,6 +13,7 @@ extension English {
         ("Установленные", "Installed"),
         ("Обновления", "Updates"),
         ("Поиск", "Search"),
+        ("Источники", "Sources"),
         ("Установка %@ %@", "Installing %@ %@"),
         ("Установка %@", "Installing %@"),
         ("Удаление %@", "Removing %@"),
@@ -21,18 +22,27 @@ extension English {
         ("Не найден dotnet — установите .NET SDK", "dotnet not found — install the .NET SDK"),
         ("%@: отменено", "%@: cancelled"),
         ("%@: ошибка, код %@", "%@: failed with code %@"),
+        ("Нужно имя", "A name is required"),
+        ("Адрес — https://…/index.json или папка на диске", "The address is https://…/index.json or a folder on disk"),
+        ("Лента «%@» уже есть", "There is already a source named “%@”"),
+
+        // NuGetClient.swift, NuGetSources.swift
+        ("%@: нужен логин и токен", "%@: needs a user name and token"),
+        ("%@: лента не умеет искать", "%@: the source doesn’t support search"),
+        ("NuGet.Config не разобрать как XML", "NuGet.Config isn’t valid XML"),
 
         // NuGetWindow.swift
         ("NuGet — %@", "NuGet — %@"),
         ("Проект этого окна закрыт", "This window’s project is closed"),
-        ("Искать на nuget.org", "Search nuget.org"),
+        ("Искать на %@", "Search %@"),
+        ("Искать в лентах: %@", "Search in %@"),
         ("Фильтр по имени", "Filter by name"),
         ("Предварительные", "Prerelease"),
         ("Показывать и предлагать версии с меткой: -beta, -rc, -preview",
          "Show and suggest labeled versions: -beta, -rc, -preview"),
         ("Перечитать проекты", "Reload Projects"),
         ("Обновить все", "Update All"),
-        ("Не удалось спросить nuget.org", "Couldn’t reach nuget.org"),
+        ("Ленты не ответили", "Package sources didn’t respond"),
         ("Ничего не нашлось", "Nothing found"),
         ("Нет проектов .NET в SDK-стиле", "No SDK-style .NET projects"),
         ("Проекты Unity генерирует редактор — пакеты NuGet в них не ставят",
@@ -59,5 +69,43 @@ extension English {
         ("Сменить на %@", "Change to %@"),
         ("Удалить из %@", "Remove from %@"),
         ("Установить", "Install"),
+
+        // NuGetWindow.swift — ленты
+        ("Перечитать NuGet.Config и проверить ленты", "Reload NuGet.Config and Check Sources"),
+        ("Проекту нужна лента «%@» — её нет в NuGet.Config",
+         "The project needs the “%@” package source — it isn’t in NuGet.Config"),
+        ("Лента «%@» не пускает без логина и токена", "The “%@” package source requires a user name and token"),
+        ("Ввести токен…", "Enter Token…"),
+        ("Подключить…", "Connect…"),
+        ("Нужны проекту", "Needed by the Project"),
+        ("NuGet.Config", "NuGet.Config"),
+        ("Новая лента", "New Source"),
+        ("Выберите ленту", "Select a package source"),
+        ("выключена", "disabled"),
+        ("Лента отвечает", "The source responds"),
+        ("Нужен логин и токен", "Needs a user name and token"),
+        ("Имя", "Name"),
+        ("Адрес", "URL"),
+        ("Логин", "User name"),
+        ("имя пользователя в GitLab", "GitLab user name"),
+        ("или пароль", "or password"),
+        ("Проверить", "Check"),
+        ("Включена", "Enabled"),
+        ("Убрать ленту из NuGet.Config", "Remove the source from NuGet.Config"),
+        ("Лента не приняла логин и токен", "The source didn’t accept the user name and token"),
+        ("Нужна проекту по его расширению", "Needed by the project’s extension"),
+        ("Взять токен Pilot для %@", "Use Pilot’s Token for %@"),
+        ("Токен, который Pilot хранит для ревью мерж-реквестов, и ваш логин в GitLab",
+         "The token Pilot keeps for merge request reviews, and your GitLab user name"),
+        ("Создать токен в GitLab", "Create a Token in GitLab"),
+        ("Права: read_api и read_registry, срок можно не ограничивать",
+         "Scopes: read_api and read_registry; no expiry needed"),
+        ("Лента объявлена в репозитории: логин и токен Pilot запишет не туда, а в ~/.nuget/NuGet/NuGet.Config.",
+         "The source is declared in the repository: Pilot writes the user name and token to ~/.nuget/NuGet/NuGet.Config instead."),
+        ("Логин и токен хранятся в ~/.nuget/NuGet/NuGet.Config открытым текстом — только так их читает dotnet на macOS. Оттуда же их берут restore, Rider и сборка.",
+         "The user name and token are stored in ~/.nuget/NuGet/NuGet.Config as plain text — that’s the only way dotnet reads them on macOS. Restore, Rider and builds read them from there too."),
+        ("Логин и токен взяты из Pilot — нажмите «%@»", "User name and token taken from Pilot — press “%@”"),
+        ("У Pilot нет рабочего токена для этого GitLab — создайте токен и вставьте его сюда",
+         "Pilot has no working token for this GitLab — create one and paste it here"),
     ]
 }

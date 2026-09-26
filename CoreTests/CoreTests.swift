@@ -4831,6 +4831,79 @@ do {
           "версия из Directory.Packages.props, id без учёта регистра")
 }
 
+// ───────────────────────────── NuGet.Config ─────────────────────────────
+section("NuGet.Config")
+do {
+    let user = URL(fileURLWithPath: "/u/NuGet.Config")
+    let repo = URL(fileURLWithPath: "/r/nuget.config")
+    let userXML = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <configuration>
+      <packageSources>
+        <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+        <add key="Old" value="https://old.example.com/index.json" />
+      </packageSources>
+      <packageSourceCredentials>
+        <Company_x0020_Feed>
+          <add key="Username" value="u.user" />
+          <add key="ClearTextPassword" value="secret" />
+        </Company_x0020_Feed>
+      </packageSourceCredentials>
+      <disabledPackageSources>
+        <add key="nuget.org" value="true" />
+      </disabledPackageSources>
+    </configuration>
+    """
+    let repoXML = """
+    <configuration>
+      <packageSources>
+        <clear />
+        <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+        <add key="Company Feed" value="https://git.example.com/api/v4/projects/1/packages/nuget/index.json" />
+      </packageSources>
+      <disabledPackageSources>
+        <add key="nuget.org" value="false" />
+      </disabledPackageSources>
+    </configuration>
+    """
+    let merged = NuGetConfig.merged([(user, Data(userXML.utf8)), (repo, Data(repoXML.utf8))])
+    check(merged.map(\.name) == ["nuget.org", "Company Feed"], "<clear /> в ближнем файле отбрасывает ленты дальнего (\(merged.map(\.name)))")
+    check(merged.last?.username == "u.user" && merged.last?.password == "secret" && merged.last?.configFile == repo,
+          "пароль из пользовательского файла находит ленту из репозитория по имени (_x0020_ — пробел)")
+    check(merged.first?.isEnabled == true && merged.first?.isNuGetOrg == true, "ближний файл снова включает выключенную ленту")
+    check(NuGetConfig.merged([(user, Data(userXML.utf8))]).first?.isEnabled == false, "disabledPackageSources выключает")
+
+    check(NuGetConfig.encodeName("Company Feed") == "Company_x0020_Feed" && NuGetConfig.encodeName("1feed") == "_x0031_feed"
+            && NuGetConfig.decodeName("Company_x0020_Feed") == "Company Feed" && NuGetConfig.decodeName("a_xZZ_b") == "a_xZZ_b",
+          "имена лент в XML: как XmlConvert")
+
+    let added = try? NuGetConfig.upserting(name: "Company Feed", url: "https://git.example.com/index.json",
+                                           credentials: ("u.user", "tok"), in: nil)
+    let reread = added.map { NuGetConfig.merged([(user, $0)]) } ?? []
+    check(reread.count == 1 && reread[0].url == "https://git.example.com/index.json" && reread[0].password == "tok",
+          "новый файл: лента с логином и токеном")
+    let onlyPassword = try? NuGetConfig.upserting(name: "company feed", url: nil, credentials: ("u2", "tok2"), in: Data(userXML.utf8))
+    let both = onlyPassword.map { NuGetConfig.merged([(user, $0), (repo, Data(repoXML.utf8))]) } ?? []
+    check(both.last?.username == "u2" && both.last?.password == "tok2"
+            && onlyPassword.map { NuGetConfig.merged([(user, $0)]).count } == 2,
+          "только пароль: прежний заменён, лент в файле не прибавилось")
+    let removed = try? NuGetConfig.removing(name: "old", from: Data(userXML.utf8))
+    check(removed.map { NuGetConfig.merged([(user, $0)]).map(\.name) } == ["nuget.org"], "удаление без учёта регистра")
+    let enabled = try? NuGetConfig.settingEnabled(true, name: "nuget.org", in: Data(userXML.utf8))
+    check(enabled.map { NuGetConfig.merged([(user, $0)]).first?.isEnabled } == true
+            && enabled.map { String(decoding: $0, as: UTF8.self).contains("disabledPackageSources") } == false,
+          "включить — отметка убрана вместе с пустым разделом")
+    check((try? NuGetConfig.upserting(name: "X", url: "https://x", credentials: nil, in: Data("не xml".utf8))) == nil,
+          "сломанный файл не переписываем")
+
+    let index = #"{"resources": [{"@id": "https://git.example.com/nuget/query", "@type": "SearchQueryService"},"# +
+        #"{"@id": "https://git.example.com/nuget/download", "@type": "PackageBaseAddress/3.0.0"}]}"#
+    let services = NuGetClient.parseServiceIndex(Data(index.utf8))
+    check(services.search?.absoluteString == "https://git.example.com/nuget/query"
+            && services.packages?.absoluteString == "https://git.example.com/nuget/download/",
+          "индекс ленты GitLab: поиск и адрес пакетов со слешем")
+}
+
 // ───────────────────────────── Запуск ─────────────────────────────
 section("Запуск")
 do {
@@ -5477,6 +5550,14 @@ do {
             && matched?.match?.matches(remotes: ["git@github.com:other/x.git"], exists: { $0 == "Game.sln" }) == true
             && matched?.match?.matches(remotes: ["git@github.com:other/x.git"], exists: { _ in false }) == false,
           "match: по адресу remote или по файлу в корне")
+    let feeds = try? ProjectRules.manifest(from: Data(#"{"name": "X", "nuget": {"sources": [{"name": "Company", "url": "https://git.example.com/index.json"}, {"url": "https://other.example.com/v3/index.json"}]}}"#.utf8))
+    check(feeds?.rules.nugetSources == [SuggestedNuGetSource(name: "Company", url: "https://git.example.com/index.json"),
+                                        SuggestedNuGetSource(name: "other.example.com", url: "https://other.example.com/v3/index.json")],
+          "nuget.sources: без имени — по хосту")
+    check((try? ProjectRules.manifest(from: Data(#"{"name": "X", "nuget": {"sources": [{"name": "A"}]}}"#.utf8))) == nil,
+          "лента без адреса — сломанное расширение")
+    let twice = ProjectRules.merged([feeds!.rules, feeds!.rules])
+    check(twice.nugetSources.count == 2, "ленты двух расширений складываются без повторов")
     let empty = try? ProjectRules.manifest(from: Data(#"{"name": "X"}"#.utf8))
     check(empty?.rules.isEmpty == true, "пустое расширение ничего не включает")
 
