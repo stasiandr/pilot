@@ -127,6 +127,12 @@ struct ServerLogView: View {
                 }
                 .contextMenu(forSelectionType: Int.self) { ids in
                     let picked = store.entries.filter { ids.contains($0.id) }
+                    let single = picked.count == 1 ? picked.first : nil
+                    Button(L("Перейти к записи лога")) { single.flatMap(logURL).map { open($0.url, $0.line) } }
+                        .disabled(single.flatMap(logURL) == nil)
+                    Button(L("Перейти к месту ошибки")) { single.flatMap(errorURL).map { open($0.url, $0.line) } }
+                        .disabled(single.flatMap(errorURL) == nil)
+                    Divider()
                     Button(L("Скопировать")) { copy(picked) }
                         .disabled(picked.isEmpty)
                 } primaryAction: { ids in
@@ -163,6 +169,12 @@ struct ServerLogView: View {
                         .font(.system(size: 12, design: .monospaced))
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                    if let site = logURL(entry) {
+                        placeLink(L("Записано"), url: site.url, line: site.line)
+                    }
+                    if let place = errorURL(entry) {
+                        placeLink(L("Место ошибки"), url: place.url, line: place.line)
+                    }
                     if !entry.properties.isEmpty {
                         Divider()
                         Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
@@ -188,7 +200,7 @@ struct ServerLogView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else {
-            Text(L("Выберите сообщение — здесь будут свойства и стек; двойной клик — к месту в коде"))
+            Text(L("Выберите сообщение — здесь будут свойства и стек; двойной клик — к строке, которая его записала, или к месту ошибки"))
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
@@ -255,9 +267,36 @@ struct ServerLogView: View {
         return FileManager.default.fileExists(atPath: url.path) ? url.standardizedFileURL : nil
     }
 
+    /// Двойной клик: у события с исключением — туда, где оно случилось,
+    /// у остальных — к вызову логгера, который его написал.
     private func go(_ entry: ServerLogEntry) {
-        guard let location = entry.location, let url = fileURL(for: location.path) else { return }
-        open(url, location.line)
+        guard let place = errorURL(entry) ?? logURL(entry) else { NSSound.beep(); return }
+        open(place.url, place.line)
+    }
+
+    private func errorURL(_ entry: ServerLogEntry) -> (url: URL, line: Int)? {
+        guard let location = entry.location, let url = fileURL(for: location.path) else { return nil }
+        return (url, location.line)
+    }
+
+    private func logURL(_ entry: ServerLogEntry) -> (url: URL, line: Int)? {
+        guard let site = store.sites.site(for: entry), let url = fileURL(for: site.path) else { return nil }
+        return (url, site.line)
+    }
+
+    /// `Записано  StartUp.cs:62` — ссылкой.
+    private func placeLink(_ label: String, url: URL, line: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(label).foregroundStyle(.secondary)
+            Button { open(url, line) } label: {
+                Text("\(url.lastPathComponent):\(line)")
+                    .foregroundStyle(Color(nsColor: Theme.assetLink))
+            }
+            .buttonStyle(.plain)
+            .help(root.map { url.path.replacingOccurrences(of: $0.path + "/", with: "") } ?? url.path)
+            .onHover { inside in if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+        }
+        .font(.system(size: 11, design: .monospaced))
     }
 
     private func copy(_ entries: [ServerLogEntry]) {

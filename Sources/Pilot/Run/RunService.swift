@@ -47,6 +47,22 @@ final class ServerLogStore: ObservableObject {
     /// очистку и перезапуск той же цели — иначе пока идёт `dotnet build`,
     /// консоль прыгала бы на сырой вывод и обратно.
     @Published private(set) var isStructured = false
+    /// Вызовы логгера в коде проекта — куда ведёт двойной клик по событию.
+    /// Собираются заново при каждом запуске: код между запусками меняется.
+    @Published private(set) var sites = LogSites([])
+    private var sitesGeneration = 0
+
+    func scanSites(root: URL) {
+        sitesGeneration += 1
+        let generation = sitesGeneration
+        Task.detached(priority: .utility) {
+            let found = LogSites.scan(root: root)
+            await MainActor.run { [weak self] in
+                guard let self, self.sitesGeneration == generation else { return }
+                self.sites = found
+            }
+        }
+    }
 
     func add(_ new: [ServerLogEntry]) {
         guard !new.isEmpty else { return }
@@ -181,6 +197,7 @@ final class RunService: ObservableObject {
         current = target
         decoder = ConsoleDecoder()
         logParser = ServerLogParser()
+        serverLog.scanSites(root: root)
         log.clear()
         let directory = target.directory.isEmpty ? root : root.appendingPathComponent(target.directory)
         log.append("▶ \(target.command)\n\n")

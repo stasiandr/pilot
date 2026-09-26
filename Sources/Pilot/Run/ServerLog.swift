@@ -41,6 +41,10 @@ struct ServerLogEntry: Identifiable, Hashable {
     /// Исключение целиком, как его напечатал .NET.
     var exception: String?
     var frames: [ServerLogFrame] = []
+    /// `@i` — хеш шаблона сообщения: по нему находится вызов логгера в коде.
+    var eventID: UInt32?
+    /// `@mt` — сам шаблон, если сервер его пишет.
+    var template: String?
 
     struct Property: Hashable {
         var name: String
@@ -62,9 +66,15 @@ struct ServerLogEntry: Identifiable, Hashable {
         return context.split(separator: ".").last.map(String.init)
     }
 
-    /// Первая строка исключения: `System.InvalidOperationException: …`.
+    /// Заголовок исключения: `System.InvalidOperationException: …`. Если он
+    /// уже есть в тексте сообщения (`Log.Error("Failed: " + e)`) — nil,
+    /// повторять незачем.
     var exceptionTitle: String? {
-        exception.map { String($0.prefix { $0 != "\n" }) }
+        guard let exception else { return nil }
+        let header = exception.split(separator: "\n").lazy.map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.hasPrefix("at ") && !$0.hasPrefix("--- ") }
+        guard let header, !header.isEmpty, !message.contains(header) else { return nil }
+        return header.hasPrefix("---> ") ? String(header.dropFirst(5)) : header
     }
 
     /// Одинаковые события сворачиваются в одно со счётчиком.
@@ -72,7 +82,8 @@ struct ServerLogEntry: Identifiable, Hashable {
         "\(level.rawValue)|\(message)|\(exceptionTitle ?? "")|\(frames.first?.text ?? "")"
     }
 
-    /// Первый кадр из кода проекта — туда ведёт двойной клик.
+    /// Где случилась ошибка: первый кадр из кода проекта. У .NET первыми
+    /// идут кадры самого внутреннего исключения — того, что бросили первым.
     var location: (path: String, line: Int)? {
         let frame = frames.first { !$0.isFramework && $0.path != nil && $0.line != nil }
             ?? frames.first { $0.path != nil && $0.line != nil }
@@ -157,8 +168,24 @@ struct ServerLogParser {
             if entry.exception == nil, !line.hasPrefix("{") { open = entry } else { out.append(entry) }
             return
         }
+        // `Unhandled exception. System.X: …` от рантайма или `Console.WriteLine(e)`:
+        // стек следующими строками — одним событием с ним.
+        if Self.isExceptionHeader(line) {
+            open = ServerLogEntry(id: nextID, level: line.hasPrefix("Unhandled exception.") ? .fatal : .error, message: line)
+            nextID += 1
+            return
+        }
         out.append(ServerLogEntry(id: nextID, level: .output, message: line))
         nextID += 1
+    }
+
+    /// `System.InvalidOperationException: …`, в том числе после `Unhandled exception. `.
+    static func isExceptionHeader(_ line: String) -> Bool {
+        var text = Substring(line)
+        if text.hasPrefix("Unhandled exception. ") { text = text.dropFirst("Unhandled exception. ".count) }
+        guard let colon = text.firstIndex(of: ":") else { return false }
+        let type = text[..<colon]
+        return type.contains(".") && !type.contains(" ") && (type.hasSuffix("Exception") || type.hasSuffix("Error"))
     }
 
     /// Строки исключения под текстовым событием: заголовок сразу под ним,
@@ -166,9 +193,7 @@ struct ServerLogParser {
     private static func continuesException(_ line: String, of entry: ServerLogEntry) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("at ") && line.first == " " { return true }
-        if trimmed.hasPrefix("--->") || (trimmed.hasPrefix("--- ") && trimmed.hasSuffix("---")) {
-            return entry.exception != nil
-        }
+        if trimmed.hasPrefix("--->") || (trimmed.hasPrefix("--- ") && trimmed.hasSuffix("---")) { return true }
         // `System.InvalidOperationException: …` — только первой строкой после события.
         if entry.exception == nil, let colon = trimmed.firstIndex(of: ":") {
             let type = trimmed[..<colon]
@@ -214,7 +239,9 @@ struct ServerLogParser {
         entry.time = (object["@t"] as? String).flatMap { clockTime($0, timeZone: timeZone) }
         entry.properties = raw.keys.sorted().map { .init(name: $0, value: display(raw[$0]!)) }
 
-        if let template = object["@mt"] as? String {
+        entry.eventID = (object["@i"] as? String).flatMap { UInt32($0, radix: 16) }
+        entry.template = object["@mt"] as? String
+        if let template = entry.template {
             (entry.message, entry.values, entry.inMessage) = render(template: template, properties: raw)
         } else if let rendered = object["@m"] as? String {
             (entry.message, entry.values, entry.inMessage) = unquote(rendered: rendered, properties: raw)
@@ -223,8 +250,28 @@ struct ServerLogParser {
         if let exception = object["@x"] as? String, !exception.isEmpty {
             entry.exception = exception.replacingOccurrences(of: "\r\n", with: "\n")
             entry.frames = entry.exception!.split(separator: "\n").compactMap { frame(String($0)) }
+        } else {
+            splitStack(&entry)
         }
         return entry
+    }
+
+    /// Стек прямо в тексте: `Log.Error("Failed: " + e)`, `Log.Error(e.ToString())`,
+    /// `$"… {exception}"`. Сообщение — до первой строки стека, остальное — исключение.
+    static func splitStack(_ entry: inout ServerLogEntry) {
+        let lines = entry.message.components(separatedBy: "\n")
+        guard lines.count > 1, let start = lines.indices.dropFirst().first(where: { i in
+            let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+            return (trimmed.hasPrefix("at ") && lines[i].first == " ") || trimmed.hasPrefix("---> ") || isExceptionHeader(trimmed)
+        }) else { return }
+        let message = lines[..<start].joined(separator: "\n")
+        let stack = lines[start...].joined(separator: "\n")
+        entry.frames = lines[start...].compactMap { frame($0) }
+        guard !entry.frames.isEmpty else { return }
+        entry.message = message
+        entry.exception = stack
+        let length = message.utf16.count
+        entry.values = entry.values.filter { $0.upperBound <= length }
     }
 
     /// `2026-09-26T20:15:03.5312345Z` → `23:15:03.531` в поясе этой машины.

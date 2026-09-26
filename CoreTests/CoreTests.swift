@@ -5662,6 +5662,68 @@ do {
     check(ServerLogParser.parseText("[not a log] line") == nil, "квадратные скобки без времени и уровня — не событие")
 }
 
+// ───────────────────────────── Лог сервера: место в коде ─────────────────────────────
+section("Лог сервера: место в коде")
+do {
+    // Хеш шаблона — как у Serilog (проверено на RenderedCompactJsonFormatter).
+    check(String(LogSites.eventID("Startup: Name: {serverName} (max players: {maxPlayers})"), radix: 16) == "c9bec4"
+            && String(LogSites.eventID("Configs loaded!"), radix: 16) == "70d7035a"
+            && String(LogSites.eventID("Привет {x}"), radix: 16) == "3ed1470b",
+          "@i — Jenkins one-at-a-time по UTF-16")
+
+    let source = """
+    public class Punishment {
+        // Log.Error("commented out {X}");
+        void Run(Exception e) {
+            Log.Information("Startup: Name: {serverName} (max players: {maxPlayers})", name, max);
+            Log.Error(e, "[{SystemName},{MethodName}]: deviceModel can't be null!",
+                nameof(Punishment), nameof(Run));
+            Log.Warning($"[TimeCorrector] retrying in {delay.TotalSeconds:0.0}s: {(ok ? "a" : "b")}");
+            Log.Error(e.ToString());
+            Log.Debug(@"Path ""{Path}"" " + "loaded");
+            var s = "Log.Fatal(\\"inside a string\\")";
+            logger.Verbose<int>("Tick {Tick}", tick);
+        }
+    }
+    """
+    let found = LogSites.sites(in: source, path: "Server/Punishment.cs")
+    check(found.map(\.line) == [4, 5, 7, 9, 11], "вызовы и их строки; комментарий, строка и e.ToString() — не места (\(found.map(\.line)))")
+    check(found.map(\.level) == [.info, .error, .warning, .debug, .verbose], "уровни по имени метода")
+    check(found[1].template == "[{SystemName},{MethodName}]: deviceModel can't be null!" && found[1].call.contains("nameof(Punishment)"),
+          "исключение первым аргументом — шаблон вторым")
+    check(found[2].isInterpolated && found[2].template == "[TimeCorrector] retrying in {}s: {}", "$\"…\": дырки, вложенные строки и формат (\(found[2].template))")
+    check(found[3].template == #"Path "{Path}" loaded"#, "@\"…\" и склейка через + (\(found[3].template))")
+
+    let sites = LogSites(found)
+    let byID = ServerLogParser.parseJSON(#"{"@t":"2026-09-26T20:01:10Z","@m":"Startup: Name: \"a\" (max players: 1)","@i":"00c9bec4","serverName":"a","maxPlayers":1}"#)!
+    check(sites.site(for: byID)?.line == 4, "по @i — точно")
+    let byText = ServerLogParser.parseText("[12:00:00 WRN] [TimeCorrector] retrying in 2.5s: a")!
+    check(sites.site(for: byText)?.line == 7, "без @i — по шаблону, в том числе интерполированному")
+    check(sites.site(for: ServerLogParser.parseText("[12:00:00 INF] Something else entirely")!) == nil, "не подходит ничего — nil")
+    check(LogSites.match(template: "{Message}", message: "anything") == nil, "шаблон без текста подходит ко всему — не считается")
+
+    // Одинаковые шаблоны в двух местах — по значениям свойств в аргументах.
+    let twins = LogSites(LogSites.sites(in: """
+    Log.Error("[{SystemName}] failed", nameof(Inventory));
+    Log.Error("[{SystemName}] failed", nameof(Garage));
+    """, path: "A.cs"))
+    let garage = ServerLogParser.parseJSON(#"{"@t":"2026-09-26T20:01:10Z","@m":"[\"Garage\"] failed","@i":"\#(String(LogSites.eventID("[{SystemName}] failed"), radix: 16))","@l":"Error","SystemName":"Garage"}"#)!
+    check(twins.site(for: garage)?.line == 2, "одинаковые шаблоны различаются по nameof(…) в аргументах")
+
+    // Стек в тексте сообщения — исключение, и туда ведёт «место ошибки».
+    let inline = ServerLogParser.parseJSON(#"{"@t":"2026-09-26T20:01:10Z","@m":"Failed: System.Exception: x\n   at Server.Loader.Load() in /src/Server/Loader.cs:line 13","@i":"cce0be38","@l":"Error"}"#)!
+    check(inline.message == "Failed: System.Exception: x" && inline.location?.line == 13 && inline.exceptionTitle == nil,
+          "Log.Error(\"…\" + e): сообщение — первая строка, стек — исключением, заголовок не повторяется")
+
+    // Падение процесса: одним событием со стеком.
+    var parser = ServerLogParser()
+    var crash = parser.feed("Unhandled exception. System.InvalidOperationException: boom\n ---> System.FormatException: bad\n   at Server.A.B() in /src/A.cs:line 3\nnext line\n")
+    crash += parser.finish()
+    check(crash.first?.level == .fatal && crash.first?.frames.first?.line == 3 && crash.last?.message == "next line"
+            && crash.filter { $0.id == crash.first?.id }.last?.exception?.contains("FormatException") == true,
+          "Unhandled exception — одно событие со стеком и вложенным исключением")
+}
+
 // ───────────────────────────── Перевод ─────────────────────────────
 section("Перевод")
 Localization.current = .en
