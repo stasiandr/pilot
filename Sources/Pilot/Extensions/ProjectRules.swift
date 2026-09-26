@@ -25,7 +25,8 @@ import Foundation
 ///   "datagrams": { "interface": "IPacket", "write": ["Write"], "read": ["Read"],
 ///                  "send": ["Send"], "receive": ["PacketFilter"] },
 ///   "configs": { "folder": "Configs", "registry": "registry.json", "aliases": "ConfigNames",
-///                "modelAttribute": "ConfigModel", "keyAttribute": "JsonProperty" }
+///                "modelAttribute": "ConfigModel", "keyAttribute": "JsonProperty" },
+///   "nuget": { "sources": [ { "name": "Company", "url": "https://git.example.com/api/v4/projects/1/packages/nuget/index.json" } ] }
 /// }
 /// ```
 ///
@@ -34,6 +35,9 @@ struct ProjectRules: Equatable, Sendable {
     var pair = PairRules()
     var datagrams: DatagramRules?
     var configs: ConfigRules?
+    /// Ленты пакетов, без которых проект не восстановить: окно NuGet
+    /// предлагает их подключить.
+    var nugetSources: [SuggestedNuGetSource] = []
 
     static let none = ProjectRules()
 
@@ -52,6 +56,10 @@ struct ProjectRules: Equatable, Sendable {
             }
             result.datagrams = result.datagrams ?? rules.datagrams
             result.configs = result.configs ?? rules.configs
+            for source in rules.nugetSources
+            where !result.nugetSources.contains(where: { $0.url.caseInsensitiveCompare(source.url) == .orderedSame }) {
+                result.nugetSources.append(source)
+            }
         }
         return result
     }
@@ -115,6 +123,13 @@ struct ConfigRules: Equatable, Sendable {
     var keyAttribute = "JsonProperty"
 
     var aliasesFile: String { aliases + ".cs" }
+}
+
+/// Лента NuGet, которую проект ждёт в источниках: имя по умолчанию и адрес
+/// её `index.json`. Логин и токен расширение не приносит — их вводят.
+struct SuggestedNuGetSource: Equatable, Sendable {
+    var name: String
+    var url: String
 }
 
 // MARK: - Разбор extension.json
@@ -188,6 +203,14 @@ extension ProjectRules {
             text("modelAttribute", into: \.modelAttribute)
             text("keyAttribute", into: \.keyAttribute)
             rules.configs = configs
+        }
+
+        if let section = json["nuget"] as? [String: Any] {
+            for item in section["sources"] as? [[String: Any]] ?? [] {
+                guard let url = item["url"] as? String, !url.isEmpty else { throw ManifestError.missing("nuget.sources.url") }
+                let name = (item["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? URL(string: url)?.host ?? url
+                rules.nugetSources.append(SuggestedNuGetSource(name: name, url: url))
+            }
         }
 
         var match: Match?

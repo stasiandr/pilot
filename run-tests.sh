@@ -24,7 +24,7 @@ cp Sources/Pilot/Decompile/{AssemblyMetadata,AssemblySignatures,AssemblySource,A
 cp Sources/Pilot/GitLab/{GitLabRemote,GitLabModels,UnifiedDiff,MergeRequestSearch}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Unity/{UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector,UnityHierarchy,UnityLog}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Archive/ArchiveLayout.swift "$TMP/Sources/coretests/"
-cp Sources/Pilot/Run/RunTargets.swift Sources/Pilot/NuGet/NuGetProjects.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Run/RunTargets.swift Sources/Pilot/NuGet/{NuGetProjects,NuGetSources,NuGetClient}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Configs/ConfigCatalog.swift Sources/Pilot/Update/Release.swift Sources/Pilot/Extensions/ProjectRules.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Debug/{SoftDebuggerWire,DebugModels,Breakpoints,DebugTargets}.swift "$TMP/Sources/coretests/"
 # Перевод: таблицы и проверка, что у каждой строки интерфейса он есть.

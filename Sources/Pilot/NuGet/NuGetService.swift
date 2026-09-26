@@ -15,20 +15,30 @@ struct InstalledPackage: Identifiable, Hashable {
     var isInconsistent: Bool { Set(versions.values.compactMap { $0 }).count > 1 }
 }
 
-/// Окно NuGet: пакеты проектов решения, поиск на nuget.org, установка,
-/// обновление и удаление через `dotnet`. У каждого проекта Pilot свой.
+/// Окно NuGet: пакеты проектов решения, поиск по лентам из NuGet.Config,
+/// установка, обновление и удаление через `dotnet`, сами ленты — с логином
+/// и токеном. У каждого проекта Pilot свой.
 @MainActor
 final class NuGetService: ObservableObject {
     enum Tab: String, CaseIterable, Identifiable {
-        case installed, updates, browse
+        case installed, updates, browse, sources
         var id: String { rawValue }
         var title: String {
             switch self {
             case .installed: return L("Установленные")
             case .updates: return L("Обновления")
             case .browse: return L("Поиск")
+            case .sources: return L("Источники")
             }
         }
+    }
+
+    /// Ответила ли лента с сохранённым логином и паролем.
+    enum SourceStatus: Equatable {
+        case checking
+        case ok
+        case unauthorized
+        case failed(String)
     }
 
     enum OperationState: Equatable {
@@ -57,6 +67,17 @@ final class NuGetService: ObservableObject {
     @Published private(set) var results: [NuGetPackage] = []
     @Published private(set) var isSearching = false
     @Published private(set) var searchError: String?
+    /// Ленты, которые при поиске не ответили, — когда остальные ответили.
+    @Published private(set) var searchFailures: [String] = []
+
+    let client = NuGetClient()
+    /// Ленты из NuGet.Config — те, что видит `dotnet restore` в корне проекта.
+    @Published private(set) var sources: [NuGetSource] = []
+    @Published private(set) var sourceStatus: [String: SourceStatus] = [:]
+    /// Выбранное на вкладке «Источники»: id ленты, `suggested:<адрес>` или `new`.
+    @Published var selectedSource: String?
+    /// Ленты, которые проекту нужны по его расширениям (ProjectRules).
+    @Published var suggestedSources: [SuggestedNuGetSource] = []
 
     /// Сведения с nuget.org о пакетах — по id в нижнем регистре.
     @Published private(set) var details: [String: NuGetPackage] = [:]
@@ -86,6 +107,9 @@ final class NuGetService: ObservableObject {
         projects = []
         results = []
         selectedID = nil
+        sources = []
+        sourceStatus = [:]
+        selectedSource = nil
         isLoaded = false
         scanGeneration += 1
     }
@@ -105,11 +129,15 @@ final class NuGetService: ObservableObject {
         isScanning = true
         Task.detached(priority: .userInitiated) {
             let found = NuGetProjects.discover(root: root)
+            let sources = NuGetConfig.sources(for: root)
             await MainActor.run { [weak self] in
                 guard let self, self.scanGeneration == generation else { return }
                 self.projects = found
                 self.isScanning = false
-                self.checkUpdates()
+                Task {
+                    await self.apply(sources)
+                    self.checkUpdates()
+                }
             }
         }
     }
@@ -150,7 +178,7 @@ final class NuGetService: ObservableObject {
         return source.filter { $0.id.localizedCaseInsensitiveContains(needle) }
     }
 
-    // MARK: - nuget.org
+    // MARK: - Ленты
 
     /// Версии всех установленных пакетов — для вкладки обновлений.
     func checkUpdates() {
@@ -158,9 +186,10 @@ final class NuGetService: ObservableObject {
         guard !ids.isEmpty else { return }
         isCheckingUpdates = true
         Task {
+            let client = self.client
             await withTaskGroup(of: (String, [NuGetVersion]?).self) { group in
                 for id in ids {
-                    group.addTask { (id, try? await NuGetClient.shared.versions(id)) }
+                    group.addTask { (id, await client.versions(id)) }
                 }
                 for await (id, found) in group {
                     if let found { versions[id] = found }
@@ -175,14 +204,14 @@ final class NuGetService: ObservableObject {
         let key = id.lowercased()
         if details[key] == nil {
             Task {
-                if let found = try? await NuGetClient.shared.package(id) {
+                if let found = await client.package(id) {
                     details[key] = found
                 }
             }
         }
         if versions[key] == nil {
             Task {
-                if let found = try? await NuGetClient.shared.versions(id) {
+                if let found = await client.versions(id) {
                     versions[key] = found
                 }
             }
@@ -199,20 +228,175 @@ final class NuGetService: ObservableObject {
         searchTask = Task {
             if debounced { try? await Task.sleep(nanoseconds: 300_000_000) }
             guard !Task.isCancelled else { return }
-            do {
-                let found = try await NuGetClient.shared.search(query, prerelease: prerelease)
-                guard !Task.isCancelled else { return }
-                results = found
-                for package in found { details[package.id.lowercased()] = details[package.id.lowercased()] ?? package }
-                if selectedID == nil || !found.contains(where: { $0.id == selectedID }) {
-                    selectedID = found.first?.id
-                }
-            } catch {
-                guard !Task.isCancelled else { return }
-                searchError = error.localizedDescription
+            let (found, failures) = await client.search(query, prerelease: prerelease)
+            guard !Task.isCancelled else { return }
+            results = found
+            for package in found { details[package.id.lowercased()] = details[package.id.lowercased()] ?? package }
+            if selectedID == nil || !found.contains(where: { $0.id == selectedID }) {
+                selectedID = found.first?.id
             }
+            // Не ответила ни одна — ошибкой на весь список, иначе строкой над ним.
+            searchError = found.isEmpty && !failures.isEmpty ? failures.joined(separator: "\n") : nil
+            searchFailures = found.isEmpty ? [] : failures
             isSearching = false
         }
+    }
+
+    // MARK: - Источники
+
+    /// Ленты поменялись — версии и описания спрашиваем заново: пакет мог
+    /// найтись в новой ленте.
+    private func apply(_ found: [NuGetSource]) async {
+        guard found != sources else { return }
+        let previous = sources
+        sources = found
+        await client.setSources(found)
+        if !previous.isEmpty {
+            versions = [:]
+            details = [:]
+            results = []
+        }
+        // Проверка в силе, только пока лента та же — с тем же логином.
+        sourceStatus = sourceStatus.filter { key, _ in
+            found.first { $0.id == key } == previous.first { $0.id == key }
+        }
+        // Свои ленты проверяем сразу: не пускающая без логина — повод для
+        // плашки. nuget.org отвечает всем.
+        for source in found where source.isEnabled && source.isRemote && !source.isNuGetOrg
+            && sourceStatus[source.id] == nil {
+            check(source)
+        }
+    }
+
+    /// Перечитать NuGet.Config: после своей правки или по кнопке.
+    func reloadSources() {
+        let root = self.root
+        Task {
+            let found = await Task.detached { NuGetConfig.sources(for: root) }.value
+            await apply(found)
+            checkUpdates()
+            if tab == .browse { search() }
+        }
+    }
+
+    /// Нужные проекту ленты, которых нет среди подключённых.
+    var missingSources: [SuggestedNuGetSource] {
+        suggestedSources.filter { suggested in
+            !sources.contains { Self.sameURL($0.url, suggested.url) }
+        }
+    }
+
+    /// Подключённая лента, которой не хватает логина: проект её ждёт, а
+    /// она отвечает 401.
+    var sourcesNeedingLogin: [NuGetSource] {
+        sources.filter { $0.isEnabled && sourceStatus[$0.id] == .unauthorized }
+    }
+
+    static func sameURL(_ a: String, _ b: String) -> Bool {
+        func normalized(_ s: String) -> String {
+            var s = s.trimmingCharacters(in: .whitespaces).lowercased()
+            while s.hasSuffix("/") { s.removeLast() }
+            return s
+        }
+        return normalized(a) == normalized(b)
+    }
+
+    /// Отвечает ли лента: с логином и паролем, какие есть.
+    func check(_ source: NuGetSource) {
+        guard source.isRemote else { return }
+        sourceStatus[source.id] = .checking
+        Task {
+            let feed = NuGetFeed(source: source)
+            let status: SourceStatus
+            do {
+                try await feed.check()
+                status = .ok
+            } catch NuGetFeed.Failure.unauthorized {
+                status = .unauthorized
+            } catch {
+                status = .failed(error.localizedDescription)
+            }
+            // Пока проверяли, ленту могли поменять.
+            if sources.first(where: { $0.id == source.id }) == source { sourceStatus[source.id] = status }
+        }
+    }
+
+    func checkAllSources() {
+        for source in sources where source.isEnabled && source.isRemote { check(source) }
+    }
+
+    /// Лента объявлена в пользовательском NuGet.Config — её можно убрать и
+    /// переименовать. Объявленной в репозитории Pilot меняет только пароль.
+    func isUserSource(_ source: NuGetSource) -> Bool {
+        source.configFile?.standardizedFileURL.path == NuGetConfig.userFile.standardizedFileURL.path
+    }
+
+    enum SourceError: LocalizedError {
+        case emptyName, badURL, duplicate(String)
+        var errorDescription: String? {
+            switch self {
+            case .emptyName: return L("Нужно имя")
+            case .badURL: return L("Адрес — https://…/index.json или папка на диске")
+            case .duplicate(let name): return L("Лента «\(name)» уже есть")
+            }
+        }
+    }
+
+    /// Добавить ленту или сохранить изменения. `original` — какую правим.
+    /// Логин и пароль пишутся в пользовательский NuGet.Config открытым
+    /// текстом: по-другому `dotnet` на macOS их не прочтёт.
+    func saveSource(original: NuGetSource?, name: String, url: String, username: String, password: String) throws {
+        let name = name.trimmingCharacters(in: .whitespaces)
+        let url = url.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { throw SourceError.emptyName }
+        let lower = url.lowercased()
+        guard lower.hasPrefix("https://") || lower.hasPrefix("http://") || url.hasPrefix("/") || url.hasPrefix("~") else {
+            throw SourceError.badURL
+        }
+        if sources.contains(where: { $0.id == name.lowercased() && $0.id != original?.id }) {
+            throw SourceError.duplicate(name)
+        }
+        let file = NuGetConfig.userFile
+        var data = try? Data(contentsOf: file)
+        let credentials = (username: username.trimmingCharacters(in: .whitespaces), password: password)
+        if let original, !isUserSource(original) {
+            // Лента из репозитория: адрес и имя — его, наш только пароль.
+            data = try NuGetConfig.upserting(name: original.name, url: nil, credentials: credentials, in: data)
+        } else {
+            if let original, original.id != name.lowercased(), let current = data {
+                data = try NuGetConfig.removing(name: original.name, from: current)
+            }
+            data = try NuGetConfig.upserting(name: name, url: url, credentials: credentials, in: data)
+        }
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data!.write(to: file, options: .atomic)
+        selectedSource = (original.map { isUserSource($0) } ?? true) ? name.lowercased() : original?.id
+        reloadSources()
+    }
+
+    func removeSource(_ source: NuGetSource) throws {
+        guard isUserSource(source), let data = try? Data(contentsOf: NuGetConfig.userFile) else { return }
+        try NuGetConfig.removing(name: source.name, from: data).write(to: NuGetConfig.userFile, options: .atomic)
+        selectedSource = nil
+        reloadSources()
+    }
+
+    func setEnabled(_ enabled: Bool, source: NuGetSource) throws {
+        let file = NuGetConfig.userFile
+        let data = try NuGetConfig.settingEnabled(enabled, name: source.name, in: try? Data(contentsOf: file))
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: file, options: .atomic)
+        reloadSources()
+    }
+
+    /// Лента в GitLab, а для этого GitLab у Pilot уже есть токен (ревью
+    /// мерж-реквестов): логин и токен для формы. Имя пользователя — у
+    /// самого GitLab.
+    func gitLabCredentials(for url: String) async -> (username: String, token: String)? {
+        guard let host = URL(string: url)?.host, url.contains("/api/v4/"),
+              let token = TokenStore.token(for: host) else { return nil }
+        guard let user = try? await GitLabClient(host: host, token: token).currentUser() else { return nil }
+        return (user.username, token)
     }
 
     // MARK: - dotnet

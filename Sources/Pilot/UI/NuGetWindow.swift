@@ -2,8 +2,9 @@ import SwiftUI
 import AppKit
 
 /// Окно NuGet проекта — как одноимённое окно Rider: слева пакеты
-/// (установленные, с обновлениями или найденные на nuget.org), справа
-/// выбранный пакет: версия и в какие проекты он поставлен.
+/// (установленные, с обновлениями или найденные в лентах), справа
+/// выбранный пакет: версия и в какие проекты он поставлен. Вкладка
+/// «Источники» — ленты из NuGet.Config с логином и токеном.
 ///
 /// Своё окно у каждого проекта: открывается по пути корня, а сервис
 /// берёт у воркспейса окна этого проекта.
@@ -40,11 +41,16 @@ struct NuGetView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            if nuget.tab != .sources { sourcesBanner }
             HSplitView {
-                packageList
-                    .frame(minWidth: 280, idealWidth: 340, maxWidth: 520)
-                detail
-                    .frame(minWidth: 420, maxWidth: .infinity)
+                Group {
+                    if nuget.tab == .sources { sourceList } else { packageList }
+                }
+                .frame(minWidth: 280, idealWidth: 340, maxWidth: 520)
+                Group {
+                    if nuget.tab == .sources { sourceDetail } else { detail }
+                }
+                .frame(minWidth: 420, maxWidth: .infinity)
             }
             if nuget.showsLog {
                 Divider()
@@ -62,7 +68,15 @@ struct NuGetView: View {
         }
         .onChange(of: nuget.tab) { _, tab in
             nuget.selectedID = nil
-            if tab == .browse { nuget.search() } else { nuget.selectedID = nuget.list(for: tab).first?.id }
+            switch tab {
+            case .browse: nuget.search()
+            case .sources:
+                nuget.checkAllSources()
+                if nuget.selectedSource == nil {
+                    nuget.selectedSource = nuget.missingSources.first.map { "suggested:" + $0.url } ?? nuget.sources.first?.id
+                }
+            default: nuget.selectedID = nuget.list(for: tab).first?.id
+            }
         }
         .onChange(of: nuget.filter) { _, _ in
             if nuget.tab == .browse { nuget.search(debounced: true) }
@@ -91,9 +105,29 @@ struct NuGetView: View {
             .labelsHidden()
             .fixedSize()
 
+            if nuget.tab == .sources {
+                Spacer()
+                Button {
+                    nuget.reloadSources()
+                    nuget.checkAllSources()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help(L("Перечитать NuGet.Config и проверить ленты"))
+            } else {
+                filterControls
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var filterControls: some View {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField(nuget.tab == .browse ? L("Искать на nuget.org") : L("Фильтр по имени"), text: $nuget.filter)
+                TextField(nuget.tab == .browse ? searchPrompt : L("Фильтр по имени"), text: $nuget.filter)
                     .textFieldStyle(.plain)
                     .focused($filterFocused)
                     .onSubmit { if nuget.tab == .browse { nuget.search() } }
@@ -119,9 +153,16 @@ struct NuGetView: View {
             }
             .buttonStyle(.borderless)
             .help(L("Перечитать проекты"))
+    }
+
+    private var searchPrompt: String {
+        let names = nuget.sources.filter { $0.isEnabled && $0.isRemote }.map(\.name)
+        if names.count > 1 {
+            let list = names.joined(separator: ", ")
+            return L("Искать в лентах: \(list)")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        let name = names.first ?? "nuget.org"
+        return L("Искать на \(name)")
     }
 
     private func tabTitle(_ tab: NuGetService.Tab) -> String {
@@ -131,6 +172,91 @@ struct NuGetView: View {
             let count = nuget.updates.count
             return count > 0 ? "\(tab.title) \(count)" : tab.title
         case .browse: return tab.title
+        case .sources:
+            let attention = nuget.missingSources.count + nuget.sourcesNeedingLogin.count
+            return attention > 0 ? "\(tab.title) \(attention)" : tab.title
+        }
+    }
+
+    // MARK: - Ленты
+
+    /// Проекту нужна лента, которой нет, или лента не пускает без логина:
+    /// без неё restore упадёт, а пакетов из неё не найти.
+    @ViewBuilder
+    private var sourcesBanner: some View {
+        let missing = nuget.missingSources
+        let locked = nuget.sourcesNeedingLogin
+        if !missing.isEmpty || !locked.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "key.fill")
+                    .foregroundStyle(Color(nsColor: Theme.diagnosticWarning))
+                if let first = missing.first {
+                    Text(L("Проекту нужна лента «\(first.name)» — её нет в NuGet.Config"))
+                } else if let first = locked.first {
+                    Text(L("Лента «\(first.name)» не пускает без логина и токена"))
+                }
+                Spacer()
+                Button(missing.isEmpty ? L("Ввести токен…") : L("Подключить…")) {
+                    nuget.selectedSource = missing.first.map { "suggested:" + $0.url } ?? locked.first?.id
+                    nuget.tab = .sources
+                }
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: Theme.diagnosticWarning).opacity(0.12))
+            Divider()
+        }
+    }
+
+    private var sourceList: some View {
+        VStack(spacing: 0) {
+            List(selection: $nuget.selectedSource) {
+                if !nuget.missingSources.isEmpty {
+                    Section(L("Нужны проекту")) {
+                        ForEach(nuget.missingSources, id: \.url) { suggested in
+                            SuggestedSourceRow(source: suggested)
+                                .tag("suggested:" + suggested.url)
+                        }
+                    }
+                }
+                Section(L("NuGet.Config")) {
+                    ForEach(nuget.sources) { source in
+                        SourceRow(source: source, status: nuget.sourceStatus[source.id])
+                            .tag(source.id)
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+            Divider()
+            HStack {
+                Button {
+                    nuget.selectedSource = "new"
+                } label: {
+                    Label(L("Новая лента"), systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+        }
+    }
+
+    @ViewBuilder
+    private var sourceDetail: some View {
+        let selection = nuget.selectedSource
+        if selection == "new" {
+            SourceDetail(nuget: nuget, source: nil, suggested: nil).id("new")
+        } else if let selection, selection.hasPrefix("suggested:"),
+                  let suggested = nuget.suggestedSources.first(where: { "suggested:" + $0.url == selection }) {
+            SourceDetail(nuget: nuget, source: nil, suggested: suggested).id(selection)
+        } else if let source = nuget.sources.first(where: { $0.id == selection }) {
+            SourceDetail(nuget: nuget, source: source, suggested: nil).id(source)
+        } else {
+            placeholder(icon: "tray.2", L("Выберите ленту"), nil)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -139,6 +265,20 @@ struct NuGetView: View {
     @ViewBuilder
     private var packageList: some View {
         VStack(spacing: 0) {
+            if nuget.tab == .browse, !nuget.searchFailures.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(Color(nsColor: Theme.diagnosticWarning))
+                    Text(nuget.searchFailures.joined(separator: "; "))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer()
+                }
+                .font(.system(size: 11))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                Divider()
+            }
             if nuget.tab == .updates, !nuget.updates.isEmpty {
                 HStack {
                     Text(Localization.count(nuget.updates.count, "обновление", "обновления", "обновлений"))
@@ -176,7 +316,7 @@ struct NuGetView: View {
             if nuget.isSearching && nuget.results.isEmpty {
                 ProgressView().controlSize(.small)
             } else if let error = nuget.searchError {
-                placeholder(icon: "wifi.exclamationmark", L("Не удалось спросить nuget.org"), error)
+                placeholder(icon: "wifi.exclamationmark", L("Ленты не ответили"), error)
             } else if nuget.results.isEmpty {
                 placeholder(icon: "shippingbox", L("Ничего не нашлось"), nil)
             }
@@ -310,6 +450,13 @@ private struct SearchRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(package.id).fontWeight(.medium).lineLimit(1)
+                    if !package.isFromNuGetOrg {
+                        Text(package.source)
+                            .font(.system(size: 10))
+                            .padding(.horizontal, 5)
+                            .background(Capsule().fill(Color(nsColor: Theme.separator)))
+                            .foregroundStyle(.secondary)
+                    }
                     if package.verified {
                         Image(systemName: "checkmark.seal.fill")
                             .font(.system(size: 10))
@@ -376,7 +523,7 @@ private struct PackageDetail: View {
     private var info: NuGetPackage? { nuget.details[key] ?? nuget.results.first { $0.id == id } }
     private var installed: InstalledPackage? { nuget.installed(id) }
 
-    /// Версии для выбора: с nuget.org, без предварительных, если их не просили.
+    /// Версии для выбора: из лент, без предварительных, если их не просили.
     private var available: [NuGetVersion] {
         let all = nuget.versions[key] ?? info?.versions ?? []
         let current = installed?.newestInstalled
@@ -426,8 +573,10 @@ private struct PackageDetail: View {
                     if let url = info?.projectURL {
                         Link(L("Сайт"), destination: url)
                     }
-                    if let url = URL(string: "https://www.nuget.org/packages/\(id)") {
+                    if info?.isFromNuGetOrg ?? true, let url = URL(string: "https://www.nuget.org/packages/\(id)") {
                         Link("nuget.org", destination: url)
+                    } else if let info {
+                        Label(info.source, systemImage: "tray.2")
                     }
                 }
                 .font(.system(size: 11))
@@ -550,5 +699,266 @@ private struct ProjectRow: View {
             }
         }
         .padding(.vertical, 6)
+    }
+}
+
+// MARK: - Источники
+
+private struct SourceRow: View {
+    let source: NuGetSource
+    let status: NuGetService.SourceStatus?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: source.isRemote ? "globe" : "folder")
+                .foregroundStyle(source.isEnabled ? Color(nsColor: Theme.assetLink) : .secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(source.name)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                    .foregroundStyle(source.isEnabled ? .primary : .secondary)
+                Text(source.url)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 4)
+            if !source.isEnabled {
+                Text(L("выключена")).font(.system(size: 11)).foregroundStyle(.tertiary)
+            } else {
+                SourceStatusIcon(status: status)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct SuggestedSourceRow: View {
+    let source: SuggestedNuGetSource
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "plus.circle")
+                .foregroundStyle(Color(nsColor: Theme.diagnosticWarning))
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(source.name).fontWeight(.medium).lineLimit(1)
+                Text(source.url)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct SourceStatusIcon: View {
+    let status: NuGetService.SourceStatus?
+
+    var body: some View {
+        switch status {
+        case .checking:
+            ProgressView().controlSize(.mini)
+        case .ok:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(Color(nsColor: Theme.gitAdded))
+                .help(L("Лента отвечает"))
+        case .unauthorized:
+            Image(systemName: "key.fill")
+                .foregroundStyle(Color(nsColor: Theme.diagnosticWarning))
+                .help(L("Нужен логин и токен"))
+        case .failed(let message):
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(Color(nsColor: Theme.diagnosticError))
+                .help(message)
+        case nil:
+            EmptyView()
+        }
+    }
+}
+
+/// Лента: подключённая (правка логина и токена), предложенная расширением
+/// проекта или новая.
+private struct SourceDetail: View {
+    @ObservedObject var nuget: NuGetService
+    let source: NuGetSource?
+    let suggested: SuggestedNuGetSource?
+
+    @State private var name = ""
+    @State private var url = ""
+    @State private var username = ""
+    @State private var password = ""
+    @State private var error: String?
+    @State private var note: String?
+    @State private var isFilling = false
+    @State private var loaded = false
+
+    /// Имя и адрес объявлены в репозитории — здесь только логин и токен.
+    private var isLocked: Bool { source.map { !nuget.isUserSource($0) } ?? false }
+    private var gitLabHost: String? {
+        guard url.contains("/api/v4/") else { return nil }
+        return URL(string: url)?.host
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                title
+                Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+                    GridRow {
+                        Text(L("Имя")).foregroundStyle(.secondary)
+                        TextField("", text: $name).disabled(isLocked)
+                    }
+                    GridRow {
+                        Text(L("Адрес")).foregroundStyle(.secondary)
+                        TextField("https://…/index.json", text: $url).disabled(isLocked)
+                    }
+                    GridRow {
+                        Text(L("Логин")).foregroundStyle(.secondary)
+                        TextField(gitLabHost != nil ? L("имя пользователя в GitLab") : "", text: $username)
+                    }
+                    GridRow {
+                        Text(L("Токен")).foregroundStyle(.secondary)
+                        SecureField(L("или пароль"), text: $password)
+                    }
+                }
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 560)
+
+                if let host = gitLabHost {
+                    gitLabHelp(host)
+                }
+
+                HStack(spacing: 10) {
+                    Button(source == nil ? L("Подключить") : L("Сохранить")) { save() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                    if let source {
+                        Button(L("Проверить")) { nuget.check(source) }
+                        SourceStatusIcon(status: nuget.sourceStatus[source.id])
+                        Spacer()
+                        Toggle(L("Включена"), isOn: Binding(
+                            get: { source.isEnabled },
+                            set: { enabled in perform { try nuget.setEnabled(enabled, source: source) } }))
+                            .toggleStyle(.checkbox)
+                        if nuget.isUserSource(source) {
+                            Button(role: .destructive) {
+                                perform { try nuget.removeSource(source) }
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .help(L("Убрать ленту из NuGet.Config"))
+                        }
+                    }
+                }
+                if case .failed(let message)? = source.flatMap({ nuget.sourceStatus[$0.id] }) {
+                    Text(message).foregroundStyle(Color(nsColor: Theme.diagnosticError)).font(.system(size: 11))
+                }
+                if case .unauthorized? = source.flatMap({ nuget.sourceStatus[$0.id] }) {
+                    Text(L("Лента не приняла логин и токен"))
+                        .foregroundStyle(Color(nsColor: Theme.diagnosticWarning))
+                        .font(.system(size: 11))
+                }
+                if let error {
+                    Text(error).foregroundStyle(Color(nsColor: Theme.diagnosticError)).font(.system(size: 11))
+                }
+                if let note {
+                    Text(note).foregroundStyle(.secondary).font(.system(size: 11))
+                }
+
+                Divider()
+                Text(footnote)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .onAppear {
+            guard !loaded else { return }
+            loaded = true
+            name = source?.name ?? suggested?.name ?? ""
+            url = source?.url ?? suggested?.url ?? ""
+            username = source?.username ?? ""
+            password = source?.password ?? ""
+        }
+    }
+
+    private var title: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(source?.name ?? suggested?.name ?? L("Новая лента"))
+                .font(.system(size: 17, weight: .semibold))
+            if let file = source?.configFile {
+                Text(file.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } else if suggested != nil {
+                Text(L("Нужна проекту по его расширению"))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func gitLabHelp(_ host: String) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                fillFromPilot()
+            } label: {
+                if isFilling { ProgressView().controlSize(.mini) } else { Text(L("Взять токен Pilot для \(host)")) }
+            }
+            .disabled(isFilling)
+            .help(L("Токен, который Pilot хранит для ревью мерж-реквестов, и ваш логин в GitLab"))
+            if let link = URL(string: "https://\(host)/-/user_settings/personal_access_tokens") {
+                Link(L("Создать токен в GitLab"), destination: link)
+                    .help(L("Права: read_api и read_registry, срок можно не ограничивать"))
+            }
+        }
+        .font(.system(size: 12))
+    }
+
+    private var footnote: String {
+        var lines: [String] = []
+        if isLocked {
+            lines.append(L("Лента объявлена в репозитории: логин и токен Pilot запишет не туда, а в ~/.nuget/NuGet/NuGet.Config."))
+        }
+        lines.append(L("Логин и токен хранятся в ~/.nuget/NuGet/NuGet.Config открытым текстом — только так их читает dotnet на macOS. Оттуда же их берут restore, Rider и сборка."))
+        return lines.joined(separator: "\n")
+    }
+
+    private func fillFromPilot() {
+        isFilling = true
+        error = nil
+        note = nil
+        Task {
+            if let found = await nuget.gitLabCredentials(for: url) {
+                username = found.username
+                password = found.token
+                let action = source == nil ? L("Подключить") : L("Сохранить")
+                note = L("Логин и токен взяты из Pilot — нажмите «\(action)»")
+            } else {
+                error = L("У Pilot нет рабочего токена для этого GitLab — создайте токен и вставьте его сюда")
+            }
+            isFilling = false
+        }
+    }
+
+    private func save() {
+        perform {
+            try nuget.saveSource(original: source, name: name, url: url, username: username, password: password)
+            note = nil
+        }
+    }
+
+    private func perform(_ action: () throws -> Void) {
+        error = nil
+        do { try action() } catch { self.error = error.localizedDescription }
     }
 }

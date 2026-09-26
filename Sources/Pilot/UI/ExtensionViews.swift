@@ -45,6 +45,7 @@ enum ExtensionSummary {
         if !rules.pair.mirrors.isEmpty { parts.append(L("зеркальные папки")) }
         if rules.datagrams != nil { parts.append(L("сетевые структуры")) }
         if rules.configs != nil { parts.append(L("конфиги")) }
+        if !rules.nugetSources.isEmpty { parts.append(L("источники NuGet")) }
         let what = parts.isEmpty ? L("ничего не описывает") : parts.joined(separator: ", ")
         return manifest.description.map { "\($0) — \(what)" } ?? what
     }

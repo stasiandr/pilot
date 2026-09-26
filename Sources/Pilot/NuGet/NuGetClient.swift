@@ -1,6 +1,6 @@
 import Foundation
 
-/// Пакет из поиска nuget.org.
+/// Пакет из поиска по лентам.
 struct NuGetPackage: Identifiable, Hashable {
     var id: String
     var version: String
@@ -12,44 +12,133 @@ struct NuGetPackage: Identifiable, Hashable {
     var iconURL: URL?
     /// Все опубликованные версии, от новой к старой.
     var versions: [NuGetVersion]
+    /// Имя ленты, где нашёлся.
+    var source = "nuget.org"
+    var isFromNuGetOrg = true
 
     var latest: NuGetVersion? { NuGetVersion(version) }
 }
 
-/// Лента nuget.org по протоколу v3: поиск и список версий. Адреса служб
-/// берутся из индекса ленты, как делает сам NuGet, — и на случай, если
-/// индекс не ответит, есть известные.
+/// Ленты проекта по протоколу v3: поиск и список версий по всем включённым
+/// сразу. Свой у каждого окна NuGet: у проектов бывают свои nuget.config.
 actor NuGetClient {
-    static let shared = NuGetClient()
+    private var feeds: [NuGetFeed] = [NuGetFeed(source: NuGetClient.nugetOrg)]
 
-    static let serviceIndex = URL(string: "https://api.nuget.org/v3/index.json")!
+    static let nugetOrg = NuGetSource(name: "nuget.org", url: NuGetFeed.nugetOrgIndex.absoluteString)
+
+    /// Ленты из NuGet.Config. Без единой — nuget.org, как у `dotnet`.
+    func setSources(_ sources: [NuGetSource]) {
+        let wanted = sources.isEmpty ? [Self.nugetOrg] : sources.filter { $0.isEnabled && $0.isRemote }
+        feeds = wanted.map { source in feeds.first { $0.source == source } ?? NuGetFeed(source: source) }
+    }
+
+    /// Найденное во всех лентах: сначала свои, потом nuget.org — свои пакеты
+    /// там и ищут. Пакет из нескольких лент — один, версии складываются.
+    /// `failures` — какие ленты не ответили и почему.
+    func search(_ query: String, prerelease: Bool, take: Int = 40)
+        async -> (packages: [NuGetPackage], failures: [String]) {
+        let ordered = feeds.filter { !$0.source.isNuGetOrg } + feeds.filter { $0.source.isNuGetOrg }
+        var found: [Int: [NuGetPackage]] = [:]
+        var failures: [Int: String] = [:]
+        await withTaskGroup(of: (Int, Result<[NuGetPackage], Error>).self) { group in
+            for (index, feed) in ordered.enumerated() {
+                group.addTask {
+                    do { return (index, .success(try await feed.search(query, prerelease: prerelease, take: take))) }
+                    catch { return (index, .failure(error)) }
+                }
+            }
+            for await (index, result) in group {
+                switch result {
+                case .success(let packages): found[index] = packages
+                case .failure(let error): failures[index] = error.localizedDescription
+                }
+            }
+        }
+        var merged: [NuGetPackage] = []
+        for index in ordered.indices {
+            for package in found[index] ?? [] {
+                if let existing = merged.firstIndex(where: { $0.id.caseInsensitiveCompare(package.id) == .orderedSame }) {
+                    merged[existing].versions = Array(Set(merged[existing].versions + package.versions)).sorted(by: >)
+                } else {
+                    merged.append(package)
+                }
+            }
+        }
+        return (merged, ordered.indices.compactMap { failures[$0] })
+    }
+
+    /// Точно этот пакет — для установленных: описание и версии. Из первой
+    /// ленты, где он есть.
+    func package(_ id: String) async -> NuGetPackage? {
+        let ordered = feeds.filter { !$0.source.isNuGetOrg } + feeds.filter { $0.source.isNuGetOrg }
+        for feed in ordered {
+            if let found = try? await feed.package(id) { return found }
+        }
+        return nil
+    }
+
+    /// Все версии из всех лент, включая предварительные и скрытые из поиска.
+    /// nil — ни одна лента не ответила.
+    func versions(_ id: String) async -> [NuGetVersion]? {
+        let feeds = self.feeds
+        var all: Set<NuGetVersion> = []
+        var answered = false
+        await withTaskGroup(of: [NuGetVersion]?.self) { group in
+            for feed in feeds { group.addTask { try? await feed.versions(id) } }
+            for await found in group {
+                guard let found else { continue }
+                answered = true
+                all.formUnion(found)
+            }
+        }
+        return answered ? all.sorted(by: >) : nil
+    }
+}
+
+/// Одна лента v3. Адреса служб берутся из её `index.json`, как делает сам
+/// NuGet, — у nuget.org на случай, если индекс не ответит, есть известные.
+/// Логин и пароль — Basic-авторизацией, как у `dotnet`.
+actor NuGetFeed {
+    let source: NuGetSource
+
+    static let nugetOrgIndex = URL(string: "https://api.nuget.org/v3/index.json")!
     private static let fallbackSearch = URL(string: "https://azuresearch-usnc.nuget.org/query")!
     private static let fallbackPackages = URL(string: "https://api.nuget.org/v3-flatcontainer/")!
 
     private var searchService: URL?
     private var packageBase: URL?
+    /// Индекс уже прочитан: служб, которых в нём нет, и не будет.
+    private var resolved = false
+
+    init(source: NuGetSource) {
+        self.source = source
+    }
 
     private static let session: URLSession = {
-        let config = URLSessionConfiguration.default
+        let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
         config.httpAdditionalHeaders = ["User-Agent": "Pilot"]
         return URLSession(configuration: config)
     }()
 
     enum Failure: LocalizedError {
-        case status(Int)
+        case unauthorized(String)
+        case status(String, Int)
+        case noSearch(String)
         var errorDescription: String? {
             switch self {
-            case .status(let code): return "nuget.org: HTTP \(code)"
+            case .unauthorized(let name): return L("\(name): нужен логин и токен")
+            case .status(let name, let code): return "\(name): HTTP \(code)"
+            case .noSearch(let name): return L("\(name): лента не умеет искать")
             }
         }
     }
 
     /// `take` — сколько в ответе; `prerelease` — и предварительные версии.
     func search(_ query: String, prerelease: Bool, skip: Int = 0, take: Int = 40) async throws -> [NuGetPackage] {
-        let base = await services().search
+        guard let base = try await services().search else { throw Failure.noSearch(source.name) }
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        components.queryItems = (components.queryItems ?? []) + [
             URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "skip", value: String(skip)),
             URLQueryItem(name: "take", value: String(take)),
@@ -57,46 +146,87 @@ actor NuGetClient {
             URLQueryItem(name: "semVerLevel", value: "2.0.0"),
         ]
         let data = try await fetch(components.url!)
-        return Self.parseSearch(data)
+        return NuGetClient.parseSearch(data, source: source)
     }
 
-    /// Точно этот пакет — для установленных: описание и версии.
+    /// Точно этот пакет. `packageid:` понимает nuget.org; другие ленты ищут
+    /// по тексту — тогда из найденного берём совпадающий по имени.
     func package(_ id: String) async throws -> NuGetPackage? {
-        let found = try await search("packageid:" + id, prerelease: true, take: 1)
-        return found.first { $0.id.caseInsensitiveCompare(id) == .orderedSame }
+        func exact(_ list: [NuGetPackage]) -> NuGetPackage? {
+            list.first { $0.id.caseInsensitiveCompare(id) == .orderedSame }
+        }
+        if let found = exact(try await search("packageid:" + id, prerelease: true, take: 1)) { return found }
+        guard !source.isNuGetOrg else { return nil }
+        return exact(try await search(id, prerelease: true, take: 20))
     }
 
-    /// Все версии, включая предварительные и скрытые из поиска.
+    /// Все версии пакета в ленте; пакета нет — пусто.
     func versions(_ id: String) async throws -> [NuGetVersion] {
-        let base = await services().packages
+        guard let base = try await services().packages else { return [] }
         let url = base.appendingPathComponent(id.lowercased()).appendingPathComponent("index.json")
-        let data = try await fetch(url)
+        let data: Data
+        do {
+            data = try await fetch(url)
+        } catch Failure.status(_, 404) {
+            return []
+        }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let list = object["versions"] as? [String] else { return [] }
         return list.compactMap(NuGetVersion.init).sorted(by: >)
     }
 
+    /// Отвечает ли лента с этими логином и паролем: для проверки в окне.
+    /// Одного индекса мало — GitLab отдаёт его и без логина, а пускать
+    /// не пускает: спрашиваем поиск.
+    func check() async throws {
+        resolved = false
+        let found = try await services(strict: true)
+        if found.search != nil {
+            _ = try await search("", prerelease: false, take: 1)
+        } else if found.packages != nil {
+            _ = try await versions("pilot.source.check")
+        }
+    }
+
     private func fetch(_ url: URL) async throws -> Data {
-        let (data, response) = try await Self.session.data(from: url)
+        var request = URLRequest(url: url)
+        if source.hasCredentials, let username = source.username, let password = source.password {
+            let token = Data("\(username):\(password)".utf8).base64EncodedString()
+            request.setValue("Basic " + token, forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await Self.session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw Failure.status(http.statusCode)
+            if http.statusCode == 401 || http.statusCode == 403 { throw Failure.unauthorized(source.name) }
+            throw Failure.status(source.name, http.statusCode)
         }
         return data
     }
 
-    private func services() async -> (search: URL, packages: URL) {
-        if let searchService, let packageBase { return (searchService, packageBase) }
-        if let data = try? await fetch(Self.serviceIndex) {
-            let found = Self.parseServiceIndex(data)
-            searchService = found.search
-            packageBase = found.packages
+    private func services(strict: Bool = false) async throws -> (search: URL?, packages: URL?) {
+        if !resolved {
+            let index = URL(string: source.url) ?? Self.nugetOrgIndex
+            do {
+                let found = NuGetClient.parseServiceIndex(try await fetch(index))
+                searchService = found.search
+                packageBase = found.packages
+                resolved = true
+            } catch {
+            // Без индекса nuget.org всё равно ответит по известным адресам;
+            // чужая лента — нет, и её ошибку лучше показать.
+                if strict || !source.isNuGetOrg { throw error }
+            }
         }
-        return (searchService ?? Self.fallbackSearch, packageBase ?? Self.fallbackPackages)
+        if source.isNuGetOrg {
+            return (searchService ?? Self.fallbackSearch, packageBase ?? Self.fallbackPackages)
+        }
+        return (searchService, packageBase)
     }
+}
 
+extension NuGetClient {
     // MARK: - Разбор
 
-    static func parseServiceIndex(_ data: Data) -> (search: URL?, packages: URL?) {
+    nonisolated static func parseServiceIndex(_ data: Data) -> (search: URL?, packages: URL?) {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let resources = object["resources"] as? [[String: Any]] else { return (nil, nil) }
         func first(_ prefix: String) -> URL? {
@@ -114,7 +244,7 @@ actor NuGetClient {
         return (first("SearchQueryService"), packages)
     }
 
-    static func parseSearch(_ data: Data) -> [NuGetPackage] {
+    nonisolated static func parseSearch(_ data: Data, source: NuGetSource = NuGetClient.nugetOrg) -> [NuGetPackage] {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let items = object["data"] as? [[String: Any]] else { return [] }
         return items.compactMap { item in
@@ -132,7 +262,9 @@ actor NuGetClient {
                 verified: item["verified"] as? Bool ?? false,
                 projectURL: (item["projectUrl"] as? String).flatMap(URL.init(string:)),
                 iconURL: (item["iconUrl"] as? String).flatMap(URL.init(string:)),
-                versions: versions)
+                versions: versions,
+                source: source.name,
+                isFromNuGetOrg: source.isNuGetOrg)
         }
     }
 }
