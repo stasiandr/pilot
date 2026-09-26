@@ -24,6 +24,8 @@ enum DeepStack {
     private final class Worker: @unchecked Sendable {
         let wake = DispatchSemaphore(value: 0)
         var job: (() -> Void)?
+        /// Сигнал зовущему: задание выполнено и отпущено.
+        var done: DispatchSemaphore?
     }
 
     private static let lock = NSLock()
@@ -35,48 +37,59 @@ enum DeepStack {
         if pthread_get_stacksize_np(pthread_self()) >= size { return body() }
         return withoutActuallyEscaping(body) { body in
             var result: T?
-            let done = DispatchSemaphore(value: 0)
             // Приоритет — зовущего: компиляция с фона не должна спорить с
             // автодополнением, которого ждут с клавиатуры.
             let qos = qos_class_self()
-            dispatch {
+            perform {
                 pthread_set_qos_class_self_np(qos, 0)
                 result = body()
-                done.signal()
             }
-            done.wait()
             return result!
         }
     }
 
-    private static func dispatch(_ job: @escaping () -> Void) {
+    /// Отдать `job` потоку и дождаться, пока тот его выполнит и отпустит.
+    /// Отпустит — важно: `withoutActuallyEscaping` на выходе проверяет, что
+    /// замыкание больше никто не держит, и роняет процесс, если поток ещё
+    /// не выпустил его из рук.
+    private static func perform(_ job: @escaping () -> Void) {
+        let done = DispatchSemaphore(value: 0)
         lock.lock()
         let worker = idle.popLast()
         lock.unlock()
         if let worker {
             worker.job = job
+            worker.done = done
             worker.wake.signal()
-            return
+        } else {
+            let fresh = Worker()
+            fresh.job = job
+            fresh.done = done
+            let thread = Thread { loop(fresh) }
+            thread.name = "pilot.rustlyn"
+            thread.stackSize = size
+            thread.start()
         }
-        let fresh = Worker()
-        fresh.job = job
-        let thread = Thread { loop(fresh) }
-        thread.name = "pilot.rustlyn"
-        thread.stackSize = size
-        thread.start()
+        done.wait()
     }
 
     private static func loop(_ worker: Worker) {
         while true {
-            worker.job?()
-            worker.job = nil
-            lock.lock()
-            guard idle.count < spare else {
-                lock.unlock()
-                return
+            let done = worker.done
+            worker.done = nil
+            do {
+                let job = worker.job
+                worker.job = nil
+                job?()
             }
-            idle.append(worker)
+            // Сперва — в запас, потом сигнал: зовущий может тут же прийти
+            // со следующим вопросом, и этот поток уже будет его ждать.
+            lock.lock()
+            let stays = idle.count < spare
+            if stays { idle.append(worker) }
             lock.unlock()
+            done?.signal()
+            guard stays else { return }
             worker.wake.wait()
         }
     }
