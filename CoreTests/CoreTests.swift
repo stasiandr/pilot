@@ -6063,6 +6063,107 @@ do {
           "hp.Value -= … — не объявление")
 }
 
+section("Граф значения: лямбды, switch и члены выражений")
+do {
+    func sources(_ expr: String) -> [ValueFlow.Source] {
+        let units = Array(expr.utf16)
+        return ValueFlow.sources(in: units, range: NSRange(location: 0, length: units.count))
+    }
+    func chains(_ expr: String) -> [String] { sources(expr).map { $0.chain + ($0.call ? "()" : "") } }
+    check(chains("Load(path, static (s, x) => { if (x) return; s.Done(); }) + bonus") == ["Load()", "path", "bonus"],
+          "параметры и тело лямбды — не источники")
+    check(chains("items.Find(i => i.Alive)") == ["items.Find()"], "лямбда-выражение без скобок")
+    check(chains("state switch { State.Idle => idle, _ => busy }") == ["state", "idle", "busy"],
+          "ветки switch — источники, шаблоны — нет")
+    check(chains("this.speed * base.Scale") == ["speed", "Scale"], "this. и base. отброшены")
+    check(sources("new Vector3(x, 0)").first?.constructs == true, "new T(…) помечен")
+    let member = sources("_hp.Get(e).Value")
+    check(member.map(\.chain) == ["e", "Value"] && member.last?.receiver == "_hp.Get" && member.last?.member == true,
+          "член у результата вызова: вызов — не источник, помнится как получатель")
+    let chain = Array("a.b.c".utf16)
+    check(sources("a.b.c").first?.head.map { ValueFlow.string(chain, $0) } == "a", "голова цепочки")
+}
+
+section("Граф значения: параметры, локальные и свойства")
+do {
+    func units(_ s: String) -> [UInt16] { Array(s.utf16) }
+    func range(_ s: String, _ what: String, from: Int = 0) -> NSRange {
+        (s as NSString).range(of: what, range: NSRange(location: from, length: (s as NSString).length - from))
+    }
+    func text(_ u: [UInt16], _ r: NSRange?) -> String? { r.map { ValueFlow.string(u, $0) } }
+    /// Имя длиной `length` в начале первого `pattern`.
+    func name(_ s: String, _ pattern: String, _ length: Int, from: Int = 0) -> NSRange {
+        NSRange(location: range(s, pattern, from: from).location, length: length)
+    }
+
+    let method = "void Apply<T>(int amount, ref Stats s) where T : struct { }"
+    check(text(units(method), ValueFlow.parameterList(in: units(method), after: range(method, "Apply")))
+            == "int amount, ref Stats s", "список параметров после дженерика")
+    check(ValueFlow.isTypeParameter(in: units(method), name: name(method, "T>", 1)), "T в <T> — параметр типа")
+    check(!ValueFlow.isTypeParameter(in: units(method), name: name(method, "amount", 6)), "параметр — не параметр типа")
+
+    let loop = "foreach (ref var hp in _healths) { }"
+    check(text(units(loop), ValueFlow.foreachCollection(in: units(loop), variable: range(loop, "hp"))) == "_healths",
+          "переменная foreach — из коллекции")
+    check(ValueFlow.foreachCollection(in: units("var hp = x;"), variable: range("var hp = x;", "hp")) == nil,
+          "не foreach")
+
+    let out = "if (_map.TryGetValue(key, out var found)) { }"
+    check(ValueFlow.isOutArgument(in: units(out), name: range(out, "found")), "out var — из вызова")
+    check(ValueFlow.enclosingCall(in: units(out), at: range(out, "found").location)?.chain == "_map.TryGetValue",
+          "вызов вокруг out")
+    check(!ValueFlow.isOutArgument(in: units("Use(key, found)"), name: range("Use(key, found)", "found")), "не out")
+
+    let lambda = "list.ForEach((a, b) => Sum(a, b)); Apply(x => x.Hp);"
+    check(ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "a,", 1)), "(a, b) =>")
+    check(ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "x =>", 1)), "x =>")
+    check(!ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "a, b)", 1, from: 24)), "аргумент — не параметр")
+
+    let tuple = "var (hp, mana) = LoadStats(id);"
+    check(text(units(tuple), ValueFlow.deconstruction(in: units(tuple), name: range(tuple, "mana"))) == "LoadStats(id)",
+          "разбор кортежа — из правой части")
+    check(ValueFlow.deconstruction(in: units("Use(hp, mana);"), name: range("Use(hp, mana);", "mana")) == nil,
+          "аргументы вызова — не разбор")
+
+    let arrow = "public int Max => _base * 2;"
+    check(ValueFlow.getterExpressions(in: units(arrow), property: NSRange(location: 0, length: arrow.utf16.count),
+                                      name: range(arrow, "Max")).map { ValueFlow.string(units(arrow), $0) } == ["_base * 2"],
+          "свойство-выражение")
+    let accessors = "public int Hp { get { if (dead) return 0; return _hp; } set { _hp = value; } }"
+    let whole = NSRange(location: 0, length: accessors.utf16.count)
+    check(ValueFlow.getterExpressions(in: units(accessors), property: whole, name: range(accessors, "Hp"))
+            .map { ValueFlow.string(units(accessors), $0) } == ["0", "_hp"], "return геттера")
+    let setter = ValueFlow.setter(in: units(accessors), property: whole, name: range(accessors, "Hp"))
+    check(setter.map { NSLocationInRange(range(accessors, "value").location, $0) } == true
+            && setter.map { NSLocationInRange(range(accessors, "dead").location, $0) } == false, "сеттер — только set")
+    let auto = "public float Speed { get; private set; } = 5f;"
+    check(text(units(auto), ValueFlow.propertyInitializer(in: units(auto), property: NSRange(location: 0, length: auto.utf16.count),
+                                                         name: range(auto, "Speed"))) == "5f", "начальное значение автосвойства")
+}
+
+section("Граф значения: стэши")
+do {
+    let code = """
+    void OnUpdate() {
+        ref var hp = ref _health.Get(e);
+        hp.Value -= damage;
+        var copy = _health.Get(e);
+        copy.Value = 0;
+        _health.Get(other).Value = max;
+        hp.Regen = 1;
+    }
+    """
+    let units = Array(code.utf16)
+    let body = NSRange(location: 0, length: units.count)
+    let writes = ValueFlow.stashFieldWrites(in: units, stash: "_health", field: "Value") { _ in body }
+    check(writes.map { $0.rhs.map { ValueFlow.string(units, $0) } ?? "" } == ["damage", "max"],
+          "через ref-локальную и прямо в Get(); копия — не запись в компонент")
+    check(writes.first?.compound == true, "-= — составная")
+    let use = (code as NSString).range(of: "hp.Regen").location
+    check(ValueFlow.stashOfLocal(in: units, local: "hp", method: body, before: use) == "_health", "ref-локальная из стэша")
+    check(ValueFlow.stashOfLocal(in: units, local: "copy", method: body, before: use) == nil, "копия — не ref")
+}
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)
