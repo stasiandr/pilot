@@ -4,6 +4,14 @@ import AppKit
 @main
 enum PilotMain {
     static func main() {
+        // `Pilot --value-graph Файл.cs:строка:столбец` — граф значения без
+        // окна: построить, напечатать, выйти (см. HeadlessGraph). Раньше
+        // пересылки: иначе `Файл.cs:строка:столбец` из аргументов ушёл бы
+        // запущенному Pilot, тот открыл бы файл у себя, а скрипт получил бы
+        // пустой вывод и код 0.
+        if HeadlessGraph.isRequested {
+            exit(MainActor.assumeIsolated { HeadlessGraph.run() })
+        }
         if LaunchForwarding.forward(OpenRequest.launch) {
             exit(0)
         }
@@ -36,14 +44,6 @@ struct PilotApp: App {
     @MainActor private static let idle = Workspace()
     private var workspace: Workspace { focused ?? Self.idle }
     private var noProjectWindow: Bool { focused == nil }
-
-    init() {
-        // `Pilot --value-graph Файл.cs:строка:столбец` — граф значения без
-        // окна: построить, напечатать, выйти (см. HeadlessGraph).
-        if HeadlessGraph.isRequested {
-            exit(MainActor.assumeIsolated { HeadlessGraph.run() })
-        }
-    }
 
     /// Пара проектов: например, клиент и сервер одного продукта. Всё, что ходит между ними.
     @CommandsBuilder
