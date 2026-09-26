@@ -230,16 +230,18 @@ final class Rustlyn: @unchecked Sendable {
 
     @discardableResult
     func open(_ url: URL) -> Bool {
-        url.path.withCString { rln_open(handle, $0) == RLN_OK }
+        DeepStack.run { url.path.withCString { rln_open(handle, $0) == RLN_OK } }
     }
 
     /// Открыть буфер, текст которого уже в руках: несохранённый или тот,
     /// что разошёлся с диском.
     @discardableResult
     func open(_ url: URL, text: String) -> Bool {
-        url.path.withCString { path in
-            text.withCString { body in
-                rln_open_text(handle, path, body) == RLN_OK
+        DeepStack.run {
+            url.path.withCString { path in
+                text.withCString { body in
+                    rln_open_text(handle, path, body) == RLN_OK
+                }
             }
         }
     }
@@ -249,9 +251,11 @@ final class Rustlyn: @unchecked Sendable {
     /// каждое нажатие клавиши.
     @discardableResult
     func setText(_ url: URL, _ text: String) -> Bool {
-        url.path.withCString { path in
-            text.withCString { body in
-                rln_set_text(handle, path, body) == RLN_OK
+        DeepStack.run {
+            url.path.withCString { path in
+                text.withCString { body in
+                    rln_set_text(handle, path, body) == RLN_OK
+                }
             }
         }
     }
@@ -302,7 +306,7 @@ final class Rustlyn: @unchecked Sendable {
     /// Структура файла — от парсера, а не от формы строк.
     func outline(_ url: URL) -> RustlynOutline? {
         var raw = RlnOutline()
-        let status = url.path.withCString { rln_outline(handle, $0, &raw) }
+        let status = DeepStack.run { url.path.withCString { rln_outline(handle, $0, &raw) } }
         guard status == RLN_OK else { return nil }
         defer { rln_outline_free(raw) }
         return RustlynOutline(raw)
@@ -328,9 +332,9 @@ final class Rustlyn: @unchecked Sendable {
         let paths: [UnsafeMutablePointer<CChar>?] = urls.map { strdup($0.path) }
         defer { paths.forEach { free($0) } }
         var pointers: [UnsafePointer<CChar>?] = paths.map { $0.map { UnsafePointer($0) } }
-        let status = pointers.withUnsafeMutableBufferPointer { buffer in
+        let status = DeepStack.run { pointers.withUnsafeMutableBufferPointer { buffer in
             rln_reindex(handle, buffer.baseAddress, buffer.count, &report)
-        }
+        } }
         guard status == RLN_OK else { return IndexReport() }
         return IndexReport(files: report.files, reused: report.reused,
                            parsed: report.parsed, unreadable: report.unreadable)
@@ -344,20 +348,20 @@ final class Rustlyn: @unchecked Sendable {
     /// объявлений; после — компилятор, и индекс — там, где тот не знает.
     func definition(_ url: URL, offset: Int, text: String? = nil) -> RustlynDefinition {
         var raw = RlnLocations()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_definition_in(handle, path, body, UInt32(max(0, offset)), &raw)
             }
-        }
+        } }
         return finish(status, raw)
     }
 
     /// Кто наследует или переопределяет то, что в позиции `offset`.
     func implementations(_ url: URL, offset: Int) -> RustlynDefinition {
         var raw = RlnLocations()
-        let status = url.path.withCString {
+        let status = DeepStack.run { url.path.withCString {
             rln_implementations(handle, $0, UInt32(max(0, offset)), &raw)
-        }
+        } }
         return finish(status, raw)
     }
 
@@ -384,9 +388,9 @@ final class Rustlyn: @unchecked Sendable {
         let paths: [UnsafeMutablePointer<CChar>?] = urls.map { strdup($0.path) }
         defer { paths.forEach { free($0) } }
         var pointers: [UnsafePointer<CChar>?] = paths.map { $0.map { UnsafePointer($0) } }
-        let status = pointers.withUnsafeMutableBufferPointer { buffer in
+        let status = DeepStack.run { pointers.withUnsafeMutableBufferPointer { buffer in
             rln_compile(handle, buffer.baseAddress, buffer.count, &raw)
-        }
+        } }
         guard status == RLN_OK else { return nil }
         return RustlynCompiled(files: raw.files, references: raw.references,
                                projects: raw.projects, milliseconds: Int(raw.milliseconds),
@@ -399,7 +403,7 @@ final class Rustlyn: @unchecked Sendable {
     /// это десятки мегабайт и доли секунды.
     @discardableResult
     func saveCompilation() -> Bool {
-        rln_save_compilation(handle) == RLN_OK
+        DeepStack.run { rln_save_compilation(handle) == RLN_OK }
     }
 
     /// Прочитать компиляцию, которую записал прошлый запуск: компилятор
@@ -409,7 +413,7 @@ final class Rustlyn: @unchecked Sendable {
     /// библиотеки.
     func loadCompilation() -> RustlynCompiled? {
         var raw = RlnCompiled()
-        guard rln_load_compilation(handle, &raw) == RLN_OK else { return nil }
+        guard DeepStack.run({ rln_load_compilation(handle, &raw) }) == RLN_OK else { return nil }
         return RustlynCompiled(files: raw.files, references: raw.references,
                                projects: raw.projects, milliseconds: Int(raw.milliseconds),
                                kind: RustlynProjectKind(rawValue: raw.kind) ?? .folder,
@@ -420,11 +424,11 @@ final class Rustlyn: @unchecked Sendable {
     /// объявлениями. `text` — как у `definition`.
     func references(_ url: URL, offset: Int, text: String? = nil) -> RustlynDefinition {
         var raw = RlnLocations()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_references(handle, path, body, UInt32(max(0, offset)), &raw)
             }
-        }
+        } }
         return finish(status, raw)
     }
 
@@ -433,11 +437,11 @@ final class Rustlyn: @unchecked Sendable {
     /// дополнение спрашивают, пока набирают.
     func completions(_ url: URL, offset: Int, text: String?) -> RustlynCompletions? {
         var raw = RlnCompletions()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_completions(handle, path, body, UInt32(max(0, offset)), &raw)
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_completions_free(raw) }
         let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
@@ -455,11 +459,11 @@ final class Rustlyn: @unchecked Sendable {
     /// Имя в позиции `offset` одной строкой: `int Count`, `void Add(T item)`.
     func describe(_ url: URL, offset: Int, text: String? = nil) -> String? {
         var out = RlnString()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_describe(handle, path, body, UInt32(max(0, offset)), &out)
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_text_free(out) }
         guard let bytes = out.bytes else { return nil }
@@ -471,9 +475,9 @@ final class Rustlyn: @unchecked Sendable {
     /// фона, после паузы в наборе.
     func diagnostics(_ url: URL, text: String?) -> RustlynDiagnostics? {
         var raw = RlnDiagnostics()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in rln_diagnostics(handle, path, body, &raw) }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_diagnostics_free(raw) }
         let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
@@ -497,12 +501,12 @@ final class Rustlyn: @unchecked Sendable {
     /// фона. `nil` — проект ещё не скомпилирован.
     func inlayHints(_ url: URL, text: String?, range: NSRange) -> [RustlynInlayHint]? {
         var raw = RlnInlayHints()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_inlay_hints(handle, path, body, UInt32(max(0, range.location)),
                                 UInt32(max(0, NSMaxRange(range))), rln_inlay_default_options(), &raw)
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_inlay_hints_free(raw) }
         let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
@@ -520,9 +524,9 @@ final class Rustlyn: @unchecked Sendable {
     /// в файле. Один проход поиска на все, но по всему проекту — из фона.
     func codeLens(_ url: URL, text: String?) -> [RustlynLens]? {
         var raw = RlnLenses()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in rln_code_lens(handle, path, body, &raw) }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_lenses_free(raw) }
         guard let items = raw.items else { return [] }
@@ -535,11 +539,11 @@ final class Rustlyn: @unchecked Sendable {
     /// вызова или проект ещё не скомпилирован.
     func signatures(_ url: URL, offset: Int, text: String?) -> RustlynSignatures? {
         var raw = RlnSignatures()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_signatures(handle, path, body, UInt32(max(0, offset)), &raw)
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_signatures_free(raw) }
         let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
@@ -560,11 +564,11 @@ final class Rustlyn: @unchecked Sendable {
     /// Документация имени в `offset`: его `///` или XML рядом со сборкой.
     func documentation(_ url: URL, offset: Int, text: String?) -> RustlynDocumentation? {
         var raw = RlnDocumentation()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_documentation(handle, path, body, UInt32(max(0, offset)), &raw)
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_documentation_free(raw) }
         let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
@@ -584,11 +588,11 @@ final class Rustlyn: @unchecked Sendable {
     /// ещё не скомпилирован или библиотека отказала.
     func prepareRename(_ url: URL, offset: Int, text: String?) -> RustlynRenameInfo? {
         var raw = RlnRenameInfo()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_prepare_rename(handle, path, body, UInt32(max(0, offset)), &raw)
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_rename_info_free(raw) }
         let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
@@ -607,13 +611,13 @@ final class Rustlyn: @unchecked Sendable {
     func rename(_ url: URL, offset: Int, to newName: String, text: String?,
                 options: RustlynRenameOptions) -> RustlynRenameResult? {
         var raw = RlnRenameResult()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 newName.withCString { name in
                     rln_rename(handle, path, body, UInt32(max(0, offset)), name, options.rawValue, &raw)
                 }
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_rename_result_free(raw) }
         let blob = UnsafeBufferPointer(start: raw.edits.strings, count: raw.edits.strings_length)
@@ -648,12 +652,12 @@ final class Rustlyn: @unchecked Sendable {
     /// синтаксис: работает и до компиляции.
     func selectionRanges(_ url: URL, selection: NSRange, text: String?) -> [NSRange]? {
         var raw = RlnRanges()
-        let status = url.path.withCString { path in
+        let status = DeepStack.run { url.path.withCString { path in
             Self.withOptionalCString(text) { body in
                 rln_selection_ranges(handle, path, body, UInt32(max(0, selection.location)),
                                      UInt32(max(0, NSMaxRange(selection))), &raw)
             }
-        }
+        } }
         guard status == RLN_OK else { return nil }
         defer { rln_ranges_free(raw) }
         guard let items = raw.items else { return [] }
@@ -675,7 +679,7 @@ final class Rustlyn: @unchecked Sendable {
     /// нет — их отдаёт `methodBody(_:token:)`, по одному и по запросу.
     func assemblyText(_ url: URL) -> String? {
         var text = RlnString()
-        let status = url.path.withCString { rln_assembly_text(handle, $0, &text) }
+        let status = DeepStack.run { url.path.withCString { rln_assembly_text(handle, $0, &text) } }
         guard status == RLN_OK else { return nil }
         defer { rln_text_free(text) }
         guard let bytes = text.bytes else { return nil }
@@ -696,7 +700,7 @@ final class Rustlyn: @unchecked Sendable {
     /// дизассемблер лучше уверенной выдумки.
     func methodBody(_ url: URL, token: UInt32) -> String? {
         var text = RlnString()
-        let status = url.path.withCString { rln_method_body(handle, $0, token, &text) }
+        let status = DeepStack.run { url.path.withCString { rln_method_body(handle, $0, token, &text) } }
         guard status == RLN_OK else { return nil }
         defer { rln_text_free(text) }
         guard let bytes = text.bytes else { return nil }
