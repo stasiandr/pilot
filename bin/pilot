@@ -1,0 +1,57 @@
+#!/bin/bash
+# pilot — открыть Pilot из терминала.
+#
+#   pilot                     Pilot с последним проектом
+#   pilot .                   папку как проект
+#   pilot src/File.cs         файл; корень — ближайший git-репозиторий
+#   pilot src/File.cs:12:5    файл на строке 12, в столбце 5
+#   pilot ~/code/proj File.cs проект и файл в нём
+#
+# Если Pilot уже открыт, всё откроется в его окне.
+set -euo pipefail
+
+# В PATH лежит ссылка на этот файл; Pilot.app — рядом с ним в репозитории.
+repo="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)"
+app="$repo/Pilot.app"
+
+absolute() {
+    if [[ -d "$1" ]]; then
+        (cd "$1" && pwd -P)
+    else
+        printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd -P)" "$(basename "$1")"
+    fi
+}
+
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        -h | --help) sed -n '2,9p' "$repo/bin/pilot" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    esac
+    path="$arg"
+    suffix=""
+    # `File.cs:12:5`: строку и столбец отрезаем, если пути с ними на диске нет.
+    for _ in 1 2; do
+        [[ -e "$path" ]] && break
+        [[ "$path" =~ ^(.+)(:[0-9]+)$ ]] || break
+        path="${BASH_REMATCH[1]}"
+        suffix="${BASH_REMATCH[2]}$suffix"
+    done
+    if [[ ! -e "$path" ]]; then
+        echo "pilot: нет такого файла или папки: $arg" >&2
+        exit 1
+    fi
+    args+=("$(absolute "$path")$suffix")
+done
+
+if [[ ! -d "$app" ]]; then
+    echo "pilot: нет $app — сначала собери: $repo/build.sh" >&2
+    exit 1
+fi
+
+if (( ${#args[@]} == 0 )); then
+    open "$app"
+else
+    # Как Unity: новый процесс отдаёт пути уже открытому Pilot и выходит
+    # (LaunchForwarding), а если Pilot не запущен — сам становится окном.
+    open -n "$app" --args "${args[@]}"
+fi

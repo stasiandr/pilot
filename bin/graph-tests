@@ -1,0 +1,34 @@
+#!/bin/bash
+# Эталонные цепочки графа значения. Строка —
+#   Файл.cs:строка:столбец | Значение <- Код <- Источник | ещё цепочка…
+# Случаи, файлов которых на этой машине нет, пропускаются. Эталоны проекта
+# удобно держать рядом с его расширением: .pilot/extensions/<имя>/graph-tests.txt.
+#
+#   bin/graph-tests                        GraphTests/*.txt
+#   bin/graph-tests путь/graph-tests.txt…  эти файлы
+#   bin/graph-tests -v …                   с деревом каждого графа
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VERBOSE=0; [[ "${1:-}" == "-v" ]] && { VERBOSE=1; shift; }
+FILES=("$@")
+if [[ ${#FILES[@]} == 0 ]]; then
+    shopt -s nullglob
+    FILES=("$ROOT"/GraphTests/*.txt)
+fi
+passed=0; failed=0; skipped=0
+while IFS= read -r line; do
+    [[ -z "${line// }" || "$line" == \#* ]] && continue
+    IFS='|' read -ra parts <<< "$line"
+    target="$(echo "${parts[0]}" | xargs)"
+    file="${target%:*:*}"
+    if [[ ! -f "$file" ]]; then skipped=$((skipped + 1)); continue; fi
+    args=()
+    for expect in "${parts[@]:1}"; do args+=(--expect "$(echo "$expect" | xargs)"); done
+    output="$("$ROOT/bin/pilot-graph" "$target" "${args[@]}" 2>/dev/null)"; code=$?
+    echo "── $(basename "$file"):${target#"$file":}"
+    if [[ $VERBOSE == 1 ]]; then echo "$output"; else echo "$output" | grep -E '^(✓|✗) '; fi
+    if [[ $code == 0 ]]; then passed=$((passed + 1)); else failed=$((failed + 1)); fi
+done < <(cat /dev/null "${FILES[@]}")
+echo
+echo "графов: прошло $passed, упало $failed, пропущено $skipped"
+[[ $failed == 0 ]]

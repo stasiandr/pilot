@@ -1,0 +1,23 @@
+#!/bin/bash
+# Граф значения без окна — тот же движок, что у ⌥⌘G:
+#
+#   bin/pilot-graph Файл.cs:строка:столбец [--depth 6] [--limit 60] [--json] [--lang en]
+#                   [--expect "Значение <- Код <- Источник"]…
+#
+# Печатает граф деревом от значения к источникам (← данные, ⇠ сеть,
+# ? условие). `--expect` — цепочка названий узлов (подстроки); код выхода 1,
+# если какой-то нет. Проект и его пара должны хоть раз открываться в Pilot:
+# компиляция и индекс берутся из кэша.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$ROOT/Pilot.app/Contents/MacOS/Pilot"
+DEBUG="$(cd "$ROOT" && swift build -c debug --show-bin-path 2>/dev/null)/Pilot"
+# Свежее из двух: debug-сборка обычно новее бандла.
+if [[ -x "$DEBUG" && ( ! -x "$BIN" || "$DEBUG" -nt "$BIN" ) ]]; then BIN="$DEBUG"; fi
+if [[ ! -x "$BIN" ]]; then
+    echo "Pilot не собран: ./build.sh debug" >&2
+    exit 2
+fi
+TARGET="$1"; shift
+# Строки NSLog (с датой) — шум для терминала; сообщения самого графа идут как "pilot: …".
+exec "$BIN" --value-graph "$TARGET" "$@" 2> >(grep -v '^[0-9]\{4\}-' >&2)

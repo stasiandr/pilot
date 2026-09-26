@@ -1,0 +1,403 @@
+import Foundation
+
+enum LSPState: Equatable {
+    case stopped
+    case starting(String)      // текст для статус-строки
+    case ready
+    case failed(String)
+}
+
+/// Клиент одного языкового сервера: процесс, кадрирование, сопоставление
+/// запросов и ответов.
+///
+/// Весь класс построен вокруг одного требования: **ни один вызов не должен
+/// блокировать интерфейс**. Всё асинхронно, у всего есть таймаут, а падение
+/// сервера переводит клиент в .failed, но никак не задевает просмотр файлов.
+final class LSPClient: @unchecked Sendable {
+
+    let config: ServerConfig
+    let root: URL
+
+    private var process: Process?
+    /// Куда писать: stdin процесса сервера.
+    private var output: FileHandle?
+    private var framer = MessageFramer()
+
+    private let lock = NSLock()
+    private var connected = false
+    private var nextID = 1
+    private var pending: [Int: CheckedContinuation<Any, Error>] = [:]
+    private var openDocuments: Set<String> = []
+    /// Версия каждого открытого документа: растёт с каждой правкой.
+    private var versions: [String: Int] = [:]
+    private var stderrTail: [String] = []
+
+    private let writeQueue = DispatchQueue(label: "pilot.lsp.write")
+
+    // NSLock нельзя держать через await: между lock и unlock задача может
+    // переехать на другой поток. Поэтому любой доступ к общему состоянию
+    // завёрнут в синхронный метод.
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock(); defer { lock.unlock() }
+        return body()
+    }
+
+    private func allocateRequestID() -> Int {
+        withLock { let id = nextID; nextID += 1; return id }
+    }
+
+    private func storePending(_ id: Int, _ continuation: CheckedContinuation<Any, Error>) {
+        withLock { pending[id] = continuation }
+    }
+
+    /// Снимает запрос с ошибкой. Продолжение забирается из `pending` под
+    /// замком, поэтому ответ, таймаут и отмена не могут возобновить его дважды:
+    /// кто первый забрал, тот и закрыл. false — запрос уже закрыт.
+    @discardableResult
+    private func failPending(_ id: Int, _ error: Error) -> Bool {
+        guard let continuation = withLock({ pending.removeValue(forKey: id) }) else { return false }
+        continuation.resume(throwing: error)
+        return true
+    }
+
+    private func failAllPending(_ error: Error) {
+        let waiting = withLock { () -> [Int: CheckedContinuation<Any, Error>] in
+            let all = pending
+            pending.removeAll()
+            return all
+        }
+        for (_, continuation) in waiting { continuation.resume(throwing: error) }
+    }
+
+    var isConnected: Bool { withLock { connected } }
+    private func setConnected(_ value: Bool) { withLock { connected = value } }
+
+    /// Сообщения о прогрессе от сервера ($/progress, window/logMessage).
+    var onStatus: (@Sendable (String) -> Void)?
+    /// Сервер умер сам по себе.
+    var onExit: (@Sendable (String) -> Void)?
+    /// Любое уведомление от сервера — для своих, нестандартных (Copilot
+    /// шлёт состояние входа в `didChangeStatus`).
+    var onNotification: (@Sendable (String, Any?) -> Void)?
+
+    private(set) var capabilities = ServerCapabilities()
+
+    init(config: ServerConfig, root: URL) {
+        self.config = config
+        self.root = root
+    }
+
+    // MARK: - Жизненный цикл
+
+    func start() throws {
+        guard let executable = config.resolvedExecutable() else {
+            throw RPCError.malformed(L("не найден исполняемый файл \(config.command[0])"))
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = Array(config.command.dropFirst())
+        proc.currentDirectoryURL = root
+
+        var env = ProcessInfo.processInfo.environment
+        env.merge(config.environment) { _, new in new }
+        proc.environment = env
+
+        let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+        proc.standardInput = inPipe
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.consume(data)
+        }
+        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            self?.recordStderr(text)
+        }
+        proc.terminationHandler = { [weak self] p in
+            self?.handleTermination(status: p.terminationStatus)
+        }
+
+        try proc.run()
+        self.process = proc
+        self.output = inPipe.fileHandleForWriting
+        setConnected(true)
+    }
+
+    func stop() {
+        // Корректное завершение: shutdown -> exit. Если сервер не отвечает,
+        // всё равно убиваем процесс — висящий сервер держит память.
+        notify("exit", [:])
+        writeQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.process?.terminate()
+        }
+        failAllPending(RPCError.cancelled)
+    }
+
+    private func handleTermination(status: Int32) {
+        setConnected(false)
+        let tail = withLock { stderrTail.suffix(5).joined(separator: "\n") }
+        failAllPending(RPCError.notRunning)
+        if status != 0 {
+            onExit?(tail.isEmpty ? L("сервер завершился с кодом \(status)") : tail)
+        }
+    }
+
+    private func recordStderr(_ text: String) {
+        lock.lock()
+        stderrTail.append(contentsOf: text.split(separator: "\n").map(String.init))
+        if stderrTail.count > 40 { stderrTail.removeFirst(stderrTail.count - 40) }
+        lock.unlock()
+    }
+
+    // MARK: - Инициализация
+
+    func initialize() async throws {
+        var params: [String: Any] = [
+            "processId": Int(ProcessInfo.processInfo.processIdentifier),
+            "clientInfo": ["name": "Pilot", "version": "0.2.0"],
+            "rootUri": root.absoluteString,
+            "rootPath": root.path,
+            "workspaceFolders": [["uri": root.absoluteString, "name": root.lastPathComponent]],
+            "capabilities": [
+                // Явно фиксируем UTF-16: в этой системе координат уже
+                // работает SyntaxModel, поэтому пересчёт смещений не нужен.
+                "general": ["positionEncodings": ["utf-16"]],
+                "textDocument": [
+                    "synchronization": ["dynamicRegistration": false, "didSave": true],
+                    // Сниппеты раскрываем сами (Snippet.expand): так сервер
+                    // присылает заглушки параметров, а не голое имя метода.
+                    "completion": [
+                        "dynamicRegistration": false,
+                        "contextSupport": true,
+                        "completionItem": [
+                            "snippetSupport": true,
+                            "insertReplaceSupport": true,
+                            "labelDetailsSupport": true,
+                            "documentationFormat": ["plaintext"],
+                        ],
+                        "completionList": ["itemDefaults": ["editRange", "insertTextFormat", "data"]],
+                    ],
+                    "definition": ["linkSupport": true],
+                    "hover": ["contentFormat": ["markdown", "plaintext"]],
+                    "references": ["dynamicRegistration": false],
+                    "documentSymbol": ["hierarchicalDocumentSymbolSupport": false],
+                ],
+                "workspace": [
+                    "workspaceFolders": true,
+                    "configuration": true,
+                    "symbol": ["dynamicRegistration": false],
+                ],
+                "window": ["workDoneProgress": true],
+            ],
+        ]
+        if let options = config.initializationOptions {
+            params["initializationOptions"] = options
+        }
+
+        let result = try await request("initialize", params, timeout: 120)
+        capabilities = ServerCapabilities.parse(result)
+        notify("initialized", [:])
+    }
+
+    // MARK: - Синхронизация документов
+
+    func didOpen(url: URL, languageId: String, text: String) {
+        let uri = url.absoluteString
+        lock.lock()
+        let alreadyOpen = openDocuments.contains(uri)
+        if !alreadyOpen { openDocuments.insert(uri); versions[uri] = 1 }
+        lock.unlock()
+        guard !alreadyOpen else { return }
+
+        notify("textDocument/didOpen", [
+            "textDocument": [
+                "uri": uri,
+                "languageId": languageId,
+                "version": 1,
+                "text": text,
+            ]
+        ])
+    }
+
+    /// Правки документа. Без `range` — полный текст (TextDocumentSyncKind.Full).
+    /// Документ, которого сервер ещё не видел, пропускаем: при открытии он
+    /// всё равно получит текст целиком.
+    func didChange(url: URL, changes: [[String: Any]]) {
+        let uri = url.absoluteString
+        lock.lock()
+        let isOpen = openDocuments.contains(uri)
+        let version = (versions[uri] ?? 1) + 1
+        if isOpen { versions[uri] = version }
+        lock.unlock()
+        guard isOpen else { return }
+        notify("textDocument/didChange", [
+            "textDocument": ["uri": uri, "version": version],
+            "contentChanges": changes,
+        ])
+    }
+
+    func isOpen(_ url: URL) -> Bool {
+        withLock { openDocuments.contains(url.absoluteString) }
+    }
+
+    /// Версия открытого документа — та, что ушла серверу последней.
+    func version(of url: URL) -> Int? {
+        withLock { versions[url.absoluteString] }
+    }
+
+    func didSave(url: URL) {
+        guard isOpen(url) else { return }
+        notify("textDocument/didSave", ["textDocument": ["uri": url.absoluteString]])
+    }
+
+    func didClose(url: URL) {
+        let uri = url.absoluteString
+        lock.lock()
+        let wasOpen = openDocuments.remove(uri) != nil
+        versions[uri] = nil
+        lock.unlock()
+        guard wasOpen else { return }
+        notify("textDocument/didClose", ["textDocument": ["uri": uri]])
+    }
+
+    // MARK: - Запросы
+
+    func request(_ method: String, _ params: [String: Any], timeout: TimeInterval = 8) async throws -> Any {
+        guard isConnected else { throw RPCError.notRunning }
+
+        let id = allocateRequestID()
+        let body: [String: Any] = [
+            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+        ]
+
+        // Таймаут и отмена обязаны именно возобновить продолжение с ошибкой.
+        // Просто выкинуть его из `pending` нельзя: тот, кто ждёт ответа,
+        // так и остался бы висеть навсегда.
+        let timer = Task { [weak self] in
+            try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            // Ждать мы перестали — пусть и сервер бросит работу.
+            if self?.failPending(id, RPCError.timeout(method: method)) == true {
+                self?.notify("$/cancelRequest", ["id": id])
+            }
+        }
+        defer { timer.cancel() }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: RPCError.cancelled)
+                    return
+                }
+                self.storePending(id, continuation)
+                self.send(body)
+            }
+        } onCancel: {
+            // Ответ больше никому не нужен — пусть и сервер бросит работу.
+            self.failPending(id, RPCError.cancelled)
+            self.notify("$/cancelRequest", ["id": id])
+        }
+    }
+
+    func notify(_ method: String, _ params: [String: Any]) {
+        send(["jsonrpc": "2.0", "method": method, "params": params])
+    }
+
+    private func send(_ body: [String: Any]) {
+        guard let data = try? JSON.encode(body) else { return }
+        let framed = MessageFramer.frame(data)
+        writeQueue.async { [weak self] in
+            guard let handle = self?.output else { return }
+            // Сервер мог умереть между проверкой и записью — write бросит
+            // SIGPIPE-исключение, которое здесь не должно ронять приложение.
+            do { try handle.write(contentsOf: framed) } catch { }
+        }
+    }
+
+    // MARK: - Приём
+
+    private func consume(_ data: Data) {
+        let messages = framer.feed(data)
+        for body in messages {
+            guard let message = JSON.object(from: body) else { continue }
+            route(message)
+        }
+    }
+
+    private func route(_ message: [String: Any]) {
+        let id = message["id"] as? Int
+        let method = message["method"] as? String
+
+        // Запрос ОТ сервера. На него обязательно нужно ответить: сервер,
+        // спросивший workspace/configuration, без ответа не завершает
+        // инициализацию.
+        if let id, let method {
+            respondToServerRequest(id: id, method: method, params: message["params"])
+            return
+        }
+        // Уведомление от сервера.
+        if let method {
+            handleNotification(method, message["params"])
+            return
+        }
+        // Ответ на наш запрос.
+        guard let id else { return }
+        lock.lock()
+        let continuation = pending.removeValue(forKey: id)
+        lock.unlock()
+        guard let continuation else { return }
+
+        if let error = message["error"] as? [String: Any] {
+            continuation.resume(throwing: RPCError.serverError(
+                code: error["code"] as? Int ?? -1,
+                message: error["message"] as? String ?? L("неизвестная ошибка")))
+        } else {
+            continuation.resume(returning: message["result"] ?? NSNull())
+        }
+    }
+
+    private func respondToServerRequest(id: Int, method: String, params: Any?) {
+        let result: Any
+        switch method {
+        case "workspace/configuration":
+            result = config.configurationResponse(params)
+        case "client/registerCapability", "client/unregisterCapability",
+             "window/workDoneProgress/create":
+            result = NSNull()
+        case "workspace/workspaceFolders":
+            result = [["uri": root.absoluteString, "name": root.lastPathComponent]]
+        default:
+            result = NSNull()
+        }
+        send(["jsonrpc": "2.0", "id": id, "result": result])
+    }
+
+    private func handleNotification(_ method: String, _ params: Any?) {
+        onNotification?(method, params)
+        switch method {
+        case "$/progress":
+            // Единственный честный источник прогресса для статус-строки:
+            // сервер сам говорит, что индексирует.
+            guard let dict = params as? [String: Any],
+                  let value = dict["value"] as? [String: Any] else { return }
+            let title = value["title"] as? String
+            let message = value["message"] as? String
+            if let text = message ?? title, !text.isEmpty { onStatus?(text) }
+
+        case "window/logMessage", "window/showMessage":
+            guard let dict = params as? [String: Any],
+                  let type = dict["type"] as? Int,
+                  let text = dict["message"] as? String else { return }
+            if type <= 2 {                                        // Error/Warning
+                recordStderr(text)
+            }
+
+        default:
+            break
+        }
+    }
+}

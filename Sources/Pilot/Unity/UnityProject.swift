@@ -1,0 +1,312 @@
+import Foundation
+
+/// GUID ассета Unity — 32 шестнадцатеричных символа из его `.meta`.
+///
+/// Хранится двумя словами, а не строкой: словарь на десятки тысяч ассетов
+/// не держит по строке на ключ, а сравнение — две инструкции.
+struct UnityGUID: Hashable, Sendable, CustomStringConvertible {
+    let hi: UInt64
+    let lo: UInt64
+
+    init(hi: UInt64, lo: UInt64) {
+        self.hi = hi
+        self.lo = lo
+    }
+
+    init?(_ string: String) {
+        let units = Array(string.utf16)
+        guard units.count == 32, let guid = UnityGUID.parse(units, at: 0) else { return nil }
+        self = guid
+    }
+
+    /// Ровно 32 hex-символа начиная с `start`, и следом не hex-символ:
+    /// иначе это кусок чего-то длиннее, а не GUID.
+    static func parse<C: RandomAccessCollection>(_ c: C, at start: Int) -> UnityGUID?
+    where C.Element: FixedWidthInteger, C.Index == Int {
+        guard start >= c.startIndex, start + 32 <= c.endIndex else { return nil }
+        if start + 32 < c.endIndex, hexValue(UInt32(truncatingIfNeeded: c[start + 32])) != nil { return nil }
+        var hi: UInt64 = 0, lo: UInt64 = 0
+        for k in 0..<32 {
+            guard let v = hexValue(UInt32(truncatingIfNeeded: c[start + k])) else { return nil }
+            if k < 16 { hi = (hi << 4) | UInt64(v) } else { lo = (lo << 4) | UInt64(v) }
+        }
+        return UnityGUID(hi: hi, lo: lo)
+    }
+
+    @inline(__always)
+    static func hexValue(_ c: UInt32) -> UInt8? {
+        switch c {
+        case 0x30...0x39: return UInt8(c - 0x30)
+        case 0x61...0x66: return UInt8(c - 0x61 + 10)
+        case 0x41...0x46: return UInt8(c - 0x41 + 10)
+        default: return nil
+        }
+    }
+
+    var description: String { String(format: "%016llx%016llx", hi, lo) }
+
+    /// ASCII-байты GUID в нижнем регистре — так Unity пишет их в файлы.
+    var asciiBytes: [UInt8] { Array(description.utf8) }
+
+    /// Встроенные ресурсы Unity (`0000000000000000e000000000000000` и
+    /// родственники) и пустая ссылка. В проекте их нет и быть не должно,
+    /// поэтому битыми ссылками они не считаются.
+    var isBuiltin: Bool { hi == 0 }
+}
+
+/// Что известно про Unity-проект без самого Unity.
+struct UnityProjectInfo: Sendable, Equatable {
+    let root: URL
+    /// `6000.3.14f1` — из `ProjectSettings/ProjectVersion.txt`.
+    let editorVersion: String?
+    /// Где Unity-проект внутри открытой папки: `""` — это она сама,
+    /// `"Game"` — если открыт репозиторий, а проект лежит в `Game/`.
+    var workspacePrefix: String = ""
+
+    /// Символы препроцессора, под которыми Unity компилирует скрипты.
+    ///
+    /// Без них половина `#if` в проекте читается как невзятая ветка, и код
+    /// внутри неё не попадает ни в подсветку, ни в структуру, ни в индекс —
+    /// то есть `⌘B` на `UNITY_EDITOR`-only методе никуда не ведёт.
+    ///
+    /// Набор Unity куда больше: у неё есть символы под платформу, под
+    /// бэкенд скриптов, под каждый установленный пакет. Здесь ровно те,
+    /// которые она ставит всегда и которые видно из самого проекта, —
+    /// угадывать остальные хуже, чем не ставить: лишний живой `#if` покажет
+    /// код, которого в сборке не будет.
+    ///
+    /// `UNITY_6000_3_OR_NEWER` и все версии ниже: Unity определяет их
+    /// лесенкой, поэтому `#if UNITY_2021_3_OR_NEWER` в проекте на 6000.3
+    /// истинно. Версии берутся из списка `majors` — годами до 2023-й, а
+    /// дальше 6000: диапазоном тут не обойтись.
+    var preprocessorSymbols: [String] {
+        // `DEBUG` и `TRACE` Unity ставит в Debug-конфигурации, а
+        // `UNITY_EDITOR` — во всём, что компилируется для редактора, то есть
+        // в том, что мы и читаем.
+        var symbols = ["UNITY_EDITOR", "UNITY_EDITOR_64", "DEBUG", "TRACE",
+                       "UNITY_64", "UNITY_ASSERTIONS", "ENABLE_MONO",
+                       "CSHARP_7_3_OR_NEWER", "NET_STANDARD_2_1", "NET_STANDARD"]
+        guard let editorVersion else { return symbols }
+
+        // `6000.3.14f1` — берём первые два числа.
+        let parts = editorVersion.split(separator: ".")
+        guard let major = parts.first.flatMap({ Int($0) }),
+              let minor = parts.count > 1 ? Int(parts[1]) : nil else { return symbols }
+        symbols.append("UNITY_\(major)")
+        symbols.append("UNITY_\(major)_\(minor)")
+
+        // Лесенка «или новее»: истинно всё, что не выше текущей версии.
+        //
+        // Перечнем, а не диапазоном: Unity нумеровалась годами до 2023-й, а
+        // потом прыгнула на 6000, и `2017...6000` породило бы четыре тысячи
+        // версий, которых не было. Лишний живой символ — это показанный код,
+        // которого в сборке нет, то есть ровно та ошибка, которой мы
+        // избегаем; поэтому список закрытый, и новую мажорную версию в него
+        // дописывают руками.
+        for release in Self.majors where release <= major {
+            for minorRelease in 1...4 {
+                if release == major && minorRelease > minor { break }
+                symbols.append("UNITY_\(release)_\(minorRelease)_OR_NEWER")
+            }
+            symbols.append("UNITY_\(release)_OR_NEWER")
+        }
+        return symbols
+    }
+
+    /// Мажорные версии Unity, по которым строится лесенка `_OR_NEWER`.
+    private static let majors = [2017, 2018, 2019, 2020, 2021, 2022, 2023, 6000]
+
+    /// Unity-проект в корне воркспейса или в одной из его папок первого
+    /// уровня — так обычно и выглядит репозиторий игры. Если проектов
+    /// несколько, какой из них главный — не угадать, и Unity-режим не включается.
+    static func find(inWorkspace root: URL) -> UnityProjectInfo? {
+        if let project = detect(root: root) { return project }
+        guard let children = try? FileManager.default.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+        else { return nil }
+        let found = children.compactMap { child -> UnityProjectInfo? in
+            guard (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                  var project = detect(root: child) else { return nil }
+            project.workspacePrefix = child.lastPathComponent
+            return project
+        }
+        return found.count == 1 ? found[0] : nil
+    }
+
+    /// Unity-проект — это `Assets/` плюс `ProjectSettings/ProjectVersion.txt`.
+    /// Один только `Assets/` бывает где угодно.
+    static func detect(root: URL) -> UnityProjectInfo? {
+        let fm = FileManager.default
+        let versionFile = root.appendingPathComponent("ProjectSettings/ProjectVersion.txt")
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: versionFile.path),
+              fm.fileExists(atPath: root.appendingPathComponent("Assets").path, isDirectory: &isDir),
+              isDir.boolValue else { return nil }
+        let text = (try? String(contentsOf: versionFile, encoding: .utf8)) ?? ""
+        return UnityProjectInfo(root: root, editorVersion: parseEditorVersion(text))
+    }
+
+    static func parseEditorVersion(_ text: String) -> String? {
+        for line in text.split(whereSeparator: \.isNewline) where line.hasPrefix("m_EditorVersion:") {
+            let value = line.dropFirst("m_EditorVersion:".count).trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    /// Папки в корне, которые Unity генерирует сам. Обычно их прячет
+    /// `.gitignore`, но без него одна `Library/` — это сотни тысяч файлов.
+    static let generatedRootFolders: Set<String> = [
+        "Library", "Temp", "Logs", "obj", "UserSettings", "MemoryCaptures", "Recordings",
+    ]
+
+    /// Что не попадает в индекс воркспейса с Unity-проектом.
+    /// `relPath` — от корня воркспейса.
+    ///
+    /// `.meta` — служебные спутники каждого ассета: в поиске и в дереве это
+    /// половина всех файлов и чистый шум. Их содержимое нужно только ради
+    /// GUID, а для этого есть свой индекс (`UnityAssetIndex`).
+    func excludedFromIndex(relPath: String, isDirectory: Bool) -> Bool {
+        guard isDirectory else { return relPath.hasSuffix(".meta") }
+        guard let local = projectPath(fromWorkspace: relPath) else { return false }
+        return !local.contains("/") && Self.generatedRootFolders.contains(local)
+    }
+
+    /// Путь от корня воркспейса → путь от корня Unity-проекта.
+    /// `nil` — файл лежит вне проекта.
+    func projectPath(fromWorkspace relPath: String) -> String? {
+        if workspacePrefix.isEmpty { return relPath }
+        guard relPath.hasPrefix(workspacePrefix + "/") else { return nil }
+        return String(relPath.dropFirst(workspacePrefix.count + 1))
+    }
+
+    // MARK: - Что лежит рядом с проектом
+
+    /// Папка `Contents` установленного редактора — в ней лежат сборки
+    /// движка. Сначала спрашиваем сам Unity: запускаясь, он пишет путь в
+    /// `Library/EditorInstance.json`. Если проект ни разу не открывали —
+    /// обычное место установки Hub по версии из `ProjectVersion.txt`.
+    var editorContents: URL? {
+        let fm = FileManager.default
+        if let data = try? Data(contentsOf: root.appendingPathComponent("Library/EditorInstance.json")),
+           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            let contents = (json["app_contents_path"] as? String)
+                ?? (json["app_path"] as? String).map { $0 + "/Contents" }
+            if let contents, fm.fileExists(atPath: contents) { return URL(fileURLWithPath: contents) }
+        }
+        guard let version = editorVersion else { return nil }
+        let candidates = [
+            "/Applications/Unity/Hub/Editor/\(version)/Unity.app/Contents",
+            NSHomeDirectory() + "/Applications/Unity/Hub/Editor/\(version)/Unity.app/Contents",
+            "/Applications/Unity/Unity.app/Contents",
+        ]
+        return candidates.first { fm.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Сборки движка и редактора: `UnityEngine.CoreModule`, `UnityEditor` и
+    /// прочие модули. Исходников к ним нет ни у кого, так что читают их
+    /// всегда декомпилированными.
+    var engineAssemblies: [URL] {
+        guard let contents = editorContents, let managed = Self.managed(in: contents) else { return [] }
+        return Self.assemblies(in: managed.appendingPathComponent("UnityEngine"))
+            + Self.assemblies(in: managed)
+    }
+
+    /// Папка со сборками движка внутри `Contents`. Unity 6 перенёс её из
+    /// `Contents/Managed` в `Contents/Resources/Scripting/Managed`; у
+    /// редактора есть одна из двух.
+    static func managed(in contents: URL) -> URL? {
+        ["Managed", "Resources/Scripting/Managed"]
+            .map { contents.appendingPathComponent($0) }
+            .first { url in
+                var isDir: ObjCBool = false
+                return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+            }
+    }
+
+    private static func assemblies(in directory: URL) -> [URL] {
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        return entries.filter { $0.pathExtension.lowercased() == "dll" }.sorted { $0.path < $1.path }
+    }
+
+    /// `Library/PackageCache/com.unity.foo@1a2b3c/Runtime/X.cs` → `com.unity.foo/Runtime/X.cs`.
+    /// Хэш версии в пути только мешает читать.
+    static func prettyPath(_ relPath: String) -> String {
+        let prefix = "Library/PackageCache/"
+        guard relPath.hasPrefix(prefix) else { return relPath }
+        let rest = relPath.dropFirst(prefix.count)
+        guard let slash = rest.firstIndex(of: "/") else { return String(rest) }
+        var package = rest[..<slash]
+        if let at = package.firstIndex(of: "@") { package = package[..<at] }
+        return String(package) + String(rest[slash...])
+    }
+}
+
+/// Что нужно знать о проекте при разборе открытого файла. Снимок:
+/// индекс ассетов может дособраться позже — тогда файл разбирается заново.
+struct UnityContext: Sendable {
+    let project: UnityProjectInfo
+    let assets: UnityAssetIndex?
+
+    func assetName(_ guid: UnityGUID) -> String? { assets?.displayName(for: guid) }
+}
+
+/// Unity-смысл открытого файла.
+enum UnitySemantics {
+
+    struct Result {
+        var outline: [OutlineItem]
+        /// Разобранный сериализованный файл — для переходов по ссылкам.
+        var serialized: UnityYAMLFile?
+        /// Иерархия сцены или префаба — ветка под файлом в дереве проекта.
+        var hierarchy: UnityHierarchy? = nil
+    }
+
+    static func isSerializedAsset(_ spec: LanguageSpec?) -> Bool {
+        spec?.name == Languages.unityYAML.name
+    }
+
+    /// `nil` — Unity здесь ни при чём, структура остаётся лексической.
+    static func analyze(model: SyntaxModel, lexicalOutline: [OutlineItem],
+                        context: UnityContext?) -> Result? {
+        if isSerializedAsset(model.spec) {
+            // Формат узнаётся по содержимому, а не по расширению: `.asset`
+            // бывает и бинарным, а в `.meta` объектов нет вовсе.
+            guard let file = UnityYAMLFile.parse(model.units) else { return nil }
+            let resolve: UnityYAMLFile.Resolver = { context?.assetName($0) }
+            return Result(outline: file.outline(resolve: resolve), serialized: file,
+                          hierarchy: UnityHierarchy.build(file: file, resolve: resolve))
+        }
+        if context != nil, model.spec?.name == Languages.csharp.name {
+            return Result(outline: UnityCSharp.annotate(lexicalOutline, units: model.units),
+                          serialized: nil)
+        }
+        return nil
+    }
+
+    /// Иконки для дерева и палитры.
+    static func icon(forExtension ext: String) -> String? {
+        switch ext {
+        case "unity":                                   return "mountain.2"
+        case "prefab":                                  return "cube"
+        case "mat", "physicmaterial", "physicsmaterial2d": return "circle.lefthalf.filled"
+        case "shader", "hlsl", "cginc", "compute", "shadergraph", "shadersubgraph", "glsl":
+            return "wand.and.stars"
+        case "anim":                                    return "figure.run"
+        case "controller", "overridecontroller", "playable": return "point.3.connected.trianglepath.dotted"
+        case "asset", "preset", "lighting":             return "doc.badge.gearshape"
+        case "asmdef", "asmref":                        return "books.vertical"
+        case "fbx", "obj", "blend", "dae", "3ds", "max": return "cube.transparent"
+        case "wav", "mp3", "ogg", "aif", "aiff", "flac": return "waveform"
+        case "tga", "psd", "exr", "hdr", "tif", "tiff", "bmp": return "photo"
+        case "uxml", "uss", "tss":                      return "rectangle.3.group"
+        case "inputactions":                            return "gamecontroller"
+        case "mixer":                                   return "slider.vertical.3"
+        case "rendertexture", "cubemap":                return "photo.on.rectangle"
+        case "ttf", "otf", "fontsettings":              return "textformat"
+        case "vfx":                                     return "sparkles"
+        default:                                        return nil
+        }
+    }
+}

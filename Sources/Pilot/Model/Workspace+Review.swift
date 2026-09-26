@@ -1,0 +1,194 @@
+import SwiftUI
+
+/// Ревью MR внутри воркспейса: какой файл MR открыт, чьи полоски и треды
+/// показывать, окно у строки и переходы по файлам MR.
+extension Workspace {
+
+    /// Файл MR, который сейчас в редакторе. Документ из рабочей копии
+    /// с тем же путём сюда не относится — у него нет ревизии.
+    var currentReviewFile: ReviewFile? {
+        guard let document, let revision = document.revision,
+              let active = review.active, let repository = review.repository else { return nil }
+        return active.files.first { file in
+            let sha = file.raw.deletedFile ? active.refs.baseSha : active.refs.headSha
+            return sha == revision && repository.appendingPathComponent(file.path).path == document.url.path
+        }
+    }
+
+    var isReviewDocument: Bool { currentReviewFile != nil }
+
+    /// Полоски в колонке номеров: у файла MR — против базы MR, у рабочей
+    /// копии — против HEAD. У удалённого файла полосок нет: он весь удалён.
+    var editorLineChanges: [LineDiff.Change] {
+        if let file = currentReviewFile { return file.raw.deletedFile ? [] : file.diff.changes }
+        return document?.revision == nil ? git.lineChanges : []
+    }
+
+    /// Значки тредов у строк открытого файла MR.
+    var editorCommentMarks: [Int: CommentMark] {
+        guard let file = currentReviewFile, let active = review.active else { return [:] }
+        return active.threads(in: file).mapValues { threads in
+            CommentMark(count: threads.count, open: threads.contains { $0.isResolvable && !$0.isResolved })
+        }
+    }
+
+    func threads(atLine line: Int) -> [GLDiscussion] {
+        guard let file = currentReviewFile else { return [] }
+        return review.active?.threads(in: file)[line] ?? []
+    }
+
+    /// Что было на месте строки до изменений: в MR — по диффу GitLab,
+    /// в рабочей копии — по HEAD.
+    func removedLines(at line: Int) -> [String]? {
+        if let file = currentReviewFile {
+            guard !file.raw.deletedFile, let removed = file.diff.block(atNewLine: line)?.removed,
+                  !removed.isEmpty else { return nil }
+            return removed
+        }
+        return document?.revision == nil ? git.removedLines(at: line) : nil
+    }
+
+    // MARK: - Окно у строки
+
+    /// Клик по номеру строки. В файле MR окно есть всегда — хотя бы чтобы
+    /// прокомментировать; в рабочей копии — только там, где что-то удалено.
+    func lineClicked(_ line: Int) {
+        if isReviewDocument || removedLines(at: line) != nil || !threads(atLine: line).isEmpty {
+            requestLinePopover(line: line, compose: false)
+        }
+    }
+
+    /// Клик по самому номеру строки: в C# — точка останова. В ревью и у
+    /// строк с тредами — окно строки, как раньше.
+    func gutterNumberClicked(_ line: Int) {
+        guard let document, document.revision == nil, DebugService.canBreak(in: document.url),
+              !isReviewDocument, threads(atLine: line).isEmpty else {
+            lineClicked(line)
+            return
+        }
+        debug.toggleBreakpoint(document.url, line: line)
+    }
+
+    func commentOnLine(_ line: Int) {
+        guard isReviewDocument else { return }
+        requestLinePopover(line: line, compose: true)
+    }
+
+    func commentOnCaretLine() {
+        guard let document else { return }
+        commentOnLine(document.model.line(containing: caretOffset))
+    }
+
+    // MARK: - MR
+
+    /// Вкладка, где этот файл MR уже открыт.
+    func reviewTab(for file: ReviewFile) -> TextBuffer? {
+        guard let active = review.active, let repository = review.repository else { return nil }
+        let sha = file.raw.deletedFile ? active.refs.baseSha : active.refs.headSha
+        return tab(for: repository.appendingPathComponent(file.path), revision: sha)
+    }
+
+    /// ⌥⌘R: вкладка ревью, а над списком MR — сразу в поиск.
+    func showReviews() {
+        navigatorTab = .review
+        if isReviewSearchVisible { focusNavigatorFilter() }
+    }
+
+    /// Поиск есть, пока виден список: у открытого MR своя панель.
+    var isReviewSearchVisible: Bool { review.phase == .ready && review.active == nil }
+
+    /// Return в поиске: верхний найденный MR. Для `!123` — именно этот номер,
+    /// даже если GitLab ещё не ответил на поиск.
+    func openTopReviewSearchResult() {
+        let search = MergeRequestSearch(review.searchQuery)
+        let top = review.listing.first
+        guard let iid = search.iid, top?.iid != iid else {
+            if let top { openReview(top) }
+            return
+        }
+        Task {
+            if let mr = await review.mergeRequest(iid: iid) { openReview(mr) }
+            else if let top { openReview(top) }
+        }
+    }
+
+    /// Открывает MR и сразу первый файл — ревью начинается с кода, а не со списка.
+    func openReview(_ mr: GLMergeRequest) {
+        Task {
+            await review.open(mr)
+            guard let files = review.active?.files, review.active?.mr.iid == mr.iid else { return }
+            // Файлы прошлого MR к этому не относятся: ни полосок, ни тредов.
+            let ours = Set(files.compactMap { reviewTab(for: $0) }.map(ObjectIdentifier.init))
+            closeTabs(tabs.filter { $0.isReviewVersion && !ours.contains(ObjectIdentifier($0)) })
+            if let first = files.first(where: { !$0.raw.deletedFile }) ?? files.first {
+                open(reviewFile: first)
+            }
+        }
+    }
+
+    /// Следующий/предыдущий файл MR; из рабочей копии — первый/последний.
+    func openAdjacentReviewFile(_ direction: Int) {
+        guard let next = review.adjacentFile(to: currentReviewFile?.id, direction: direction) else { return }
+        open(reviewFile: next)
+    }
+
+    /// Выход из ревью закрывает вкладки с версиями из MR — правок в них нет,
+    /// терять нечего — и возвращает файл в версии рабочей копии, если он есть.
+    func closeReview() {
+        let url = document?.revision != nil ? document?.url : nil
+        review.close()
+        closeTabs(tabs.filter(\.isReviewVersion))
+        if let url, FileManager.default.fileExists(atPath: url.path) {
+            open(file: url)
+        }
+    }
+
+    /// Следующий/предыдущий тред в файле — по кругу, как вхождения.
+    func jumpToThread(_ direction: Int) {
+        guard let document else { return }
+        let lines = editorCommentMarks.keys.sorted()
+        guard !lines.isEmpty else { return }
+        let current = document.model.line(containing: caretOffset)
+        let target = direction > 0
+            ? lines.first { $0 > current } ?? lines.first!
+            : lines.last { $0 < current } ?? lines.last!
+        requestReveal(LSPRange(start: LSPPosition(line: target, character: 0),
+                               end: LSPPosition(line: target, character: 0)))
+        requestLinePopover(line: target, compose: false)
+    }
+}
+
+// MARK: - Отладка
+
+extension Workspace {
+    /// ⌘F8 — точка на строке с курсором.
+    func toggleBreakpointAtCaret() {
+        guard let document, document.revision == nil else { return }
+        debug.toggleBreakpoint(document.url, line: document.model.line(containing: caretOffset))
+    }
+
+    /// Точки открытого файла — для гаттера.
+    var editorBreakpoints: [Int: BreakpointMark] {
+        guard let document, document.revision == nil else { return [:] }
+        return debug.marks(for: document.url)
+    }
+
+    /// Строка открытого файла, где стоит программа.
+    var editorExecutionLine: Int? {
+        guard let document, document.revision == nil, let location = debug.executionLocation,
+              location.url == document.url.standardizedFileURL else { return nil }
+        return location.line
+    }
+
+    /// Остановка или выбор кадра: файл открывается на строке выполнения.
+    /// В историю переходов не пишем — каждый шаг отладчика засорил бы ⌘[.
+    func showDebugLocation(_ url: URL, line: Int) {
+        let range = LSPRange(start: LSPPosition(line: line, character: 0), end: LSPPosition(line: line, character: 0))
+        if document?.url.standardizedFileURL == url.standardizedFileURL {
+            isPaletteOpen = false
+            requestReveal(range)
+        } else {
+            open(file: url, reveal: range)
+        }
+    }
+}

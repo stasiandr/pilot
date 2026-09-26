@@ -1,0 +1,9 @@
+.build/
+Pilot.app/
+*.xcodeproj
+.DS_Store
+
+# Заголовок Rustlyn копируется сюда сборкой: он должен приходить из того же
+# билда, с которым Pilot слинкуется, а не из коммита, который мог отстать.
+Sources/CRustlyn/include/rustlyn.h
+dist/
