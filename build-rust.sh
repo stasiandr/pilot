@@ -22,6 +22,19 @@ if [[ ! -f "$RUSTLYN_PATH/Cargo.toml" ]]; then
     exit 1
 fi
 
+# Launched from Finder or hop, the build gets a login shell's PATH, and
+# many setups extend PATH only in .zshrc, which a non-interactive shell never
+# reads. So look where rustup puts cargo: its own installer, and brew's
+# keg-only rustup, which is never linked into /opt/homebrew/bin.
+if ! command -v cargo > /dev/null; then
+    for dir in "$HOME/.cargo/bin" /opt/homebrew/opt/rustup/bin /usr/local/opt/rustup/bin; do
+        if [[ -x "$dir/cargo" ]]; then
+            PATH="$dir:$PATH"
+            break
+        fi
+    done
+fi
+
 if ! command -v cargo > /dev/null; then
     echo "cargo not found — install Rust from https://rustup.rs" >&2
     exit 1

@@ -126,8 +126,10 @@ final class Launcher: NSObject, NSApplicationDelegate {
         let logHandle = try? FileHandle(forWritingTo: log)
 
         let process = Process()
-        // Login-шелл — за PATH пользователя: cargo, JDK из brew. Из Finder и
-        // hop приложение получает голый /usr/bin:/bin.
+        // Login-шелл — за PATH пользователя. Из Finder и hop приложение
+        // получает голый /usr/bin:/bin, а .zshrc неинтерактивный шелл не
+        // читает — поэтому cargo build-rust.sh ищет ещё и сам, а JDK берётся
+        // по абсолютному пути.
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-lc", "exec ./build.sh release"]
         process.currentDirectoryURL = repo
