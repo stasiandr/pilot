@@ -8,7 +8,7 @@ import Foundation
 /// выигрывает первый, и тесты ядра говорят о повторе с другим переводом.
 enum English {
     static let parts: [[(String, String)]] = [
-        app, settings, model, ui, services, nuget, unity, commit, update, extensions, database,
+        app, settings, model, ui, services, nuget, unity, run, commit, update, extensions, database,
     ]
 
     static let table: [String: String] = Dictionary(parts.joined().map { $0 }, uniquingKeysWith: { first, _ in first })

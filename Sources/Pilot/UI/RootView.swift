@@ -116,7 +116,9 @@ struct RootView: View {
             }
             content
             if workspace.root != nil, workspace.run.showsConsole {
-                RunConsole(run: workspace.run)
+                RunConsole(run: workspace.run, logs: workspace.run.serverLog, root: workspace.root) { url, line in
+                    workspace.openLogLocation(url, line: line, column: nil)
+                }
             }
             if workspace.root != nil, workspace.debug.isPanelVisible {
                 DebugPanel(debug: workspace.debug)

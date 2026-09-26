@@ -5609,6 +5609,59 @@ check(orphanResult.missingKeymap == "ReSharper OSX"
         && orphanResult.keymap.shortcut(for: .rename) == Shortcut("r", command: true),
       "неизвестная родительская раскладка: переносится хотя бы своё")
 try? FileManager.default.removeItem(at: riderDir)
+// ───────────────────────────── Лог сервера ─────────────────────────────
+section("Лог сервера")
+do {
+    let utc = TimeZone(identifier: "UTC")!
+    // RenderedCompactJsonFormatter — как clm-server пишет по умолчанию.
+    let rendered = #"{"@t":"2026-09-26T20:15:03.5312345Z","@m":"Startup: Name: \"Frankfurt #2\" (max players: 120)","@i":"a1b2c3d4","serverName":"Frankfurt #2","maxPlayers":120,"Room":"arena 3"}"#
+    let entry = ServerLogParser.parseJSON(rendered, timeZone: utc)
+    check(entry?.level == .info && entry?.time == "20:15:03.531", "CLEF: без @l — Information, время до миллисекунд (\(entry?.time ?? "nil"))")
+    check(entry?.message == "Startup: Name: Frankfurt #2 (max players: 120)", "кавычки вокруг строк сняты (\(entry?.message ?? "nil"))")
+    if let entry {
+        let highlighted = entry.values.map { (entry.message as NSString).substring(with: NSRange(location: $0.lowerBound, length: $0.count)) }
+        check(highlighted == ["Frankfurt #2", "120"], "подставленные значения найдены (\(highlighted))")
+        check(entry.inMessage == ["serverName", "maxPlayers"] && entry.extraProperties.map(\.name) == ["Room"],
+              "рядом — только свойства, которых в тексте нет")
+    }
+    check(ServerLogParser.clockTime("2026-09-26T20:15:03.5+03:00", timeZone: utc) == "17:15:03.500", "пояс в метке учитывается")
+
+    // CompactJsonFormatter: шаблон отдельно.
+    let templated = #"{"@t":"2026-09-26T20:15:03Z","@mt":"Player {Nickname} joined {{room}} {@Pos} {Missing}","@l":"Warning","Nickname":"stas","Pos":{"x":1,"y":2}}"#
+    let fromTemplate = ServerLogParser.parseJSON(templated, timeZone: utc)
+    check(fromTemplate?.level == .warning && fromTemplate?.message == #"Player stas joined {room} {"x":1,"y":2} {Missing}"#,
+          "шаблон: подстановка, {{ }}, объект JSON-ом, неизвестное — как есть (\(fromTemplate?.message ?? "nil"))")
+
+    // Исключение: стек разобран, ведёт в код проекта мимо рантайма.
+    let failed = #"{"@t":"2026-09-26T20:15:03Z","@m":"Failed","@l":"Error","@x":"System.InvalidOperationException: broken\n ---> System.FormatException: bad\n   at System.Number.ThrowFormatException()\n   at Server.Configs.Loader.Load() in /src/Server/Configs/Loader.cs:line 42\n   --- End of inner exception stack trace ---"}"#
+    let error = ServerLogParser.parseJSON(failed, timeZone: utc)
+    check(error?.level == .error && error?.exceptionTitle == "System.InvalidOperationException: broken", "исключение из @x")
+    check(error?.frames.count == 2 && error?.frames.first?.isFramework == true
+            && error?.location?.path == "/src/Server/Configs/Loader.cs" && error?.location?.line == 42,
+          "кадры: рантайм отличается, переход — к своему коду")
+
+    check(ServerLogParser.parseJSON(#"{"name":"not a log"}"#) == nil && ServerLogParser.parseJSON("{broken") == nil,
+          "чужой JSON и мусор — не события")
+
+    // Поток: куски рвут строки, текстовый формат со стеком, вывод процесса.
+    var parser = ServerLogParser(timeZone: utc)
+    var entries: [ServerLogEntry] = []
+    func add(_ new: [ServerLogEntry]) {
+        for e in new { if entries.last?.id == e.id { entries[entries.count - 1] = e } else { entries.append(e) } }
+    }
+    add(parser.feed("Building...\n{\"@t\":\"2026-09-26T20:15:03Z\",\"@m\":\"Con"))
+    check(entries.map(\.level) == [.output], "недописанная строка ждёт")
+    add(parser.feed("figs loaded!\"}\n[12:00:01 ERR] Boom\n"))
+    check(entries.last?.message == "Boom" && entries.last?.level == .error, "текстовое событие видно сразу, не дожидаясь следующей строки")
+    add(parser.feed("System.Exception: boom\r\n   at Server.A.B() in /src/A.cs:line 7\n[12:00:02 INF] Next\nplain\n"))
+    add(parser.finish())
+    check(entries.map(\.level) == [.output, .info, .error, .info, .output], "уровни по порядку (\(entries.map(\.level)))")
+    check(entries[2].exceptionTitle == "System.Exception: boom" && entries[2].frames.first?.line == 7,
+          "стек под текстовым событием дописан к нему (\(entries[2].exception ?? "nil"))")
+    check(Set(entries.map(\.id)).count == entries.count, "номера не повторяются")
+    check(ServerLogParser.parseText("[not a log] line") == nil, "квадратные скобки без времени и уровня — не событие")
+}
+
 // ───────────────────────────── Перевод ─────────────────────────────
 section("Перевод")
 Localization.current = .en

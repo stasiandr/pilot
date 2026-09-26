@@ -35,6 +35,42 @@ final class RunLog {
     }
 }
 
+/// Тот же вывод, разобранный на события лога сервера (см. `ServerLogParser`):
+/// консоль показывает их списком с фильтрами, если сервер пишет через Serilog.
+@MainActor
+final class ServerLogStore: ObservableObject {
+    /// Больше не держим: старое уходит пачкой, чтобы не резать на каждом событии.
+    static let limit = 50_000
+
+    @Published private(set) var entries: [ServerLogEntry] = []
+    /// В выводе были события лога, а не только текст процесса. Переживает
+    /// очистку и перезапуск той же цели — иначе пока идёт `dotnet build`,
+    /// консоль прыгала бы на сырой вывод и обратно.
+    @Published private(set) var isStructured = false
+
+    func add(_ new: [ServerLogEntry]) {
+        guard !new.isEmpty else { return }
+        var list = entries
+        for entry in new {
+            // Текстовое событие дополнилось стеком — приходит ещё раз с тем же номером.
+            if list.last?.id == entry.id { list[list.count - 1] = entry } else { list.append(entry) }
+        }
+        if list.count > Self.limit { list.removeFirst(list.count - Self.limit * 3 / 4) }
+        entries = list
+        if !isStructured, new.contains(where: { $0.level != .output }) { isStructured = true }
+    }
+
+    func clear() {
+        entries = []
+    }
+
+    /// Запускаем другую цель: что она пишет, ещё неизвестно.
+    func reset() {
+        entries = []
+        isStructured = false
+    }
+}
+
 /// Кнопка ▶: что в проекте можно запустить, что запущено сейчас и его вывод.
 @MainActor
 final class RunService: ObservableObject {
@@ -55,12 +91,14 @@ final class RunService: ObservableObject {
     @Published var showsConsole = false
 
     let log = RunLog()
+    let serverLog = ServerLogStore()
 
     private var root: URL?
     private var process: RunProcess?
     /// ▶ во время работы — перезапуск: сначала дождаться выхода старого.
     private var restartPending = false
     private var decoder = ConsoleDecoder()
+    private var logParser = ServerLogParser()
     private var scanGeneration = 0
 
     /// Вывод копится в фоне и уходит на главный поток пачками: при
@@ -139,8 +177,10 @@ final class RunService: ObservableObject {
 
     private func launch() {
         guard let target = selected, let root else { return }
+        if current?.name != target.name { serverLog.reset() } else { serverLog.clear() }
         current = target
         decoder = ConsoleDecoder()
+        logParser = ServerLogParser()
         log.clear()
         let directory = target.directory.isEmpty ? root : root.appendingPathComponent(target.directory)
         log.append("▶ \(target.command)\n\n")
@@ -161,6 +201,7 @@ final class RunService: ObservableObject {
 
     private func exited(_ code: Int32) {
         flush()
+        serverLog.add(logParser.finish())
         process = nil
         let wasStopped = state == .stopping
         state = .exited(code)
@@ -204,6 +245,14 @@ final class RunService: ObservableObject {
         guard !chunks.isEmpty else { return }
         var data = Data()
         chunks.forEach { data.append($0) }
-        log.append(decoder.feed(data))
+        let text = decoder.feed(data)
+        log.append(text)
+        serverLog.add(logParser.feed(text))
+    }
+
+    /// 🗑 в консоли: и текст, и события.
+    func clearOutput() {
+        log.clear()
+        serverLog.clear()
     }
 }
