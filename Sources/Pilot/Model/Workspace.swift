@@ -158,7 +158,7 @@ final class Workspace: ObservableObject {
     // MARK: Навигатор
 
     enum NavigatorTab: Hashable, CaseIterable {
-        case project, outline, review, recent
+        case project, outline, review, recent, hierarchy
 
         var icon: String {
             switch self {
@@ -166,6 +166,7 @@ final class Workspace: ObservableObject {
             case .outline: return "list.bullet.indent"
             case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock"
+            case .hierarchy: return "list.bullet.below.rectangle"
             }
         }
 
@@ -175,6 +176,7 @@ final class Workspace: ObservableObject {
             case .outline: return "list.bullet.indent"
             case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock.fill"
+            case .hierarchy: return "list.bullet.below.rectangle"
             }
         }
 
@@ -184,11 +186,14 @@ final class Workspace: ObservableObject {
             case .outline: return L("Структура файла")
             case .review:  return L("Ревью мерж-реквестов")
             case .recent:  return L("Недавние проекты")
+            case .hierarchy: return L("Иерархия")
             }
         }
     }
 
     @Published var navigatorTab: NavigatorTab = .project
+    /// Иерархия вызовов или типов во вкладке навигатора; `nil` — вкладки нет.
+    @Published var hierarchy: HierarchyModel?
     /// Навигатор слева — у каждого окна свой. Последний выбор запоминается
     /// и достаётся следующему окну и следующему запуску.
     @Published var showsSidebar = UserDefaults.standard.object(forKey: Workspace.sidebarKey) as? Bool ?? true {
@@ -3788,19 +3793,43 @@ final class Workspace: ObservableObject {
     /// пропускается целиком и называется в итоге — лучше недоделать, чем
     /// вписать имя посреди чужого слова.
     func applyRename(_ result: RustlynRenameResult, old: String, new: String) {
-        var byFile: [URL: [(range: NSRange, text: String)]] = [:]
-        for edit in result.edits { byFile[edit.url.standardizedFileURL, default: []].append((edit.range, edit.text)) }
-        var skipped: Set<URL> = []
-        let actionName = L("Переименование «\(old)»")
-
-        func fits(_ edits: [(range: NSRange, text: String)], in text: NSString) -> Bool {
+        let outcome = applyProjectEdits(result.edits, files: result.files,
+                                        actionName: L("Переименование «\(old)»")) { _, edits, text in
             edits.allSatisfy { NSMaxRange($0.range) <= text.length
                 && Rename.isOccurrence(text.substring(with: $0.range), of: old) }
         }
+        let occurrences = Theme.count(outcome.applied, "вхождение", "вхождения", "вхождений")
+        let inFiles = Theme.count(outcome.files, "файле", "файлах", "файлах")
+        let summary = L("«\(old)» → «\(new)»: \(occurrences) в \(inFiles)")
+        let skippedList = outcome.skipped.map(\.lastPathComponent).sorted().joined(separator: ", ")
+        showNotice(outcome.skipped.isEmpty ? summary
+                   : L("\(summary). Пропущены — текст ушёл от компиляции: \(skippedList)"))
+    }
+
+    struct EditOutcome {
+        var applied = 0
+        var files = 0
+        var skipped: Set<URL> = []
+    }
+
+    /// Правки по проекту — открытым вкладкам через их историю ⌘Z, остальным
+    /// файлам — на диск. Вкладки, в которых не было несохранённого,
+    /// сохраняются: иначе компилятор видел бы половину правки.
+    ///
+    /// `fits` сверяет правки файла с его текстом перед заменой: Rustlyn
+    /// считает их в тексте последней компиляции, и открытая вкладка с
+    /// несохранённым могла от него уйти. Не сошлось — файл пропускается
+    /// целиком: лучше недоделать, чем вписать правку не туда.
+    @discardableResult
+    func applyProjectEdits(_ all: [RustlynFileEdit], files moves: [RustlynFileMove], actionName: String,
+                           fits: (URL, [(range: NSRange, text: String)], NSString) -> Bool) -> EditOutcome {
+        var byFile: [URL: [(range: NSRange, text: String)]] = [:]
+        for edit in all { byFile[edit.url.standardizedFileURL, default: []].append((edit.range, edit.text)) }
+        var skipped: Set<URL> = []
 
         for (url, edits) in byFile {
             if let tab = tab(for: url, revision: nil) {
-                guard !tab.isReadOnly, fits(edits, in: tab.storage.string as NSString) else {
+                guard !tab.isReadOnly, fits(url, edits, tab.storage.string as NSString) else {
                     skipped.insert(url)
                     continue
                 }
@@ -3811,7 +3840,7 @@ final class Workspace: ObservableObject {
             }
             do {
                 let document = try LoadedDocument.load(url: url)
-                guard fits(edits, in: document.text as NSString),
+                guard fits(url, edits, document.text as NSString),
                       let updated = Rename.apply(edits, to: document.text) else {
                     skipped.insert(url)
                     continue
@@ -3826,18 +3855,12 @@ final class Workspace: ObservableObject {
                 skipped.insert(url)
             }
         }
-        for move in result.files where !skipped.contains(move.from.standardizedFileURL) {
+        for move in moves where !skipped.contains(move.from.standardizedFileURL) {
             renameFile(move.from, to: move.to)
         }
         scheduleCompile()
-        let applied = result.edits.count - byFile.filter { skipped.contains($0.key) }
-            .reduce(0) { $0 + $1.value.count }
-        let occurrences = Theme.count(applied, "вхождение", "вхождения", "вхождений")
-        let inFiles = Theme.count(byFile.count - skipped.count, "файле", "файлах", "файлах")
-        let summary = L("«\(old)» → «\(new)»: \(occurrences) в \(inFiles)")
-        let skippedList = skipped.map(\.lastPathComponent).sorted().joined(separator: ", ")
-        showNotice(skipped.isEmpty ? summary
-                   : L("\(summary). Пропущены — текст ушёл от компиляции: \(skippedList)"))
+        let applied = all.count - byFile.filter { skipped.contains($0.key) }.reduce(0) { $0 + $1.value.count }
+        return EditOutcome(applied: applied, files: byFile.count - skipped.count, skipped: skipped)
     }
 
     /// Файл — вслед за классом, и его `.meta` рядом: иначе Unity потеряет

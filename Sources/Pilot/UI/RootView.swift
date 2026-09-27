@@ -185,6 +185,7 @@ struct RootView: View {
                          onBreakpointCondition: workspace.canSetBreakpoints
                              ? { workspace.setBreakpointCondition(line: $0, $1) } : nil,
                          contextActions: { workspace.contextActions(at: $0) },
+                         codeActions: { await workspace.codeActionGroups(selection: $0) },
                          requestCompletions: { offset, trigger, retrigger in
                              await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)
                          },

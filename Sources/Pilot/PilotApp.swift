@@ -403,6 +403,15 @@ struct PilotApp: App {
                 Divider()
                 Button(L("Переименовать…")) { workspace.renameSymbol() }
                     .keyboardShortcut(keys.keyboardShortcut(.rename))
+                Button(L("Форматировать код")) { workspace.formatCode() }
+                    .keyboardShortcut(keys.keyboardShortcut(.formatCode))
+                    .disabled(workspace.document == nil)
+                Button(L("Иерархия вызовов")) { workspace.showCallHierarchy() }
+                    .keyboardShortcut(keys.keyboardShortcut(.callHierarchy))
+                    .disabled(workspace.document == nil)
+                Button(L("Иерархия типов")) { workspace.showTypeHierarchy() }
+                    .keyboardShortcut(keys.keyboardShortcut(.typeHierarchy))
+                    .disabled(workspace.document == nil)
                 Button(L("Следующая ошибка")) { workspace.jumpToProblem(1) }
                     .keyboardShortcut(keys.keyboardShortcut(.nextProblem))
                 Button(L("Предыдущая ошибка")) { workspace.jumpToProblem(-1) }

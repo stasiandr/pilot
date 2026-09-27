@@ -662,6 +662,183 @@ final class Rustlyn: @unchecked Sendable {
         return result
     }
 
+    // MARK: - Лампочка (⌥↩)
+
+    /// Исправления ошибок в `range` и рефакторинги выделения, каждое — с
+    /// правками. Нужна компиляция, поэтому с фона.
+    func codeActions(_ url: URL, range: NSRange, text: String?) -> [RustlynCodeAction]? {
+        var raw = RlnCodeActions()
+        let status = DeepStack.run { url.path.withCString { path in
+            Self.withOptionalCString(text) { body in
+                rln_code_actions(handle, path, body, UInt32(max(0, range.location)),
+                                 UInt32(max(0, NSMaxRange(range))), &raw)
+            }
+        } }
+        guard status == RLN_OK else { return nil }
+        defer { rln_code_actions_free(raw) }
+        let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
+        let edits = raw.edits.map { UnsafeBufferPointer(start: $0, count: raw.edit_count).map { Self.edit($0, blob) } } ?? []
+        let moves = raw.renames.map { UnsafeBufferPointer(start: $0, count: raw.rename_count).map { Self.move($0, blob) } } ?? []
+        guard let items = raw.items else { return [] }
+        return UnsafeBufferPointer(start: items, count: raw.count).map { item in
+            let e = Int(item.first_edit), r = Int(item.first_rename)
+            return RustlynCodeAction(
+                title: Rustlyn.read(blob, item.title),
+                fixes: Rustlyn.read(blob, item.fixes),
+                kind: RustlynCodeAction.Kind(rawValue: item.kind) ?? .refactor,
+                edits: Array(edits[min(e, edits.count)..<min(e + Int(item.edit_count), edits.count)]),
+                files: Array(moves[min(r, moves.count)..<min(r + Int(item.rename_count), moves.count)]))
+        }
+    }
+
+    /// Исправление диагностики `code` везде в файле или во всём проекте.
+    func fixAll(_ url: URL, code: String, inProject: Bool, text: String?) -> RustlynEdits? {
+        var raw = RlnEdits()
+        let status = DeepStack.run { url.path.withCString { path in
+            Self.withOptionalCString(text) { body in
+                code.withCString { code in
+                    rln_fix_all(handle, path, body, code,
+                                UInt8(inProject ? RLN_FIX_ALL_PROJECT : RLN_FIX_ALL_DOCUMENT), &raw)
+                }
+            }
+        } }
+        return edits(status, raw)
+    }
+
+    // MARK: - Форматирование
+
+    /// Правки, которые форматируют весь файл по правилам Roslyn и
+    /// `.editorconfig`. Только синтаксис: работает и до компиляции.
+    func formatDocument(_ url: URL, text: String?) -> RustlynEdits? {
+        var raw = RlnEdits()
+        let status = DeepStack.run { url.path.withCString { path in
+            Self.withOptionalCString(text) { body in rln_format_document(handle, path, body, &raw) }
+        } }
+        return edits(status, raw)
+    }
+
+    /// То же для строк, которых касается `range`, и ни для каких других.
+    func formatRange(_ url: URL, range: NSRange, text: String?) -> RustlynEdits? {
+        var raw = RlnEdits()
+        let status = DeepStack.run { url.path.withCString { path in
+            Self.withOptionalCString(text) { body in
+                rln_format_range(handle, path, body, UInt32(max(0, range.location)),
+                                 UInt32(max(0, NSMaxRange(range))), &raw)
+            }
+        } }
+        return edits(status, raw)
+    }
+
+    private func edits(_ status: RlnStatus, _ raw: RlnEdits) -> RustlynEdits? {
+        guard status == RLN_OK else { return nil }
+        defer { rln_edits_free(raw) }
+        let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
+        var result = RustlynEdits()
+        if let items = raw.items {
+            result.edits = UnsafeBufferPointer(start: items, count: raw.count).map { Self.edit($0, blob) }
+        }
+        if let renames = raw.renames {
+            result.files = UnsafeBufferPointer(start: renames, count: raw.rename_count).map { Self.move($0, blob) }
+        }
+        return result
+    }
+
+    private static func edit(_ raw: RlnEdit, _ blob: UnsafeBufferPointer<UInt8>) -> RustlynFileEdit {
+        RustlynFileEdit(url: URL(fileURLWithPath: Rustlyn.read(blob, raw.path)),
+                        range: NSRange(location: Int(raw.start), length: Int(raw.length)),
+                        text: Rustlyn.read(blob, raw.text))
+    }
+
+    private static func move(_ raw: RlnRename, _ blob: UnsafeBufferPointer<UInt8>) -> RustlynFileMove {
+        RustlynFileMove(from: URL(fileURLWithPath: Rustlyn.read(blob, raw.from)),
+                        to: URL(fileURLWithPath: Rustlyn.read(blob, raw.to)))
+    }
+
+    // MARK: - Иерархии вызовов и типов
+
+    /// Метод, свойство, поле или конструктор под курсором — корень иерархии вызовов.
+    func callHierarchy(_ url: URL, offset: Int, text: String?) -> RustlynHierarchyItem? {
+        var raw = RlnHierarchyItems()
+        let status = DeepStack.run { url.path.withCString { path in
+            Self.withOptionalCString(text) { body in rln_call_hierarchy(handle, path, body, UInt32(max(0, offset)), &raw) }
+        } }
+        return hierarchy(status, raw)?.first
+    }
+
+    /// Тип под курсором или тип того, что под курсором, — корень иерархии типов.
+    func typeHierarchy(_ url: URL, offset: Int, text: String?) -> RustlynHierarchyItem? {
+        var raw = RlnHierarchyItems()
+        let status = DeepStack.run { url.path.withCString { path in
+            Self.withOptionalCString(text) { body in rln_type_hierarchy(handle, path, body, UInt32(max(0, offset)), &raw) }
+        } }
+        return hierarchy(status, raw)?.first
+    }
+
+    func supertypes(_ key: String) -> [RustlynHierarchyItem]? {
+        var raw = RlnHierarchyItems()
+        let status = DeepStack.run { key.withCString { rln_supertypes(handle, $0, &raw) } }
+        return hierarchy(status, raw)
+    }
+
+    func subtypes(_ key: String) -> [RustlynHierarchyItem]? {
+        var raw = RlnHierarchyItems()
+        let status = DeepStack.run { key.withCString { rln_subtypes(handle, $0, &raw) } }
+        return hierarchy(status, raw)
+    }
+
+    func incomingCalls(_ key: String) -> [RustlynCall]? {
+        var raw = RlnCalls()
+        let status = DeepStack.run { key.withCString { rln_incoming_calls(handle, $0, &raw) } }
+        return calls(status, raw)
+    }
+
+    func outgoingCalls(_ key: String) -> [RustlynCall]? {
+        var raw = RlnCalls()
+        let status = DeepStack.run { key.withCString { rln_outgoing_calls(handle, $0, &raw) } }
+        return calls(status, raw)
+    }
+
+    private func hierarchy(_ status: RlnStatus, _ raw: RlnHierarchyItems) -> [RustlynHierarchyItem]? {
+        guard status == RLN_OK else { return nil }
+        defer { rln_hierarchy_items_free(raw) }
+        let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
+        guard let items = raw.items else { return [] }
+        return UnsafeBufferPointer(start: items, count: raw.count).map { hierarchyItem($0, blob) }
+    }
+
+    private func calls(_ status: RlnStatus, _ raw: RlnCalls) -> [RustlynCall]? {
+        guard status == RLN_OK else { return nil }
+        defer { rln_calls_free(raw) }
+        let blob = UnsafeBufferPointer(start: raw.strings, count: raw.strings_length)
+        let ranges = raw.ranges.map { UnsafeBufferPointer(start: $0, count: raw.range_count).map {
+            LSPRange(start: LSPPosition(line: Int($0.start_line), character: Int($0.start_character)),
+                     end: LSPPosition(line: Int($0.end_line), character: Int($0.end_character)))
+        } } ?? []
+        guard let items = raw.items else { return [] }
+        return UnsafeBufferPointer(start: items, count: raw.count).map { call in
+            let path = Rustlyn.read(blob, call.path)
+            let first = Int(call.first_range)
+            return RustlynCall(
+                item: hierarchyItem(call.item, blob),
+                url: path.isEmpty ? nil : RustlynTarget.url(forPath: path, root: root),
+                ranges: Array(ranges[min(first, ranges.count)..<min(first + Int(call.range_count), ranges.count)]),
+                throughBase: call.through_base)
+        }
+    }
+
+    private func hierarchyItem(_ raw: RlnHierarchyItem, _ blob: UnsafeBufferPointer<UInt8>) -> RustlynHierarchyItem {
+        let name = Rustlyn.read(blob, raw.name)
+        let path = Rustlyn.read(blob, raw.path)
+        let target = raw.has_location && !path.isEmpty
+            ? RustlynTarget(url: RustlynTarget.url(forPath: path, root: root), name: name,
+                            line: Int(raw.line), character: Int(raw.character), length: Int(raw.length),
+                            kind: RustlynDeclarationKind(rawValue: raw.kind) ?? .method)
+            : nil
+        return RustlynHierarchyItem(name: name, detail: Rustlyn.read(blob, raw.detail),
+                                    container: Rustlyn.read(blob, raw.container),
+                                    key: Rustlyn.read(blob, raw.key), target: target)
+    }
+
     /// Всё более крупные куски кода вокруг выделения — шаги ⌥↑. Только
     /// синтаксис: работает и до компиляции.
     func selectionRanges(_ url: URL, selection: NSRange, text: String?) -> [NSRange]? {

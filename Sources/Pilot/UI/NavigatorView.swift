@@ -31,7 +31,7 @@ struct NavigatorView: View {
         switch workspace.navigatorTab {
         case .project, .outline: return true
         case .review:            return workspace.isReviewSearchVisible
-        case .recent:            return false
+        case .recent, .hierarchy: return false
         }
     }
 
@@ -48,6 +48,12 @@ struct NavigatorView: View {
             case .outline: OutlineList(workspace: workspace)
             case .review:  ReviewNavigator(workspace: workspace)
             case .recent:  RecentList(workspace: workspace)
+            case .hierarchy:
+                if let model = workspace.hierarchy {
+                    HierarchyNavigator(workspace: workspace, model: model)
+                } else {
+                    placeholder(L("⌃H — иерархия типов, ⌃⌥⇧H — вызовов"))
+                }
             }
         }
     }
@@ -103,7 +109,10 @@ struct NavigatorView: View {
     /// Стоят в строке заголовка: место там всё равно пустует.
     private var tabBar: some View {
         HStack(spacing: 0) {
-            ForEach(Workspace.NavigatorTab.allCases, id: \.self) { tab in
+            // Иерархия — только когда её спросили: пятая иконка не влезла бы
+            // в узкий навигатор.
+            ForEach(Workspace.NavigatorTab.allCases.filter { $0 != .hierarchy || workspace.hierarchy != nil },
+                    id: \.self) { tab in
                 let selected = workspace.navigatorTab == tab
                 Button {
                     workspace.navigatorTab = tab

@@ -209,6 +209,9 @@ enum EditorCommand: String, CaseIterable {
     case nextProblem = "nav.nextProblem"
     case previousProblem = "nav.previousProblem"
     case rename = "refactor.rename"
+    case formatCode = "refactor.format"
+    case callHierarchy = "nav.callHierarchy"
+    case typeHierarchy = "nav.typeHierarchy"
     // Вкладки и вид
     case nextTab = "view.nextTab"
     case previousTab = "view.previousTab"
@@ -315,6 +318,9 @@ enum EditorCommand: String, CaseIterable {
         case .nextProblem: return L("Следующая ошибка")
         case .previousProblem: return L("Предыдущая ошибка")
         case .rename: return L("Переименовать")
+        case .formatCode: return L("Форматировать код")
+        case .callHierarchy: return L("Иерархия вызовов")
+        case .typeHierarchy: return L("Иерархия типов")
         case .nextTab: return L("Следующая вкладка")
         case .previousTab: return L("Предыдущая вкладка")
         case .recentTab: return L("Недавняя вкладка (кроме ⌃Tab)")
@@ -440,6 +446,9 @@ enum EditorCommand: String, CaseIterable {
         case .nextProblem: return Shortcut("f2")
         case .previousProblem: return Shortcut("f2", shift: true)
         case .rename: return Shortcut("f6", shift: true)
+        case .formatCode: return Shortcut("l", command: true, option: true)
+        case .callHierarchy: return Shortcut("h", option: true, control: true, shift: true)
+        case .typeHierarchy: return Shortcut("h", control: true)
         case .nextTab: return Shortcut("]", command: true, shift: true)
         case .previousTab: return Shortcut("[", command: true, shift: true)
         case .recentTab: return nil

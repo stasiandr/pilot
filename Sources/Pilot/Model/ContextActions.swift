@@ -16,6 +16,8 @@ struct ContextAction {
 struct ContextActionGroup {
     var title: String?
     var actions: [ContextAction]
+    /// Выше навигации: исправления ошибок, ради которых ⌥↩ обычно и жмут.
+    var leading = false
 }
 
 struct KeyShortcut {

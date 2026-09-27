@@ -603,3 +603,48 @@ struct RustlynDocumentation: Equatable {
     /// Есть ли что показать сверх сигнатуры.
     var hasText: Bool { !summary.isEmpty || !returns.isEmpty || !parameters.isEmpty }
 }
+
+// MARK: - Лампочка, форматирование, иерархии
+
+/// Пункт ⌥↩: исправление ошибки или рефакторинг — с уже посчитанными
+/// правками по всему проекту.
+struct RustlynCodeAction: Equatable {
+    enum Kind: UInt8 {
+        case quickFix = 0, refactor, extract, inline, rewrite, organize, generate
+    }
+
+    var title: String
+    /// Код диагностики, которую оно исправляет (`CS0246`); пусто у рефакторинга.
+    var fixes: String
+    var kind: Kind
+    var edits: [RustlynFileEdit]
+    var files: [RustlynFileMove]
+}
+
+/// Правки по проекту: результат форматирования и «исправить всё».
+struct RustlynEdits: Equatable {
+    var edits: [RustlynFileEdit] = []
+    var files: [RustlynFileMove] = []
+}
+
+/// Узел иерархии вызовов или типов. `key` раскрывает его дальше и
+/// переживает перекомпиляцию: он называет символ, а не место.
+struct RustlynHierarchyItem: Equatable {
+    var name: String
+    /// Сигнатура: `double Area()`, `class Circle`.
+    var detail: String
+    var container: String
+    var key: String
+    /// Куда прыгать; `nil` — у символа нет исходника.
+    var target: RustlynTarget?
+}
+
+/// Вызывающий (входящие) или вызываемый (исходящие) — с местами вызовов.
+struct RustlynCall: Equatable {
+    var item: RustlynHierarchyItem
+    /// Файл, где вызовы, и сами вызовы в нём.
+    var url: URL?
+    var ranges: [LSPRange]
+    /// Вызов через базовый метод или интерфейс: может дойти сюда, а может нет.
+    var throughBase: Bool
+}

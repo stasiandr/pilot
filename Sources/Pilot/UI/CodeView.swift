@@ -1169,6 +1169,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Что можно сделать в позиции — для меню ⌘. Правку текста
     /// (комментарий, дополнение) меню добавляет само.
     var contextActions: ((Int) -> [ContextActionGroup])?
+    /// Исправления и рефакторинги Rustlyn для выделения — их ждут до показа меню.
+    var codeActions: ((NSRange) async -> [ContextActionGroup])?
 
     /// Документация имени в позиции (⌃J, наведение мышью) и перегрузки
     /// вызова, в скобках которого курсор. `nil` — ответить нечем.
@@ -1972,10 +1974,27 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Нативное меню прямо под курсором: на macOS 26 оно само стеклянное,
     /// стрелки, Return, Esc и поиск по первым буквам — штатные.
     func presentContextActions() {
-        guard let window = view.window, let buffer else { return }
+        guard view.window != nil, let buffer else { return }
         hideCompletion()
-        let caret = textView.selectedRange().location
-        var groups = contextActions?(caret) ?? []
+        let selection = textView.selectedRange()
+        guard let codeActions else {
+            showContextMenu(extra: [], selection: selection)
+            return
+        }
+        // Меню ждёт Rustlyn; курсор за это время мог уйти или вкладка смениться.
+        Task { @MainActor [weak self] in
+            let extra = await codeActions(selection)
+            guard let self, self.buffer === buffer, self.textView.selectedRange() == selection else { return }
+            self.showContextMenu(extra: extra, selection: selection)
+        }
+    }
+
+    private func showContextMenu(extra: [ContextActionGroup], selection: NSRange) {
+        guard let window = view.window, let buffer else { return }
+        let caret = selection.location
+        var groups = extra.filter(\.leading)
+        groups += contextActions?(caret) ?? []
+        groups += extra.filter { !$0.leading }
         groups.append(ContextActionGroup(title: nil, actions: editingActions(readOnly: buffer.isReadOnly)))
 
         let menu = NSMenu()
@@ -3521,6 +3540,7 @@ struct CodeView: NSViewControllerRepresentable {
     var onBreakpointClick: ((Int) -> Void)? = nil
     var onBreakpointCondition: ((Int, String?) -> Void)? = nil
     var contextActions: ((Int) -> [ContextActionGroup])? = nil
+    var codeActions: ((NSRange) async -> [ContextActionGroup])? = nil
     let requestCompletions: (Int, String?, Bool) async -> CompletionList?
     /// Подсказка Copilot у курсора; nil — Copilot выключен.
     var requestSuggestion: ((Int) async -> CopilotSuggestion?)? = nil
@@ -3557,6 +3577,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.onBreakpointClick = onBreakpointClick
         controller.onBreakpointCondition = onBreakpointCondition
         controller.contextActions = contextActions
+        controller.codeActions = codeActions
         controller.requestCompletions = requestCompletions
         controller.requestSuggestion = requestSuggestion
         controller.onSuggestionShown = onSuggestionShown

@@ -102,6 +102,16 @@ final class Rustlyn: @unchecked Sendable {
     func prepareRename(_ url: URL, offset: Int, text: String?) -> RustlynRenameInfo? { nil }
     func rename(_ url: URL, offset: Int, to newName: String, text: String?,
                 options: RustlynRenameOptions) -> RustlynRenameResult? { nil }
+    func codeActions(_ url: URL, range: NSRange, text: String?) -> [RustlynCodeAction]? { nil }
+    func fixAll(_ url: URL, code: String, inProject: Bool, text: String?) -> RustlynEdits? { nil }
+    func formatDocument(_ url: URL, text: String?) -> RustlynEdits? { nil }
+    func formatRange(_ url: URL, range: NSRange, text: String?) -> RustlynEdits? { nil }
+    func callHierarchy(_ url: URL, offset: Int, text: String?) -> RustlynHierarchyItem? { nil }
+    func typeHierarchy(_ url: URL, offset: Int, text: String?) -> RustlynHierarchyItem? { nil }
+    func incomingCalls(_ key: String) -> [RustlynCall]? { nil }
+    func outgoingCalls(_ key: String) -> [RustlynCall]? { nil }
+    func supertypes(_ key: String) -> [RustlynHierarchyItem]? { nil }
+    func subtypes(_ key: String) -> [RustlynHierarchyItem]? { nil }
 
     func assemblyText(_ url: URL) -> String? { nil }
     func methodToken(_ url: URL, line: Int) -> UInt32? { nil }
