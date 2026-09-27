@@ -136,14 +136,27 @@ struct PilotApp: App {
                     .keyboardShortcut(keys.keyboardShortcut(.closeProject))
                     .disabled(workspace.root == nil)
             }
-            CommandGroup(replacing: .saveItem) {
+            // После «Открыть…», а не на месте `.saveItem`: у приложения без
+            // документов macOS 27 этой группы не строит, и её пункты пропадали
+            // из меню вместе с ⌘W и ⌘S. Системные «Закрыть» (⌘W) и «Закрыть
+            // все» (⌥⌘W) закрывают окно — то есть проект; из пунктов с одной
+            // клавишей AppKit берёт первый, а эти стоят раньше.
+            CommandGroup(after: .newItem) {
+                Divider()
                 // ⌘W закрывает вкладку, а не окно — как в Xcode и браузерах.
+                // Включён, пока открыт проект, даже без вкладок: выключенный,
+                // он отдал бы ⌘W системному «Закрыть», и окно с проектом
+                // закрылось бы вместо файла.
                 Button(L("Закрыть вкладку")) { workspace.closeActiveTab() }
                     .keyboardShortcut(keys.keyboardShortcut(.closeTab))
-                    .disabled(workspace.buffer == nil && workspace.loadError == nil)
-                Button(L("Закрыть другие вкладки")) { workspace.closeOtherTabs() }
+                    .disabled(workspace.root == nil)
+                // Тоже включён с проектом: иначе ⌥⌘W ушёл бы системному
+                // «Закрыть все» — все окна со всеми проектами.
+                Button(L("Закрыть другие вкладки")) {
+                    if workspace.buffer != nil { workspace.closeOtherTabs() }
+                }
                     .keyboardShortcut(keys.keyboardShortcut(.closeOtherTabs))
-                    .disabled(workspace.buffer == nil || workspace.tabs.count < 2)
+                    .disabled(workspace.root == nil)
                 Divider()
                 Button(L("Сохранить")) { workspace.save() }
                     .keyboardShortcut(keys.keyboardShortcut(.save))
