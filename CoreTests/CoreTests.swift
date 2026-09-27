@@ -6129,6 +6129,63 @@ do {
           "файла, который Unity не компилировала, нет ни в одной сборке")
 }
 
+section("Кэши на диске")
+do {
+    // Хэш тот же, что у индекса (%016llx) и у папки Rustlyn (без нулей впереди).
+    let root = "/Users/me/work/game"
+    let hash = CacheStore.projectHash(root)
+    check(CacheStore.splitNameAndHash("game-" + String(hash, radix: 16))?.hash == hash, "имя папки Rustlyn → хэш")
+    check(CacheStore.splitNameAndHash("color-scheme-ad5525-00ff")?.name == "color-scheme-ad5525", "дефисы в имени проекта")
+    check(CacheStore.splitNameAndHash("assemblies") == nil, "не папка проекта")
+
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("pilot-caches-\(getpid())")
+    defer { try? fm.removeItem(at: base) }
+    let places = CacheStore.Locations(caches: base.appendingPathComponent("Caches"), support: base.appendingPathComponent("Support"))
+    let gone = base.appendingPathComponent("gone").path
+    let open = base.appendingPathComponent("open")
+    try? fm.createDirectory(at: open, withIntermediateDirectories: true)
+    func touch(_ url: URL, _ text: String = "x", age days: Double = 0) {
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -days * 86_400)], ofItemAtPath: url.path)
+    }
+    let goneHex = String(format: "%016llx", CacheStore.projectHash(gone))
+    let openHash = CacheStore.projectHash(open.path)
+    touch(places.caches.appendingPathComponent(goneHex + ".idx"), age: 200)
+    touch(places.caches.appendingPathComponent(goneHex + ".symbols"), age: 200)
+    touch(places.rustlyn.appendingPathComponent("gone-\(String(CacheStore.projectHash(gone), radix: 16))/db"), age: 200)
+    touch(places.caches.appendingPathComponent(String(format: "%016llx", openHash) + ".idx"))
+    touch(places.rustlyn.appendingPathComponent("stranger-00000000000000ab/db"), age: 2)
+    touch(places.rustlyn.appendingPathComponent("assemblies/a.bin"))
+    touch(places.caches.appendingPathComponent("jadx.jsa"))
+    touch(places.copilot.appendingPathComponent("1.0.0/server"))
+    touch(places.copilot.appendingPathComponent("2.0.0/server"))
+    touch(places.history.appendingPathComponent("gone-\(goneHex)/f.txt"), age: 200)
+    touch(places.caches.appendingPathComponent("00000000000000c1.idx"))
+    touch(places.caches.appendingPathComponent("00000000000000c2.types"))
+
+    let entries = CacheStore.scan(known: [URL(fileURLWithPath: gone)], open: [open], copilotVersion: "2.0.0", at: places)
+    let goneEntry = entries.first { $0.kind == .project && $0.name == "gone" }
+    check(goneEntry?.urls.count == 3, "индекс, символы и папка Rustlyn одного проекта — одна строка")
+    check(goneEntry?.isOrphan == true, "проекта нет на диске")
+    check(entries.first { $0.kind == .project && $0.name == "open" }?.isOpen == true, "открытый проект помечен")
+    check(entries.contains { $0.kind == .project && $0.name == "stranger" && $0.projectPath == nil },
+          "незнакомый проект — по имени папки Rustlyn")
+    check(entries.first { $0.kind == .oldCopilot }?.urls.map(\.lastPathComponent) == ["1.0.0"], "старый Copilot — кроме текущей версии")
+    check(entries.contains { $0.kind == .assemblies } && entries.contains { $0.kind == .jadx }, "общие кэши найдены")
+    check(entries.first { $0.kind == .history }?.name == "gone", "история — отдельной строкой")
+    check(entries.filter { $0.id == "project-unknown" }.first?.urls.count == 2
+            && !entries.contains { $0.name.hasPrefix("00000000000000c") },
+          "безымянные проекты — одной строкой")
+
+    let stale = CacheStore.stale(entries, olderThan: 30)
+    check(stale.map(\.name) == ["gone"], "устарели: удалённый проект; открытый, свежий и история — нет")
+    let openEntry = entries.first { $0.isOpen && $0.kind == .project }!
+    check(!CacheStore.remove(openEntry) && fm.fileExists(atPath: openEntry.urls[0].path), "кэш открытого проекта не удаляется")
+    check(CacheStore.remove(goneEntry!) && goneEntry!.urls.allSatisfy { !fm.fileExists(atPath: $0.path) }, "удалённый кэш — с диска")
+}
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)

@@ -15,7 +15,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/Sources/coretests"
-cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,AutoPairs,LocalHistory,Tabs,OpenRequest,FileChanges,UnifiedSearch,ContentSearch,NavigationHistory,LineEditing,FoldRegions,SelectionSteps,Rename,Keymap,RiderImport,RiderBundledKeymaps,MediaKind,FBX,Markdown,ProjectPair,DatagramContract,ConfigLinks,PairQueries,ValueFlow}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,AutoPairs,LocalHistory,Tabs,OpenRequest,FileChanges,UnifiedSearch,ContentSearch,NavigationHistory,LineEditing,FoldRegions,SelectionSteps,Rename,Keymap,RiderImport,RiderBundledKeymaps,MediaKind,FBX,Markdown,ProjectPair,DatagramContract,ConfigLinks,PairQueries,ValueFlow,CacheStore}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Highlight/{Language,Lexer,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,Completion}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Git/{LineDiff,GitParsing,Git,MergeConflicts,GitCommit}.swift "$TMP/Sources/coretests/"

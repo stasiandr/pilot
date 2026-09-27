@@ -487,6 +487,8 @@ struct PilotApp: App {
                     .tabItem { Label("Copilot", systemImage: "sparkles") }
                 ExtensionSettingsView()
                     .tabItem { Label(L("Расширения"), systemImage: "puzzlepiece.extension") }
+                CacheSettingsView()
+                    .tabItem { Label(L("Кэши"), systemImage: "internaldrive") }
             }
             .id(language.current)
         }
@@ -576,6 +578,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in CopilotService.shared.startIfEnabled() }
         // Новая версия на GitHub — плашкой над редактором (Updater).
         Task { @MainActor in Updater.shared.start() }
+        // Кэши давно не открытых проектов (Настройки → Кэши), если так
+        // настроено. Через минуту: окна проектов к тому времени восстановлены,
+        // и их кэши, которые в работе, не тронут.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(60))
+            CacheStore.autoClean(known: CacheSettingsView.knownRoots, open: CacheSettingsView.openRoots,
+                                 copilotVersion: CopilotInstaller.version)
+        }
         // Таблицы видов и цветов Pilot повторяет за Rustlyn вручную — иначе
         // пришлось бы тянуть их через границу на каждый токен. Расхождение
         // на одно значение ничего не сломает и всё сдвинет: у полей появится
