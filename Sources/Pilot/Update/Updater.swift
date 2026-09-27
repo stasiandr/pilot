@@ -17,7 +17,7 @@ final class Updater: ObservableObject {
     static let shared = Updater()
 
     /// Источник из Info.plist; не задан или не разобрался — апстрим.
-    static let source: UpdateSource =
+    nonisolated static let source: UpdateSource =
         (Bundle.main.object(forInfoDictionaryKey: "PilotUpdateSource") as? String).flatMap(UpdateSource.init)
             ?? .github(repository: "stasiandr/pilot")
     private static let automaticKey = "pilot.update.automatic"
@@ -119,12 +119,18 @@ final class Updater: ObservableObject {
     /// Откуда брать последний релиз. `PILOT_UPDATE_FEED` подменяет адрес —
     /// можно и `file://` с сохранённым ответом API: так плашку и установку
     /// проверяют, не выпуская настоящий релиз.
-    private static var feed: URL {
+    nonisolated private static var feed: URL {
         ProcessInfo.processInfo.environment["PILOT_UPDATE_FEED"].flatMap(URL.init(string:)) ?? source.latestURL
     }
 
     /// Запрос к источнику: GitLab — с токеном его хоста.
-    private static func authorized(_ url: URL) throws -> URLRequest {
+    ///
+    /// Токен читается из связки ключей, а у сборки из исходников после
+    /// каждой пересборки macOS сначала спрашивает разрешение — и держит
+    /// вызов, пока на вопрос не ответят. Поэтому не на главном потоке:
+    /// иначе окно замирало через пять секунд после запуска и стояло, пока
+    /// висел вопрос.
+    nonisolated private static func authorized(_ url: URL) throws -> URLRequest {
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
         if let host = source.tokenHost, url.host == host {
@@ -134,7 +140,7 @@ final class Updater: ObservableObject {
         return request
     }
 
-    private static func latestRelease() async throws -> ReleaseInfo? {
+    nonisolated private static func latestRelease() async throws -> ReleaseInfo? {
         var request = try authorized(feed)
         if case .github = source { request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept") }
         let (data, response) = try await URLSession.shared.data(for: request)

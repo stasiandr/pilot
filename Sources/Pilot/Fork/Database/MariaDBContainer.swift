@@ -109,9 +109,14 @@ final class MariaDBContainer: ObservableObject {
         stopLogs()
     }
 
+    /// Опрос идёт каждые три секунды, пока видна кнопка в тулбаре, — то есть
+    /// всё время. Поэтому в @Published пишутся только перемены: любая запись,
+    /// даже того же значения, перерисовывает кнопку, а SwiftUI вслед за ней
+    /// пересобирает весь тулбар окна — это десятки миллисекунд главного
+    /// потока, а под нагрузкой и сотни.
     func refresh() async {
         guard DockerCLI.docker != nil else {
-            state = .noDocker
+            update(state: .noDocker, details: details)
             return
         }
         let r = await DockerCLI.run(["inspect", "--format",
@@ -123,15 +128,19 @@ final class MariaDBContainer: ObservableObject {
             // Порт привязан и к IPv4, и к IPv6 — одинаковые пары показываем раз.
             var ports: [String] = []
             for p in f[5].split(separator: " ").map(String.init) where !ports.contains(p) { ports.append(p) }
-            details = Details(image: f[2], id: String(f[3].prefix(12)), startedAt: f[4], ports: ports.joined(separator: " "))
-            state = f[0] == "running" ? .running(health: f[1]) : .stopped(f[0])
+            update(state: f[0] == "running" ? .running(health: f[1]) : .stopped(f[0]),
+                   details: Details(image: f[2], id: String(f[3].prefix(12)), startedAt: f[4],
+                                    ports: ports.joined(separator: " ")))
         } else if r.err.localizedCaseInsensitiveContains("no such") {
-            details = Details()
-            state = .absent
+            update(state: .absent, details: Details())
         } else {
-            details = Details()
-            state = .daemonDown(r.err.trimmingCharacters(in: .whitespacesAndNewlines))
+            update(state: .daemonDown(r.err.trimmingCharacters(in: .whitespacesAndNewlines)), details: Details())
         }
+    }
+
+    private func update(state new: State, details newDetails: Details) {
+        if details != newDetails { details = newDetails }
+        if state != new { state = new }
     }
 
     // MARK: - Действия

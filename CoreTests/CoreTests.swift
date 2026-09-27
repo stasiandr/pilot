@@ -1848,10 +1848,12 @@ do {
     check(reused.guid(forAsset: "Assets/UI/Button.prefab")?.description == buttonPrefabGUID,
           "неизменившийся .meta не перечитывается: GUID из прошлого индекса")
     check(reused.count == assetIndex.count, "повторная сборка знает те же ассеты (получено \(reused.count))")
+    check(reused.hasSameEntries(as: assetIndex), "ничего не менялось — записи те же, кэш переписывать незачем")
     setTime(Date().addingTimeInterval(60))
     let reread = UnityAssetIndex.build(root: unityRoot, reusing: assetIndex, since: Date())
     check(reread.guid(forAsset: "Assets/UI/Button.prefab")?.description == other,
           "изменённый после прошлой сборки .meta перечитан")
+    check(!reread.hasSameEntries(as: assetIndex), "сменился GUID — записи уже не те")
     put("Assets/UI/Button.prefab.meta", "fileFormatVersion: 2\nguid: \(buttonPrefabGUID)\n")
 }
 
@@ -1864,6 +1866,7 @@ if let reread = UnityAssetIndex.deserialize(assetText) {
     check(reread.displayName(for: UnityGUID(playerGUID)!) == "Player", "из кэша: имя скрипта")
     check(reread.assemblyPaths == assetIndex.assemblyPaths, "из кэша: те же сборки")
     check(reread.serialized() == assetText, "и записывается обратно байт в байт")
+    check(reread.hasSameEntries(as: assetIndex), "из кэша: те же записи в том же порядке")
 } else {
     check(false, "кэш индекса GUID читается")
 }
@@ -4014,6 +4017,16 @@ check(Rustlyn.shared == nil, "без библиотеки сессии нет")
 check(Rustlyn.start(root: URL(fileURLWithPath: "/tmp")) == nil, "и не поднимается")
 check(!Rustlyn.understands(URL(fileURLWithPath: "/a/B.cs")), "без библиотеки понимать нечего")
 check(Rustlyn.buildsAgree(), "сверять нечего — значит, расхождения нет")
+
+// Исходники среди путей индекса — по строке, без `URL` (и без `lstat`).
+check(CSharpSources.contains("Assets/Scripts/Pawn.cs"), ".cs — исходник")
+check(CSharpSources.contains("Tools/Build.csx") && CSharpSources.contains("OLD/PAWN.CS"), ".csx и любой регистр")
+check(!CSharpSources.contains("Web/site.css"), ".css — не C#")
+check(!CSharpSources.contains("Assets/Pawn.cs.meta") && !CSharpSources.contains("App.csproj"), ".meta и .csproj — не исходники")
+check(!CSharpSources.contains("Samples.cs/README") && !CSharpSources.contains("Makefile"), "точка в папке и имя без точки")
+check(CSharpSources.among(["A.cs", "b.txt", "c/D.CS"], root: URL(fileURLWithPath: "/p")) == ["/p/A.cs", "/p/c/D.CS"],
+      "исходники — абсолютными путями")
+check(CSharpSources.among(["A.cs"], root: URL(fileURLWithPath: "/")) == ["/A.cs"], "от корня диска — без двойного слеша")
 
 // Виды объявлений ложатся на виды структуры файла.
 check(RustlynDeclarationKind.class.outlineKind == .type, "класс — это тип")

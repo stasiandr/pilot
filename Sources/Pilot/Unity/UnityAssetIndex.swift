@@ -84,6 +84,13 @@ final class UnityAssetIndex: @unchecked Sendable {   // неизменяем п�
         return UnityAssetIndex(entries: entries)
     }
 
+    /// Те же записи в том же порядке — свежий обход ничего не нашёл нового.
+    /// Тогда ни кэш переписывать, ни открытое переразбирать незачем.
+    func hasSameEntries(as other: UnityAssetIndex) -> Bool {
+        guard entries.count == other.entries.count else { return false }
+        return zip(entries, other.entries).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+    }
+
     func path(for guid: UnityGUID) -> String? { pathByGUID[guid] }
 
     func guid(forAsset relPath: String) -> UnityGUID? { guidByPath[relPath] }

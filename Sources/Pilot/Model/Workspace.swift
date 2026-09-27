@@ -17,6 +17,8 @@ final class Workspace: ObservableObject {
     /// С какого момента собран `symbolIndex`: при следующей сборке заново
     /// разбирается только изменённое после него.
     private var symbolsBuiltFrom: Date?
+    /// Символы, прочитанные из кэша при этом открытии проекта (см. `LoadedSymbols`).
+    private var loadedSymbols = LoadedSymbols()
     /// То же для `assemblyIndex`.
     private var assembliesBuiltFrom: Date?
     /// Типы из сборок, к которым нет исходников: плагины проекта и сам
@@ -721,9 +723,12 @@ final class Workspace: ObservableObject {
             }
         }
         // Символы из кэша — чтобы быстрый навигатор работал с первой секунды,
-        // не дожидаясь разбора всего проекта.
+        // не дожидаясь разбора всего проекта. Их же берёт и сам разбор.
+        let loaded = LoadedSymbols()
+        loadedSymbols = loaded
         typeWork.async { [weak self] in
             guard let cached = IndexCache.loadSymbols(root: url) else { return }
+            loaded.store(cached.index, builtAt: cached.builtAt)
             Task { @MainActor in
                 guard let self, self.scanGeneration.isCurrent(generation),
                       self.symbolIndex == nil else { return }
@@ -801,12 +806,16 @@ final class Workspace: ObservableObject {
         // а не разбирает заново, — поэтому после сохранения это работа над
         // одним файлом, а не над проектом, и при повторном открытии проекта
         // это чтение, а не разбор.
-        let sources = files.filter { Rustlyn.understands(url.appendingPathComponent($0)) }
-            .map { url.appendingPathComponent($0) }
-        if !sources.isEmpty, let rustlyn = rustlyn {
+        //
+        // Исходники выбираются тоже в фоне и по строке пути: `URL` из каждого
+        // пути — это `lstat` на каждый, и на Unity-проекте в 272 000 файлов
+        // главный поток стоял больше полусекунды.
+        if let rustlyn = rustlyn {
             typeWork.async { [weak self] in
                 guard counter.isCurrent(generation) else { return }
-                rustlyn.reindex(sources)
+                let sources = Rustlyn.sources(among: files, root: url)
+                guard !sources.isEmpty else { return }
+                rustlyn.reindex(paths: sources)
                 // Индекс собран — теперь компиляция: она берёт файлы из него.
                 Task { @MainActor in
                     guard counter.isCurrent(generation) else { return }
@@ -817,18 +826,30 @@ final class Workspace: ObservableObject {
         // Прошлый индекс и время, с которого он собран: разбирать заново
         // нужно только то, что менялось после. Без него — весь проект.
         let base = symbolIndex.flatMap { index in symbolsBuiltFrom.map { (index, $0) } }
+        let loaded = loadedSymbols
         typeWork.async { [weak self] in
             let builtFrom = Date()
             let stop = { !counter.isCurrent(generation) }
             let symbols: SymbolIndex?
-            // Кэш с диска мог ещё не дойти до главного потока — тогда он
-            // читается здесь: разобрать заново весь проект дороже.
-            let previous = base ?? IndexCache.loadSymbols(root: url).flatMap { cached in
+            // Кэш с диска мог ещё не дойти до главного потока. Прочитан он
+            // на этой же очереди раньше — берём оттуда; читать и разбирать
+            // десятки мегабайт второй раз незачем.
+            let previous = base ?? loaded.take() ?? IndexCache.loadSymbols(root: url).flatMap { cached in
                 cached.builtAt.map { (cached.index, $0) }
             }
+            loaded.clear()
+            // Ничего не менялось с прошлой сборки: индекс из кэша и есть
+            // свежий. Ни пересобирать его, ни переписывать кэш не нужно, и
+            // метка времени у кэша остаётся прежней — она по-прежнему верна.
+            var unchanged = false
             if let (index, since) = previous, index.root == url {
                 let (changed, removed) = SymbolIndex.changes(from: index, files: files, since: since)
-                symbols = SymbolIndex.updating(index, changed: changed, removed: removed, shouldStop: stop)
+                if changed.isEmpty, removed.isEmpty {
+                    symbols = index
+                    unchanged = true
+                } else {
+                    symbols = SymbolIndex.updating(index, changed: changed, removed: removed, shouldStop: stop)
+                }
                 NSLog("[index] объявления: разобрано заново %d файлов, убрано %d, за %d мс",
                       changed.count, removed.count, Int(Date().timeIntervalSince(builtFrom) * 1000))
             } else {
@@ -838,15 +859,42 @@ final class Workspace: ObservableObject {
                       Int(Date().timeIntervalSince(builtFrom) * 1000))
             }
             guard let symbols else { return }
+            let stamp = unchanged ? previous?.1 ?? builtFrom : builtFrom
             let fresh = TypeIndex.make(root: url, entries: symbols.typeEntries())
             Task { @MainActor in
                 guard let self, counter.isCurrent(generation), batch.isCurrent(symbolBatch) else { return }
-                self.symbolIndex = symbols
-                self.symbolsBuiltFrom = builtFrom
+                if self.symbolIndex !== symbols { self.symbolIndex = symbols }
+                self.symbolsBuiltFrom = stamp
                 self.adoptTypes(fresh, indexing: false)
             }
+            guard !unchanged else { return }
             IndexCache.saveTypes(fresh, root: url)
             IndexCache.saveSymbols(symbols, root: url, builtFrom: builtFrom)
+        }
+    }
+
+    /// Символы из кэша, прочитанные при открытии проекта, — для полного
+    /// разбора следом. Оба дела идут на `typeWork` по очереди, поэтому
+    /// замок здесь только для порядка: пишет одно, читает другое, и никогда
+    /// одновременно.
+    final class LoadedSymbols: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: (SymbolIndex, Date)?
+
+        func store(_ index: SymbolIndex, builtAt: Date?) {
+            guard let builtAt else { return }
+            lock.lock(); value = (index, builtAt); lock.unlock()
+        }
+
+        func take() -> (SymbolIndex, Date)? {
+            lock.lock(); defer { lock.unlock() }
+            return value
+        }
+
+        /// Держать индекс дольше разбора незачем: он большой, а у главного
+        /// потока к тому времени уже свой.
+        func clear() {
+            lock.lock(); value = nil; lock.unlock()
         }
     }
 
@@ -974,7 +1022,7 @@ final class Workspace: ObservableObject {
         pendingRemoved.removeAll()
         // Правка C# — это и индекс Rustlyn, и компиляция проекта. Удалённый
         // файл языка уже не скажет, поэтому любое удаление тоже в счёт.
-        if !removed.isEmpty || changed.contains(where: { Rustlyn.understands(root.appendingPathComponent($0)) }) {
+        if !removed.isEmpty || changed.contains(where: Rustlyn.understands(path:)) {
             // Список файлов вот-вот соберут заново (checkout, новые файлы):
             // компилировать по старому — значит компилировать дважды.
             if rescanScheduled { rustlynAfterRescan = true } else { refreshRustlyn() }
@@ -1012,9 +1060,12 @@ final class Workspace: ObservableObject {
     /// объявлений.
     private func refreshRustlyn() {
         guard let root, let rustlyn = rustlyn, let files = index?.display else { return }
-        let sources = files.map { root.appendingPathComponent($0) }.filter(Rustlyn.understands)
+        // Список исходников — в фоне и без `URL` на каждый путь: это
+        // каждое сохранение C#, и `lstat` на все файлы Unity-проекта
+        // останавливал на нём главный поток на полсекунды.
         typeWork.async { [weak self] in
-            if !sources.isEmpty { rustlyn.reindex(sources) }
+            let sources = Rustlyn.sources(among: files, root: root)
+            if !sources.isEmpty { rustlyn.reindex(paths: sources) }
             Task { @MainActor in self?.scheduleCompile() }
         }
     }
@@ -1104,15 +1155,28 @@ final class Workspace: ObservableObject {
     ///
     /// Сверяем с событиями до фильтра игнорирования: сгенерированный код
     /// Unity лежит в `Temp` и `Library`, в индекс не попадает, но открыт.
+    ///
+    /// `realPath` — несколько системных вызовов на путь, а событий в пачке во
+    /// время компиляции Unity тысячи, и все они шли через него на главном
+    /// потоке. Вкладок же единицы: сначала сверяются имена файлов, и до
+    /// `realPath` доходят только события с именем открытого файла.
     private func reloadOpenTabs(touched events: [FileEvent]) {
-        let touched = Set(events.map { Self.realPath(URL(fileURLWithPath: $0.path)).path })
+        let reloadable = tabs.compactMap { tab -> (tab: TextBuffer, path: String)? in
+            guard tab.document.media == nil, tab.document.decompiled == nil, !tab.isReviewVersion
+            else { return nil }
+            return (tab, Self.realPath(tab.url).path)
+        }
+        guard !reloadable.isEmpty else { return }
+        let names = Set(reloadable.map { ($0.path as NSString).lastPathComponent.lowercased() })
+        let touched = Set(events.lazy
+            .filter { names.contains(($0.path as NSString).lastPathComponent.lowercased()) }
+            .map { Self.realPath(URL(fileURLWithPath: $0.path)).path })
+        guard !touched.isEmpty else { return }
         let prefix = ((watchRoot ?? root)?.path ?? "") + "/"
-        let candidates = tabs.filter { tab in
-            let path = Self.realPath(tab.url).path
+        let candidates = reloadable.compactMap { tab, path -> TextBuffer? in
             // Своё сохранение — не изменение снаружи.
             let own = path.hasPrefix(prefix) && ownWrites.contains(String(path.dropFirst(prefix.count)))
-            return tab.document.media == nil && tab.document.decompiled == nil && !tab.isReviewVersion
-                && touched.contains(path) && !own
+            return touched.contains(path) && !own ? tab : nil
         }
         for tab in candidates {
             if tab.isDirty {
@@ -1699,10 +1763,12 @@ final class Workspace: ObservableObject {
             && (scope == .text || intent.text ? !trimmed.isEmpty : trimmed.count >= 3)
         if wantsText, let files = snapshot.files, let root {
             paletteBusy = true
-            let paths = textSearchOrder(files.display, data: scope == .text)
+            let order = textSearchOrder(data: scope == .text)
             let needle = scope == .text ? q : trimmed
             // Пауза: на каждую букву читать проект незачем.
             textWork.asyncAfter(deadline: .now() + .milliseconds(scope == .text ? 80 : 160)) { [weak self] in
+                guard counter.isCurrent(generation) else { return }
+                let paths = order.apply(to: files.display)
                 guard counter.isCurrent(generation) else { return }
                 let hits = ContentSearch.search(needle, root: root, paths: paths,
                                                 shouldStop: { !counter.isCurrent(generation) })
@@ -1754,12 +1820,13 @@ final class Workspace: ObservableObject {
                     if intent.text || scope == .text { self.paletteBusy = false }
                     return
                 }
-                let paths = files.display.filter {
-                    scope == .text || !Self.serializedExtensions.contains(($0 as NSString).pathExtension.lowercased())
-                }
                 let needle = scope == .text ? q : trimmed
                 self.textWork.asyncAfter(deadline: .now() + .milliseconds(scope == .text ? 120 : 200)) { [weak self] in
                     guard counter.isCurrent(generation) else { return }
+                    // Фильтр — здесь, а не на главном: у пары бывает и
+                    // Unity-проект в сотни тысяч файлов.
+                    let paths = TextSearchOrder(open: [], folder: nil, data: scope == .text)
+                        .apply(to: files.display)
                     let hits = ContentSearch.search(needle, root: pair.root, paths: paths,
                                                     shouldStop: { !counter.isCurrent(generation) })
                     let candidates = hits.enumerated().map { number, hit -> SearchCandidate in
@@ -1895,19 +1962,34 @@ final class Workspace: ObservableObject {
     ///
     /// Сцены, префабы и ассеты (`data`) читаются только в фильтре «Текст»:
     /// их бывают сотни мегабайт, а во «Всём» ищут код.
-    private func textSearchOrder(_ all: [String], data: Bool) -> [String] {
-        let open = Set(tabs.map { relativePath(for: $0.document.url) })
-        let folder = openFilePath.map { ($0 as NSString).deletingLastPathComponent + "/" }
-        var first: [String] = [], near: [String] = [], rest: [String] = []
-        first.reserveCapacity(open.count)
-        rest.reserveCapacity(all.count)
-        for path in all {
-            if !data, Self.serializedExtensions.contains((path as NSString).pathExtension.lowercased()) { continue }
-            if open.contains(path) { first.append(path) }
-            else if let folder, folder != "/", path.hasPrefix(folder) { near.append(path) }
-            else { rest.append(path) }
+    ///
+    /// Вкладки и открытый файл снимаются здесь, на главном, а сам список
+    /// раскладывается в фоне: это все файлы проекта, на Unity-проекте —
+    /// сотни тысяч путей, и главный поток тратил на них ~0,1 с на каждую
+    /// букву запроса.
+    private func textSearchOrder(data: Bool) -> TextSearchOrder {
+        TextSearchOrder(open: Set(tabs.map { relativePath(for: $0.document.url) }),
+                        folder: openFilePath.map { ($0 as NSString).deletingLastPathComponent + "/" },
+                        data: data)
+    }
+
+    struct TextSearchOrder: Sendable {
+        let open: Set<String>
+        let folder: String?
+        let data: Bool
+
+        func apply(to all: [String]) -> [String] {
+            var first: [String] = [], near: [String] = [], rest: [String] = []
+            first.reserveCapacity(open.count)
+            rest.reserveCapacity(all.count)
+            for path in all {
+                if !data, Workspace.serializedExtensions.contains((path as NSString).pathExtension.lowercased()) { continue }
+                if open.contains(path) { first.append(path) }
+                else if let folder, folder != "/", path.hasPrefix(folder) { near.append(path) }
+                else { rest.append(path) }
+            }
+            return first + near + rest
         }
-        return first + near + rest
     }
 
     /// Пустой запрос: открытые вкладки, дальше файлы проекта — как ⌘P.
@@ -4086,6 +4168,14 @@ enum IndexCache {
     static func saveAssets(_ index: UnityAssetIndex, root: URL, builtFrom: Date) {
         guard let url = fileURL(root: root, extension: "unity") else { return }
         try? index.serialized().data(using: .utf8)?.write(to: url, options: .atomic)
+        stamp(url, builtFrom)
+    }
+
+    /// Обход не нашёл ничего нового: содержимое кэша верно, сдвигается
+    /// только его метка — иначе `.meta`, тронутые без смены GUID (настройки
+    /// импорта), перечитывались бы при каждом открытии.
+    static func restampAssets(root: URL, builtFrom: Date) {
+        guard let url = fileURL(root: root, extension: "unity") else { return }
         stamp(url, builtFrom)
     }
 

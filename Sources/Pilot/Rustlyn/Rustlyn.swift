@@ -228,6 +228,14 @@ final class Rustlyn: @unchecked Sendable {
         ["cs", "csx"].contains(url.pathExtension.lowercased())
     }
 
+    /// То же по пути строкой — для списков из индекса файлов (см. `CSharpSources`).
+    static func understands(path: String) -> Bool { CSharpSources.contains(path) }
+
+    /// Исходники Rustlyn среди путей индекса — абсолютными путями.
+    static func sources(among files: [String], root: URL) -> [String] {
+        CSharpSources.among(files, root: root)
+    }
+
     @discardableResult
     func open(_ url: URL) -> Bool {
         DeepStack.run { url.path.withCString { rln_open(handle, $0) == RLN_OK } }
@@ -328,8 +336,14 @@ final class Rustlyn: @unchecked Sendable {
     /// сохранения это дёшево, а дорого только в первый раз.
     @discardableResult
     func reindex(_ urls: [URL]) -> IndexReport {
+        reindex(paths: urls.map(\.path))
+    }
+
+    /// То же по абсолютным путям — так их отдаёт `sources(among:root:)`.
+    @discardableResult
+    func reindex(paths files: [String]) -> IndexReport {
         var report = RlnReport()
-        let paths: [UnsafeMutablePointer<CChar>?] = urls.map { strdup($0.path) }
+        let paths: [UnsafeMutablePointer<CChar>?] = files.map { strdup($0) }
         defer { paths.forEach { free($0) } }
         var pointers: [UnsafePointer<CChar>?] = paths.map { $0.map { UnsafePointer($0) } }
         let status = DeepStack.run { pointers.withUnsafeMutableBufferPointer { buffer in

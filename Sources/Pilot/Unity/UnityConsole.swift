@@ -77,15 +77,36 @@ final class UnityConsole: ObservableObject {
 
     // MARK: - Чтение
 
+    /// Опрос — дважды в секунду всё время, пока открыт Unity-проект, поэтому
+    /// `stat` идёт в фоне: при занятом диске и он стоит сотни миллисекунд,
+    /// а на главном потоке это подвисание окна. Раньше здесь был
+    /// `attributesOfItem` — он читает ещё и расширенные атрибуты файла.
     private func poll() {
         guard projectRoot != nil, !reading else { return }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = (attributes[.size] as? NSNumber)?.uint64Value,
-              let node = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value else {
-            isMissing = true
+        reading = true
+        let path = url.path
+        queue.async { [weak self] in
+            var info = stat()
+            let found = stat(path, &info) == 0
+            let size = UInt64(max(0, info.st_size))
+            let node = UInt64(info.st_ino)
+            Task { @MainActor in
+                guard let self else { return }
+                self.reading = false
+                self.polled(found: found, size: size, node: node)
+            }
+        }
+    }
+
+    private func polled(found: Bool, size: UInt64, node: UInt64) {
+        guard projectRoot != nil else { return }
+        // Только перемены: запись в @Published перерисовывает подписчиков,
+        // даже если значение то же, — а опрос идёт дважды в секунду.
+        guard found else {
+            if !isMissing { isMissing = true }
             return
         }
-        isMissing = false
+        if isMissing { isMissing = false }
         // Unity перезапустили: новый файл или тот же, но короче.
         if node != inode || size < offset {
             let fresh = inode == 0

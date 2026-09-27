@@ -7,6 +7,32 @@ import Foundation
 // сборке Pilot у того, кто не ставил Rust. Разбор C-структур живёт в
 // `Rustlyn.swift`, за `#if canImport`.
 
+/// Исходники C# в списке путей — по строке, без `URL`.
+///
+/// Списки эти — индекс файлов проекта, на Unity-проекте сотни тысяч путей,
+/// а `appendingPathComponent` без подсказки спрашивает диск (`lstat`), не
+/// папка ли это. Расширение же видно и по строке.
+enum CSharpSources {
+    /// `.cs` и `.csx` в любом регистре — то же, что `Rustlyn.understands(_:)`.
+    static func contains(_ path: String) -> Bool {
+        let bytes = path.utf8
+        guard let dot = bytes.lastIndex(of: UInt8(ascii: ".")) else { return false }
+        // `| 0x20` переводит латиницу в нижний регистр: `.CS` — тоже C#.
+        var letters = bytes[bytes.index(after: dot)...].makeIterator()
+        guard letters.next().map({ $0 | 0x20 }) == UInt8(ascii: "c"),
+              letters.next().map({ $0 | 0x20 }) == UInt8(ascii: "s") else { return false }
+        guard let third = letters.next() else { return true }
+        return third | 0x20 == UInt8(ascii: "x") && letters.next() == nil
+    }
+
+    /// Исходники среди путей индекса (относительных, через `/`) —
+    /// абсолютными путями, как их ждут `reindex` и `compile`.
+    static func among(_ files: [String], root: URL) -> [String] {
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return files.filter(contains).map { prefix + $0 }
+    }
+}
+
 /// Что объявляет объявление. Повторяет `DeclarationKind` из Rustlyn; что
 /// таблицы не разъехались, проверяет `Rustlyn.buildsAgree()` при запуске.
 enum RustlynDeclarationKind: UInt8, CaseIterable {

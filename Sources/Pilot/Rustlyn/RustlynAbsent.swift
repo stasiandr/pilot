@@ -39,6 +39,8 @@ final class Rustlyn: @unchecked Sendable {
 
     /// Без библиотеки понимать нечего.
     static func understands(_ url: URL) -> Bool { false }
+    static func understands(path: String) -> Bool { false }
+    static func sources(among files: [String], root: URL) -> [String] { [] }
 
     /// Сверять нечего, поэтому расхождения нет.
     static func buildsAgree() -> Bool { true }
@@ -79,6 +81,8 @@ final class Rustlyn: @unchecked Sendable {
 
     @discardableResult
     func reindex(_ urls: [URL]) -> IndexReport { IndexReport() }
+    @discardableResult
+    func reindex(paths: [String]) -> IndexReport { IndexReport() }
 
     func definition(_ url: URL, offset: Int, text: String? = nil) -> RustlynDefinition { RustlynDefinition() }
     func implementations(_ url: URL, offset: Int) -> RustlynDefinition { RustlynDefinition() }

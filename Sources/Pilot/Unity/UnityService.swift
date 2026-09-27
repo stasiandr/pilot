@@ -72,12 +72,26 @@ final class UnityService: ObservableObject {
                                               since: cached?.builtAt,
                                               shouldStop: { !counter.isCurrent(current) })
             let ms = Int(Date().timeIntervalSince(started) * 1000)
+            // Обычно между запусками не меняется ничего. Тогда кэш на диске
+            // уже верен — сдвигается только его метка, — а подписи в
+            // открытом файле уже сделаны по нему: переписывать десяток
+            // мегабайт и переразбирать файл незачем.
+            let unchanged = cached.map { index.hasSameEntries(as: $0.index) } ?? false
             if counter.isCurrent(current) {
-                IndexCache.saveAssets(index, root: project.root, builtFrom: builtFrom)
+                if unchanged {
+                    IndexCache.restampAssets(root: project.root, builtFrom: builtFrom)
+                } else {
+                    IndexCache.saveAssets(index, root: project.root, builtFrom: builtFrom)
+                }
             }
             Task { @MainActor in
                 guard let self, counter.isCurrent(current) else { return }
-                NSLog("[unity] индекс GUID: %d ассетов за %d мс", index.count, ms)
+                NSLog("[unity] индекс GUID: %d ассетов за %d мс%@", index.count, ms,
+                      unchanged ? " (как в кэше)" : "")
+                if unchanged, self.assets != nil {
+                    self.isIndexingAssets = false
+                    return
+                }
                 self.assets = index
                 self.isIndexingAssets = false
                 self.decorationsVersion += 1
