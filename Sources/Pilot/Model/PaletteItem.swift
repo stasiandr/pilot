@@ -17,6 +17,7 @@ enum PaletteMode: Equatable, CaseIterable {
     case counterparts   // ⌃⌘T — двойник во второй половине пары, связи конфига
     case contract       // сверка датаграмм клиента и сервера
     case mirrors        // зеркальные файлы пары, которые разошлись
+    case generated      // что генераторы Unity написали для типов открытого файла
 
     var placeholder: String {
         switch self {
@@ -31,6 +32,7 @@ enum PaletteMode: Equatable, CaseIterable {
         case .counterparts: return L("Во второй половине пары")
         case .contract:   return L("Датаграмма…")
         case .mirrors:    return L("Зеркальный файл…")
+        case .generated:  return L("Сгенерированный файл…")
         }
     }
 
@@ -47,6 +49,7 @@ enum PaletteMode: Equatable, CaseIterable {
         case .counterparts: return "arrow.left.arrow.right"
         case .contract:   return "antenna.radiowaves.left.and.right"
         case .mirrors:    return "doc.on.doc"
+        case .generated:  return "gearshape.2"
         }
     }
 }

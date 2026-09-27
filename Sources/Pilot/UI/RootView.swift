@@ -345,12 +345,24 @@ struct RootView: View {
             StatusIndicator(workspace: workspace)
         }
 
-        ToolbarItem(id: "outline", placement: .automatic) {
-            Button { workspace.openPalette(mode: .outline) } label: {
-                Label(L("Структура файла"), systemImage: "list.bullet.indent")
+        Group {
+            ToolbarItem(id: "outline", placement: .automatic) {
+                Button { workspace.openPalette(mode: .outline) } label: {
+                    Label(L("Структура файла"), systemImage: "list.bullet.indent")
+                }
+                .help(KeymapStore.shared.help(L("Структура файла"), .fileStructure))
+                .disabled(workspace.document == nil)
             }
-            .help(KeymapStore.shared.help(L("Структура файла"), .fileStructure))
-            .disabled(workspace.document == nil)
+
+            // Что генераторы Unity написали для типов этого файла.
+            ToolbarItem(id: "generated", placement: .automatic) {
+                if workspace.unity.project != nil, workspace.document?.url.pathExtension == "cs" {
+                    Button { workspace.openPalette(mode: .generated) } label: {
+                        Label(L("Сгенерированный код"), systemImage: "gearshape.2")
+                    }
+                    .help(L("Что генераторы исходников написали для типов этого файла"))
+                }
+            }
         }
 
         ToolbarItem(id: "search", placement: .automatic) {

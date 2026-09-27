@@ -21,5 +21,19 @@ extension English {
          "Select a message to see its stack; double-click to go to the code"),
         ("Editor.log сейчас пишет другой проект", "Editor.log is being written by another project"),
         ("Показать всё равно", "Show Anyway"),
+        // Сгенерированный код: UnityGenerators.swift, Workspace+Generated.swift
+        ("Сгенерированный код", "Generated Code"),
+        ("Сгенерированный файл…", "Generated file…"),
+        ("Что генераторы исходников написали для типов этого файла", "What source generators wrote for the types in this file"),
+        ("Сгенерированный код есть только у Unity-проекта", "Generated code is only available in a Unity project"),
+        ("Сначала откройте файл C#", "Open a C# file first"),
+        ("Не найден редактор Unity %@", "Unity editor %@ not found"),
+        ("Не найден компилятор Unity в %@", "Unity's compiler not found in %@"),
+        ("Файл не из Unity-проекта", "The file is not in the Unity project"),
+        ("Ищу сборку %@…", "Finding the assembly of %@…"),
+        ("Генераторы работают над %@…", "Running generators on %@…"),
+        ("Unity ещё не компилировала %@ — откройте проект в Unity", "Unity has not compiled %@ yet — open the project in Unity"),
+        ("Для типов этого файла генераторы ничего не написали", "Generators wrote nothing for the types in this file"),
+        ("Для типов этого файла генераторы ничего не написали (всего в %@: %@)", "Generators wrote nothing for the types in this file (%@ has %@ in total)"),
     ]
 }

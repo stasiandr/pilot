@@ -210,7 +210,7 @@ struct PaletteView: View {
             case .symbols: return workspace.symbolIndex == nil && !workspace.lsp.isReady
             }
         case .outline, .references, .declarations, .implementations, .changes, .assetUsages, .recentLocations,
-             .counterparts, .contract, .mirrors: return false
+             .counterparts, .contract, .mirrors, .generated: return false
         }
     }
 
@@ -228,7 +228,7 @@ struct PaletteView: View {
                 .foregroundStyle(.tertiary)
                 .help(L("Типов в индексе"))
         case .search, .references, .declarations, .implementations, .outline, .changes, .assetUsages, .recentLocations,
-             .counterparts, .contract, .mirrors:
+             .counterparts, .contract, .mirrors, .generated:
             if !workspace.items.isEmpty {
                 Text("\(workspace.items.count)")
                     .font(.system(size: 11, design: .monospaced))
@@ -249,7 +249,10 @@ struct PaletteView: View {
     }
 
     private var emptyMessage: String {
-        if workspace.paletteBusy { return L("Ищу…") }
+        if workspace.paletteBusy {
+            return workspace.paletteMode == .generated && !workspace.generatedStatus.isEmpty
+                ? workspace.generatedStatus : L("Ищу…")
+        }
         switch workspace.paletteMode {
         case .search:
             return searchEmptyMessage
@@ -282,6 +285,11 @@ struct PaletteView: View {
             return workspace.query.isEmpty ? L("Датаграммы клиента и сервера сходятся") : L("Ничего не найдено")
         case .mirrors:
             return workspace.query.isEmpty ? L("Зеркальные файлы одинаковы в обеих половинах") : L("Ничего не найдено")
+        case .generated:
+            return workspace.query.isEmpty
+                ? (workspace.generatedStatus.isEmpty ? L("Для типов этого файла генераторы ничего не написали")
+                                                     : workspace.generatedStatus)
+                : L("Ничего не найдено")
         }
     }
 

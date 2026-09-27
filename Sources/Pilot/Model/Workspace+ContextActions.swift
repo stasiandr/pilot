@@ -194,6 +194,12 @@ extension Workspace {
                                          shortcut: KeymapStore.shared.menuShortcut(.toggleMeta)) { [weak self] in
                 self?.toggleMetaFile()
             })
+            if document.url.pathExtension == "cs" {
+                actions.append(ContextAction(title: L("Сгенерированный код"), icon: "gearshape.2",
+                                             shortcut: nil) { [weak self] in
+                    self?.openPalette(mode: .generated)
+                })
+            }
         }
         return actions
     }

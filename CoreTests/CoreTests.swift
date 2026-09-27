@@ -1727,7 +1727,7 @@ section("Режимы палитры")
 
 // CaseIterable + исчерпывающие switch: если в enum добавится режим,
 // а ветку забудут — это упадёт здесь, а не при сборке приложения.
-check(PaletteMode.allCases.count == 11, "режимов палитры одиннадцать: файлы, типы и символы — один поиск, три — у пары")
+check(PaletteMode.allCases.count == 12, "режимов палитры двенадцать: файлы, типы и символы — один поиск, три — у пары")
 for scope in SearchScope.allCases {
     check(!scope.title.isEmpty && !scope.placeholder.isEmpty && !scope.icon.isEmpty,
           "у фильтра \(scope) есть подпись, подсказка и иконка")
@@ -6074,6 +6074,59 @@ do {
     check(mult.map { ValueFlow.string(units, $0) } == "crit ? 2 : 1", "var mult = … — объявление")
     check(ValueFlow.localInitializer(in: units, name: "Value", within: method, before: units.count) == nil,
           "hp.Value -= … — не объявление")
+}
+
+section("Unity: сгенерированный код")
+do {
+    let log = """
+    error CS0016: Could not write to output file '/p/Temp/GeneratedCode/A/Gen/G.Type/X.g.cs' -- 'Could not find a part of the path.'
+    Assets/A.cs(1,2): error CS0246: The type or namespace name 'Q' could not be found
+    """
+    check(UnityGenerators.unwritable(in: log) == ["/p/Temp/GeneratedCode/A/Gen/G.Type/X.g.cs"],
+          "папки под вывод берутся из CS0016, прочие ошибки — мимо")
+
+    let source = "namespace N {\n  public partial class UpdateGiftsSystem : ISystem {}\n  enum LootCaseType { A }\n  struct Row {}\n}"
+    check(UnityGenerators.declaredTypes(in: source) == ["UpdateGiftsSystem", "LootCaseType", "Row"],
+          "типы файла: класс, перечисление, структура")
+
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("pilot-generated-\(getpid())")
+    defer { try? fm.removeItem(at: dir) }
+    let pipeline = dir.appendingPathComponent("Out/SystemCallGenerator/SourceGenerators.Generators.Pipelines.SystemsPipeline")
+    try? fm.createDirectory(at: pipeline, withIntermediateDirectories: true)
+    let byName = pipeline.appendingPathComponent("UpdateGiftsSystem.system_0123abcd.g.cs")
+    let enumFile = pipeline.appendingPathComponent("dev.Scripts.LootCaseType_to_default_string.g.cs")
+    let byContent = pipeline.appendingPathComponent("Registry.g.cs")
+    let other = pipeline.appendingPathComponent("UpdateGiftsSystemX.system_ffff.g.cs")
+    try? "class Unrelated {}".write(to: byName, atomically: true, encoding: .utf8)
+    try? "static class E {}".write(to: enumFile, atomically: true, encoding: .utf8)
+    try? "namespace N { partial struct Row { } }".write(to: byContent, atomically: true, encoding: .utf8)
+    try? "partial class UpdateGiftsSystemX {}".write(to: other, atomically: true, encoding: .utf8)
+    let all = UnityGenerators.generatedFiles(in: dir.appendingPathComponent("Out"))
+    check(all.count == 4, "вывод генераторов — все .cs под папкой")
+    let picked = Set(UnityGenerators.files(all, about: ["UpdateGiftsSystem", "LootCaseType", "Row"]).map(\.lastPathComponent))
+    check(picked == [byName.lastPathComponent, enumFile.lastPathComponent, byContent.lastPathComponent],
+          "свои файлы — по имени и по partial, похожее имя — нет")
+    check(UnityGenerators.files(all, about: []).isEmpty, "без типов — ничего")
+    check(UnityGenerators.generatorName(of: byName, in: dir.appendingPathComponent("Out")) == "SystemsPipeline",
+          "подпись — короткое имя генератора")
+
+    // Два графа Bee знают один файл — берём тот, что Unity писала последней.
+    let old = dir.appendingPathComponent("Library/Bee/artifacts/100.dag")
+    let new = dir.appendingPathComponent("Library/Bee/artifacts/200.dag")
+    try? fm.createDirectory(at: old, withIntermediateDirectories: true)
+    try? fm.createDirectory(at: new, withIntermediateDirectories: true)
+    let line = "-target:library\n\"Assets/Game/Gifts.cs\"\n"
+    try? line.write(to: old.appendingPathComponent("Game.rsp"), atomically: true, encoding: .utf8)
+    try? line.write(to: new.appendingPathComponent("Game.rsp"), atomically: true, encoding: .utf8)
+    try? line.write(to: new.appendingPathComponent("Game.dll.mvfrm.rsp"), atomically: true, encoding: .utf8)
+    try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)],
+                          ofItemAtPath: old.appendingPathComponent("Game.rsp").path)
+    check(UnityGenerators.responseFile(for: "Assets/Game/Gifts.cs", project: dir)?.resolvingSymlinksInPath().path
+            == new.appendingPathComponent("Game.rsp").resolvingSymlinksInPath().path,
+          "сборка файла — из свежего графа, .mvfrm.rsp мимо")
+    check(UnityGenerators.responseFile(for: "Assets/Game/Other.cs", project: dir) == nil,
+          "файла, который Unity не компилировала, нет ни в одной сборке")
 }
 
 print("\n════════════════════════════════════")

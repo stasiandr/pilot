@@ -230,6 +230,8 @@ final class Workspace: ObservableObject {
     private(set) var requestedFile: URL?
     /// Имя ассета, чьи использования сейчас в палитре.
     @Published private(set) var usagesTitle: String = ""
+    /// Над какой сборкой сейчас работают генераторы — для палитры, пока ждём.
+    @Published var generatedStatus: String = ""
 
     private var unityChanges: AnyCancellable?
     private var archiveChanges: AnyCancellable?
@@ -1394,6 +1396,7 @@ final class Workspace: ObservableObject {
         case .contract:   auditDatagrams()
         case .mirrors:    showMirrorDrift()
         case .counterparts: break                                              // наполняет goToCounterpart()
+        case .generated:  showGeneratedCode()
         }
     }
 
@@ -1402,7 +1405,7 @@ final class Workspace: ObservableObject {
         switch paletteMode {
         case .search:     runSearch()
         case .references, .declarations, .implementations, .assetUsages, .recentLocations,
-             .contract, .mirrors, .counterparts: filterReferences()
+             .contract, .mirrors, .counterparts, .generated: filterReferences()
         case .outline:    buildOutlineItems()
         case .changes:    buildChangeItems()
         }
@@ -1447,7 +1450,7 @@ final class Workspace: ObservableObject {
         case .search:  refreshSearch()
         case .changes: buildChangeItems()
         case .outline, .references, .declarations, .implementations, .assetUsages, .recentLocations,
-             .counterparts, .contract, .mirrors: break
+             .counterparts, .contract, .mirrors, .generated: break
         }
     }
 
