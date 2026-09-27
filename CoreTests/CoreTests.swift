@@ -6142,7 +6142,7 @@ do {
     let base = fm.temporaryDirectory.appendingPathComponent("pilot-caches-\(getpid())")
     defer { try? fm.removeItem(at: base) }
     let places = CacheStore.Locations(caches: base.appendingPathComponent("Caches"), support: base.appendingPathComponent("Support"))
-    let gone = base.appendingPathComponent("gone").path
+    let gone = base.appendingPathComponent("gone")
     let open = base.appendingPathComponent("open")
     try? fm.createDirectory(at: open, withIntermediateDirectories: true)
     func touch(_ url: URL, _ text: String = "x", age days: Double = 0) {
@@ -6150,40 +6150,208 @@ do {
         try? text.write(to: url, atomically: true, encoding: .utf8)
         try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -days * 86_400)], ofItemAtPath: url.path)
     }
-    let goneHex = String(format: "%016llx", CacheStore.projectHash(gone))
-    let openHash = CacheStore.projectHash(open.path)
-    touch(places.caches.appendingPathComponent(goneHex + ".idx"), age: 200)
-    touch(places.caches.appendingPathComponent(goneHex + ".symbols"), age: 200)
-    touch(places.rustlyn.appendingPathComponent("gone-\(String(CacheStore.projectHash(gone), radix: 16))/db"), age: 200)
-    touch(places.caches.appendingPathComponent(String(format: "%016llx", openHash) + ".idx"))
-    touch(places.rustlyn.appendingPathComponent("stranger-00000000000000ab/db"), age: 2)
-    touch(places.rustlyn.appendingPathComponent("assemblies/a.bin"))
-    touch(places.caches.appendingPathComponent("jadx.jsa"))
+    // Папки Rustlyn называются так же, как их называет сессия.
+    let goneFolder = places.rustlynFolder(root: gone)
+    let openFolder = places.rustlynFolder(root: open)
+    check(goneFolder.lastPathComponent == "gone-" + String(CacheStore.projectHash(gone.path), radix: 16),
+          "папка Rustlyn: имя проекта и хэш без нулей впереди")
+    let big = String(repeating: "c", count: 20_000)
+    touch(places.indexFile(root: gone, extension: "idx"), age: 200)
+    touch(places.indexFile(root: gone, extension: "symbols"), big, age: 200)
+    touch(places.indexFile(root: gone, extension: "types"), age: 200)
+    touch(goneFolder.appendingPathComponent("compilation.bin"), big + big, age: 200)
+    touch(goneFolder.appendingPathComponent("symbols/ab/cd"), age: 200)
+    touch(goneFolder.appendingPathComponent("outline/ef/01"), age: 200)
+    touch(goneFolder.appendingPathComponent("assembly/99/aa"), age: 200)
+    touch(places.indexFile(root: open, extension: "idx"))
+    touch(places.indexFile(root: open, extension: "unity"))
+    touch(openFolder.appendingPathComponent("compilation.bin"))
+    touch(openFolder.appendingPathComponent("outline/12/34"))
+    touch(openFolder.appendingPathComponent("decompiled/56/78"))
+    touch(places.rustlyn.appendingPathComponent("stranger-00000000000000ab/symbols/x"), age: 2)
+    try? fm.createDirectory(at: places.rustlyn.appendingPathComponent("empty-00000000000000cd"), withIntermediateDirectories: true)
+    touch(places.sharedAssemblies.appendingPathComponent("assembly/a.bin"))
+    touch(places.jadxArchive)
     touch(places.copilot.appendingPathComponent("1.0.0/server"))
     touch(places.copilot.appendingPathComponent("2.0.0/server"))
-    touch(places.history.appendingPathComponent("gone-\(goneHex)/f.txt"), age: 200)
+    touch(places.history.appendingPathComponent("gone-\(String(format: "%016llx", CacheStore.projectHash(gone.path)))/f.txt"), age: 200)
     touch(places.caches.appendingPathComponent("00000000000000c1.idx"))
     touch(places.caches.appendingPathComponent("00000000000000c2.types"))
 
-    let entries = CacheStore.scan(known: [URL(fileURLWithPath: gone)], open: [open], copilotVersion: "2.0.0", at: places)
-    let goneEntry = entries.first { $0.kind == .project && $0.name == "gone" }
-    check(goneEntry?.urls.count == 3, "индекс, символы и папка Rustlyn одного проекта — одна строка")
-    check(goneEntry?.isOrphan == true, "проекта нет на диске")
-    check(entries.first { $0.kind == .project && $0.name == "open" }?.isOpen == true, "открытый проект помечен")
-    check(entries.contains { $0.kind == .project && $0.name == "stranger" && $0.projectPath == nil },
-          "незнакомый проект — по имени папки Rustlyn")
-    check(entries.first { $0.kind == .oldCopilot }?.urls.map(\.lastPathComponent) == ["1.0.0"], "старый Copilot — кроме текущей версии")
-    check(entries.contains { $0.kind == .assemblies } && entries.contains { $0.kind == .jadx }, "общие кэши найдены")
-    check(entries.first { $0.kind == .history }?.name == "gone", "история — отдельной строкой")
-    check(entries.filter { $0.id == "project-unknown" }.first?.urls.count == 2
-            && !entries.contains { $0.name.hasPrefix("00000000000000c") },
-          "безымянные проекты — одной строкой")
+    let on = CachePolicy()
+    let entries = CacheStore.scan(known: [gone], open: [open], held: [openFolder.path], copilotVersion: "2.0.0", at: places)
+    let goneEntry = entries.first { $0.scope == .project && $0.name == "gone" }!
+    let openEntry = entries.first { $0.scope == .project && $0.name == "open" }!
+    check(goneEntry.parts.map(\.kind) == [.compilation, .parsedFiles, .declarations, .fileList, .leftovers],
+          "проект — по видам, в порядке схемы: \(goneEntry.parts.map(\.kind.rawValue))")
+    check(goneEntry.part(.declarations)?.urls.count == 2, "объявления и типы — один вид")
+    check(goneEntry.folders.map(\.path) == [goneFolder.path], "папка Rustlyn — отдельно от частей")
+    check(goneEntry.isOrphan, "проекта нет на диске")
+    check(openEntry.isOpen && openEntry.part(.parsedFiles)?.isHeld == true && openEntry.part(.fileList)?.isHeld == false,
+          "открытый проект помечен, папка сессии — занята")
+    check(openEntry.part(.leftovers) != nil, "decompiled в папке проекта — остатки")
 
-    let stale = CacheStore.stale(entries, olderThan: 30)
-    check(stale.map(\.name) == ["gone"], "устарели: удалённый проект; открытый, свежий и история — нет")
-    let openEntry = entries.first { $0.isOpen && $0.kind == .project }!
-    check(!CacheStore.remove(openEntry) && fm.fileExists(atPath: openEntry.urls[0].path), "кэш открытого проекта не удаляется")
-    check(CacheStore.remove(goneEntry!) && goneEntry!.urls.allSatisfy { !fm.fileExists(atPath: $0.path) }, "удалённый кэш — с диска")
+    // Разбивка сходится: части строки — это вся строка, виды — все строки.
+    let caches = entries.filter { $0.scope != .history }
+    check(entries.allSatisfy { $0.size == $0.parts.reduce(0) { $0 + $1.size } }, "размер строки — сумма её частей")
+    let indexFiles = goneEntry.parts.flatMap(\.urls).filter { !$0.path.hasPrefix(goneFolder.path + "/") }
+    check(goneEntry.size == CacheStore.measure(indexFiles + goneEntry.folders).0,
+          "части покрывают всё, что лежит у проекта, и ничего дважды")
+    check(goneEntry.part(.compilation)!.size > goneEntry.part(.fileList)!.size, "виды меряются порознь")
+    let totals = CacheStore.totals(caches)
+    check(totals.values.reduce(0, +) == caches.reduce(0) { $0 + $1.size }, "виды вместе — все кэши")
+    check(totals[.compilation] == CacheStore.measure([goneFolder.appendingPathComponent("compilation.bin"),
+                                                     openFolder.appendingPathComponent("compilation.bin")]).0,
+          "компиляция — по всем проектам")
+    check(totals[.history] == nil, "история — не кэш и в разбивку не входит")
+    check(CacheStore.totals(entries)[.history] == entries.first { $0.scope == .history }?.size, "а её размер считается отдельно")
+
+    check(entries.contains { $0.scope == .project && $0.name == "stranger" && $0.projectPath == nil },
+          "незнакомый проект — по имени папки Rustlyn")
+    check(entries.first { $0.id == "oldCopilot" }?.urls.map(\.lastPathComponent) == ["1.0.0"], "старый Copilot — кроме текущей версии")
+    check(entries.contains { $0.id == "decompiled" && $0.scope == .shared }
+            && entries.contains { $0.id == "jadx" && $0.scope == .shared }, "общие кэши найдены")
+    check(entries.first { $0.scope == .history }?.name == "gone", "история — отдельной строкой")
+    let unknown = entries.first { $0.id == "project-unknown" }
+    check(unknown?.parts.map(\.kind) == [.declarations, .fileList] && !entries.contains { $0.name.hasPrefix("00000000000000c") },
+          "безымянные проекты — одной строкой, тоже по видам")
+
+    // Открытый проект: то, что он запишет заново, — занято; выключенное и остатки — нет.
+    let idx = openEntry.part(.fileList)!
+    check(CacheStore.isBusy(idx, in: openEntry, policy: on), "список файлов открытого проекта занят")
+    let noFiles = CachePolicy(switchedOff: [.fileList])
+    check(!CacheStore.isBusy(idx, in: openEntry, policy: noFiles), "выключили — открытый проект его больше не пишет")
+    check(CacheStore.isBusy(openEntry.part(.parsedFiles)!, in: openEntry, policy: CachePolicy(switchedOff: [.parsedFiles])),
+          "папку разбора сессия держит до закрытия, даже выключенную")
+    check(CacheStore.isBusy(openEntry.part(.compilation)!, in: openEntry, policy: on)
+            && !CacheStore.isBusy(openEntry.part(.compilation)!, in: openEntry, policy: CachePolicy(switchedOff: [.compilation])),
+          "компиляцию открытого проекта держит сессия, пока её хранят")
+    check(!CacheStore.isBusy(openEntry.part(.leftovers)!, in: openEntry, policy: on), "остатки не держит никто")
+    check(!CacheStore.remove(openEntry, policy: on) && fm.fileExists(atPath: idx.urls[0].path)
+            && !fm.fileExists(atPath: openFolder.appendingPathComponent("decompiled").path)
+            && fm.fileExists(atPath: openFolder.path),
+          "открытый проект: занятое остаётся, остатки — удалены")
+    check(CacheStore.remove(openEntry, kinds: [.fileList], policy: noFiles) && !fm.fileExists(atPath: idx.urls[0].path)
+            && fm.fileExists(atPath: places.indexFile(root: open, extension: "unity").path),
+          "выключенный вид открытого проекта удаляется, остальное — нет")
+
+    let stale = CacheStore.stale(entries, olderThan: 30, policy: on)
+    check(Set(stale.map(\.name)) == ["gone", "open", "empty"],
+          "устарели: удалённый проект, пустая папка и остатки у открытого; свежий и история — нет")
+    check(stale.first { $0.name == "open" }?.parts.map(\.kind) == [.leftovers], "у открытого — только остатки")
+    check(!stale.contains { $0.parts.contains { $0.kind == .oldCopilot } }, "чужая «старая» версия Copilot может быть чьей-то текущей")
+    check(CacheStore.remove(goneEntry, policy: on) && goneEntry.urls.allSatisfy { !fm.fileExists(atPath: $0.path) },
+          "удалённый кэш — с диска, вместе с опустевшей папкой")
+    let empty = entries.first { $0.name == "empty" }
+    check(empty?.size == 0 && empty.map { CacheStore.canRemove($0, policy: on) } == true
+            && empty.map { CacheStore.remove($0, policy: on) } == true
+            && !fm.fileExists(atPath: places.rustlyn.appendingPathComponent("empty-00000000000000cd").path),
+          "пустая папка проекта — тоже убирается")
+    check(fm.fileExists(atPath: places.history.path), "история правок — на месте")
+}
+
+section("Кэши: что хранить")
+do {
+    let all = CachePolicy()
+    check(CacheKind.caches.allSatisfy(all.stores), "по умолчанию хранится всё")
+    let noParse = CachePolicy(switchedOff: [.parsedFiles])
+    check(!noParse.stores(.parsedFiles) && !noParse.stores(.compilation) && noParse.stores(.declarations),
+          "без разбора Rustlyn не хранит и компиляцию — она в той же папке")
+    check(!noParse.switchedOff.contains(.compilation), "а её собственная настройка не меняется")
+    check(CachePolicy(switchedOff: [.leftovers, .history]).stores(.history), "не выключается то, что не кэш Pilot")
+    check(CacheKind.ofIndexFile(extension: "symbols") == .declarations && CacheKind.ofIndexFile(extension: "types") == .declarations
+            && CacheKind.ofIndexFile(extension: "idx") == .fileList && CacheKind.ofIndexFile(extension: "assemblies") == .assemblyTypes
+            && CacheKind.ofIndexFile(extension: "unity") == .unityAssets && CacheKind.ofIndexFile(extension: "jsa") == nil,
+          "виды файлов индекса")
+    check(CacheKind.ofRustlynItem("compilation.bin") == .compilation && CacheKind.ofRustlynItem("compilation.41.partial") == .compilation
+            && CacheKind.ofRustlynItem("outline") == .parsedFiles && CacheKind.ofRustlynItem("lines") == .parsedFiles
+            && CacheKind.ofRustlynItem("assembly") == .leftovers && CacheKind.ofRustlynItem("decompiled") == .leftovers,
+          "виды того, что в папке Rustlyn")
+
+    // Настройка живёт в UserDefaults: незнакомое имя (вид из другой версии) не мешает.
+    let suite = "pilot.coretests.caches.\(getpid())"
+    let saved = CachePolicy.defaults
+    CachePolicy.defaults = UserDefaults(suiteName: suite)!
+    defer {
+        CachePolicy.defaults = saved
+        UserDefaults().removePersistentDomain(forName: suite)
+    }
+    check(CachePolicy.current == all, "пустая настройка — хранится всё")
+    CachePolicy.current = CachePolicy(switchedOff: [.jadx, .compilation])
+    check(CachePolicy.current.switchedOff == [.jadx, .compilation], "настройка переживает перезапуск")
+    CachePolicy.defaults.set(["jadx", "будущий-вид"], forKey: CachePolicy.key)
+    check(CachePolicy.current.switchedOff == [.jadx], "незнакомые имена пропускаются")
+
+    // Rustlyn и jadx получают кэш по настройке.
+    let places = CacheStore.Locations(caches: URL(fileURLWithPath: "/c"), support: URL(fileURLWithPath: "/s"))
+    let project = URL(fileURLWithPath: "/work/game")
+    let full = CacheStore.rustlynCaches(root: project, policy: all, at: places)
+    check(full.project == places.rustlynFolder(root: project) && full.assemblies == places.sharedAssemblies && full.keepsAssemblies,
+          "всё хранится: папка проекта и общие сборки")
+    check(CacheStore.rustlynCaches(root: project, policy: noParse, at: places).project == nil,
+          "без разбора — сессия без папки: между запусками ничего")
+    let noAssemblies = CacheStore.rustlynCaches(root: project, policy: CachePolicy(switchedOff: [.decompiled]), at: places)
+    check(noAssemblies.assemblies == CacheStore.nowhere && !noAssemblies.keepsAssemblies && noAssemblies.project != nil,
+          "без сборок — общее хранилище в никуда, а не папка проекта")
+    try? FileManager.default.createDirectory(at: CacheStore.nowhere.appendingPathComponent("assembly"), withIntermediateDirectories: true)
+    check(!FileManager.default.fileExists(atPath: CacheStore.nowhere.path), "в «никуда» и правда не создать папку")
+    check(CacheStore.jadxArguments(policy: all, at: places).first == "-XX:SharedArchiveFile=/c/jadx.jsa",
+          "jadx: архив классов — в кэше Pilot")
+    check(CacheStore.jadxArguments(policy: CachePolicy(switchedOff: [.jadx]), at: places).isEmpty, "jadx без архива — без флагов")
+}
+
+section("Кэши: индекс слушается настройки")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("pilot-index-cache-\(getpid())")
+    let suite = "pilot.coretests.index-cache.\(getpid())"
+    let savedPlaces = IndexCache.locations, savedDefaults = CachePolicy.defaults
+    IndexCache.locations = CacheStore.Locations(caches: base.appendingPathComponent("Caches"), support: base.appendingPathComponent("Support"))
+    CachePolicy.defaults = UserDefaults(suiteName: suite)!
+    defer {
+        IndexCache.locations = savedPlaces
+        CachePolicy.defaults = savedDefaults
+        UserDefaults().removePersistentDomain(forName: suite)
+        try? fm.removeItem(at: base)
+    }
+    let project = base.appendingPathComponent("game")
+    try? fm.createDirectory(at: project, withIntermediateDirectories: true)
+    try? "class Player { void Move() {} }".write(to: project.appendingPathComponent("Player.cs"), atomically: true, encoding: .utf8)
+    func file(_ ext: String) -> String { IndexCache.locations.indexFile(root: project, extension: ext).path }
+
+    let files = FileIndex(root: project, paths: ["Player.cs"])
+    let symbols = SymbolIndex.build(root: project, files: ["Player.cs"], shouldStop: { false }) ?? SymbolIndex(root: project)
+    let types = TypeIndex.make(root: project, entries: symbols.typeEntries())
+    let assets = UnityAssetIndex(entries: [(UnityGUID("0123456789abcdef0123456789abcdef")!, "Assets/Player.cs")])
+    let started = Date(timeIntervalSinceNow: -60)
+
+    IndexCache.save(files, root: project)
+    IndexCache.saveSymbols(symbols, root: project, builtFrom: started)
+    IndexCache.saveTypes(types, root: project)
+    IndexCache.saveAssets(assets, root: project, builtFrom: started)
+    check(["idx", "symbols", "types", "unity"].allSatisfy { fm.fileExists(atPath: file($0)) }, "включено — всё пишется")
+    check(IndexCache.load(root: project)?.display == ["Player.cs"] && IndexCache.loadSymbols(root: project)?.index.count == symbols.count
+            && IndexCache.loadTypes(root: project) != nil && IndexCache.loadAssets(root: project)?.index.count == 1,
+          "и читается")
+
+    CachePolicy.current = CachePolicy(switchedOff: [.fileList, .declarations, .unityAssets, .assemblyTypes])
+    check(IndexCache.load(root: project) == nil && IndexCache.loadSymbols(root: project) == nil
+            && IndexCache.loadTypes(root: project) == nil && IndexCache.loadAssets(root: project) == nil,
+          "выключено — прежнее на диске не читается")
+    let stamp = (try? fm.attributesOfItem(atPath: file("unity")))?[.modificationDate] as? Date
+    IndexCache.restampAssets(root: project, builtFrom: Date())
+    check((try? fm.attributesOfItem(atPath: file("unity")))?[.modificationDate] as? Date == stamp, "и метка не сдвигается")
+    for ext in ["idx", "symbols", "types", "unity"] { try? fm.removeItem(atPath: file(ext)) }
+    IndexCache.save(files, root: project)
+    IndexCache.saveSymbols(symbols, root: project, builtFrom: started)
+    IndexCache.saveTypes(types, root: project)
+    IndexCache.saveAssets(assets, root: project, builtFrom: started)
+    check(["idx", "symbols", "types", "unity"].allSatisfy { !fm.fileExists(atPath: file($0)) }, "и не пишется")
+
+    CachePolicy.current = CachePolicy(switchedOff: [.declarations])
+    IndexCache.save(files, root: project)
+    IndexCache.saveSymbols(symbols, root: project, builtFrom: started)
+    check(fm.fileExists(atPath: file("idx")) && !fm.fileExists(atPath: file("symbols")), "выключается только свой вид")
 }
 
 print("\n════════════════════════════════════")

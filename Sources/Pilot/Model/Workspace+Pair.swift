@@ -111,8 +111,14 @@ extension Workspace {
         partnerWorkspace?.symbolIndex ?? partner.flatMap { Self.pairCache[$0.path]?.index.symbols }
     }
 
+    /// Объявления второй половины на диске не хранятся (Настройки → Кэши) —
+    /// «один раз» не поможет: без её окна их взять неоткуда.
     private func noPartnerIndex(_ label: String) {
-        showNotice("Индекса \(label) ещё нет — откройте его один раз (⌃⌘P)")
+        if CachePolicy.current.stores(.declarations) {
+            showNotice("Индекса \(label) ещё нет — откройте его один раз (⌃⌘P)")
+        } else {
+            showNotice("Индекс \(label) не хранится на диске (Настройки → Кэши) — откройте его окно (⌃⌘P)")
+        }
     }
 
     // MARK: Переход в окно второй половины

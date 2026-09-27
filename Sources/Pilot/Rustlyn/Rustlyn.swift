@@ -108,6 +108,14 @@ final class Rustlyn: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Папки кэша, в которые сейчас пишут живые сессии: удалять их незачем
+    /// до закрытия проекта (Настройки → Кэши).
+    static func foldersInUse() -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(sessions.compactMap(\.cacheFolder?.path))
+    }
+
     /// Выход из Pilot: снимки компиляции пишутся здесь же, синхронно, —
     /// после возврата процесса уже нет. Нечего писать (не компилировали или
     /// не менялось с прошлой записи) — сессия пропускается сразу.
@@ -133,10 +141,21 @@ final class Rustlyn: @unchecked Sendable {
 
     let root: URL
 
+    /// Папка кэша проекта (`CacheStore.Locations.rustlynFolder`) — рядом с
+    /// прочими кэшами Pilot, по одной на проект: у двух проектов бывают
+    /// файлы с одинаковым путём относительно корня. nil — разбор файлов не
+    /// хранится (Настройки → Кэши): сессия держит всё в памяти, а
+    /// компиляцию писать некуда. Берётся при открытии проекта и до его
+    /// закрытия не меняется.
+    let cacheFolder: URL?
+
     private init?(root: URL, symbols: [String]) {
         self.root = root
-        let cache = Rustlyn.cacheDirectory(for: root)
-        try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let caches = CacheStore.rustlynCaches(root: root, policy: .current)
+        cacheFolder = caches.project
+        if let folder = caches.project {
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
 
         // Массив C-строк живёт ровно до конца вызова: Rust копирует их себе.
         // Элементы опциональные — так `const char *const *` приходит в Swift.
@@ -145,7 +164,7 @@ final class Rustlyn: @unchecked Sendable {
         var pointers: [UnsafePointer<CChar>?] = defined.map { $0.map { UnsafePointer($0) } }
 
         let session: OpaquePointer? = root.path.withCString { rootPath in
-            cache.path.withCString { cachePath in
+            Rustlyn.withOptionalCString(caches.project?.path) { cachePath in
                 pointers.withUnsafeMutableBufferPointer { buffer in
                     rln_session_new(rootPath, cachePath,
                                     buffer.baseAddress, buffer.count)
@@ -156,35 +175,24 @@ final class Rustlyn: @unchecked Sendable {
         handle = session
         // Декомпилированные сборки — общие для всех проектов: движок Unity
         // одной версии — один и тот же файл в каждом проекте, и разбирать
-        // `UnityEditor` (секунды) заново для каждого незачем.
-        let assemblies = Rustlyn.sharedAssemblyCache
-        try? FileManager.default.createDirectory(at: assemblies, withIntermediateDirectories: true)
-        _ = assemblies.path.withCString { rln_session_share_assembly_cache(session, $0) }
-    }
-
-    private static var sharedAssemblyCache: URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return caches.appendingPathComponent("Pilot/rustlyn/assemblies")
+        // `UnityEditor` (секунды) заново для каждого незачем. Не хранятся —
+        // хранилище всё равно общее, но в памяти (`CacheStore.nowhere`):
+        // без него Rustlyn сложил бы сборки в папку проекта.
+        if caches.keepsAssemblies {
+            try? FileManager.default.createDirectory(at: caches.assemblies, withIntermediateDirectories: true)
+        }
+        _ = caches.assemblies.path.withCString { rln_session_share_assembly_cache(session, $0) }
     }
 
     deinit {
         rln_session_free(handle)
     }
 
-    /// Кэш рядом с прочими кэшами Pilot, по одной папке на проект: у двух
-    /// проектов бывают файлы с одинаковым путём относительно корня.
-    private static func cacheDirectory(for root: URL) -> URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        // Имя папки — из пути проекта: читаемое начало плюс хэш, чтобы два
-        // проекта с одинаковым именем не делили один кэш.
-        let name = root.lastPathComponent.prefix(32)
-        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for byte in root.path.utf8 {
-            hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01B3
-        }
-        return caches.appendingPathComponent("Pilot/rustlyn/\(name)-\(String(hash, radix: 16))")
+    /// Компиляция хранится между запусками: есть папка и её не выключили.
+    /// Спрашивается при каждой записи — выключенную в настройках открытый
+    /// проект перестаёт писать сразу, а не со следующего открытия.
+    private var keepsCompilation: Bool {
+        cacheFolder != nil && CachePolicy.current.stores(.compilation)
     }
 
     /// Последняя причина отказа, словами. Пустая строка, если ничего не
@@ -414,18 +422,22 @@ final class Rustlyn: @unchecked Sendable {
 
     /// Записать компиляцию в кэш проекта, если она изменилась с прошлой
     /// записи или чтения. Для закрытия проекта и выхода: на большом проекте
-    /// это десятки мегабайт и доли секунды.
+    /// это десятки мегабайт и доли секунды. Компиляцию не хранят — `false`
+    /// сразу.
     @discardableResult
     func saveCompilation() -> Bool {
-        DeepStack.run { rln_save_compilation(handle) == RLN_OK }
+        guard keepsCompilation else { return false }
+        return DeepStack.run { rln_save_compilation(handle) == RLN_OK }
     }
 
     /// Прочитать компиляцию, которую записал прошлый запуск: компилятор
     /// отвечает сразу, не дожидаясь компиляции. Она могла устареть —
     /// следующая `compile` это выяснит и заменит её, только если что-то
-    /// изменилось. `nil` — читать нечего или её писала другая сборка
-    /// библиотеки.
+    /// изменилось. `nil` — читать нечего, её писала другая сборка
+    /// библиотеки или компиляцию не хранят: тогда проект компилируется,
+    /// как в первый раз.
     func loadCompilation() -> RustlynCompiled? {
+        guard keepsCompilation else { return nil }
         var raw = RlnCompiled()
         guard DeepStack.run({ rln_load_compilation(handle, &raw) }) == RLN_OK else { return nil }
         return RustlynCompiled(files: raw.files, references: raw.references,

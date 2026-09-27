@@ -33,6 +33,9 @@ final class Rustlyn: @unchecked Sendable {
 
     static func activate(_ session: Rustlyn?) {}
 
+    /// Сессий нет — и папок, в которые они пишут.
+    static func foldersInUse() -> Set<String> { [] }
+
     func isGenerated(_ url: URL) -> Bool { false }
 
     static func persist() {}

@@ -9,9 +9,10 @@ import Foundation
 /// Проект — ближайшая папка с `.git` над файлом, вторая половина пары — по
 /// тем же правилам, что у окна. Встроенные расширения и расширения из
 /// `.pilot/extensions/` обеих половин действуют без вопроса: скрипт
-/// запускают для этого проекта сознательно. Компиляция и индекс берутся из кэша: проект
-/// должен хоть раз открываться в Pilot. `--expect` — цепочка названий узлов
-/// от значения к источникам (подстроки); код выхода 1, если какой-то нет.
+/// запускают для этого проекта сознательно. Компиляция и индекс берутся из кэша, а
+/// без него (проект в Pilot не открывали или кэш выключен в настройках) —
+/// строятся, как при первом открытии, только дольше. `--expect` — цепочка
+/// названий узлов от значения к источникам (подстроки); код выхода 1, если какой-то нет.
 @MainActor
 enum HeadlessGraph {
 
@@ -30,19 +31,29 @@ enum HeadlessGraph {
             self.root = root
             self.partner = partner
             self.rules = rules
-            let symbols = UnityProjectInfo.find(inWorkspace: root)?.preprocessorSymbols ?? []
-            let session = Rustlyn.start(root: root, symbols: symbols)
+            let unity = UnityProjectInfo.find(inWorkspace: root)
+            let session = Rustlyn.start(root: root, symbols: unity?.preprocessorSymbols ?? [])
             let started = Date()
+            // Список файлов — из кэша индекса, а без него — обходом папки, как
+            // при первом открытии. Нужен, только если чего-то нет в кэше.
+            var listed: [String]?
+            func files() -> [String] {
+                if let listed { return listed }
+                let found = IndexCache.load(root: root)?.display
+                    ?? FileIndex.scan(root: root, exclude: unity.map { $0.excludedFromIndex }, shouldStop: { false }).display
+                listed = found
+                return found
+            }
             if let session, session.loadCompilation() == nil {
-                // Кэша компиляции нет — собрать по списку файлов из кэша индекса.
-                let files = IndexCache.load(root: root)?.display ?? []
-                session.reindex(files.map { root.appendingPathComponent($0) }.filter(Rustlyn.understands))
+                // Кэша компиляции нет — собрать по списку файлов.
+                session.reindex(files().map { root.appendingPathComponent($0) }.filter(Rustlyn.understands))
                 _ = session.compile()
             }
             rustlyn = session
             symbolIndex = IndexCache.loadSymbols(root: root)?.index
+                ?? SymbolIndex.build(root: root, files: files(), shouldStop: { false })
             log("\(root.lastPathComponent): компилятор \(session == nil ? "не поднялся" : "готов"), "
-                + "индекс \(symbolIndex.map { "\($0.count) объявлений" } ?? "нет в кэше") "
+                + "индекс \(symbolIndex.map { "\($0.count) объявлений" } ?? "не собрался") "
                 + "за \(Int(Date().timeIntervalSince(started) * 1000)) мс")
         }
 

@@ -606,7 +606,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(60))
             CacheStore.autoClean(known: CacheSettingsView.knownRoots, open: CacheSettingsView.openRoots,
-                                 copilotVersion: CopilotInstaller.version)
+                                 held: Rustlyn.foldersInUse(), copilotVersion: CopilotInstaller.version)
         }
         // Таблицы видов и цветов Pilot повторяет за Rustlyn вручную — иначе
         // пришлось бы тянуть их через границу на каждый токен. Расхождение

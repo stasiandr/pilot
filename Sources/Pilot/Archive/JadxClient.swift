@@ -161,15 +161,18 @@ final class JadxClient: @unchecked Sendable {
             throw JadxError(message: L("Не найдена Java для jadx: brew install openjdk"))
         }
 
-        let cache = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Pilot")
-        try? fm.createDirectory(at: cache, withIntermediateDirectories: true)
+        // Архив общих классов: второй и следующие запуски JVM заметно быстрее.
+        // Его можно не хранить (Настройки → Кэши) — тогда флагов нет вовсе.
+        let locations = CacheStore.Locations.standard
+        let archive = CacheStore.jadxArguments(policy: .current, at: locations)
+        if !archive.isEmpty {
+            try? fm.createDirectory(at: locations.caches, withIntermediateDirectories: true)
+        }
         let classpath = ["engine.jar", "jadx.jar"].map { jars.appendingPathComponent($0).path }.joined(separator: ":")
         return (java, [
             "-XX:+UseG1GC", "-XX:MaxRAMPercentage=60", "-Xss8m",
             "-Djava.awt.headless=true", "-Dfile.encoding=UTF-8",
-            // Архив общих классов: второй и следующие запуски JVM заметно быстрее.
-            "-XX:SharedArchiveFile=\(cache.appendingPathComponent("jadx.jsa").path)",
-            "-XX:+AutoCreateSharedArchive", "-Xshare:auto",
+        ] + archive + [
             "-cp", classpath, "pilot.JadxEngine",
         ])
     }
