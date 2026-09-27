@@ -1255,6 +1255,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var decorator: CodeDecorator?
     private var fontSize: CGFloat = 12.5
     private var isApplying = false
+    /// Идёт `highlightVisible` — второй раз, изнутри раскладки, в неё не входим.
+    private var isHighlighting = false
+    /// Перекраска после правки уже назначена на следующий виток.
+    private var repaintScheduled = false
     /// Покрашенный участок текста. В символах, а не строках: временные
     /// атрибуты едут вместе с текстом, и участок сдвигается вслед за правками.
     private var painted: NSRange?
@@ -1362,6 +1366,13 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(viewportChanged),
             name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
+        // Клип вырос — закрыли панель снизу, растянули окно, новый редактор
+        // получил размер: границы клипа при этом не сдвигаются, boundsDidChange
+        // не приходит, а строк на экране стало больше, чем покрашено с запасом.
+        scrollView.contentView.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(viewportResized),
+            name: NSView.frameDidChangeNotification, object: scrollView.contentView)
         NotificationCenter.default.addObserver(
             self, selector: #selector(colorSchemeChanged), name: ThemeStore.didChange, object: nil)
 
@@ -2343,6 +2354,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         if popup.isVisible { hideCompletion(keepSession: true) }
     }
 
+    @objc private func viewportResized() {
+        highlightVisible()
+    }
+
     /// Сменили цветовую схему. Обычный текст и фон перекрасятся сами —
     /// цвета у них динамические; остальное здесь запомнено заранее:
     /// курсор и выделение у самого NSTextView, токены — временными
@@ -2446,17 +2461,22 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// `toolTips: false` — после правки текста: подсказки (единственное,
     /// что остаётся в тексте) сдвинулись вместе с ним, а разбор, по которому
     /// их ставить, ещё не догнал правку — обновятся с ним.
+    ///
+    /// Какие строки на экране, спрашиваем по разложенному тексту (см.
+    /// `charactersOnScreen`): по оценке после прыжка бегунком красились не те
+    /// строки, и экран оставался без подсветки до следующей прокрутки.
     private func highlightVisible(toolTips: Bool = true) {
-        guard !isApplying,
+        // Раскладка видимого ниже уточняет высоту текста, клип от этого
+        // сдвигается и зовёт сюда снова — изнутри раскладки. Вложенный вызов
+        // пропускаем: этот и так спросит видимое заново, когда она закончится.
+        guard !isApplying, !isHighlighting,
               let model, model.spec != nil,
               let storage = textView.textStorage,
-              let layout = textView.layoutManager,
-              let container = textView.textContainer,
               storage.length > 0 else { return }
+        isHighlighting = true
+        defer { isHighlighting = false }
 
-        let rect = scrollView.contentView.bounds
-        let glyphRange = layout.glyphRange(forBoundingRect: rect, in: container)
-        let charRange = layout.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+        guard let charRange = textView.charactersOnScreen() else { return }
 
         let pad = 40   // запас строк сверху и снизу, чтобы скролл был плавным
         let firstLine = max(0, model.line(containing: charRange.location) - pad)
@@ -2487,6 +2507,27 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         unpainted = unpainted.map {
             NSUnionRange(Self.shift($0, byEditAt: range.location, from: oldLength, to: range.length), fresh)
         } ?? fresh
+        scheduleRepaintAfterEdit()
+    }
+
+    /// Набор перекрашивает `textDidChange`. Правки мимо поля ввода — файл
+    /// перечитан с диска, форматирование, переименование, их отмена — туда не
+    /// приходят: новый текст стоял без цвета, пока разбор не догонит правку,
+    /// а на большом файле это заметная пауза. Поэтому на следующем витке
+    /// перекрашиваем то, что осталось неперекрашенным, — видимое заново:
+    /// правка могла быть любого размера и сдвинуть экран на другие строки.
+    /// После набора `textDidChange` успевает раньше, и здесь нечего делать.
+    private func scheduleRepaintAfterEdit() {
+        guard !repaintScheduled else { return }
+        repaintScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.repaintScheduled = false
+            guard self.unpainted != nil else { return }
+            self.unpainted = nil
+            self.painted = nil
+            self.highlightVisible(toolTips: false)
+        }
     }
 
     /// Куда уедет участок текста, когда `length` символов с `location`

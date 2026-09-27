@@ -33,6 +33,11 @@ cp Sources/Pilot/Localization/*.swift Sources/Pilot/Localization/English/*.swift
 # всегда: пакет собирается без CRustlyn, поэтому `#if canImport` выбирает
 # заглушку, и проверяется ровно то, что Pilot делает своими силами.
 cp Sources/Pilot/Rustlyn/{RustlynTypes,RustlynAbsent,RustlynNavigator}.swift "$TMP/Sources/coretests/"
+# Что видно на экране редактора — вопрос к раскладке AppKit, поэтому эта
+# проверка только на macOS.
+if [[ "$(uname)" == Darwin ]]; then
+    cp Sources/Pilot/Editor/VisibleText.swift CoreTests/EditorLayoutTests.swift "$TMP/Sources/coretests/"
+fi
 cp CoreTests/CoreTests.swift "$TMP/Sources/coretests/main.swift"
 
 cat > "$TMP/Package.swift" <<'MANIFEST'

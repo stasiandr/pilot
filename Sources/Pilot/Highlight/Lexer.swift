@@ -58,9 +58,36 @@ final class SyntaxModel: @unchecked Sendable {
     /// строку, а Rustlyn пришлось бы отдавать весь текст заново.
     private(set) var settledFile: URL?
 
+    /// Строки у нас и у Rustlyn — одни и те же, и его токены можно спрашивать
+    /// по нашим номерам строк (см. `linesMatchCSharp`).
+    private var rustlynLinesAgree = true
+
     /// Считать подсветку этого файла по Rustlyn, пока его не начали править.
     func useRustlyn(for url: URL) {
         settledFile = Rustlyn.understands(url) ? url : nil
+        rustlynLinesAgree = Self.linesMatchCSharp(units)
+    }
+
+    /// Строки текста режутся только по `\n` — так, как режем их мы. C# рвёт
+    /// строку ещё на одиноком `\r` и на U+0085, U+2028, U+2029, и Rustlyn
+    /// считает строки так же. Токены он отдаёт по номерам строк: в файле с
+    /// такими разрывами он раскрасил бы не те строки, а видимые остались бы
+    /// без цвета. Такой файл красит свой лексер.
+    static func linesMatchCSharp(_ units: [UInt16]) -> Bool {
+        var i = 0
+        let n = units.count
+        while i < n {
+            switch units[i] {
+            case 0x0D:
+                if i + 1 == n || units[i + 1] != 0x0A { return false }
+                i += 2
+            case 0x85, 0x2028, 0x2029:
+                return false
+            default:
+                i += 1
+            }
+        }
+        return true
     }
 
     var lineCount: Int { lineStarts.count }
@@ -78,6 +105,7 @@ final class SyntaxModel: @unchecked Sendable {
         spec = other.spec
         version = other.version
         settledFile = other.settledFile
+        rustlynLinesAgree = other.rustlynLinesAgree
     }
 
     /// Неизменяемая копия для фоновой работы. Массивы копируются лениво
@@ -228,7 +256,7 @@ final class SyntaxModel: @unchecked Sendable {
         // — и тогда работает свой лексер, как работал всегда. Поэтому
         // ошибку здесь не показывают: подсветка не та причина, по которой
         // стоит что-то говорить пользователю.
-        if let settledFile, let rustlyn = Rustlyn.session(for: settledFile),
+        if let settledFile, rustlynLinesAgree, let rustlyn = Rustlyn.session(for: settledFile),
            let tokens = rustlyn.tokens(settledFile, lines: first...last) {
             return tokens
         }

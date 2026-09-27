@@ -242,6 +242,19 @@ check(lm.line(containing: 0) == 0, "line(containing:) начало")
 check(lm.line(containing: 4) == 1, "line(containing:) вторая строка")
 check(lm.line(containing: 10) == 2, "line(containing:) третья строка")
 
+// Rustlyn режет строки как C#: ещё и по одинокому \r, U+0085, U+2028, U+2029.
+// Токены он отдаёт по номерам строк, так что в таком файле он раскрасил бы
+// не те строки, а видимые остались бы без цвета: его красит свой лексер.
+func agree(_ s: String) -> Bool { SyntaxModel.linesMatchCSharp(Array(s.utf16)) }
+check(agree("") && agree("a\nb") && agree("a\r\nb\r\n"), "строки как у C#: \\n и \\r\\n")
+check(!agree("a\rb") && !agree("a\r\nb\r"), "одинокий \\r рвёт строку только у C#")
+check(!agree("s = \"\u{2028}\"") && !agree("a\u{2029}b") && !agree("a\u{85}b"),
+      "U+2028, U+2029, U+0085 рвут строку только у C#")
+
+#if canImport(AppKit)
+MainActor.assumeIsolated { runEditorLayoutTests() }
+#endif
+
 // ───────────────────────── Производительность ─────────────────────────
 section("Производительность")
 let synthetic = FileIndex(root: URL(fileURLWithPath: "/"))
