@@ -68,6 +68,9 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
     /// `static void Say(this Player p)` зовётся как член Player, но лежит
     /// в постороннем static-классе, и через `membersByOwner` его не найти.
     private(set) var extensionsByReceiver: [String: [Int32]] = [:]
+    /// Компонент → поля-стэши с ним: `Stash<Health>` → `_health`, и
+    /// объявленные, и те, что допишет генератор из `[IncludeStash]`.
+    private(set) var stashesByComponent: [String: [Int32]] = [:]
 
     /// «контейнер.имя» в нижнем регистре подряд — для fuzzy-поиска без аллокаций.
     private var bytes: [UInt8] = []
@@ -125,6 +128,9 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             }
             if Self.isMember(s.kind), let owner = s.container { membersByOwner[owner, default: []].append(id) }
             if let receiver = Self.extensionReceiver(s) { extensionsByReceiver[receiver, default: []].append(id) }
+            if s.kind == .field, let type = s.typeText, type.hasPrefix("Stash"), let component = Self.stashComponent(type) {
+                stashesByComponent[component, default: []].append(id)
+            }
 
             let start = bytes.count
             var nameStart = 0
@@ -136,6 +142,13 @@ final class SymbolIndex: @unchecked Sendable {   // неизменяем пос�
             for b in s.name.utf8 { bytes.append(Self.lower(b)) }
             spans.append((Int32(start), Int32(bytes.count - start), Int32(nameStart)))
         }
+    }
+
+    /// `Stash<Game.Health>` → `Health`: компонент стэша Morpeh.
+    static func stashComponent(_ type: String) -> String? {
+        let compact = type.replacingOccurrences(of: " ", with: "")
+        guard compact.hasPrefix("Stash<"), compact.hasSuffix(">") else { return nil }
+        return compact.dropFirst(6).dropLast().split(separator: ".").last.map(String.init)
     }
 
     /// Тип, который расширяет метод: `static void Say(this Player p)` → `Player`.

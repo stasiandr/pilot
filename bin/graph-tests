@@ -27,7 +27,15 @@ while IFS= read -r line; do
     output="$("$ROOT/bin/pilot-graph" "$target" "${args[@]}" 2>/dev/null)"; code=$?
     echo "── $(basename "$file"):${target#"$file":}"
     if [[ $VERBOSE == 1 ]]; then echo "$output"; else echo "$output" | grep -E '^(✓|✗) '; fi
-    if [[ $code == 0 ]]; then passed=$((passed + 1)); else failed=$((failed + 1)); fi
+    # Прошёл — если каждая цепочка отметилась ✓. Код 0 с пустым выводом
+    # значит, что граф не строился вовсе (Pilot отдал запрос открытому окну).
+    confirmed=$(echo "$output" | grep -c '^✓ ')
+    if [[ $code == 0 && -n "$output" ]] && (( confirmed == ${#args[@]} / 2 )); then
+        passed=$((passed + 1))
+    else
+        [[ $code == 0 ]] && echo "✗ граф не построился: $(echo "$output" | head -1)"
+        failed=$((failed + 1))
+    fi
 done < <(cat /dev/null "${FILES[@]}")
 echo
 echo "графов: прошло $passed, упало $failed, пропущено $skipped"

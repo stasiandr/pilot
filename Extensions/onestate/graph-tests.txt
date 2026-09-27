@@ -7,3 +7,11 @@
 
 # Компонент целиком: где его ставят и снимают.
 /Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedsFeature/Components/States/PedCuff.cs:11:28 | PedCuff <- PedCuffSyncSystem.OnUpdate
+
+# Запись через ref-локальную из сгенерированного стэша (`[IncludeStash]`):
+# `stamina.value = datagram.Value` на клиенте — и дальше через сеть до
+# админ-команды на сервере.
+/Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedsFeature/Components/Stamina.cs:12:20 | Stamina.value <- PedStaminaStateSyncSystem.OnUpdate <- PedStaminaStateDatagram.Value <- PedStaminaStateDatagram.Value <- PedStaminaStateSyncSystem.OnUpdate <- PedStaminaStateSync.Value <- SetStaminaCommand.Run | Stamina.value <- StaminaService.ConsumeStamina <- amount | Stamina.value <- PedFactorySystem.Create <- ElementConstants.MaxStamina <- ElementConstants.MaxStamina
+
+# Свойство: Rustlyn ставит его на начало объявления, а записи ищутся от имени.
+/Users/stas/work/clm-server/Server/GlobalUtils/ReliableTime.cs:13:34 | ReliableTime.TimeOffset <- SetReliableTimeOffsetCommand.Run <- TimeSpan.TryParse | ReliableTime.TimeOffset <- SuperSeasonCommandService.SetExactTime <- time
