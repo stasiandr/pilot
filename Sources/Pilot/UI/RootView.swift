@@ -157,6 +157,7 @@ struct RootView: View {
                          reveal: workspace.reveal,
                          occurrences: occurrences,
                          lineChanges: workspace.editorLineChanges,
+                         removedLines: workspace.editorRemovedLines,
                          commentMarks: workspace.editorCommentMarks,
                          isReview: workspace.isReviewDocument,
                          popover: workspace.linePopover,

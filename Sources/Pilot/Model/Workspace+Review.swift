@@ -24,6 +24,15 @@ extension Workspace {
         return document?.revision == nil ? git.lineChanges : []
     }
 
+    /// Удалённые строки файла MR — красным прямо в тексте, над строкой, с
+    /// которой начинается изменение. У удалённого файла их нет: он показан
+    /// из базы MR целиком.
+    var editorRemovedLines: [RemovedLines] {
+        guard let file = currentReviewFile, !file.raw.deletedFile else { return [] }
+        return file.diff.blocks.filter { !$0.removed.isEmpty }
+            .map { RemovedLines(line: $0.newLines.lowerBound, lines: $0.removed) }
+    }
+
     /// Значки тредов у строк открытого файла MR.
     var editorCommentMarks: [Int: CommentMark] {
         guard let file = currentReviewFile, let active = review.active else { return [:] }

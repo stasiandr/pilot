@@ -320,6 +320,7 @@ final class CodeTextView: NSTextView {
             line.intersection(dirtyRect).intersection(bounds).fill()
         }
         super.draw(dirtyRect)
+        drawRemovedLines(in: dirtyRect)
         drawPlaceholders(in: dirtyRect)
         drawInlayHints(in: dirtyRect)
         drawGhost(in: dirtyRect)
@@ -929,6 +930,53 @@ final class CodeTextView: NSTextView {
             let size = label.size(withAttributes: attributes)
             label.draw(at: NSPoint(x: pill.midX - size.width / 2, y: pill.midY - size.height / 2),
                        withAttributes: attributes)
+        }
+    }
+
+    // MARK: Удалённые строки ревью
+
+    /// Строки, которые MR удалил, — красным над строкой, с которой начинается
+    /// изменение, как в диффе GitLab. В тексте их нет: место под них даёт
+    /// раскладка отступом перед абзацем `anchor`, над счётчиком использований.
+    struct RemovedBlock: Equatable {
+        /// Начало строки, над которой блок.
+        var anchor: Int
+        var lines: [String]
+    }
+
+    var removedBlocks: [RemovedBlock] = [] {
+        didSet {
+            guard removedBlocks != oldValue else { return }
+            removedLineCounts = Dictionary(removedBlocks.map { ($0.anchor, $0.lines.count) }, uniquingKeysWith: +)
+            needsDisplay = true
+        }
+    }
+    /// Сколько удалённых строк над началом строки — для раскладки.
+    private(set) var removedLineCounts: [Int: Int] = [:]
+
+    private func drawRemovedLines(in dirtyRect: NSRect) {
+        guard !removedBlocks.isEmpty, let layout = layoutManager, let font,
+              let length = textStorage?.length, length > 0, let visible = visibleCharacters() else { return }
+        let height = layout.defaultLineHeight(for: font)
+        let origin = textContainerOrigin
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: Theme.removedLineText]
+        let padding = textContainer?.lineFragmentPadding ?? 0
+        // Блок над первой видимой строкой может быть виден, хотя его строка — нет.
+        let from = max(0, visible.location - 1), to = NSMaxRange(visible) + 1
+        for block in removedBlocks where block.anchor >= from && block.anchor <= to && block.anchor < length {
+            let fragment = layout.lineFragmentRect(forGlyphAt: layout.glyphIndexForCharacter(at: block.anchor),
+                                                   effectiveRange: nil)
+            let band = NSRect(x: 0, y: origin.y + fragment.minY, width: bounds.width,
+                              height: CGFloat(block.lines.count) * height)
+            guard band.intersects(dirtyRect) else { continue }
+            Theme.removedLineBackground.setFill()
+            band.intersection(dirtyRect).fill()
+            for (i, text) in block.lines.enumerated() {
+                let y = band.minY + CGFloat(i) * height
+                guard y < dirtyRect.maxY, y + height > dirtyRect.minY else { continue }
+                (text.replacingOccurrences(of: "\t", with: "    ") as NSString)
+                    .draw(at: NSPoint(x: origin.x + padding, y: y), withAttributes: attributes)
+            }
         }
     }
 
@@ -2309,6 +2357,33 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         ruler?.needsDisplay = true
     }
 
+    /// Удалённые строки ревью MR: номер новой строки, над которой они, и сами строки.
+    func setRemovedLines(_ removed: [RemovedLines]) {
+        guard let model, let layout = textView.layoutManager, let storage = textView.textStorage else { return }
+        let length = storage.length
+        let lineCount = model.lineStarts.count
+        // Удалённое в конце файла — над последней строкой: ниже неё места нет.
+        let blocks = removed.compactMap { item -> CodeTextView.RemovedBlock? in
+            guard !item.lines.isEmpty, lineCount > 0 else { return nil }
+            let anchor = Int(model.lineStarts[min(max(0, item.line), lineCount - 1)])
+            return anchor < length ? .init(anchor: anchor, lines: item.lines) : nil
+        }
+        let old = Set(textView.removedBlocks.map(\.anchor))
+        guard blocks != textView.removedBlocks else { return }
+        let changed = old.union(blocks.map(\.anchor))
+        // Место над строками выше экрана сдвинуло бы текст — держим верхнюю строку.
+        saveViewState()
+        textView.removedBlocks = blocks
+        for anchor in changed where anchor < length {
+            layout.invalidateLayout(forCharacterRange: NSRange(location: anchor, length: 1), actualCharacterRange: nil)
+        }
+        if let state = buffer?.viewState {
+            scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
+        }
+        textView.needsDisplay = true
+        ruler?.needsDisplay = true
+    }
+
     /// Отличия от HEAD — полосками в колонке номеров.
     func setLineChanges(_ changes: [LineDiff.Change]) {
         ruler?.setChanges(changes)
@@ -3063,9 +3138,14 @@ extension CodeViewController: NSLayoutManagerDelegate {
                                    withProposedLineFragmentRect rect: NSRect) -> CGFloat {
         MainActor.assumeIsolated {
             let ghost = textView.ghost
-            guard !textView.lensAnchors.isEmpty || ghost?.anchor != nil else { return 0 }
+            let removed = textView.removedLineCounts
+            guard !textView.lensAnchors.isEmpty || ghost?.anchor != nil || !removed.isEmpty else { return 0 }
             let character = layoutManager.characterIndexForGlyph(at: glyphIndex)
             var space: CGFloat = textView.lensAnchors.contains(character) ? textView.lensSpace : 0
+            // Удалённые строки ревью — над счётчиком, в верху отведённого места.
+            if let count = removed[character], let font = textView.font {
+                space += CGFloat(count) * layoutManager.defaultLineHeight(for: font)
+            }
             // Строки подсказки Copilot — между строкой курсора и следующей.
             if let ghost, ghost.anchor == character { space += ghost.space }
             return space
@@ -3513,6 +3593,8 @@ struct CodeView: NSViewControllerRepresentable {
     let reveal: Workspace.RevealRequest?
     let occurrences: [NSRange]
     let lineChanges: [LineDiff.Change]
+    /// Удалённые строки ревью MR — прямо в тексте; пусто вне ревью.
+    var removedLines: [RemovedLines] = []
     var commentMarks: [Int: CommentMark] = [:]
     /// Документ из ревью: под значки тредов в гаттере всегда есть место.
     var isReview = false
@@ -3638,6 +3720,10 @@ struct CodeView: NSViewControllerRepresentable {
         }
 
         // Блоков изменений — единицы, сравнить массивы целиком дёшево.
+        if documentChanged || context.coordinator.removedLines != removedLines {
+            context.coordinator.removedLines = removedLines
+            controller.setRemovedLines(removedLines)
+        }
         if documentChanged || context.coordinator.lineChanges != lineChanges {
             context.coordinator.lineChanges = lineChanges
             controller.setLineChanges(lineChanges)
@@ -3763,6 +3849,7 @@ struct CodeView: NSViewControllerRepresentable {
         var fontSize: CGFloat = 12.5
         var appliedReveal: Int = -1
         var lineChanges: [LineDiff.Change] = []
+        var removedLines: [RemovedLines] = []
         var commentMarks: [Int: CommentMark] = [:]
         var isReview = false
         var appliedPopover = 0
@@ -3780,4 +3867,11 @@ struct CodeView: NSViewControllerRepresentable {
         var diagnosticsVersion = -1
         var insightsVersion = -1
     }
+}
+
+/// Удалённые строки одного блока диффа: над какой новой строкой (с нуля) их
+/// показать и что в них было.
+struct RemovedLines: Equatable {
+    var line: Int
+    var lines: [String]
 }
