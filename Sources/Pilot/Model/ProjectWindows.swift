@@ -181,6 +181,24 @@ final class ProjectWindows {
         workspace.bringToFront()
     }
 
+    // MARK: - Между проектами
+
+    /// ⌘` и ⇧⌘` — следующий и предыдущий проект, как Next Project Window
+    /// в Rider. Только окна проектов, без настроек, NuGet и прочих: штатный
+    /// ⌘` macOS перебирает все. Порядок — как окна открывались, а вкладки
+    /// проектов — в том порядке, в каком стоят на полосе.
+    func cycleProjects(_ step: Int) {
+        let windows = workspaces.compactMap(\.window)
+        var ordered: [NSWindow] = []
+        for window in windows.sorted(by: { $0.windowNumber < $1.windowNumber }) where !ordered.contains(window) {
+            ordered += (window.tabbedWindows ?? [window]).filter { windows.contains($0) && !ordered.contains($0) }
+        }
+        guard ordered.count > 1 else { return }
+        let current = front?.window.flatMap { ordered.firstIndex(of: $0) } ?? (step > 0 ? -1 : 0)
+        let next = ordered[(current + step + ordered.count) % ordered.count]
+        workspaces.first { $0.window === next }?.bringToFront()
+    }
+
     /// Новое окно со стартовым экраном — ⇧⌘N.
     func openEmptyWindow() {
         newWindow(nil)

@@ -70,17 +70,20 @@ struct ExtensionSettingsView: View {
                 Text(L("Расширение — папка .pilot/extensions/<имя>/ с extension.json в репозитории проекта (или встроенное в сборку Pilot). Оно описывает соглашения проекта: как узнать вторую половину пары, какие папки у половин одинаковые, как устроены сетевые структуры и конфиги. Код расширения не исполняют."))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                // Здесь, а не в .toolbar: тулбар у окна настроек — это
+                // полоса вкладок, и кнопка вставала рядом с ними.
+                HStack {
+                    Spacer()
+                    Button(L("Перечитать")) {
+                        ProjectWindows.shared.workspaces.forEach { $0.refreshExtensions() }
+                        reload()
+                    }
+                }
             }
         }
         .formStyle(.grouped)
         .frame(width: 640, height: 420)
         .onAppear(perform: reload)
-        .toolbar {
-            Button(L("Перечитать")) {
-                ProjectWindows.shared.workspaces.forEach { $0.refreshExtensions() }
-                reload()
-            }
-        }
     }
 
     private func reload() {

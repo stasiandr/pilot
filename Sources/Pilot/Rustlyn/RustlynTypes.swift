@@ -539,6 +539,46 @@ struct RustlynDiagnostics: Equatable {
     var warnings: Int { items.filter { $0.severity == .warning }.count }
 }
 
+// MARK: - Что подчёркнуто и почему
+
+extension RustlynDiagnostic {
+    /// Под какими символами волна: сам диапазон в пределах текста, а у
+    /// пустого (пропущенная `;`) — символ перед ним, конец того, за чем
+    /// её не хватает. Наведение ищет ошибку там же, где её видно.
+    func underline(textLength length: Int) -> NSRange {
+        let inside = NSIntersectionRange(range, NSRange(location: 0, length: length))
+        guard inside.length == 0 else { return inside }
+        return NSRange(location: max(0, min(range.location, length) - 1), length: 1)
+    }
+
+    /// Ошибки, чья волна под символом `index`, — что объяснять под мышью.
+    static func under(_ index: Int, in all: [RustlynDiagnostic], textLength: Int) -> [RustlynDiagnostic] {
+        listed(all.filter { NSLocationInRange(index, $0.underline(textLength: textLength)) })
+    }
+
+    /// Ошибки у курсора: он на волне или вплотную к ней — в том числе сразу
+    /// за словом, под которым она, как бывает, когда слово только набрали.
+    static func at(caret: Int, in all: [RustlynDiagnostic], textLength: Int) -> [RustlynDiagnostic] {
+        listed(all.filter {
+            let underline = $0.underline(textLength: textLength)
+            return underline.location <= caret && caret <= NSMaxRange(underline)
+        })
+    }
+
+    /// Порядок в окне: ошибки выше предупреждений, дальше — по месту в
+    /// тексте; одно и то же сообщение с тем же кодом — один раз.
+    static func listed(_ items: [RustlynDiagnostic]) -> [RustlynDiagnostic] {
+        var seen = Set<String>()
+        return items
+            .sorted { a, b in
+                if a.severity != b.severity { return a.severity.rawValue > b.severity.rawValue }
+                if a.range.location != b.range.location { return a.range.location < b.range.location }
+                return a.range.length < b.range.length
+            }
+            .filter { seen.insert($0.code + "\u{1}" + $0.message).inserted }
+    }
+}
+
 /// Подсказка в строке, как в Rider: имя параметра перед аргументом
 /// (`count:`), тип там, где он не написан (`var`, параметры лямбды).
 /// В тексте её нет — редактор рисует её перед символом `position`.

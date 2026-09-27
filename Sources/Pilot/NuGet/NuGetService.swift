@@ -89,9 +89,22 @@ final class NuGetService: ObservableObject {
     let log = RunLog()
     @Published var showsLog = false
 
+    /// Восстановлены ли пакеты — для кнопки в тулбаре, плашки окна и того,
+    /// чтобы окно открылось само (Workspace+NuGet). Читается и без окна.
+    @Published private(set) var restore = NuGetRestoreReport()
+    /// Окно NuGet этого проекта открыто. Счётчиком: при смене языка окно
+    /// строится заново, и новое может появиться раньше, чем исчезнет старое.
+    private var shown = 0
+    var isShown: Bool { shown > 0 }
+
     private var process: RunProcess?
     private var searchTask: Task<Void, Never>?
     private var scanGeneration = 0
+    private var restoreTask: Task<Void, Never>?
+    private var restoreGeneration = 0
+    /// Проекты, где окно уже показывало, что пакеты не восстановлены, — открытое
+    /// само или руками. Второй раз за запуск Pilot само оно там не откроется.
+    private static var noticed: Set<String> = []
 
     private static let prereleaseKey = "pilot.nuget.prerelease"
 
@@ -112,12 +125,24 @@ final class NuGetService: ObservableObject {
         selectedSource = nil
         isLoaded = false
         scanGeneration += 1
+        restoreTask?.cancel()
+        restoreGeneration += 1
+        if restore != NuGetRestoreReport() { restore = NuGetRestoreReport() }
+        // Не сразу: открытие проекта и так занимает все ядра.
+        if root != nil { checkRestore(after: 2) }
     }
 
     /// Окно открылось: читаем проекты, если ещё не читали.
     func activate() {
+        shown += 1
+        if restore.needsAttention { markNoticed() }
         guard !isLoaded else { return }
         refresh()
+    }
+
+    /// Окно закрылось.
+    func deactivate() {
+        shown = max(0, shown - 1)
     }
 
     /// Перечитать .csproj: открыли окно, поменялось на диске, отработал dotnet.
@@ -126,12 +151,19 @@ final class NuGetService: ObservableObject {
         isLoaded = true
         scanGeneration += 1
         let generation = scanGeneration
+        // Восстановлены ли пакеты — заодно, по тем же проектам.
+        restoreTask?.cancel()
+        restoreGeneration += 1
+        let checked = restoreGeneration
         isScanning = true
         Task.detached(priority: .userInitiated) {
             let found = NuGetProjects.discover(root: root)
+            let report = NuGetRestore.check(root: root, projects: found)
             let sources = NuGetConfig.sources(for: root)
             await MainActor.run { [weak self] in
-                guard let self, self.scanGeneration == generation else { return }
+                guard let self else { return }
+                if self.restoreGeneration == checked { self.publish(report) }
+                guard self.scanGeneration == generation else { return }
                 self.projects = found
                 self.isScanning = false
                 Task {
@@ -176,6 +208,54 @@ final class NuGetService: ObservableObject {
         let needle = filter.trimmingCharacters(in: .whitespaces)
         guard !needle.isEmpty else { return source }
         return source.filter { $0.id.localizedCaseInsensitiveContains(needle) }
+    }
+
+    // MARK: - restore
+
+    /// Восстановлены ли пакеты: открыли проект, на диске поменялись проекты
+    /// или то, что restore оставил в obj/. Только чтение файлов — ни сети,
+    /// ни `dotnet` (см. NuGetRestore).
+    func checkRestore(after delay: TimeInterval = 0) {
+        guard let root else { return }
+        restoreTask?.cancel()
+        restoreGeneration += 1
+        let generation = restoreGeneration
+        restoreTask = Task { [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            guard !Task.isCancelled else { return }
+            let report = await Task.detached(priority: .utility) {
+                NuGetRestore.check(root: root, projects: NuGetProjects.discover(root: root))
+            }.value
+            guard let self, self.restoreGeneration == generation else { return }
+            self.publish(report)
+        }
+    }
+
+    /// На диске поменялись .csproj, props или project.assets.json. Без окна —
+    /// с задержкой: пачки событий от restore или checkout сворачиваются в одну
+    /// проверку.
+    func filesChanged() {
+        // Свою команду dotnet проверит `finished`, когда та кончится.
+        guard root != nil, !isBusy else { return }
+        if isLoaded { refresh() } else { checkRestore(after: 1) }
+    }
+
+    private func publish(_ report: NuGetRestoreReport) {
+        // Тот же отчёт не публикуем: на него смотрит тулбар окна проекта.
+        guard restore != report else { return }
+        restore = report
+        if isShown, report.needsAttention { markNoticed() }
+    }
+
+    /// Открыть окно NuGet самому: пакеты не восстановлены, окна нет, и за
+    /// этот запуск Pilot оно здесь такого ещё не показывало.
+    var wantsAutoOpen: Bool {
+        guard let root, restore.needsAttention, !isShown else { return false }
+        return !Self.noticed.contains(root.path)
+    }
+
+    func markNoticed() {
+        if let root { Self.noticed.insert(root.path) }
     }
 
     // MARK: - Ленты
@@ -425,6 +505,12 @@ final class NuGetService: ObservableObject {
             }
         }
         execute(commands, title: L("Обновление пакетов"))
+    }
+
+    /// `dotnet restore` проектов, чьи пакеты не восстановлены: сперва тех,
+    /// где restore не удался.
+    func restorePackages() {
+        execute(restore.projects.map(NuGetProjects.restoreCommand), title: L("Восстановление пакетов"))
     }
 
     func cancel() {

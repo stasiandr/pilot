@@ -12,8 +12,12 @@ final class DoubleShiftMonitor {
 
     /// `workspace` — чьё окно слушать: у каждого окна проекта свой монитор.
     init(workspace: Workspace, onDoubleShift: @escaping () -> Void) {
+        // И отпускание клавиши: нажатие Tab или стрелки съедает монитор
+        // палитры, а порядок мониторов AppKit не гарантирует — сюда оно может
+        // не дойти, и два быстрых ⇧Tab в поиске сошли бы за ⇧⇧. Отпускание
+        // не съедает никто.
         monitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown]
+            matching: [.flagsChanged, .keyDown, .keyUp, .leftMouseDown, .rightMouseDown]
         ) { [weak self, weak workspace] event in
             guard let self, let workspace, workspace.owns(event) else { return event }
             switch event.type {

@@ -33,11 +33,23 @@ enum Theme {
     /// Обычный текст и фон редактора — динамические цвета: они запечены
     /// в атрибуты текста каждой вкладки и в фоны AppKit-видов, а так
     /// берут значение из схемы при каждой отрисовке и перекрашивать их
-    /// при смене схемы не нужно.
+    /// при смене схемы не нужно. Только для AppKit — в SwiftUI см. ниже.
     private static let plainText = NSColor(name: "PilotText") { _ in ThemeStore.shared.scheme.p.text }
     private static let background = NSColor(name: "PilotBackground") { _ in ThemeStore.shared.scheme.p.base }
 
     static var editorBackground: NSColor { background }
+
+    /// Фон и обычный текст для SwiftUI — готовыми цветами схемы, а не
+    /// динамическими. SwiftUI перечитывает динамический цвет, только когда
+    /// меняется светлое или тёмное оформление: между двумя тёмными (или двумя
+    /// светлыми) схемами оно то же, и фон редактора, вкладок и статус-строки
+    /// оставался от прошлой схемы. Чтение `current` к тому же подписывает
+    /// вид на смену схемы.
+    static var swiftUIEditorBackground: NSColor { P.base }
+
+    static func swiftUIColor(_ kind: TokenKind) -> NSColor {
+        kind == .plain ? P.text : color(kind)
+    }
 
     /// Фон вхождений идентификатора под курсором. Намеренно бледный:
     /// это ориентир при чтении, а не результат поиска.
@@ -92,6 +104,10 @@ enum Theme {
 
     /// Молния быстрого индекса в статус-строке: пока навигация идёт по нему.
     static var fastIndex: NSColor { P.yellow }
+
+    /// Строка второй половины пары в выдаче поиска: метка и полоска слева.
+    /// Оранжевым, как в графе значения: своя половина синяя, вторая — оранжевая.
+    static var pairProject: NSColor { P.peach }
 
     // MARK: - Иконки файлов
 

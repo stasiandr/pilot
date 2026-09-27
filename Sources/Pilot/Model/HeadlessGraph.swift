@@ -3,8 +3,8 @@ import Foundation
 /// Граф значения без окна — тот же движок, что у ⌥⌘G, для проверки из
 /// терминала и скриптов:
 ///
-///     Pilot --value-graph File.cs:13:30 [--depth 6] [--limit 60] [--calls] [--json] [--lang en]
-///           [--expect "Health.value <- DamageSystem.OnUpdate"]…
+///     Pilot --value-graph File.cs:13:30 [--depth 6] [--limit 60] [--no-calls] [--arguments] [--assets]
+///           [--fan-in N] [--json] [--lang en] [--expect "Health.value <- DamageSystem.OnUpdate"]…
 ///     Pilot --value-graph Folder/ [--depth 6] [--limit 60] [--calls] [-v]
 ///
 /// Проект — ближайшая папка с `.git` над файлом, вторая половина пары — по
@@ -15,10 +15,21 @@ import Foundation
 /// строятся, как при первом открытии, только дольше. `--expect` — цепочка
 /// названий узлов от значения к источникам (подстроки); код выхода 1, если какой-то нет.
 ///
+/// В позиции — любое значение: поле, свойство, локальная, параметр, метод
+/// (что он возвращает), значение перечисления, тип-компонент. Как окно, граф
+/// идёт сначала по записям, потом через вызовы и параметры к источникам;
+/// `--no-calls` — только записи. Имена, которые стоят лишь аргументом
+/// вызова метода проекта (`entity` в `GetMax(entity)`), граф показывает, но
+/// сам не раскрывает; `--arguments` — раскрывать и их. `--assets` — искать
+/// значения полей инспектора в префабах и сценах (окно — по кнопке).
+/// `--fan-in N` — мест у узла не больше N, как в окне (по умолчанию без
+/// предела). После дерева — строка «источники:» — все, до которых дошёл граф.
+///
 /// С папкой — обзор: граф каждого поля и свойства из её файлов, строкой на
 /// граф, и где он теряет след — имена, которых компилятор не узнал, и
-/// раскрытия, которые ничего не дали. `--calls` — раскрывать самому и вызовы
-/// с параметрами, а не только значения; `-v` — печатать и сами графы.
+/// раскрытия, которые ничего не дали. Обзор сравнивают с прошлыми, поэтому
+/// раскрывает он как раньше: вызовы и параметры — только с `--calls`,
+/// аргументы — всегда; `-v` — печатать и сами графы.
 @MainActor
 enum HeadlessGraph {
 
@@ -94,9 +105,13 @@ enum HeadlessGraph {
             return 2
         }
         guard let projects = load(from: start) else { return 2 }
+        // Обзор — как раньше, чтобы числа сравнивались: вызовы только с `--calls`.
         let reach = ValueGraph.Reach(nodes: value("--limit").flatMap(Int.init) ?? 60,
                                      depth: value("--depth").flatMap(Int.init) ?? 6,
-                                     calls: arguments.contains("--calls"))
+                                     calls: folder == nil ? !arguments.contains("--no-calls") : arguments.contains("--calls"),
+                                     assets: arguments.contains("--assets"),
+                                     fanIn: value("--fan-in").flatMap(Int.init) ?? 0,
+                                     arguments: folder != nil || arguments.contains("--arguments"))
         if let folder {
             return survey(folder, projects: projects, reach: reach, verbose: arguments.contains("-v"))
         }
@@ -123,7 +138,7 @@ enum HeadlessGraph {
             return 2
         }
         guard let graph = graph(of: found, projects: projects, reach: reach) else {
-            log("\(found.name) — не поле, не свойство и не компонент")
+            log("\(found.name) [\(found.kind)] — не значение: ни поле, ни переменная, ни параметр, ни метод, ни компонент")
             return 2
         }
 
@@ -131,6 +146,8 @@ enum HeadlessGraph {
             print(json(graph))
         } else {
             print(tree(graph))
+            let summary = sourcesSummary(graph)
+            if !summary.isEmpty { print("источники: " + summary) }
         }
         let expectations = arguments.indices.filter { arguments[$0] == "--expect" && $0 + 1 < arguments.count }
             .map { arguments[$0 + 1] }
@@ -165,21 +182,17 @@ enum HeadlessGraph {
         return Projects(home: home, lookup: { projects[$0.path] })
     }
 
-    /// Граф того, что нашёл компилятор, — как по ⌥⌘G: поле и свойство —
-    /// откуда значение, класс и структура — где компонент ставят и снимают.
+    /// Граф того, что нашёл компилятор, — как по ⌥⌘G: поле, свойство,
+    /// переменная — кто их пишет и откуда это берётся, параметр — что в него
+    /// передают, метод — что он возвращает, класс и структура — где
+    /// компонент ставят и снимают.
     private static func graph(of found: RustlynTarget, projects: Projects, reach: ValueGraph.Reach) -> ValueGraph? {
-        switch found.kind {
-        case .field, .property:
-            return ValueGraph(home: projects.home, lookup: projects.lookup,
-                              value: ValueGraph.Declaration(url: found.url, line: found.line, character: found.character,
-                                                            length: found.length, name: found.name),
-                              synchronous: true, reach: reach)
-        case .struct, .class:
-            return ValueGraph(home: projects.home, lookup: projects.lookup, component: found.shortName,
-                              synchronous: true, reach: reach)
-        default:
-            return nil
-        }
+        let home = projects.home
+        guard let root = home.root, let rustlyn = home.rustlyn else { return nil }
+        let context = ValueGraphAnalysis.Context(root: root, rustlyn: rustlyn, texts: [:], index: home.symbolIndex,
+                                                 network: home.rules.datagrams, configs: home.rules.configs)
+        guard let start = context.root(for: found) else { return nil }
+        return ValueGraph(home: home, lookup: projects.lookup, root: start, synchronous: true, reach: reach)
     }
 
     // MARK: - Обзор папки
@@ -198,6 +211,8 @@ enum HeadlessGraph {
         var unexplored = 0
         /// Значения, которых код не пишет, с известным источником: база, конфиг, инспектор.
         var origins: [String] = []
+        /// Источники, до которых граф дошёл, — по видам.
+        var sources: [ValueOrigin.Kind] = []
 
         @MainActor init(_ graph: ValueGraph) {
             for id in graph.order {
@@ -213,6 +228,7 @@ enum HeadlessGraph {
                 }
                 if node.state == .collapsed, node.isExpandable { unexplored += 1 }
                 if let origin = node.origin { origins.append(origin) }
+                if case .source(let origin, _) = node.kind { sources.append(origin.kind) }
             }
         }
 
@@ -234,10 +250,11 @@ enum HeadlessGraph {
             .sorted { (index.relPath($0), index[$0].line) < (index.relPath($1), index[$1].line) }
         log("\(prefix.isEmpty ? root.lastPathComponent : prefix): полей и свойств \(members.count)")
 
-        var graphs = 0, nodes = 0, unresolved = 0, rootEmpty = 0, guessed = 0, cut = 0, clean = 0
+        var graphs = 0, nodes = 0, unresolved = 0, rootEmpty = 0, guessed = 0, cut = 0, clean = 0, sourced = 0
         var unknownNames: [String: [String: Int]] = [:]
         var emptyByKind: [String: Int] = [:]
         var originCounts: [String: Int] = [:]
+        var sourceCounts: [ValueOrigin.Kind: Int] = [:]
         var slowest: (title: String, seconds: Double)?
         var models: [URL: SyntaxModel] = [:]
         let started = Date()
@@ -270,6 +287,8 @@ enum HeadlessGraph {
             for unknown in losses.unknown { unknownNames[unknown.reason, default: [:]][unknown.name, default: 0] += 1 }
             for node in losses.empty { emptyByKind[kindName(node.kind), default: 0] += 1 }
             for origin in losses.origins { originCounts[origin, default: 0] += 1 }
+            for kind in losses.sources { sourceCounts[kind, default: 0] += 1 }
+            if !losses.sources.isEmpty { sourced += 1 }
 
             var line = "\(graph.title) · \(graph.nodes.count) узл. · \(String(format: "%.1f", seconds)) с"
             if losses.rootEmpty { line += " · записей нет" }
@@ -299,6 +318,7 @@ enum HeadlessGraph {
         print("полей и свойств \(members.count), графов \(graphs), узлов \(nodes), \(String(format: "%.0f", total)) с"
               + (slowest.map { " · дольше всех \($0.title) \(String(format: "%.1f", $0.seconds)) с" } ?? ""))
         print("чистых графов: \(clean) из \(graphs)")
+        print("графов с источниками: \(sourced) из \(graphs)")
         if unresolved > 0 { print("объявлений, которых не узнал компилятор: \(unresolved)") }
         print("значений без записей: \(rootEmpty)")
         for (reason, names) in unknownNames.sorted(by: { $0.value.values.reduce(0, +) > $1.value.values.reduce(0, +) }) {
@@ -313,6 +333,10 @@ enum HeadlessGraph {
         if !originCounts.isEmpty {
             print("код не пишет, но известно откуда: " + originCounts.sorted { $0.value > $1.value }
                 .map { "\($0.key) \($0.value)" }.joined(separator: ", "))
+        }
+        if !sourceCounts.isEmpty {
+            print("источники: " + sourceCounts.sorted { ($1.value, $0.key.rawValue) < ($0.value, $1.key.rawValue) }
+                .map { "\($0.key.label) \($0.value)" }.joined(separator: ", "))
         }
         if guessed > 0 { print("найдено по имени: \(guessed)") }
         if cut > 0 { print("упёрлись в предел (--limit, --depth): \(cut) графов") }
@@ -362,8 +386,21 @@ enum HeadlessGraph {
         case .network: return "сеть"
         case .call: return "вызов"
         case .parameter: return "параметр"
+        case .source(let origin, _): return "источник: \(origin.kind.label)"
+        case .data: return "данные"
+        case .more: return "ещё"
         case .unknown: return "не узнано"
         }
+    }
+
+    /// Источники графа одной строкой: `константа 1500 · время Time.deltaTime`.
+    static func sourcesSummary(_ graph: ValueGraph) -> String {
+        var seen: Set<String> = []
+        return graph.sources.compactMap { node -> String? in
+            guard case .source(let origin, _) = node.kind else { return nil }
+            let text = "\(origin.kind.label) \(origin.title)"
+            return seen.insert(text).inserted ? text : nil
+        }.joined(separator: " · ")
     }
 
     private static func describe(_ node: ValueGraph.Node) -> String {
@@ -378,7 +415,8 @@ enum HeadlessGraph {
     static func json(_ graph: ValueGraph) -> String {
         let nodes: [[String: Any]] = graph.order.compactMap { graph.nodes[$0] }.map { node in
             var entry: [String: Any] = ["id": node.id, "title": node.title, "subtitle": node.subtitle,
-                                        "project": node.project.path, "depth": node.depth]
+                                        "project": node.project.path, "depth": node.depth, "kind": kindName(node.kind)]
+            if case .source(let origin, _) = node.kind { entry["source"] = origin.kind.rawValue }
             if let url = node.url { entry["file"] = url.path }
             if let line = node.line { entry["line"] = line + 1 }
             if let note = node.note { entry["note"] = note }

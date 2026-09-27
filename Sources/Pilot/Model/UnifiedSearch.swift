@@ -38,6 +38,14 @@ enum SearchScope: Int, CaseIterable, Equatable {
         }
     }
 
+    /// Соседний фильтр по кругу — Tab и ⇧Tab в палитре, как в Search
+    /// Everywhere у JetBrains: за «Текстом» снова «Всё».
+    func next(backwards: Bool = false) -> SearchScope {
+        let all = Self.allCases
+        let index = all.firstIndex(of: self) ?? 0
+        return all[(index + (backwards ? all.count - 1 : 1)) % all.count]
+    }
+
     /// Какие источники спрашивать.
     func includes(_ source: SearchSource) -> Bool {
         switch self {

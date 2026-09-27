@@ -42,6 +42,52 @@ enum PairQueries {
         return result
     }
 
+    /// Тип `name` — датаграмма этого индекса, в том же смысле, что у `datagrams`.
+    static func isDatagram(_ name: String, in index: SymbolIndex, rules: DatagramRules) -> Bool {
+        let base = SymbolIndex.baseKey(rules.interface)
+        return (index.typesByName[name] ?? []).contains { id in
+            let symbol = index[id]
+            return symbol.kind == .type && symbol.keyword != "interface"
+                && symbol.bases.contains { SymbolIndex.baseKey($0) == base }
+        }
+    }
+
+    /// Сверка одной датаграммы: первая строка — она сама во второй
+    /// половине, дальше её расхождения с ней (сначала те, что ломают
+    /// провод) с переходом к полю или шагу в своём файле. nil — во второй
+    /// половине такой датаграммы нет.
+    static func datagramReport(named name: String, ownText: String, ownURL: URL, ownPath: String, ownLabel: String,
+                               theirs: SymbolIndex, label: String, rules: DatagramRules) -> [PaletteItem]? {
+        guard let id = datagrams(in: theirs, rules: rules)[name] else { return nil }
+        let twin = theirs.target(id)
+        var items = [PaletteItem(id: 0, icon: "arrow.left.arrow.right", primary: name,
+                                 secondary: "\(label) · \(theirs.relPath(id))", trailing: L("двойник"), target: twin)]
+        guard let own = DatagramContract.shape(named: name, in: ownText, rules: rules),
+              let otherText = SymbolIndex.readSource(twin.url),
+              let other = DatagramContract.shape(named: name, in: otherText, rules: rules) else { return items }
+        let issues = DatagramContract.compare(own, with: other, label: label, rules: rules)
+        for issue in issues.filter(\.breaksWire) + issues.filter({ !$0.breaksWire }) {
+            let range = LSPRange(start: position(of: issue.range.location, in: ownText),
+                                 end: position(of: issue.range.location + issue.range.length, in: ownText))
+            items.append(PaletteItem(id: items.count, icon: issue.breaksWire ? "exclamationmark.triangle" : "textformat",
+                                     primary: issue.message, secondary: "\(ownLabel) · \(ownPath)",
+                                     trailing: issue.breaksWire ? L("провод") : L("имена"),
+                                     target: NavTarget(url: ownURL, range: range)))
+        }
+        return items
+    }
+
+    /// Строка и колонка (UTF-16, как у LSP) смещения в тексте.
+    static func position(of offset: Int, in text: String) -> LSPPosition {
+        var line = 0, lineStart = 0, index = 0
+        for unit in text.utf16 {
+            guard index < offset else { break }
+            if unit == 0x0A { line += 1; lineStart = index + 1 }
+            index += 1
+        }
+        return LSPPosition(line: line, character: offset - lineStart)
+    }
+
     static func contractReport(own: SymbolIndex, theirs: SymbolIndex, label: String, ownLabel: String,
                                rules: DatagramRules) -> [PaletteItem] {
         let ours = datagrams(in: own, rules: rules)
@@ -145,7 +191,11 @@ enum PairQueries {
         }
     }
 
-    static func configLinks(file: URL, text: String, offset: Int, line: String,
+    /// Связи конфига и кода у строки курсора. `model` — тип этой строки:
+    /// объявленный в ней или тот, чьё поле с ключом в ней объявлено. У поля
+    /// первыми идут ключи в конфигах этой модели, а объявление модели ведёт
+    /// к её конфигам и alias'ам — так же, как строка самого alias'а.
+    static func configLinks(file: URL, text: String, offset: Int, line: String, model: String? = nil,
                             sides: [PairIndex], rules: ConfigRules) -> [PaletteItem] {
         var result: [PaletteItem] = []
         var seen = Set<String>()
@@ -186,39 +236,76 @@ enum PairQueries {
                 }
             }
         }
+        /// Тип объявлен в одной из половин.
+        func isType(_ name: String) -> Bool { sides.contains { $0.symbols?.typesByName[name] != nil } }
+        /// Классы алиасов половины — разбираются один раз на запрос.
+        var aliasClasses: [Int: ConfigModels] = [:]
+        func models(_ i: Int) -> ConfigModels {
+            if let known = aliasClasses[i] { return known }
+            let side = sides[i]
+            let found = ConfigModels(files: csharp(side)
+                .filter { $0.hasSuffix("/" + rules.aliasesFile) || $0 == rules.aliasesFile }
+                .compactMap { path in
+                    SymbolIndex.readSource(side.root.appendingPathComponent(path)).map { (path: path, text: $0) }
+                })
+            aliasClasses[i] = found
+            return found
+        }
         /// alias → константа, модель и те, кто читает, в обеих половинах.
-        func alias(_ alias: String) {
-            for side in sides {
-                let paths = csharp(side)
-                for path in paths where path.hasSuffix("/" + rules.aliasesFile) || path == rules.aliasesFile {
-                    let url = side.root.appendingPathComponent(path)
-                    guard let source = SymbolIndex.readSource(url),
-                          let declaration = ConfigLinks.declaration(of: alias, in: source) else { continue }
-                    let position = LSPPosition(line: declaration.line, character: 0)
+        /// Модель — как у «Модели конфига»: последнее имя в `typeof(…)`,
+        /// которое — тип (атрибут может стоять и строкой выше).
+        func alias(_ alias: String, readers: Bool = true) {
+            for (i, side) in sides.enumerated() {
+                for use in models(i).uses(ofAlias: alias) {
+                    let declaration = use.declaration
                     add(PaletteItem(id: 0, icon: "tag", primary: "\(declaration.constant) = \"\(alias)\"",
-                                    secondary: "\(side.label) · \(path)", trailing: "alias",
-                                    target: NavTarget(url: url, range: LSPRange(start: position, end: position))))
-                    if let model = declaration.model { types(model, icon: "cube", what: "модель") }
-                    for (usePath, hit) in search("\(rules.aliases).\(declaration.constant)", in: side, paths: paths)
+                                    secondary: "\(side.label) · \(use.file)", trailing: "alias",
+                                    target: use.target(root: side.root)))
+                    for text in declaration.types {
+                        if let model = ConfigLinks.model(inTypeof: text, isType: isType) {
+                            types(model, icon: "cube", what: "модель")
+                        }
+                    }
+                    guard readers else { continue }
+                    for (usePath, hit) in search("\(rules.aliases).\(declaration.constant)", in: side, paths: csharp(side))
                     where hit.wholeWord {
                         add(item(side, usePath, hit, icon: "arrow.turn.down.right", what: "читает"))
                     }
                 }
             }
         }
+        /// Alias'ы, чья модель — `name`, в обеих половинах, по порядку объявления.
+        func aliases(ofModel name: String) -> [String] {
+            var result: [String] = []
+            for i in sides.indices {
+                for use in models(i).uses(ofModel: name, isType: isType) where !result.contains(use.alias) {
+                    result.append(use.alias)
+                }
+            }
+            return result
+        }
+        /// Реестры половин: путь JSON от корня половины → alias.
+        var registries: [Int: [(path: String, alias: String)]] = [:]
+        func registry(_ i: Int) -> [(path: String, alias: String)] {
+            if let known = registries[i] { return known }
+            var found: [(path: String, alias: String)] = []
+            for path in sides[i].files?.display ?? [] where (path as NSString).lastPathComponent == rules.registry {
+                guard let data = try? Data(contentsOf: sides[i].root.appendingPathComponent(path)) else { continue }
+                let folder = (path as NSString).deletingLastPathComponent
+                for (file, alias) in ConfigLinks.aliases(meta: data).sorted(by: { $0.key < $1.key }) {
+                    found.append((folder.isEmpty ? file : folder + "/" + file, alias))
+                }
+            }
+            registries[i] = found
+            return found
+        }
         /// JSON с этим alias по реестру той половины, где он лежит.
         func jsonFiles(alias wanted: String) {
-            for side in sides {
-                for path in side.files?.display ?? [] where (path as NSString).lastPathComponent == rules.registry {
-                    let meta = side.root.appendingPathComponent(path)
-                    guard let data = try? Data(contentsOf: meta) else { continue }
-                    let folder = (path as NSString).deletingLastPathComponent
-                    for (file, alias) in ConfigLinks.aliases(meta: data) where alias == wanted {
-                        let relative = folder.isEmpty ? file : folder + "/" + file
-                        add(PaletteItem(id: 0, icon: "doc.text", primary: (file as NSString).lastPathComponent,
-                                        secondary: "\(side.label) · \(relative)", trailing: "конфиг",
-                                        target: NavTarget(url: side.root.appendingPathComponent(relative), range: nil)))
-                    }
+            for (i, side) in sides.enumerated() {
+                for entry in registry(i) where entry.alias == wanted {
+                    add(PaletteItem(id: 0, icon: "doc.text", primary: (entry.path as NSString).lastPathComponent,
+                                    secondary: "\(side.label) · \(entry.path)", trailing: "конфиг",
+                                    target: NavTarget(url: side.root.appendingPathComponent(entry.path), range: nil)))
                 }
             }
         }
@@ -231,6 +318,22 @@ enum PairQueries {
                 if let name = ConfigLinks.aliases(meta: data)[relative] { alias(name) }
             }
         } else if let key = ConfigLinks.jsonProperty(in: line, attribute: rules.keyAttribute) {
+            // Поле модели конфига — сперва этот ключ в её конфигах, по
+            // первому в файле: общий поиск ниже упирается в предел и до них
+            // может не дойти.
+            if let model {
+                let wanted = aliases(ofModel: model)
+                for (i, side) in sides.enumerated() {
+                    let entries = registry(i)
+                    let paths = wanted.flatMap { alias in entries.filter { $0.alias == alias }.map(\.path) }
+                    var done = Set<String>()
+                    for (path, hit) in search("\"\(key)\"", in: side, paths: paths, limit: 400)
+                    where ConfigLinks.isKey(key, in: hit.text) {
+                        guard done.insert(path).inserted else { continue }
+                        add(item(side, path, hit, icon: "doc.text", what: "конфиг"))
+                    }
+                }
+            }
             properties(key)
             // И сами JSON, где этот ключ есть.
             for side in sides {
@@ -242,6 +345,15 @@ enum PairQueries {
         } else if let name = ConfigLinks.alias(declaredIn: line) {
             jsonFiles(alias: name)
             alias(name)
+        } else if let model {
+            // Объявление модели конфига: её JSON, она сама в обеих половинах
+            // (двойник — там же) и alias'ы, которые её читают. Кто читает
+            // каждый конфиг — только когда их немного: это поиск по всему C#
+            // на каждый alias.
+            let names = aliases(ofModel: model)
+            names.forEach { jsonFiles(alias: $0) }
+            types(model, icon: "cube", what: "модель")
+            names.forEach { alias($0, readers: names.count <= 3) }
         }
         return result
     }

@@ -25,7 +25,7 @@ struct JumpBar: View {
         }
         .padding(.horizontal, 10)
         .frame(height: chrome.isCompact ? 25 : 30)
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .overlay(alignment: .bottom) {
             Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
         }

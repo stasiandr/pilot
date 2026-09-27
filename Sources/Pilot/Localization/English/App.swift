@@ -103,12 +103,10 @@ extension English {
         ("Переименовать…", "Rename…"),
         ("Следующая ошибка", "Next Problem"),
         ("Предыдущая ошибка", "Previous Problem"),
+        ("Описание ошибки", "Error Description"),
         ("Следующая вкладка", "Next Tab"),
         ("Предыдущая вкладка", "Previous Tab"),
         ("Недавняя вкладка  ⌃Tab", "Recent Tab  ⌃Tab"),
-        ("Крупнее", "Bigger"),
-        ("Мельче", "Smaller"),
-        ("Исходный размер", "Actual Size"),
         ("Подсказки в строках", "Inlay Hints"),
         ("Счётчики использований", "Usage Counts"),
 
@@ -117,7 +115,38 @@ extension English {
         ("Настроить запуск…", "Configure Run…"),
         ("Показать консоль", "Show Console"),
         ("Скрыть консоль", "Hide Console"),
-        ("Панель над редактором", "Toolbar Above Editor"),
         ("Цветовая схема", "Color Scheme"),
+
+        // Подменю «Правки» и «Вида»
+        ("Строки", "Lines"),
+        ("Код", "Code"),
+        ("Свёртка", "Folding"),
+        ("Найти", "Find"),
+        ("Переход", "Navigate"),
+        ("Ревью", "Review"),
+        ("Конфликты", "Conflicts"),
+        ("Вкладки", "Tabs"),
+        ("Редактор", "Editor"),
+        // Окно: между проектами
+        ("Следующий проект", "Next Project"),
+        ("Предыдущий проект", "Previous Project"),
+        // Меню «Отладка» и «Пара»
+        ("Начать отладку…", "Start Debugging…"),
+        ("Ещё раз: %@", "Debug Again: %@"),
+        ("Показать панель отладки", "Show Debug Panel"),
+        ("Скрыть панель отладки", "Hide Debug Panel"),
+        ("Открыть %@", "Open %@"),
+        ("Двойник в %@", "Counterpart in %@"),
+        ("Сверка датаграмм…", "Datagram Contract…"),
+        ("Расхождения зеркал…", "Mirror Drift…"),
+        ("Искать и в %@", "Search in %@ Too"),
+        ("Открывать пару вместе", "Open Pair Together"),
+        ("Связать с проектом…", "Link to Project…"),
+        ("Разорвать пару", "Unlink Pair"),
+        ("Вторая половина пары — %@", "Other half of the pair — %@"),
+        // Настройки → Оформление
+        ("Популярные", "Popular"),
+        ("Тёмная схема", "Dark scheme"),
+        ("Светлая схема", "Light scheme"),
     ]
 }

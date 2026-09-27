@@ -220,6 +220,8 @@ final class Workspace: ObservableObject {
     let unity = UnityService()
     /// Каталог конфигов по правилам расширения: ⌘B по алиасу — в JSON.
     let configCatalogs = ConfigCatalogCache()
+    /// Модели конфигов из класса алиасов: модель тоже открывает свой конфиг.
+    let configModelsCache = ConfigModelsCache()
     /// APK, JAR, AAR и DEX: проект только для чтения, файлы даёт jadx.
     let archive = ArchiveService()
 
@@ -235,8 +237,11 @@ final class Workspace: ObservableObject {
     private(set) var requestedFile: URL?
     /// Имя ассета, чьи использования сейчас в палитре.
     @Published private(set) var usagesTitle: String = ""
-    /// Над какой сборкой сейчас работают генераторы — для палитры, пока ждём.
+    /// Статус палитры «Сгенерированный код»: над чем работают генераторы и
+    /// от какого времени показанный вывод.
     @Published var generatedStatus: String = ""
+    /// Прогоны генераторов Unity: по кнопке и заранее (см. Workspace+Generated).
+    let generatorRuns = UnityGeneratorRuns()
 
     private var unityChanges: AnyCancellable?
     private var archiveChanges: AnyCancellable?
@@ -248,6 +253,8 @@ final class Workspace: ObservableObject {
     let debug = DebugService()
     /// Окно NuGet: пакеты проектов .NET, поиск и установка.
     let nuget = NuGetService()
+    /// Окно NuGet ждёт, когда его можно открыть само (Workspace+NuGet).
+    var nugetOffer: Task<Void, Never>?
     /// Консоль Unity: Editor.log следом за редактором. Не пробрасывается
     /// в objectWillChange — лог пишется часто, а смотрят его только панель
     /// и значок в строке состояния, подписанные сами.
@@ -276,11 +283,14 @@ final class Workspace: ObservableObject {
 
     /// Второй проект пары: клиент для сервера и наоборот.
     @Published var partner: URL?
-    /// Единый поиск заодно ищет во второй половине пары.
+    /// Единый поиск заодно ищет во второй половине пары. Настройка одна на
+    /// все окна: нажали кнопку в одном — она нажата и в остальных.
     @Published var searchIncludesPair = UserDefaults.standard.bool(forKey: Workspace.pairSearchKey) {
         didSet {
+            guard searchIncludesPair != oldValue else { return }
             UserDefaults.standard.set(searchIncludesPair, forKey: Self.pairSearchKey)
             refreshSearch()
+            for other in ProjectWindows.shared.workspaces { other.searchIncludesPair = searchIncludesPair }
         }
     }
     static let pairSearchKey = "pilot.pairSearch"
@@ -290,9 +300,6 @@ final class Workspace: ObservableObject {
     let pairCheckGeneration = AtomicCounter()
     /// Открытый файл из зеркальных папок и его копия во второй половине.
     @Published var mirror: MirrorState?
-    /// Использования во второй половине пары — дописываются к ⌘R.
-    var pairReferenceItems: [PaletteItem] = []
-    let pairReferenceGeneration = AtomicCounter()
 
     /// Окно этого проекта. У каждого окна свой воркспейс — см. ProjectWindows.
     private(set) weak var window: NSWindow?
@@ -334,6 +341,13 @@ final class Workspace: ObservableObject {
             // Издатель срабатывает до записи нового значения — ждём её.
             Task { @MainActor in self?.languageServerBecameReady() }
         }
+        // Кнопка NuGet в тулбаре смотрит на отчёт о restore. Остальное NuGet
+        // окно проекта не перерисовывает, а отчёт публикуется, только когда
+        // он другой. Не восстановлены пакеты — окно NuGet открывается само.
+        observations.append(nuget.$restore.dropFirst().sink { [weak self] _ in
+            self?.objectWillChange.send()
+            Task { @MainActor in self?.offerNuGet() }
+        })
     }
 
     /// Окно у строки: удалённое, треды, новый комментарий. Номер запроса —
@@ -576,6 +590,7 @@ final class Workspace: ObservableObject {
         git.workspaceChanged(to: archived ? nil : url)
         review.workspaceChanged(to: archived ? nil : url)
         unity.workspaceChanged(to: archived ? nil : url)
+        generatedCodeProjectChanged()
         run.workspaceChanged(to: archived ? nil : url)
         nuget.workspaceChanged(to: archived ? nil : url)
         unityConsole.workspaceChanged(to: archived ? nil : unity.project?.root)
@@ -588,6 +603,8 @@ final class Workspace: ObservableObject {
         debug.workspaceChanged(to: archived ? nil : url)
         archive.close()
         requestedFile = nil
+        // Файл прежнего проекта, который ещё читается, сюда уже не попадёт.
+        _ = loadGeneration.bump()
         let generation = scanGeneration.bump()
         isIndexing = true
         typeIndex = nil
@@ -969,10 +986,12 @@ final class Workspace: ObservableObject {
     /// Файл сохранён — значит он снова совпадает с диском, и про C# опять
     /// отвечает Rustlyn.
     ///
-    /// Первая же правка сбросила `settledFile`, и с тех пор красил свой
-    /// лексер. Здесь связь восстанавливается: заново прочитать файл на той
-    /// стороне (его отпечаток изменился, кэш это увидит сам), пометить
-    /// модель и в фоне расставить точки возврата.
+    /// Первая же правка сбросила `settledFile`, а раскраска с тех пор шла по
+    /// прежнему тексту, перенесённому через правки. Здесь связь
+    /// восстанавливается: заново прочитать файл на той стороне (его отпечаток
+    /// изменился, кэш это увидит сам), пометить модель и в фоне расставить
+    /// точки возврата — а потом перекрасить экран по свежему разбору, весь
+    /// и одним разом.
     ///
     /// Структура пересобирается тем же путём, что и всегда, — через
     /// `reindexAfterSave` ниже; здесь только про подсветку и про то, кому
@@ -980,9 +999,38 @@ final class Workspace: ObservableObject {
     private func settleWithRustlyn(_ buffer: TextBuffer) {
         guard let rustlyn = rustlyn, Rustlyn.understands(buffer.url) else { return }
         guard rustlyn.open(buffer.url) else { return }
-        buffer.model.useRustlyn(for: buffer.url)
+        buffer.model.useRustlyn(for: buffer.url, session: rustlyn)
         let url = buffer.url
-        DispatchQueue.global(qos: .utility).async { rustlyn.warm(url) }
+        DispatchQueue.global(qos: .utility).async {
+            rustlyn.warm(url)
+            Task { @MainActor in buffer.onDisplayRecolor?() }
+        }
+    }
+
+    /// Копия правленого текста у Rustlyn — только чтобы он её раскрасил: файл
+    /// на диске ещё прежний. Живёт, пока по ней красят (её держит раскраска
+    /// модели), и закрывается сама.
+    private final class ColorCopy: @unchecked Sendable {
+        private let url: URL
+        private weak var session: Rustlyn?
+
+        /// Отдать текст и пройти его целиком — с фона: это весь файл.
+        init?(of file: URL, text: String, session: Rustlyn) {
+            // Только имя для Rustlyn: на диске такого файла нет и не будет.
+            url = file.deletingLastPathComponent()
+                .appendingPathComponent(".\(file.lastPathComponent).pilot-colors-\(UUID().uuidString).cs")
+            self.session = session
+            guard session.open(url, text: text) else { return nil }
+            session.warm(url)
+        }
+
+        // Не на главном: замок сессии бывает занят проходом по другому файлу.
+        deinit {
+            let (session, url) = (session, url)
+            DispatchQueue.global(qos: .utility).async { session?.close(url) }
+        }
+
+        func tokens(_ lines: ClosedRange<Int>) -> [Token]? { session?.tokens(url, lines: lines) }
     }
 
     private func reindexAfterSave(_ url: URL) {
@@ -1129,10 +1177,17 @@ final class Workspace: ObservableObject {
         // Индекс эти папки не видит (Temp, Library), поэтому смотрим на
         // события до разбора: компиляция Rustlyn должна взять новый текст.
         if events.contains(where: { Self.isGeneratedCode($0.path) }) { scheduleCompile() }
+        // restore записал пакеты проекта заново — компиляции нужны их сборки.
+        // obj/ обычно в .gitignore, и разбор ниже этих событий не пропустит.
+        let restored = events.contains(where: { NuGetRestore.isAssets($0.path) })
+        if restored { scheduleCompile() }
+        // Unity компилировала или стёрла `Temp` — генераторам пора заранее обновить вывод.
+        generatorRuns.noticed(events)
         // Новый проект .NET или правка `.pilot/run.json` — другой список у ▶.
         if events.contains(where: { RunTargets.isRelevant($0.path) }) { run.refresh() }
-        // Пакеты перечитываем, только если окно NuGet уже открывали.
-        if nuget.isLoaded, events.contains(where: { NuGetProjects.isRelevant($0.path) }) { nuget.refresh() }
+        // Проекты .NET или то, что оставил restore: восстановлены ли пакеты
+        // (кнопка NuGet), а окно NuGet, если его открывали, — перечитать.
+        if events.contains(where: { NuGetRestore.isRelevant($0.path) }) { nuget.filesChanged() }
         reloadOpenTabs(touched: events)
         // FSEvents присылает настоящие пути: `/private/tmp/…` для проекта,
         // открытого как `/tmp/…`, путь без симлинков — для открытого через
@@ -1151,7 +1206,7 @@ final class Workspace: ObservableObject {
         pendingRemoved.formUnion(batch.removed)
         if !pendingReindex.isEmpty || !pendingRemoved.isEmpty { scheduleReindexFlush() }
         // Проект описан заново: другие ссылки, другие символы, другие файлы.
-        if batch.changed.contains(where: RustlynProjectKind.isProjectFile) { scheduleCompile() }
+        if !restored, batch.changed.contains(where: RustlynProjectKind.isProjectFile) { scheduleCompile() }
         if batch.needsRescan { scheduleRescan() }
     }
 
@@ -1300,8 +1355,11 @@ final class Workspace: ObservableObject {
         git.workspaceChanged(to: nil)
         review.workspaceChanged(to: nil)
         unity.workspaceChanged(to: nil)
+        generatedCodeProjectChanged()
         run.workspaceChanged(to: nil)
         nuget.workspaceChanged(to: nil)
+        nugetOffer?.cancel()
+        nugetOffer = nil
         unityConsole.workspaceChanged(to: nil)
         commits.workspaceChanged(to: nil)
         localHistory = nil
@@ -2061,8 +2119,9 @@ final class Workspace: ObservableObject {
             var pairSnapshot = SearchSnapshot(files: pair.files, symbols: pair.symbols, root: pair.root)
             pairSnapshot.textHits = snapshot.pairTextHits
             guard var item = searchItem(own, id: id, in: pairSnapshot) else { return nil }
-            // Метка половины пары — первой в приглушённой строке.
-            item.secondary = [pair.label, item.secondary].compactMap { $0 }.joined(separator: " · ")
+            // Чья строка, видно по метке и полоске цвета пары (PaletteRow) —
+            // в приглушённой строке подпись больше не нужна.
+            item.pairLabel = pair.label
             if c.source == .file { item.trailing = nil }
             return item
         }
@@ -2181,6 +2240,11 @@ final class Workspace: ObservableObject {
     /// языковой сервер, если он готов, и быстрый навигатор, если нет или он
     /// ничего не нашёл.
     ///
+    /// Имя на самом объявлении — идти некуда, мы на нём: как в Rider (⌘B и
+    /// ⌘+клик там — «к объявлению или использованиям»), показываем его
+    /// использования. Объявление ли это, решает ответ того, кто ведёт к
+    /// объявлению: он указал ровно на это имя.
+    ///
     /// `followConfigs: false` — к объявлению константы, а не в конфиг, на
     /// который указывает её значение (`ConfigNames.Jobs` → `jobs.json`).
     func goToDefinition(at offset: Int, followConfigs: Bool = true) {
@@ -2188,13 +2252,20 @@ final class Workspace: ObservableObject {
 
         if followConfigs, goToConfig(at: offset, in: document) { return }
 
+        // ⌘ держали над этим объявлением: его использования уже ищутся.
+        if let search = usageSearch, search.atDeclaration, !search.wanted,
+           search.query == usageQuery(at: offset, in: document) {
+            showUsagesOfDeclaration(at: offset)
+            return
+        }
+
         // Декомпилированный класс: куда ведёт имя, точно знает jadx.
         if archive.owns(document.url) {
             Task { [weak self] in
                 guard let self else { return }
                 switch await self.archive.definition(in: document, at: offset) {
                 case .target(let target):   self.navigate(to: target)
-                case .declaration:          self.findReferences(at: offset)
+                case .declaration:          self.showUsagesOfDeclaration(at: offset)
                 case .unavailable(let why): self.showNotice(why)
                 }
             }
@@ -2226,10 +2297,16 @@ final class Workspace: ObservableObject {
 
         let position = document.model.position(at: offset)
         let url = document.url
+        let asked = navDocument(document)
         Task { [weak self] in
             guard let self else { return }
             let locations = await self.lsp.definition(url: url, position: position)
-            if let first = locations.first, let target = first.fileURL {
+            let targets = locations.compactMap { location in
+                location.fileURL.map { NavTarget(url: $0, range: location.range) }
+            }
+            if asked.declares(targets, at: offset) {
+                self.showUsagesOfDeclaration(at: offset)
+            } else if let first = locations.first, let target = first.fileURL {
                 self.navigate(to: NavTarget(url: target, range: first.range))
             } else {
                 self.jumpToLocalDeclaration(at: offset, in: document)
@@ -2254,6 +2331,12 @@ final class Workspace: ObservableObject {
     private func jumpToLocalDeclaration(at offset: Int, in document: LoadedDocument) {
         let navigator = LocalNavigator(index: symbolIndex, document: navDocument(document))
         var answer = navigator.definition(at: offset)
+        // Ответ указал на само это имя — оно и есть объявление.
+        if navigator.document.declares(answer.declarations.map(\.target), at: offset) {
+            NSLog("[nav] ⌘B %@:%d → объявление здесь, его использования", document.url.lastPathComponent, offset)
+            showUsagesOfDeclaration(at: offset)
+            return
+        }
         // Догадка по имени против типа из сборки, который файл видит через
         // `using`: `Vector3` в файле с `using UnityEngine` — движковый, даже
         // если где-то в пакетах лежит одноимённый тестовый.
@@ -2384,111 +2467,250 @@ final class Workspace: ObservableObject {
         showDeclarations(answer.declarations, mode: .implementations)
     }
 
+    // MARK: - Использования
+    //
+    // Палитра использований открывается, когда список готов целиком: свои,
+    // во второй половине пары и роли датаграмм. Раньше она открывалась сразу —
+    // узкой и пустой, с «Ищу…», — а с ответом раздувалась под строки и
+    // предпросмотр, потом дописывала пару и перекрашивала значки датаграмм:
+    // всё это мелькало. Долгий поиск всё же открывает её через
+    // `usagesPatience` — со спиннером и сразу того размера, какой будет со
+    // списком.
+    //
+    // ⌘ над объявлением (`prepareCommandClick`) начинает поиск заранее, и к
+    // клику он обычно уже готов.
+
+    /// Что ищем: имя в этой версии файла.
+    private struct UsageQuery: Equatable {
+        var url: URL
+        var version: Int
+        /// Имя в тексте этой версии; пустое — не на имени.
+        var word: NSRange
+    }
+
+    /// Поиск использований — по ⌘R, по клику или заранее, пока держат ⌘.
+    private struct UsageSearch {
+        var query: UsageQuery
+        var generation: Int
+        /// Начало имени — чтобы узнать его среди найденного.
+        var place: NavTarget?
+        /// Имя — само объявление (так ответил ⌘B): в список оно не идёт, а
+        /// единственное использование открывается сразу — как в Rider.
+        var atDeclaration: Bool
+        /// Показать, как только готово; `false` — готовится заранее.
+        var wanted: Bool
+        /// Поиск долгий: палитра уже открыта со спиннером.
+        var openedEarly = false
+        /// Что сказать о поиске, когда его захотят увидеть.
+        var notice: String?
+        /// Найденное; `nil` — ещё ищется.
+        var own: [PaletteItem]?
+        var partner: [PaletteItem]?
+    }
+
+    private var usageSearch: UsageSearch?
+    private var usageTask: Task<Void, Never>?
+    private let usageGeneration = AtomicCounter()
+    /// Сколько ждать готового списка, прежде чем открыть палитру со спиннером.
+    private static let usagesPatience: UInt64 = 250_000_000
+
+    /// ⌘R: использования имени в позиции `offset`.
     func findReferences(at offset: Int) {
+        searchUsages(at: offset, atDeclaration: false)
+    }
+
+    /// ⌘B и ⌘+клик по самому объявлению.
+    private func showUsagesOfDeclaration(at offset: Int) {
+        searchUsages(at: offset, atDeclaration: true)
+    }
+
+    private func searchUsages(at offset: Int, atDeclaration: Bool) {
         guard let document else { return }
-        let position = document.model.position(at: offset)
-        let url = document.url
-        pairReferenceItems = []
-        let word = Occurrences.identifier(in: document.model, at: offset)?.text
+        preparing = nil
+        let query = usageQuery(at: offset, in: document)
+        if var search = usageSearch, search.query == query, !search.wanted {
+            // Начат заранее, пока держали ⌘, — показываем, как только готов.
+            search.wanted = true
+            search.atDeclaration = atDeclaration
+            if let notice = search.notice { showNotice(notice) }
+            search.notice = nil
+            usageSearch = search
+        } else {
+            startUsageSearch(query, at: offset, in: document, atDeclaration: atDeclaration, wanted: true)
+        }
+        guard let search = usageSearch else { return }
+        if search.own != nil, search.partner != nil {
+            finishUsages()
+        } else {
+            openUsagesIfSlow(search.generation)
+        }
+    }
 
-        paletteMode = .references
-        query = ""
-        selection = 0
-        items = []
-        allReferences = []
-        paletteBusy = true
-        isPaletteOpen = true
-        // Имя типа — ищем его и во второй половине пары: датаграмму шлёт
-        // одна сторона, а ловит другая.
-        if let word { findPartnerReferences(of: word) }
+    private func usageQuery(at offset: Int, in document: LoadedDocument) -> UsageQuery {
+        let word = Occurrences.identifier(in: document.model, at: offset)?.range
+        return UsageQuery(url: document.url, version: document.model.version,
+                          word: word ?? NSRange(location: offset, length: 0))
+    }
 
-        if archive.owns(url) {
-            let generation = searchGeneration.bump()
-            let counter = searchGeneration
-            Task { [weak self] in
-                guard let self else { return }
-                let found = await self.archive.usages(in: document, at: offset)
-                guard counter.isCurrent(generation), self.paletteMode == .references else { return }
-                self.showReferences(found)
+    private func startUsageSearch(_ query: UsageQuery, at offset: Int, in document: LoadedDocument,
+                                  atDeclaration: Bool, wanted: Bool) {
+        usageTask?.cancel()
+        let generation = usageGeneration.bump()
+        usageSearch = UsageSearch(query: query, generation: generation, place: namePlace(at: offset, in: document),
+                                  atDeclaration: atDeclaration, wanted: wanted)
+        let word = Occurrences.identifier(in: document.model, at: offset)?.text ?? ""
+        let counter = usageGeneration
+        usageTask = Task { [weak self] in
+            guard let self else { return }
+            // Имя типа — ищем его и во второй половине пары: датаграмму шлёт
+            // одна сторона, а ловит другая.
+            async let theirs = self.partnerReferences(of: word, generation: generation, counter: counter)
+            let found = await self.ownUsages(at: offset, in: document, generation: generation)
+            let mine = await self.withDatagramRoles(self.usageItems(found), word: word)
+            let partner = await theirs
+            guard var search = self.usageSearch, search.generation == generation else { return }
+            search.own = mine
+            search.partner = partner
+            self.usageSearch = search
+            if search.wanted { self.finishUsages() }
+        }
+    }
+
+    /// Всё найдено, и его ждут: список — в палитру, разом.
+    private func finishUsages() {
+        guard let search = usageSearch, search.wanted, var own = search.own, let partner = search.partner else { return }
+        usageSearch = nil
+        if search.openedEarly {
+            // Пока искали, палитру закрыли или открыли в ней другое.
+            guard isPaletteOpen, paletteMode == .references else {
+                if !isPaletteOpen { paletteBusy = false }
+                return
             }
+        } else if (isPaletteOpen && paletteMode != .references) || document?.url != search.query.url {
+            // Пока искали, ушли в другой файл или открыли другую палитру.
             return
         }
+        paletteBusy = false
+        if search.atDeclaration {
+            // Объявление, по которому кликнули, — не использование.
+            if let place = search.place { own.removeAll { Self.isPlace($0.target, place) } }
+            let all = own + partner
+            if all.count == 1 {
+                showNotice(L("Единственное использование"))
+                navigate(to: all[0].target)
+                return
+            }
+            if all.isEmpty, !search.openedEarly {
+                showNotice(L("Использований не найдено"))
+                return
+            }
+        }
+        if !search.openedEarly {
+            paletteMode = .references
+            query = ""
+            selection = 0
+        }
+        allReferences = renumbered(own + partner)
+        filterReferences()
+        isPaletteOpen = true
+    }
 
-        // C# — Rustlyn: использования символа, а не слова.
-        if Rustlyn.understands(document.url), let rustlyn = rustlyn, document.decompiled == nil {
-            findRustlynReferences(rustlyn, at: offset, in: document)
-            return
+    /// Поиск долгий: через `usagesPatience` палитра открывается со спиннером.
+    private func openUsagesIfSlow(_ generation: Int) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.usagesPatience)
+            guard let self, var search = self.usageSearch, search.generation == generation, search.wanted,
+                  !search.openedEarly, !self.isPaletteOpen, self.document?.url == search.query.url else { return }
+            search.openedEarly = true
+            self.usageSearch = search
+            self.paletteMode = .references
+            self.query = ""
+            self.selection = 0
+            self.items = []
+            self.allReferences = []
+            self.paletteBusy = true
+            self.isPaletteOpen = true
+        }
+    }
+
+    /// Сказать о поиске — если его ждут; готовящийся заранее скажет при клике.
+    private func noteUsages(_ text: String, generation: Int) {
+        guard var search = usageSearch, search.generation == generation else { return }
+        if search.wanted {
+            showNotice(text)
+        } else {
+            search.notice = text
+            usageSearch = search
+        }
+    }
+
+    /// Свои использования: C# — Rustlyn, другие языки — языковой сервер,
+    /// а без них — по тексту проекта.
+    private func ownUsages(at offset: Int, in document: LoadedDocument,
+                           generation: Int) async -> [(url: URL, range: LSPRange)] {
+        let url = document.url
+        if archive.owns(url) {
+            return await archive.usages(in: document, at: offset)
+        }
+        // C# — Rustlyn: скомпилированный проект, и в нём всё, что связывается
+        // с тем же символом — перегрузка не спутается с перегрузкой, а поле с
+        // одноимённой локальной переменной. Пока компиляции нет — по тексту.
+        if Rustlyn.understands(url), let rustlyn, document.decompiled == nil {
+            // Правленый файл спрашиваем его текстом: смещение — в нём.
+            let text: String? = document.model.settledFile == nil ? document.model.text : nil
+            let counter = usageGeneration
+            let found: RustlynDefinition? = await withCheckedContinuation { done in
+                referenceQueue.async {
+                    done.resume(returning: counter.isCurrent(generation)
+                        ? rustlyn.references(url, offset: offset, text: text) : nil)
+                }
+            }
+            guard let found else { return [] }
+            switch found.refusal {
+            case .none where !found.targets.isEmpty:
+                return found.targets.map { target in
+                    (target.url, LSPRange(
+                        start: LSPPosition(line: target.line, character: target.character),
+                        end: LSPPosition(line: target.line, character: target.character + target.length)))
+                }
+            case .notAName:
+                return []
+            default:
+                if found.refusal == .notCompiled, case .compiling = compiler {
+                    noteUsages(L("Rustlyn ещё компилирует проект — ищу по тексту"), generation: generation)
+                }
+                return await localUsages(at: offset, in: document, generation: generation)
+            }
         }
         // Про текст из метаданных .dll сервер ничего не знает.
         guard lsp.isReady, document.decompiled == nil else {
-            findLocalReferences(at: offset, in: document)
-            return
+            return await localUsages(at: offset, in: document, generation: generation)
         }
-        Task { [weak self] in
-            guard let self else { return }
-            let locations = await self.lsp.references(url: url, position: position)
-            guard self.paletteMode == .references else { return }
-            if locations.isEmpty {
-                self.findLocalReferences(at: offset, in: document)
-                return
-            }
-            self.showReferences(locations.map { ($0.fileURL ?? url, $0.range) })
-        }
+        let locations = await lsp.references(url: url, position: document.model.position(at: offset))
+        if locations.isEmpty { return await localUsages(at: offset, in: document, generation: generation) }
+        return locations.map { ($0.fileURL ?? url, $0.range) }
     }
 
-    /// ⌘R по C#: скомпилированный проект, и в нём всё, что связывается с
-    /// тем же символом — перегрузка не спутается с перегрузкой, а поле с
-    /// одноимённой локальной переменной. Пока компиляции нет — по тексту.
-    private func findRustlynReferences(_ rustlyn: Rustlyn, at offset: Int, in document: LoadedDocument) {
-        let url = document.url
-        // Правленый файл спрашиваем его текстом: смещение — в нём.
-        let text: String? = document.model.settledFile == nil ? document.model.text : nil
-        let generation = searchGeneration.bump()
-        let counter = searchGeneration
-        referenceQueue.async { [weak self] in
-            let found = rustlyn.references(url, offset: offset, text: text)
-            Task { @MainActor in
-                guard let self, counter.isCurrent(generation), self.paletteMode == .references else { return }
-                switch found.refusal {
-                case .none where !found.targets.isEmpty:
-                    self.showReferences(found.targets.map { target in
-                        (target.url, LSPRange(
-                            start: LSPPosition(line: target.line, character: target.character),
-                            end: LSPPosition(line: target.line, character: target.character + target.length)))
-                    })
-                case .notAName:
-                    self.showReferences([])
-                default:
-                    if found.refusal == .notCompiled, case .compiling = self.compiler {
-                        self.showNotice(L("Rustlyn ещё компилирует проект — ищу по тексту"))
-                    }
-                    self.findLocalReferences(at: offset, in: document)
-                }
-            }
-        }
-    }
-
-    /// ⌘R без сервера: слово целиком по исходникам того же языка, без строк
-    /// и комментариев. На проекте в 26 000 файлов — доли секунды, в фоне.
-    private func findLocalReferences(at offset: Int, in document: LoadedDocument) {
-        guard let root else { return }
+    /// Без сервера — слово целиком по исходникам того же языка, без строк и
+    /// комментариев. На проекте в 26 000 файлов — доли секунды, в фоне.
+    private func localUsages(at offset: Int, in document: LoadedDocument,
+                             generation: Int) async -> [(url: URL, range: LSPRange)] {
+        guard let root else { return [] }
         let files = index?.display ?? []
         let navigator = LocalNavigator(index: symbolIndex, document: navDocument(document))
-        let generation = searchGeneration.bump()
-        let counter = searchGeneration
-        referenceQueue.async { [weak self] in
-            let found = navigator.references(at: offset, root: root, files: files,
-                                             shouldStop: { !counter.isCurrent(generation) })
-            Task { @MainActor in
-                guard let self, counter.isCurrent(generation), self.paletteMode == .references else { return }
-                self.showReferences(found.map { ($0.target.url, $0.target.range ?? LSPRange(
-                    start: LSPPosition(line: $0.line, character: 0), end: LSPPosition(line: $0.line, character: 0))) })
+        let counter = usageGeneration
+        let found = await withCheckedContinuation { done in
+            referenceQueue.async {
+                done.resume(returning: navigator.references(at: offset, root: root, files: files,
+                                                             shouldStop: { !counter.isCurrent(generation) }))
             }
         }
+        return found.map { ($0.target.url, $0.target.range ?? LSPRange(
+            start: LSPPosition(line: $0.line, character: 0), end: LSPPosition(line: $0.line, character: 0))) }
     }
 
-    private func showReferences(_ locations: [(url: URL, range: LSPRange)]) {
-        let built = locations.prefix(500).enumerated().map { position, location -> PaletteItem in
+    private func usageItems(_ locations: [(url: URL, range: LSPRange)]) -> [PaletteItem] {
+        locations.prefix(500).enumerated().map { position, location -> PaletteItem in
             PaletteItem(
                 id: position,
                 icon: "arrow.turn.down.right",
@@ -2497,10 +2719,71 @@ final class Workspace: ObservableObject {
                 trailing: ":\(location.range.start.line + 1)",
                 target: NavTarget(url: location.url, range: location.range))
         }
-        allReferences = renumbered(built + pairReferenceItems)
-        filterReferences()
-        paletteBusy = false
-        ownReferencesShown(built)
+    }
+
+    // MARK: ⌘ над объявлением
+
+    /// ⌘ зажат, и мышь остановилась на имени в `offset`; `nil` — ⌘ отпустили
+    /// или мышь ушла из текста. Клик, скорее всего, будет: если имя объявлено
+    /// здесь же, его использования ищутся уже сейчас, и клик покажет их
+    /// готовым списком. Куда вести с остального, ⌘+клик решает сам и быстро.
+    func prepareCommandClick(at offset: Int?) {
+        // Идёт поиск, которого ждут, — не перебиваем.
+        if usageSearch?.wanted == true { return }
+        guard let offset, let document, !isPaletteOpen else {
+            dropPreparedUsages()
+            return
+        }
+        let query = usageQuery(at: offset, in: document)
+        guard query != usageSearch?.query, query != preparing else { return }
+        dropPreparedUsages()
+        // Заранее — только там, где ⌘B отвечает сразу, навигатором: C# и
+        // файлы без языкового сервера. Архиву и сценам отвечают jadx и Unity,
+        // другим языкам — сервер, и все они не мгновенно.
+        guard !archive.owns(document.url), !unity.isReferenceFile(document),
+              Rustlyn.understands(document.url) || !lsp.isReady
+                  || document.revision != nil || document.decompiled != nil,
+              Occurrences.symbol(in: document.model, at: offset) != nil else { return }
+        // Объявление ли это — фоном: правленый файл Rustlyn разбирает заново,
+        // и мышь с зажатым ⌘ не должна на этом спотыкаться.
+        preparing = query
+        let navigator = LocalNavigator(index: symbolIndex, document: navDocument(document))
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let answer = navigator.definition(at: offset)
+            let declared = navigator.document.declares(answer.declarations.map(\.target), at: offset)
+            Task { @MainActor in
+                guard let self, self.preparing == query else { return }
+                self.preparing = nil
+                guard declared, self.usageSearch == nil, !self.isPaletteOpen, let document = self.document,
+                      self.usageQuery(at: offset, in: document) == query else { return }
+                self.startUsageSearch(query, at: offset, in: document, atDeclaration: true, wanted: false)
+            }
+        }
+    }
+
+    /// Имя, о котором фоном выясняют, объявление ли оно.
+    private var preparing: UsageQuery?
+
+    /// Поиск, начатый заранее, клика не дождался.
+    private func dropPreparedUsages() {
+        preparing = nil
+        guard let search = usageSearch, !search.wanted else { return }
+        usageTask?.cancel()
+        _ = usageGeneration.bump()
+        usageSearch = nil
+    }
+
+    /// Где начинается имя в `offset` — чтобы узнать его среди найденного.
+    private func namePlace(at offset: Int, in document: LoadedDocument) -> NavTarget? {
+        guard let word = Occurrences.identifier(in: document.model, at: offset) else { return nil }
+        let start = document.model.position(at: word.range.location)
+        return NavTarget(url: document.url, range: LSPRange(start: start, end: start))
+    }
+
+    /// Цель — то же имя: тот же файл и то же начало.
+    private static func isPlace(_ target: NavTarget, _ place: NavTarget) -> Bool {
+        guard let start = target.range?.start, start == place.range?.start else { return false }
+        return target.url.standardizedFileURL == place.url.standardizedFileURL
     }
 
     /// Номера строк палитры подряд: списки собраны из разных источников.
@@ -3024,10 +3307,14 @@ final class Workspace: ObservableObject {
             // Прежний переход относится к прежнему файлу. Редактор, который
             // появится заново после картинки или Markdown, не должен его повторить.
             if reveal == nil { self.reveal = nil }
-            // Курсор — там, где его оставили; редактор восстановит его сам,
-            // и совпадение значений не даст ему опубликовать смену посреди
-            // обновления вьюхи.
-            caret.setOffset(buffer.lastCaret)
+            // Место перехода — за вкладкой: редактор покажет её здесь, а не
+            // там, где её оставили, и не даст потом увести (см. Landing).
+            // Без перехода — прежнее место.
+            buffer.landing = reveal
+            // Курсор — там, где его поставит редактор: на месте перехода или
+            // где его оставили. Редактор выставит его сам, и совпадение
+            // значений не даст ему опубликовать смену посреди обновления вьюхи.
+            caret.setOffset(reveal.map { buffer.model.offset(at: $0.start) } ?? buffer.lastCaret)
             setBuffer(buffer)
             caret.setOccurrences([])
             occurrenceWord = nil
@@ -3159,8 +3446,13 @@ final class Workspace: ObservableObject {
 
         let restore = restoreGeneration.bump()
         let restoreCounter = restoreGeneration
-        // Файл, который открывают в это время, важнее сохранённой активной.
-        let load = takingFocus ? loadGeneration.bump() : nil
+        // Файл, который просили открыть, важнее сохранённой активной: и тот,
+        // что начали открывать до этого места (`requestedFile`), и тот, что
+        // начнут, пока вкладки читаются (сдвинется поколение загрузки). Само
+        // поколение здесь не сдвигаем: сдвиг отменил бы уже идущее открытие,
+        // и файл с местом перехода (Unity, вторая половина пары) так бы и не
+        // показался — вместо него встала бы сохранённая вкладка.
+        let load = loadGeneration.current
         let loadCounter = loadGeneration
         let unityContext = unity.context
         isRestoringTabs = true
@@ -3176,8 +3468,9 @@ final class Workspace: ObservableObject {
                 if url == activeURL {
                     Task { @MainActor in
                         guard let self, restoreCounter.isCurrent(restore) else { return }
+                        let untouched = loadCounter.isCurrent(load) && self.requestedFile == nil
                         self.adoptRestored([url], documents: [url: document], preview: preview,
-                                           activate: load.map(loadCounter.isCurrent) == true ? url : nil)
+                                           activate: takingFocus && untouched ? url : nil)
                     }
                 }
             }
@@ -3261,12 +3554,27 @@ final class Workspace: ObservableObject {
     private func rebuildOutline(_ buffer: TextBuffer) {
         let snapshot = buffer.model.snapshot()
         let context = unity.context
+        // Раскраска правленого C# — по тексту, каким его прочитал Rustlyn, и
+        // своему лексеру там, где правили. Пауза в наборе — отдать Rustlyn
+        // копию нынешнего текста и красить уже по ней. Проход по копии держит
+        // замок сессии, и прокрутка на это время ждёт: на огромном файле это
+        // заметно на каждой паузе — там свежий разбор только при сохранении.
+        let recolor = snapshot.colorsLag && snapshot.lineCount <= 20_000 ? rustlyn : nil
+        let url = buffer.url
         work.async { [weak self] in
             let outline = OutlineBuilder.build(model: snapshot)
             let semantics = UnitySemantics.analyze(model: snapshot, lexicalOutline: outline, context: context)
+            let fresh = recolor.flatMap { ColorCopy(of: url, text: snapshot.text, session: $0) }
             Task { @MainActor in
                 guard let self, buffer === self.buffer,
                       buffer.model.version == snapshot.version else { return }
+                // Разбор ровно этого текста — никаких правок поверх; экран
+                // перекрашивается весь и одним разом. Файл успели сохранить —
+                // значит, раскраска уже по нему, и копия не нужна.
+                if let fresh, buffer.model.settledFile == nil {
+                    buffer.model.useColors { lines in fresh.tokens(lines) }
+                    buffer.onDisplayRecolor?()
+                }
                 self.objectWillChange.send()
                 buffer.setSemantics(outline: semantics?.outline ?? outline,
                                     unityFile: semantics?.serialized, hierarchy: semantics?.hierarchy,
@@ -3457,10 +3765,15 @@ final class Workspace: ObservableObject {
             self?.confirmUnsavedChanges() ?? true
         }
         let center = NotificationCenter.default
+        KeyboardIdle.start()
         windowObservers = [
             // Файлы вне проектов (сборки движка) спрашивают у сессии переднего окна.
+            // Окно NuGet, которое ждало, пока проект выйдет вперёд, — теперь.
             center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { Rustlyn.activate(self?.rustlyn) }
+                MainActor.assumeIsolated {
+                    Rustlyn.activate(self?.rustlyn)
+                    self?.offerNuGet()
+                }
             },
             center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.windowClosed() }
@@ -3560,8 +3873,10 @@ final class Workspace: ObservableObject {
                 // Проект ещё не скомпилирован — прежние остаются: они
                 // сдвигаются вместе с правками и лучше, чем ничего.
                 if hints == nil, lenses == nil, self.insightsBuffer == id { return }
-                self.currentInsights = RustlynInsights(hints: hints ?? [], lenses: lenses ?? [])
+                let found = RustlynInsights(hints: hints ?? [], lenses: lenses ?? [])
+                self.currentInsights = found
                 self.insightsBuffer = id
+                buffer.insights = (snapshot.version, found)
                 self.insightsVersion += 1
             }
         }
@@ -3593,7 +3908,12 @@ final class Workspace: ObservableObject {
     }
 
     func insights(for buffer: TextBuffer) -> RustlynInsights {
-        guard insightsBuffer == ObjectIdentifier(buffer), let found = currentInsights else { return RustlynInsights() }
+        var found = insightsBuffer == ObjectIdentifier(buffer) ? currentInsights : nil
+        // Вкладку только что сменили: свежие ещё считаются, а прежние этого
+        // файла верны, если текст с тех пор не менялся. Без них счётчики и
+        // подсказки пропадали и через секунду появлялись снова.
+        if found == nil, let kept = buffer.insights, kept.version == buffer.model.version { found = kept.found }
+        guard let found else { return RustlynInsights() }
         return RustlynInsights(hints: showsInlayHints ? found.hints : [],
                                lenses: showsCodeLens ? found.lenses : [])
     }
@@ -3685,8 +4005,31 @@ final class Workspace: ObservableObject {
                     self.showNotice("«\(info.text)» не переименовать: \(refused)")
                     return
                 }
+                self.warmRenameReferences(rustlyn, url: url, offset: offset, text: text)
                 self.confirmRename(info, url: url, offset: offset, text: text)
             }
+        }
+    }
+
+    /// Поколение прогрева: окно закрыли без переименования — прогрев,
+    /// который ещё не начался, не нужен.
+    private let renameGeneration = AtomicCounter()
+
+    /// Пока в окне набирают новое имя, Rustlyn уже ищет использования
+    /// старого — любого имени: типа, метода, поля, переменной. Ищет тем же
+    /// связыванием, что и переименование, а связанные тела методов кэширует
+    /// (до 4096), так что после Enter переименование берёт их готовыми.
+    /// Очередь у них одна: переименование встанет за прогревом, а не рядом.
+    ///
+    /// Чего прогрев не ускоряет: проверку конфликтов — Rustlyn собирает
+    /// проект заново уже с новым именем, — и сам файл, если в нём есть
+    /// несохранённое: тела, связанные по тексту редактора, не кэшируются.
+    private func warmRenameReferences(_ rustlyn: Rustlyn, url: URL, offset: Int, text: String) {
+        let generation = renameGeneration.bump()
+        let counter = renameGeneration
+        referenceQueue.async {
+            guard counter.isCurrent(generation) else { return }
+            _ = rustlyn.references(url, offset: offset, text: text)
         }
     }
 
@@ -3724,9 +4067,14 @@ final class Workspace: ObservableObject {
         alert.addButton(withTitle: L("Переименовать"))
         alert.addButton(withTitle: L("Отмена"))
         alert.window.initialFirstResponder = field
+        // Окно — сразу, без системной анимации появления: его ждут, чтобы печатать.
+        alert.window.animationBehavior = .none
         // Имя выделено целиком: набранное сразу его заменяет.
         DispatchQueue.main.async { field.currentEditor()?.selectAll(nil) }
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            _ = renameGeneration.bump()
+            return
+        }
 
         let new = field.stringValue.trimmingCharacters(in: .whitespaces)
         guard new != old else { return }
@@ -3734,6 +4082,7 @@ final class Workspace: ObservableObject {
             let warning = NSAlert()
             warning.messageText = L("Так назвать нельзя")
             warning.informativeText = problem
+            warning.window.animationBehavior = .none
             warning.runModal()
             return
         }
@@ -3780,6 +4129,7 @@ final class Workspace: ObservableObject {
             + (conflicts.count > shown.count ? "\n…и ещё \(conflicts.count - shown.count)" : "")
         alert.addButton(withTitle: "Отмена")
         alert.addButton(withTitle: "Всё равно переименовать")
+        alert.window.animationBehavior = .none
         return alert.runModal() == .alertSecondButtonReturn
     }
 
@@ -3820,12 +4170,16 @@ final class Workspace: ObservableObject {
     /// считает их в тексте последней компиляции, и открытая вкладка с
     /// несохранённым могла от него уйти. Не сошлось — файл пропускается
     /// целиком: лучше недоделать, чем вписать правку не туда.
+    ///
+    /// Отменяется правка целиком, как в Rider, — одним ⌘Z во всех файлах,
+    /// с переездами файлов (см. `ProjectChange`).
     @discardableResult
     func applyProjectEdits(_ all: [RustlynFileEdit], files moves: [RustlynFileMove], actionName: String,
                            fits: (URL, [(range: NSRange, text: String)], NSString) -> Bool) -> EditOutcome {
         var byFile: [URL: [(range: NSRange, text: String)]] = [:]
         for edit in all { byFile[edit.url.standardizedFileURL, default: []].append((edit.range, edit.text)) }
         var skipped: Set<URL> = []
+        let change = ProjectChange(actionName: actionName)
 
         for (url, edits) in byFile {
             if let tab = tab(for: url, revision: nil) {
@@ -3834,7 +4188,14 @@ final class Workspace: ObservableObject {
                     continue
                 }
                 let wasClean = !tab.isDirty
-                tab.applyEdits(edits, actionName: actionName)
+                let before = tab.storage.string
+                // Своего шага у вкладки нет: шаг один на всю правку, ниже.
+                let inverse = tab.applyEdits(edits, actionName: actionName, registersUndo: false)
+                if !inverse.isEmpty {
+                    change.add(ProjectChange.File(url: url, edits: edits, inverse: inverse, before: before,
+                                                  after: tab.storage.string, encoding: tab.document.encoding,
+                                                  bom: false))
+                }
                 if wasClean { save(tab) }
                 continue
             }
@@ -3845,49 +4206,272 @@ final class Workspace: ObservableObject {
                     skipped.insert(url)
                     continue
                 }
-                var data = updated.data(using: document.encoding) ?? Data(updated.utf8)
-                if let head = try? FileHandle(forReadingFrom: url).read(upToCount: 3), head == Rename.utf8BOM {
-                    data = Rename.utf8BOM + data
-                }
-                try data.write(to: url, options: .atomic)
+                let head = try? FileHandle(forReadingFrom: url).read(upToCount: 3)
+                let file = ProjectChange.File(url: url, edits: edits,
+                                              inverse: Rename.inverse(of: edits, in: document.text as NSString),
+                                              before: document.text, after: updated,
+                                              encoding: document.encoding, bom: head == Rename.utf8BOM)
+                try file.data(updated).write(to: url, options: .atomic)
                 reindexAfterSave(url)
+                change.add(file)
             } catch {
                 skipped.insert(url)
             }
         }
         for move in moves where !skipped.contains(move.from.standardizedFileURL) {
-            renameFile(move.from, to: move.to)
+            if renameFile(move.from, to: move.to) { change.add(move) }
         }
         scheduleCompile()
+        // Шаг ⌘Z — у активной вкладки, где правку заказали, и у каждой
+        // открытой, которую она задела.
+        register(change, undo: true, on: (buffer.map { [$0] } ?? []) + tabs(holding: change))
         let applied = all.count - byFile.filter { skipped.contains($0.key) }.reduce(0) { $0 + $1.value.count }
         return EditOutcome(applied: applied, files: byFile.count - skipped.count, skipped: skipped)
     }
 
+    /// Правка по проекту — переименование, исправление во всём проекте, —
+    /// которую ⌘Z отменяет целиком, как в Rider: во всех файлах сразу и с
+    /// переездами файлов, а ⇧⌘Z так же повторяет.
+    ///
+    /// Шаг отмены — одно действие на всю правку, и оно стоит в истории
+    /// активной вкладки и каждой открытой, которую правка задела: отменить
+    /// можно из любой. Задетой вкладке шаг нужен и для порядка: её прежние
+    /// шаги набора посчитаны по тексту до правки, и ⌘Z, дойдя до них
+    /// раньше неё, вписал бы их не туда.
+    ///
+    /// Файл, который с тех пор изменился, отмена не трогает — правка в нём
+    /// остаётся, и о нём говорит уведомление.
+    final class ProjectChange {
+        struct File {
+            /// Где файл был, когда его правили, — до переезда вслед за типом.
+            let url: URL
+            /// Правки в координатах `before` и обратные им — в координатах `after`.
+            let edits: [(range: NSRange, text: String)]
+            let inverse: [(range: NSRange, text: String)]
+            let before: String
+            let after: String
+            /// Как текст лежит на диске — для файлов, которые не открыты.
+            let encoding: String.Encoding
+            let bom: Bool
+
+            func data(_ text: String) -> Data {
+                let body = text.data(using: encoding) ?? Data(text.utf8)
+                return bom ? Rename.utf8BOM + body : body
+            }
+        }
+
+        let actionName: String
+        private(set) var files: [File] = []
+        private(set) var moves: [RustlynFileMove] = []
+        /// Действует ли сейчас правка файла и его переезд — по индексам.
+        var applied: [Bool] = []
+        var moved: [Bool] = []
+
+        init(actionName: String) { self.actionName = actionName }
+
+        func add(_ file: File) {
+            files.append(file)
+            applied.append(true)
+        }
+
+        func add(_ move: RustlynFileMove) {
+            moves.append(move)
+            moved.append(true)
+        }
+
+        /// Правка файла, который переехал этим переездом.
+        func file(movedBy move: RustlynFileMove) -> Int? {
+            files.indices.first { files[$0].url == move.from.standardizedFileURL }
+        }
+
+        /// Где файл правки сейчас: переехал вслед за типом — там.
+        func location(of index: Int) -> URL {
+            let url = files[index].url
+            guard let move = moves.indices.first(where: { moves[$0].from.standardizedFileURL == url }),
+                  moved[move] else { return url }
+            return moves[move].to
+        }
+    }
+
+    private enum ChangeState { case before, after, other }
+
+    /// Что сейчас в файле правки: текст до неё, после или что-то третье.
+    /// Открытая вкладка сверяется по буквам, остальное — по байтам на диске.
+    private func state(of file: ProjectChange.File, at url: URL) -> ChangeState {
+        if let tab = tab(for: url, revision: nil) {
+            let text = tab.storage.string.utf16
+            if text.elementsEqual(file.after.utf16) { return .after }
+            return text.elementsEqual(file.before.utf16) ? .before : .other
+        }
+        guard let data = try? Data(contentsOf: url) else { return .other }
+        if data == file.data(file.after) { return .after }
+        return data == file.data(file.before) ? .before : .other
+    }
+
+    /// Открытые вкладки, в которых правка сейчас действует.
+    private func tabs(holding change: ProjectChange) -> [TextBuffer] {
+        change.files.indices.compactMap { index in
+            change.applied[index] ? tab(for: change.location(of: index), revision: nil) : nil
+        }
+    }
+
+    /// Шаг правки в истории вкладок: `undo` — отменить её, иначе повторить.
+    /// У вкладки, которая сейчас отменяет, шаг встаёт в «повторить».
+    private func register(_ change: ProjectChange, undo: Bool, on holders: [TextBuffer]) {
+        guard !change.files.isEmpty || !change.moves.isEmpty else { return }
+        var seen = Set<ObjectIdentifier>()
+        for tab in holders where !tab.isReadOnly && seen.insert(ObjectIdentifier(tab)).inserted {
+            let history = tab.undoManager
+            history.beginUndoGrouping()
+            // Правку держит сам шаг: без него отменять уже нечего.
+            history.registerUndo(withTarget: change) { [weak self, weak tab] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let tab else { return }
+                    self.replay(change, undo: undo, from: tab)
+                }
+            }
+            history.setActionName(change.actionName)
+            history.endUndoGrouping()
+        }
+    }
+
+    /// ⌘Z (`undo`) или ⇧⌘Z правки по проекту из вкладки `holder`. Файлы
+    /// ехали после правок, значит, при отмене — обратно до них: правки
+    /// отменяются там, где их делали. Изменившийся с тех пор файл не
+    /// трогается, и его переезд — тоже.
+    private func replay(_ change: ProjectChange, undo: Bool, from holder: TextBuffer) {
+        var skipped: [URL] = []
+        var done = 0
+        if undo {
+            for index in change.moves.indices.reversed() where change.moved[index] {
+                let move = change.moves[index]
+                if let file = change.file(movedBy: move), change.applied[file],
+                   state(of: change.files[file], at: move.to) != .after {
+                    skipped.append(move.to)
+                } else if renameFile(move.to, to: move.from) {
+                    change.moved[index] = false
+                } else {
+                    skipped.append(move.to)
+                }
+            }
+        }
+        for index in change.files.indices where change.applied[index] == undo {
+            let file = change.files[index]
+            let url = change.location(of: index)
+            // Файл не вернулся на старое место — не возвращаем и текст:
+            // иначе в файле с новым именем стоял бы старый класс.
+            guard url == file.url else { continue }
+            switch (state(of: file, at: url), undo) {
+            case (.before, true), (.after, false):
+                change.applied[index] = !undo
+                continue
+            case (.after, true), (.before, false):
+                break
+            default:
+                skipped.append(url)
+                continue
+            }
+            if let tab = tab(for: url, revision: nil) {
+                guard !tab.isReadOnly else { skipped.append(url); continue }
+                let wasClean = !tab.isDirty
+                tab.applyEdits(undo ? file.inverse : file.edits, actionName: change.actionName, registersUndo: false)
+                if wasClean { save(tab) }
+            } else {
+                do {
+                    try file.data(undo ? file.before : file.after).write(to: url, options: .atomic)
+                } catch {
+                    skipped.append(url)
+                    continue
+                }
+                reindexAfterSave(url)
+            }
+            change.applied[index] = !undo
+            done += 1
+        }
+        if !undo {
+            for index in change.moves.indices where !change.moved[index] {
+                let move = change.moves[index]
+                if let file = change.file(movedBy: move), !change.applied[file] {
+                    skipped.append(move.from)
+                } else if renameFile(move.from, to: move.to) {
+                    change.moved[index] = true
+                } else {
+                    skipped.append(move.from)
+                }
+            }
+        }
+        scheduleCompile()
+
+        // Шаги в истории вкладок. Отменили — шаг остаётся только там, где
+        // правка уцелела, и «повторить» — там, где отменяли. Повторили —
+        // шаг снова у каждой задетой вкладки, по одному.
+        let holding = tabs(holding: change)
+        for tab in tabs where tab !== holder && !(undo && holding.contains { $0 === tab }) {
+            tab.undoManager.removeAllActions(withTarget: change)
+        }
+        register(change, undo: !undo, on: [holder])
+        if !undo { register(change, undo: true, on: holding.filter { $0 !== holder }) }
+
+        let files = Theme.count(done, "файл", "файла", "файлов")
+        let summary = undo ? L("Отменено: \(change.actionName) — \(files)")
+                           : L("Повторено: \(change.actionName) — \(files)")
+        if !skipped.isEmpty {
+            let list = Set(skipped.map(\.lastPathComponent)).sorted().joined(separator: ", ")
+            showNotice(L("\(summary). Не тронуты — изменились с тех пор: \(list)"))
+        } else if change.files.count > 1 || !change.moves.isEmpty {
+            showNotice(summary)
+        }
+    }
+
     /// Файл — вслед за классом, и его `.meta` рядом: иначе Unity потеряет
     /// GUID скрипта, и сцены — ссылки на него.
-    private func renameFile(_ from: URL, to: URL) {
+    ///
+    /// Открытая вкладка едет вместе с файлом: тот же буфер, с историей ⌘Z
+    /// и курсором, — только путь новый. Закрыть и открыть заново значило
+    /// бы потерять отмену и мигнуть соседней вкладкой.
+    @discardableResult
+    private func renameFile(_ from: URL, to: URL) -> Bool {
         let fm = FileManager.default
         guard !fm.fileExists(atPath: to.path) else {
             showNotice(L("Файл \(to.lastPathComponent) уже есть — имя файла осталось прежним"))
-            return
+            return false
         }
         let openTab = tab(for: from, revision: nil)
-        if let openTab, openTab.isDirty, !save(openTab) { return }
+        if let openTab, openTab.isDirty, !save(openTab) { return false }
         do {
             try fm.moveItem(at: from, to: to)
-            let meta = from.appendingPathExtension("meta")
-            if fm.fileExists(atPath: meta.path) {
-                try fm.moveItem(at: meta, to: to.appendingPathExtension("meta"))
-            }
         } catch {
             showNotice(L("Не удалось переименовать файл: \(error.localizedDescription)"))
-            return
+            return false
         }
-        if let openTab {
-            let wasActive = openTab === buffer
-            closeTabs([openTab])
-            if wasActive { open(file: to) }
+        if let openTab { relocate(openTab, to: to) }
+        let meta = from.appendingPathExtension("meta")
+        if fm.fileExists(atPath: meta.path) {
+            do {
+                try fm.moveItem(at: meta, to: to.appendingPathExtension("meta"))
+            } catch {
+                showNotice(L("Не удалось переименовать файл: \(error.localizedDescription)"))
+            }
         }
+        return true
+    }
+
+    /// Вкладка переехала вслед за файлом: языковой сервер и Copilot узнают
+    /// её под новым путём, Rustlyn снова красит её по диску, а список
+    /// вкладок сохраняется с новым именем.
+    private func relocate(_ tab: TextBuffer, to url: URL) {
+        lsp.documentClosed(tab.url)
+        CopilotService.shared.documentClosed(tab.url)
+        tab.relocate(to: url)
+        settleWithRustlyn(tab)
+        if tab === buffer {
+            requestedFile = url
+            lsp.documentOpened(tab.document)
+            CopilotService.shared.documentOpened(tab.document)
+            git.documentOpened(tab.document)
+        }
+        objectWillChange.send()
+        persistTabs()
     }
 
     // MARK: - Запуск
@@ -3899,6 +4483,15 @@ final class Workspace: ObservableObject {
         saveAll()
         run.run()
     }
+
+    /// ■ и ⌘F2, как в Rider: останавливают то, что идёт, — отладку или
+    /// запуск. Идут оба — сначала отладку, следующее нажатие — запуск.
+    func stopRunOrDebug() {
+        if debug.isActive { debug.stop() } else { run.stop() }
+    }
+
+    /// Есть что остановить: ■ включена.
+    var isRunningOrDebugging: Bool { run.isRunning || debug.isActive }
 
     /// Окно коммита этого проекта; уже открыто — выходит вперёд.
     func openCommitWindow() {
@@ -4012,32 +4605,29 @@ final class Workspace: ObservableObject {
     /// Варианты в позиции курсора: для C# — от Rustlyn, для остального —
     /// от языкового сервера, а если их нет (или они не ответили) — слова
     /// файла и ключевые слова языка.
-    /// ⌥⌘G — граф «откуда берётся значение» для поля под курсором.
+    /// ⌥⌘G — граф «откуда берётся значение» для значения под курсором:
+    /// поля, свойства, переменной, параметра, вызова, значения перечисления
+    /// или компонента.
     func showValueGraph(at offset: Int) {
-        guard let buffer, Rustlyn.understands(buffer.url), let rustlyn else {
+        guard let buffer, Rustlyn.understands(buffer.url), let rustlyn, let root else {
             showNotice(L("Граф значения — для C#, когда Rustlyn скомпилировал проект"))
             return
         }
         let url = buffer.url
         let text: String? = buffer.isDirty ? buffer.model.text : nil
-        referenceQueue.async {
+        let context = ValueGraphAnalysis.Context(root: root, rustlyn: rustlyn, texts: openTexts(), index: symbolIndex,
+                                                 network: rules.datagrams, configs: rules.configs)
+        referenceQueue.async { [weak self] in
             let definition = rustlyn.definition(url, offset: offset, text: text)
+            // Что это за имя — поле, локальная, параметр, метод, — решает место объявления.
+            let start = definition.targets.first.flatMap(context.root(for:))
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard let target = definition.targets.first else {
-                    self.showNotice(L("Поставьте курсор на поле, свойство или компонент — граф покажет, откуда они берутся"))
+                guard let start else {
+                    self.showNotice(L("Поставьте курсор на значение — поле, переменную, параметр, вызов или компонент: граф покажет, откуда оно берётся"))
                     return
                 }
-                if [.field, .property].contains(target.kind) {
-                    let value = ValueGraph.Declaration(url: target.url, line: target.line, character: target.character,
-                                                       length: target.length, name: target.name)
-                    ValueGraphWindows.show(ValueGraph(workspace: self, value: value))
-                } else if [.struct, .class].contains(target.kind) {
-                    // Тип — как компонент: где его ставят в стэш и где убирают.
-                    ValueGraphWindows.show(ValueGraph(workspace: self, component: target.shortName))
-                } else {
-                    self.showNotice(L("Поставьте курсор на поле, свойство или компонент — граф покажет, откуда они берутся"))
-                }
+                ValueGraphWindows.show(ValueGraph(workspace: self, root: start))
             }
         }
     }

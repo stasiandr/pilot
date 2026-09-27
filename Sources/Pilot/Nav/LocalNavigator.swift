@@ -7,6 +7,31 @@ struct NavDocument {
     let relPath: String?
     let model: SyntaxModel
     let outline: [OutlineItem]
+
+    /// Указал ли ответ ⌘B на имя в `offset` — то есть стоим на его объявлении.
+    ///
+    /// Обычно ответ — само имя: поля, метода, типа, переменной. Но у свойства,
+    /// конструктора и деструктора Rustlyn отдаёт объявление целиком, от
+    /// атрибутов до тела, — тогда имя внутри него. Что это именно имя, а не
+    /// обращение к тому же символу из тела (`Parent.Depth` в свойстве `Depth`,
+    /// `new Node()` в конструкторе `Node`), говорит структура файла.
+    func declares(_ targets: [NavTarget], at offset: Int) -> Bool {
+        guard let word = Occurrences.identifier(in: model, at: offset)?.range else { return false }
+        let start = model.position(at: word.location)
+        let named = outline.contains { $0.range.location == word.location }
+        return targets.contains { target in
+            guard let range = target.range, target.url.standardizedFileURL == url.standardizedFileURL
+            else { return false }
+            if range.start == start { return true }
+            guard named else { return false }
+            // Цель Rustlyn — начало и длина: объявление в несколько строк
+            // приходит одной строкой, и её конец — длина, а не столбец.
+            let from = model.offset(at: range.start)
+            let to = range.end.line == range.start.line
+                ? from + range.end.character - range.start.character : model.offset(at: range.end)
+            return from <= word.location && NSMaxRange(word) <= to
+        }
+    }
 }
 
 /// Найденное объявление: куда прыгать и как показать в списке выбора.
@@ -84,9 +109,10 @@ struct LocalNavigator {
               isWord(tokens[k]) else { return .none }   // внутри строки или комментария
         let name = identifier.text
 
-        // Курсор на самом объявлении — идти некуда.
-        if document.outline.contains(where: { $0.range.location == identifier.range.location }) {
-            return .none
+        // Курсор на самом объявлении: ответ — оно само. Идти некуда, и
+        // ⌘B покажет его использования.
+        if let item = document.outline.first(where: { $0.range.location == identifier.range.location }) {
+            return Answer(declarations: [declaration(item: item)], isExact: true)
         }
 
         // `receiver.name`

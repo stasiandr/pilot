@@ -3,26 +3,18 @@ import AppKit
 
 /// Консоль под редактором, как область отладки Xcode: вывод запущенной
 /// цели. Высоту тянут за верхний край, и она переживает перезапуск.
-/// Если цель пишет лог через Serilog, вывод показывается событиями
-/// (`ServerLogView`), а сырой текст — на соседней вкладке.
+/// Сам вывод — `ProgramOutputView`, тот же, что у отладки.
 struct RunConsole: View {
     @ObservedObject var run: RunService
-    @ObservedObject var logs: ServerLogStore
     let root: URL?
     let open: (URL, Int) -> Void
     @AppStorage("pilot.consoleHeight") private var height: Double = 220
-    @AppStorage("pilot.runConsole.raw") private var showsRaw = false
     @State private var dragStart: Double?
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            if logs.isStructured && !showsRaw {
-                Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
-                ServerLogView(store: logs, root: root, open: open)
-            } else {
-                ConsoleTextView(log: run.log)
-            }
+            ProgramOutputView(output: run.output, root: root, open: open)
         }
         .frame(height: height)
         .background(Color(nsColor: Theme.chromeBackground))
@@ -41,16 +33,7 @@ struct RunConsole: View {
             Text(stateText)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            if logs.isStructured {
-                Picker("", selection: $showsRaw) {
-                    Text(L("Лог")).tag(false)
-                    Text(L("Вывод")).tag(true)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                .help(L("Лог сервера событиями или вывод процесса как есть"))
-            }
+            ProgramOutputModePicker(logs: run.output.serverLog)
             Spacer()
             Button { run.clearOutput() } label: { Image(systemName: "trash") }
                 .help("Очистить")
@@ -115,6 +98,55 @@ struct RunConsole: View {
                     height = min(max(start - value.translation.height, 80), 900)
                 }
                 .onEnded { _ in dragStart = nil })
+    }
+}
+
+/// Вывод программы — один вид на ▶ и на отладку: если она пишет лог через
+/// Serilog, вывод показывается событиями (`ServerLogView`), иначе — текстом.
+struct ProgramOutputView: View {
+    let output: ProgramOutput
+    @ObservedObject private var logs: ServerLogStore
+    let root: URL?
+    let open: (URL, Int) -> Void
+    @AppStorage(ProgramOutputModePicker.rawKey) private var showsRaw = false
+
+    init(output: ProgramOutput, root: URL?, open: @escaping (URL, Int) -> Void) {
+        self.output = output
+        _logs = ObservedObject(wrappedValue: output.serverLog)
+        self.root = root
+        self.open = open
+    }
+
+    var body: some View {
+        if logs.isStructured && !showsRaw {
+            VStack(spacing: 0) {
+                Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
+                ServerLogView(store: logs, root: root, open: open)
+            }
+        } else {
+            ConsoleTextView(log: output.log)
+        }
+    }
+}
+
+/// «Лог | Вывод» — события или текст как есть. Выбор общий у ▶ и отладки;
+/// пока событий лога не было, выбирать не из чего, и переключателя нет.
+struct ProgramOutputModePicker: View {
+    static let rawKey = "pilot.runConsole.raw"
+    @ObservedObject var logs: ServerLogStore
+    @AppStorage(Self.rawKey) private var showsRaw = false
+
+    var body: some View {
+        if logs.isStructured {
+            Picker("", selection: $showsRaw) {
+                Text(L("Лог")).tag(false)
+                Text(L("Вывод")).tag(true)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .help(L("Лог сервера событиями или вывод процесса как есть"))
+        }
     }
 }
 

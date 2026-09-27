@@ -4,7 +4,8 @@ import AppKit
 // MARK: - Загрузка файла
 
 struct LoadedDocument: Sendable {
-    let url: URL
+    /// Меняется только вслед за самим файлом — см. `moved(to:)`.
+    private(set) var url: URL
     let model: SyntaxModel
     let languageName: String
     /// Структура файла для навигации. Строится здесь же, в фоне,
@@ -34,6 +35,14 @@ struct LoadedDocument: Sendable {
 
     /// Текущий текст. Берётся из модели: она правится вместе с редактором.
     var text: String { model.text }
+
+    /// Тот же документ по новому пути: файл переименовали вслед за типом,
+    /// а текст, разбор и всё посчитанное остались прежними.
+    func moved(to url: URL) -> LoadedDocument {
+        var moved = self
+        moved.url = url
+        return moved
+    }
 
     /// Откуда взялся C#, которого в проекте нет.
     enum Decompiled: Sendable, Equatable {
@@ -126,7 +135,7 @@ struct LoadedDocument: Sendable {
         // структуру от своего разбора.
         if revision == nil, let rustlyn = Rustlyn.session(for: url), Rustlyn.understands(url) {
             if rustlyn.open(url) {
-                model.useRustlyn(for: url)
+                model.useRustlyn(for: url, session: rustlyn)
                 // Расставить точки возврата лексера по всему файлу, чтобы
                 // прыжок в конец стоил столько же, сколько прокрутка. Фоном:
                 // на файле в 200 000 строк это доли секунды, а первый экран
@@ -222,8 +231,45 @@ extension NSLayoutManager {
 final class CodeTextView: NSTextView {
     /// ⌘+клик по символу — переход к определению.
     var onCommandClick: ((Int) -> Void)?
+    /// ⌘ зажат, и мышь над символом `index`: клик по нему, скорее всего,
+    /// будет. `nil` — ⌘ отпустили или мышь ушла из текста.
+    var onCommandHover: ((Int?) -> Void)?
+    /// ⌘ был зажат на прошлом событии — чтобы заметить, что его отпустили.
+    private var commandHeld = false
+
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        let held = event.modifierFlags.contains(.command)
+        guard held != commandHeld else { return }
+        commandHeld = held
+        guard held, let window else {
+            onCommandHover?(nil)
+            return
+        }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        onCommandHover?(visibleRect.contains(point) ? character(at: point) : nil)
+    }
+
+    /// Человек сам взялся за текст: клавиша, клик, фокус ушёл в другое поле.
+    /// Переход, который ещё «встаёт», после этого больше не держится (см. Landing).
+    var onUserInput: (() -> Void)?
+
+    override func rightMouseDown(with event: NSEvent) {
+        onUserInput?()
+        super.rightMouseDown(with: event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { onUserInput?() }
+        return resigned
+    }
 
     override func mouseDown(with event: NSEvent) {
+        onUserInput?()
+        // Нажатие — не наведение: окно подсказки, открытое мышью, прячется
+        // и не появится, пока мышь снова не сдвинется.
+        onHover?(nil)
         let clicked = convert(event.locationInWindow, from: nil)
         if let folded = foldedRanges.first(where: { placeholderRect(for: $0)?.contains(clicked) == true }) {
             onUnfold?(folded)
@@ -414,18 +460,31 @@ final class CodeTextView: NSTextView {
 
     /// Задан — в меню текста появляется «Комментировать строку».
     var onCommentLine: ((Int) -> Void)?
+    /// Пункты в начало меню текста для символа под мышью (не под курсором):
+    /// позиция — его буква. Пусто — пунктов нет.
+    var textMenuActions: ((Int) -> [ContextAction])?
 
     override func menu(for event: NSEvent) -> NSMenu? {
+        // Меню — не наведение: окно подсказки под мышью ему только мешает.
+        onHover?(nil)
         let menu = super.menu(for: event) ?? NSMenu()
-        guard onCommentLine != nil else { return menu }
         let point = convert(event.locationInWindow, from: nil)
-        let index = characterIndexForInsertion(at: point)
-        let item = NSMenuItem(title: L("Комментировать строку…"), action: #selector(commentFromMenu(_:)),
-                              keyEquivalent: "")
-        item.target = self
-        item.representedObject = index
-        menu.insertItem(item, at: 0)
-        menu.insertItem(.separator(), at: 1)
+        var top: [NSMenuItem] = []
+        if let textMenuActions, let index = character(at: point) {
+            let actions = textMenuActions(index)
+            if !actions.isEmpty {
+                top += actions.map { ContextMenuItem($0) as NSMenuItem }
+                top.append(.separator())
+            }
+        }
+        if onCommentLine != nil {
+            let item = NSMenuItem(title: L("Комментировать строку…"), action: #selector(commentFromMenu(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = characterIndexForInsertion(at: point)
+            top += [item, .separator()]
+        }
+        for (position, item) in top.enumerated() { menu.insertItem(item, at: position) }
         return menu
     }
 
@@ -710,14 +769,28 @@ final class CodeTextView: NSTextView {
 
     // MARK: Подсказки
 
-    /// ⌃J — документация имени под курсором; ⇧⌘Space — сигнатура вызова.
+    /// ⌃J — документация имени под курсором; ⇧⌘Space — сигнатура вызова;
+    /// ⌘F1 — почему подчёркнуто там, где курсор.
     var onQuickDocumentation: (() -> Void)?
     var onParameterInfo: (() -> Void)?
-    /// Мышь остановилась над символом `index` (или ушла — `nil`).
+    var onProblemDescription: (() -> Void)?
+    /// Мышь над символом `index` — на каждом её движении; ушла с текста или
+    /// нажата кнопка — `nil`. Остановилась ли она, решает получатель.
     var onHover: ((Int?) -> Void)?
+    /// Нажата клавиша — до того, как текст её разберёт.
+    var onKeyDown: ((NSEvent) -> Void)?
 
     @objc func showQuickDocumentation(_ sender: Any?) { onQuickDocumentation?() }
     @objc func showParameterInfo(_ sender: Any?) { onParameterInfo?() }
+    /// «Описание ошибки» (⌘F1, ShowErrorDescription в Rider) — пункт меню
+    /// шлёт его первому ответчику, как и ⌃J.
+    @objc func showProblemDescription(_ sender: Any?) { onProblemDescription?() }
+
+    override func keyDown(with event: NSEvent) {
+        onUserInput?()
+        onKeyDown?(event)
+        super.keyDown(with: event)
+    }
 
     private var hoverArea: NSTrackingArea?
 
@@ -735,27 +808,33 @@ final class CodeTextView: NSTextView {
         super.mouseMoved(with: event)
         let point = convert(event.locationInWindow, from: nil)
         hoverLens(at: point)
-        guard let layout = layoutManager, let container = textContainer, let storage = textStorage,
-              storage.length > 0 else {
-            onHover?(nil)
-            return
+        let index = character(at: point)
+        onHover?(index)
+        // ⌘ могли зажать и отпустить, пока фокус был не у текста.
+        let held = event.modifierFlags.contains(.command)
+        if held || commandHeld {
+            commandHeld = held
+            onCommandHover?(held ? index : nil)
         }
+    }
+
+    /// Символ под точкой; `nil` — мимо текста.
+    private func character(at point: NSPoint) -> Int? {
+        guard let layout = layoutManager, let container = textContainer, let storage = textStorage,
+              storage.length > 0 else { return nil }
         let inContainer = NSPoint(x: point.x - textContainerOrigin.x, y: point.y - textContainerOrigin.y)
         var fraction: CGFloat = 0
         let glyph = layout.glyphIndex(for: inContainer, in: container, fractionOfDistanceThroughGlyph: &fraction)
-        // Мимо текста — правее конца строки или ниже последней.
         let glyphRect = layout.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: container)
-        guard glyphRect.insetBy(dx: -1, dy: -1).contains(inContainer) else {
-            onHover?(nil)
-            return
-        }
-        onHover?(layout.characterIndexForGlyph(at: glyph))
+        guard glyphRect.insetBy(dx: -1, dy: -1).contains(inContainer) else { return nil }
+        return layout.characterIndexForGlyph(at: glyph)
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
         hoverLens(at: nil)
         onHover?(nil)
+        onCommandHover?(nil)
     }
 
     // MARK: Ошибки
@@ -774,16 +853,11 @@ final class CodeTextView: NSTextView {
         let origin = textContainerOrigin
         // Предупреждения первыми: ошибка поверх, если они в одном месте.
         for diagnostic in diagnostics.sorted(by: { $0.severity.rawValue < $1.severity.rawValue }) {
-            var range = NSIntersectionRange(diagnostic.range, NSRange(location: 0, length: length))
-            // Пустой диапазон (пропущенная `;`) — волна под символом рядом.
-            if range.length == 0 {
-                // Пропущенная `;` стоит сразу за словом — волна под его концом.
-                range = NSRange(location: max(0, min(diagnostic.range.location, length) - 1), length: 1)
-            }
+            // Пустой диапазон (пропущенная `;`) — волна под символом перед ним.
+            let range = diagnostic.underline(textLength: length)
             guard NSIntersectionRange(range, visible).length > 0 || NSLocationInRange(range.location, visible)
             else { continue }
-            let color = diagnostic.severity == .error ? Theme.diagnosticError
-                : diagnostic.severity == .warning ? Theme.diagnosticWarning : Theme.foldMarker
+            let color = diagnostic.severity.color
             let glyphs = layout.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             layout.enumerateEnclosingRects(forGlyphRange: glyphs,
                                            withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
@@ -1146,6 +1220,14 @@ private final class ContextMenuItem: NSMenuItem {
 /// она «плавает» над текстом, и начало строк прячется за гаттером.
 /// Возвращаем классическую раскладку: текст начинается справа от линейки.
 final class CodeScrollView: NSScrollView {
+    /// Колесо и трекпад: прокручивает человек (см. Landing).
+    var onUserScroll: (() -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        onUserScroll?()
+        super.scrollWheel(with: event)
+    }
+
     override func tile() {
         super.tile()
         guard rulersVisible, let ruler = verticalRulerView else { return }
@@ -1189,6 +1271,9 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var onCaretChange: ((Int) -> Void)?
     /// ⌘+клик по символу.
     var onGoToDefinition: ((Int) -> Void)?
+    /// ⌘ зажат, и мышь остановилась на символе: клик по нему, скорее всего,
+    /// будет — пусть готовятся заранее. `nil` — ⌘ отпустили или мышь ушла.
+    var onCommandHover: ((Int?) -> Void)?
     /// Варианты дополнения в позиции: `trigger` — символ, открывший список
     /// (например «.»), `retrigger` — переспросить при неполном списке.
     var requestCompletions: ((_ offset: Int, _ trigger: String?, _ retrigger: Bool) async -> CompletionList?)?
@@ -1217,6 +1302,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Что можно сделать в позиции — для меню ⌘. Правку текста
     /// (комментарий, дополнение) меню добавляет само.
     var contextActions: ((Int) -> [ContextActionGroup])?
+    /// Пункты в начало меню правого клика для символа под мышью.
+    var textMenuActions: ((Int) -> [ContextAction])? {
+        didSet { if isViewLoaded { textView.textMenuActions = textMenuActions } }
+    }
     /// Исправления и рефакторинги Rustlyn для выделения — их ждут до показа меню.
     var codeActions: ((NSRange) async -> [ContextActionGroup])?
 
@@ -1275,7 +1364,13 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Окно подсказки открыто наведением мыши: его прячет уход мыши, а не
     /// движение курсора.
     fileprivate var hoverShown = false
-    fileprivate var hoveredWord: NSRange?
+    /// О каком куске текста окно, открытое мышью: пока она над ним, окно стоит.
+    fileprivate var hoverRange: NSRange?
+    /// Ошибка, которую оно объясняет первой: ⌘. при открытом окне — о ней.
+    fileprivate var hoverProblem: NSRange?
+    /// Слово под мышью с зажатым ⌘ и отложенный рассказ о нём.
+    fileprivate var commandHoverWord: NSRange?
+    fileprivate var commandHoverTask: Task<Void, Never>?
     fileprivate var foldRegions: [FoldRegion] = []
     fileprivate var foldWork: DispatchWorkItem?
     /// Подсказки и счётчики, как пришли: при смене шрифта раскладываются заново.
@@ -1332,18 +1427,27 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.isIncrementalSearchingEnabled = true
         textView.delegate = self
         textView.onCommandClick = { [weak self] index in
+            // Клик уже здесь: отложенное «мышь над словом» опоздало, а после
+            // перехода в другой файл его позиция была бы в чужом тексте.
+            self?.commandHoverTask?.cancel()
             self?.onGoToDefinition?(index)
         }
+        textView.onCommandHover = { [weak self] index in self?.commandHovered(index) }
         textView.onCompletionRequest = { [weak self] in
             self?.requestCompletion(trigger: nil, manual: true)
         }
-        textView.onQuickDocumentation = { [weak self] in self?.showDocumentation(at: nil) }
+        textView.onQuickDocumentation = { [weak self] in self?.showDocumentation() }
         textView.onParameterInfo = { [weak self] in self?.requestSignatureHelp(manual: true) }
+        textView.onProblemDescription = { [weak self] in self?.showProblemDescription() }
         textView.onHover = { [weak self] index in self?.hovered(index) }
+        textView.onKeyDown = { [weak self] event in self?.keyPressed(event) }
         textView.onUnfold = { [weak self] range in self?.unfold(range) }
         textView.onFoldCommand = { [weak self] command in self?.fold(command) }
         textView.onLens = { [weak self] target in self?.onLensClick?(target) }
         textView.selectionSteps = selectionSteps
+        textView.textMenuActions = textMenuActions
+        textView.onUserInput = { [weak self] in self?.cancelLanding() }
+        scrollView.onUserScroll = { [weak self] in self?.cancelLanding() }
         layout.delegate = self
 
         scrollView.contentView = CodeClipView()
@@ -1375,6 +1479,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             name: NSView.frameDidChangeNotification, object: scrollView.contentView)
         NotificationCenter.default.addObserver(
             self, selector: #selector(colorSchemeChanged), name: ThemeStore.didChange, object: nil)
+        // Бегунок и трекпад — тоже прокрутка человеком.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(userScrolled), name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView)
 
         popup.onPick = { [weak self] index in self?.acceptCompletion(index) }
 
@@ -1399,6 +1507,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     /// Действие панели поиска. Показ панели сам отдаёт фокус её полю.
     func performFind(_ action: NSTextFinder.Action) {
+        // Поиск сам ведёт выделение — место перехода больше не держим.
+        cancelLanding()
         let clip = scrollView.contentView
         let insetBefore = clip.contentInsets.top
         let sender = NSMenuItem()
@@ -1419,17 +1529,25 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// У каждого буфера свой NSTextStorage: подменяем его под layout manager,
     /// а не переписываем текст — так правки и история отмены остаются
     /// с файлом, пока смотрим другие.
-    func show(_ buffer: TextBuffer) {
+    ///
+    /// Возвращает место перехода (`buffer.landing`), на котором вкладка
+    /// показана; nil — перехода не было.
+    @discardableResult
+    func show(_ buffer: TextBuffer) -> NSRange? {
         saveViewState()
+        cancelLanding()
         self.buffer?.onDisplayEdit = nil
+        self.buffer?.onDisplayRecolor = nil
         hideCompletion()
         closePopover()
+        commandHovered(nil)   // слово под мышью было в прежнем тексте
         self.buffer = buffer
         painted = nil
         unpainted = nil
         buffer.onDisplayEdit = { [weak self] range, delta, settled in
             self?.textEdited(range, delta: delta, settled: settled)
         }
+        buffer.onDisplayRecolor = { [weak self] in self?.invalidateDecorations() }
         // Версия файла из MR — только для чтения: её правки некуда сохранить.
         textView.isEditable = !buffer.isReadOnly
 
@@ -1457,13 +1575,19 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         // файла и может лежать за концом этого. Первое же чтение атрибутов
         // по нему (typingAttributes → updateFontPanel) — NSRangeException,
         // поэтому ставим выделение раньше всего остального.
-        // Вкладка, где уже были, — ровно как её оставили; новая — с начала.
+        // Вкладку, открытую переходом, — на месте перехода; где уже были —
+        // ровно как её оставили; новую — с начала (см. Landing.start).
         let length = buffer.storage.length
-        if let selection = buffer.viewState?.selection {
-            let location = min(selection.location, length)
-            textView.setSelectedRange(NSRange(location: location,
-                                              length: min(selection.length, length - location)))
-        } else {
+        let target = buffer.landing.map { Self.clamped(buffer.model.nsRange(for: $0), to: length) }
+        // Место перехода теперь держит редактор; вкладке оно больше не нужно.
+        buffer.landing = nil
+        let start = Landing.start(target: target, hasSaved: buffer.viewState != nil)
+        switch start {
+        case .target(let range):
+            textView.setSelectedRange(range)
+        case .saved:
+            textView.setSelectedRange(Self.clamped(buffer.viewState?.selection ?? NSRange(), to: length))
+        case .top:
             textView.setSelectedRange(NSRange(location: 0, length: 0))
         }
         textView.breakUndoCoalescing()
@@ -1476,6 +1600,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.autoPairs = spec != nil && spec?.name != "Markdown"
         textView.autoPairQuotes = AutoPairs.quotes(for: spec)
 
+        dismissInfo()
         info.hide()
         diagnostics = []
         textView.diagnostics = []
@@ -1489,16 +1614,22 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         rulerLineCount = buffer.model.lineCount
         ruler?.eventLines = Self.gutterMarkers(for: buffer.document)
         ruler?.invalidateWidth()
-        if let state = buffer.viewState {
-            scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
-            // Высота текста после подмены хранилища досчитывается не сразу,
-            // и далёкая строка могла упереться в старую. Второй проход, когда
-            // раскладка дошла, почти всегда ничего не двигает.
-            DispatchQueue.main.async { [weak self, weak buffer] in
-                guard let self, let buffer, self.buffer === buffer else { return }
-                self.scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
+        switch start {
+        case .target(let range):
+            land(on: range)
+        case .saved:
+            if let state = buffer.viewState {
+                scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
+                // Высота текста после подмены хранилища досчитывается не сразу,
+                // и далёкая строка могла упереться в старую. Второй проход, когда
+                // раскладка дошла, почти всегда ничего не двигает. Переход,
+                // пришедший тем временем, важнее — его место не трогаем.
+                DispatchQueue.main.async { [weak self, weak buffer] in
+                    guard let self, let buffer, self.buffer === buffer, self.landing == nil else { return }
+                    self.scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
+                }
             }
-        } else {
+        case .top:
             textView.scroll(NSPoint(x: 0, y: 0))
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
         }
@@ -1506,6 +1637,13 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
                                                                max(0, buffer.model.units.count - 1)))
         highlightVisible()
         textView.updateCurrentLineHighlight()
+        return target
+    }
+
+    /// Диапазон, подрезанный по длине текста.
+    static func clamped(_ range: NSRange, to length: Int) -> NSRange {
+        let location = max(0, min(range.location, length))
+        return NSRange(location: location, length: max(0, min(range.length, length - location)))
     }
 
     /// Подсветка живёт во временных атрибутах раскладки, а не в тексте:
@@ -1584,6 +1722,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     func apply(_ request: TextEditRequest) -> Bool {
         guard let buffer, request.buffer === buffer, let storage = textView.textStorage,
               UnityEdits.validate(request.edits, in: storage.string as NSString) else { return false }
+        cancelLanding()
         let undo = textView.undoManager
         // Не набор: дополнение на `0.5` открываться не должно.
         isApplyingCompletion = true
@@ -1604,10 +1743,14 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     func showEmpty() {
         saveViewState()
+        cancelLanding()
         self.buffer?.onDisplayEdit = nil
+        self.buffer?.onDisplayRecolor = nil
         hideCompletion()
         closePopover()
+        commandHovered(nil)   // слово под мышью было в прежнем тексте
         buffer = nil
+        dismissInfo()
         info.hide()
         diagnostics = []
         textView.diagnostics = []
@@ -1688,7 +1831,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
                 self?.closePopover()
             },
             cancel: { [weak self] in self?.closePopover() })
-        presentPopover(line: line, content: AnyView(editor.preferredColorScheme(.dark)))
+        presentPopover(line: line,
+                       content: AnyView(editor.preferredColorScheme(Theme.current.isDark ? .dark : .light)))
     }
 
     // MARK: - Конфликты слияния
@@ -1781,6 +1925,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         let fresh = MergeConflicts.find(in: buffer.model)
         let targets = start.map { line in fresh.filter { $0.start == line } } ?? fresh
         guard !targets.isEmpty else { NSSound.beep(); return }
+        cancelLanding()
         var caret = 0
         // Снизу вверх: правка ниже не сдвигает строки выше.
         for conflict in targets.sorted(by: { $0.start > $1.start }) {
@@ -1840,6 +1985,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Текст уже в модели (TextBuffer правит её в том же вызове) — осталось
     /// перекрасить видимое и решить судьбу списка дополнений.
     func textDidChange(_ notification: Notification) {
+        // Окно об ошибке или имени — уже не о том тексте.
+        dismissInfo()
         repaintEdited()
         highlightVisible(toolTips: false)
         // Номера и пометки у строк сдвигаются, только когда меняется число
@@ -1872,6 +2019,11 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             case #selector(NSResponder.cancelOperation(_:)): hideCompletion(); return true
             default: return false
             }
+        }
+        // Окно об ошибке или документации: Esc прячет его, и только.
+        if selector == #selector(NSResponder.cancelOperation(_:)), info.isVisible, !info.isSignatureHelp {
+            dismissInfo()
+            return true
         }
         // Серый текст Copilot: Tab — принять, Esc — убрать.
         if self.textView.ghost != nil {
@@ -2034,7 +2186,18 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// стрелки, Return, Esc и поиск по первым буквам — штатные.
     func presentContextActions() {
         guard view.window != nil, let buffer else { return }
+        cancelLanding()
         hideCompletion()
+        // Окно ошибки под мышью обещает «⌘. — исправить»: меню — о ней, и
+        // курсор встаёт на неё, как если бы по ней щёлкнули.
+        if hoverShown, info.isVisible, !info.isSignatureHelp, let problem = hoverProblem {
+            let caret = textView.selectedRange()
+            if caret.length > 0 || caret.location < problem.location || caret.location > NSMaxRange(problem) {
+                let location = min(problem.location, textView.textStorage?.length ?? 0)
+                textView.setSelectedRange(NSRange(location: location, length: 0))
+            }
+        }
+        dismissInfo()
         let selection = textView.selectedRange()
         guard let codeActions else {
             showContextMenu(extra: [], selection: selection)
@@ -2235,6 +2398,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     @objc private func windowResigned() {
         hideCompletion()
+        dismissInfo()
         info.hide()
     }
 
@@ -2282,47 +2446,179 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.scrollRangeToVisible(selection)
     }
 
-    // MARK: - Переходы
+    // MARK: - Переходы (см. Landing)
 
-    /// Прокручивает к диапазону, выделяет его и коротко подсвечивает.
+    /// Переход, который ещё «встаёт»: его место держится, пока человек сам
+    /// не тронул текст, а экран не перестал сдвигаться без него.
+    private var landing: Landing?
+    /// Номер перехода: проверки прежнего не трогают новый.
+    private var landingToken = 0
+    /// Экран двигаем мы сами — это не повод проверять место.
+    private var isPlacing = false
+    private var landingCheckQueued = false
+
+    /// Часы для Landing: монотонные, в секундах.
+    private var clock: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// Запас над и под целью: у самого края строку легко не заметить.
+    private var revealMargin: CGFloat {
+        2 * (textView.layoutManager?.defaultLineHeight(for: textView.font ?? Theme.editorFont(size: fontSize)) ?? 15)
+    }
+
+    func isShowing(_ buffer: TextBuffer) -> Bool { self.buffer === buffer }
+
+    /// Переход в показанном файле: выделить, показать, коротко подсветить.
     /// Без вспышки после перехода глазами не найти, куда именно попал.
     func reveal(range: NSRange) {
         guard let storage = textView.textStorage, storage.length > 0 else { return }
-        let location = max(0, min(range.location, storage.length))
-        let length = max(0, min(range.length, storage.length - location))
-        let safe = NSRange(location: location, length: length)
-
-        textView.setSelectedRange(safe)
-        scrollCentering(safe)
-        flash(safe)
-        onCaretChange?(location)
+        let safe = Self.clamped(range, to: storage.length)
+        land(on: safe)
+        onCaretChange?(safe.location)
     }
 
-    /// scrollRangeToVisible прижимает строку к краю окна; для перехода
-    /// удобнее видеть её примерно на трети экрана сверху.
-    ///
-    /// Раскладка ленивая, и позиция далёкой строки до раскладки — лишь
-    /// оценка: прокрутишь по ней, строки выше разложатся по-настоящему,
-    /// и на экране окажется совсем другое место. Поэтому уточняем:
+    /// Встать на место перехода и держать его. После перехода раскладка
+    /// досчитывает высоту текста, SwiftUI даёт вьюхе размер, вкладка
+    /// восстанавливает свою прокрутку, над строками появляются счётчики —
+    /// поэтому место проверяется на следующих витках и, если его увели,
+    /// ставится снова. Клавиша, клик, прокрутка колесом или правка текста
+    /// это прекращают: с человеком не спорим.
+    private func land(on range: NSRange) {
+        landingToken += 1
+        landing = Landing(range: range, now: clock)
+        place(range)
+        flash(range)
+        let token = landingToken
+        for delay in Landing.checkDelays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.landingToken == token else { return }
+                self.checkLanding()
+            }
+        }
+    }
+
+    /// Выделить и показать — без вспышки. Видна цель — экран не двигается;
+    /// нет — она посередине, как в Rider.
+    private func place(_ range: NSRange) {
+        isPlacing = true
+        defer { isPlacing = false }
+        if textView.selectedRange() != range { textView.setSelectedRange(range) }
+        if !isOnScreen(range) { scrollCentering(range) }
+        highlightVisible()
+    }
+
+    private func checkLanding() {
+        guard var landing else { return }
+        guard let storage = textView.textStorage, NSMaxRange(landing.range) <= storage.length else {
+            self.landing = nil
+            return
+        }
+        if landing.needsFix(selection: textView.selectedRange(), onScreen: isOnScreen(landing.range)) {
+            place(landing.range)
+        }
+        self.landing = landing.isOver(now: clock) ? nil : landing
+    }
+
+    /// Человек взялся за текст сам, сменили вкладку, правят текст — место
+    /// перехода больше не держим.
+    private func cancelLanding() {
+        guard landing != nil else { return }
+        landing = nil
+        landingToken += 1
+    }
+
+    @objc private func userScrolled() { cancelLanding() }
+
+    /// Экран сдвинулся не от нас: на следующем витке — на месте ли переход.
+    private func landingMayHaveMoved() {
+        guard landing != nil, !isPlacing, !landingCheckQueued else { return }
+        landingCheckQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.landingCheckQueued = false
+            self.checkLanding()
+        }
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        // Вьюха получила размер (только что создана, сверху появилась полоса):
+        // место перехода могло оказаться за краем.
+        landingMayHaveMoved()
+    }
+
+    /// Цель видна с запасом (см. Landing.isVisible) — и по вертикали, и по
+    /// горизонтали. Пустая вьюха (ещё без текста) — считаем, что видна.
+    private func isOnScreen(_ range: NSRange) -> Bool {
+        guard let rect = targetRect(for: range) else { return true }
+        let clip = scrollView.contentView
+        let bounds = clip.bounds
+        let insets = clip.contentInsets
+        let top = bounds.minY + insets.top
+        let visible = top...max(top, bounds.maxY - insets.bottom)
+        let width = bounds.width - insets.right
+        return Landing.isVisible(target: rect.minY...max(rect.minY, rect.maxY), visible: visible, margin: revealMargin)
+            && rect.minX >= bounds.minX && Self.shownEnd(of: rect, width: width) <= bounds.minX + width
+    }
+
+    /// Докуда цели должно быть видно по горизонтали: длинную (строка во всю
+    /// ширину) целиком не показать — хватит её начала.
+    private static func shownEnd(of rect: NSRect, width: CGFloat) -> CGFloat {
+        min(rect.maxX, rect.minX + width / 2)
+    }
+
+    /// Куда поставить клип, чтобы цель была посередине (Landing.centeredTop);
+    /// nil — она уже там. По горизонтали: строка до цели помещается от
+    /// левого края — к краю; цель и так видна — где есть; нет — на трети ширины.
+    private func centeredOrigin(for range: NSRange) -> NSPoint? {
+        guard let rect = targetRect(for: range) else { return nil }
+        let clip = scrollView.contentView
+        let bounds = clip.bounds
+        let insets = clip.contentInsets
+        let height = max(0, bounds.height - insets.top - insets.bottom)
+        let width = bounds.width - insets.right
+        let top = Landing.centeredTop(target: rect.minY...max(rect.minY, rect.maxY), height: height, margin: revealMargin)
+        let end = Self.shownEnd(of: rect, width: width)
+        var x = bounds.minX
+        if end <= width {
+            x = 0
+        } else if rect.minX < bounds.minX || end > bounds.minX + width {
+            x = max(0, rect.minX - width / 3)
+        }
+        let origin = clip.constrainBoundsRect(NSRect(origin: NSPoint(x: x, y: top - insets.top), size: bounds.size)).origin
+        if abs(origin.x - bounds.minX) < 1, abs(origin.y - bounds.minY) < 1 { return nil }
+        return origin
+    }
+
+    /// Цель в координатах текста; пустая (курсор) — её место в строке.
+    private func targetRect(for range: NSRange) -> NSRect? {
+        guard let layout = textView.layoutManager, let container = textView.textContainer,
+              let storage = textView.textStorage, storage.length > 0 else { return nil }
+        // Курсор за последним символом — у пустого диапазона там нет глифа.
+        let chars = range.location < storage.length ? range : NSRange(location: storage.length - 1, length: 1)
+        let glyphs = layout.glyphRange(forCharacterRange: chars, actualCharacterRange: nil)
+        layout.ensureLayout(forGlyphRange: glyphs)
+        var rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+        rect.origin.x += textView.textContainerOrigin.x
+        rect.origin.y += textView.textContainerOrigin.y
+        return rect
+    }
+
+    /// Цель — посередине. Раскладка ленивая, и позиция далёкой строки до
+    /// раскладки — лишь оценка: прокрутишь по ней, строки выше разложатся
+    /// по-настоящему, и на экране окажется другое место. Поэтому уточняем:
     /// прокрутили, разложили видимое, пересчитали — пара итераций сходится.
     private func scrollCentering(_ range: NSRange) {
         guard let layout = textView.layoutManager, let container = textView.textContainer else {
             textView.scrollRangeToVisible(range)
             return
         }
-        let glyphRange = layout.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
         let clip = scrollView.contentView
         for _ in 0..<4 {
-            layout.ensureLayout(forGlyphRange: glyphRange)
-            var rect = layout.boundingRect(forGlyphRange: glyphRange, in: container)
-            rect.origin.y += textView.textContainerInset.height
-            let targetY = max(0, rect.midY - clip.bounds.height / 3)
-            if abs(clip.bounds.origin.y - targetY) < 1 { break }
-            clip.scroll(to: NSPoint(x: 0, y: targetY))
+            guard let origin = centeredOrigin(for: range) else { break }
+            clip.scroll(to: origin)
             scrollView.reflectScrolledClipView(clip)
             layout.ensureLayout(forBoundingRect: clip.bounds, in: container)
         }
-        highlightVisible()
     }
 
     private func flash(_ range: NSRange) {
@@ -2347,11 +2643,13 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     private var flashToken = 0
 
     @objc private func viewportChanged() {
-        if info.isVisible && !info.isSignatureHelp { info.hide() }
+        // Текст поехал из-под окна — и из-под мыши.
+        dismissInfo()
         highlightVisible()
         ruler?.needsDisplay = true
         if !conflicts.isEmpty { layoutConflictStrips() }
         if popup.isVisible { hideCompletion(keepSession: true) }
+        landingMayHaveMoved()
     }
 
     @objc private func viewportResized() {
@@ -2361,11 +2659,12 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Сменили цветовую схему. Обычный текст и фон перекрасятся сами —
     /// цвета у них динамические; остальное здесь запомнено заранее:
     /// курсор и выделение у самого NSTextView, токены — временными
-    /// атрибутами раскладки.
+    /// атрибутами раскладки, полосы конфликтов — готовыми цветами.
     @objc private func colorSchemeChanged() {
         textView.insertionPointColor = Theme.caret
         textView.selectedTextAttributes = [.backgroundColor: Theme.selection]
         textView.typingAttributes[.foregroundColor] = Theme.color(.plain)
+        if !conflicts.isEmpty { setConflicts(conflicts) }
         painted = nil
         highlightVisible()
         textView.needsDisplay = true
@@ -2434,6 +2733,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         fontSize = max(8, min(32, size))
         let font = Theme.editorFont(size: fontSize)
         textView.typingAttributes[.font] = font
+        // Номера строк — и у редактора, которому ещё нечего показать: размер
+        // ему ставят до первого файла (см. CodeView.updateNSViewController).
+        ruler?.font = font
+        ruler?.invalidateWidth()
         guard let buffer, buffer.storage.length > 0 else { return }
         isApplying = true
         buffer.storage.addAttribute(.font, value: font, range: NSRange(location: 0, length: buffer.storage.length))
@@ -2441,8 +2744,6 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         buffer.fontSize = fontSize
         buffer.fixAttributesAhead()
         painted = nil
-        ruler?.font = font
-        ruler?.invalidateWidth()
         applyInsights()
         highlightVisible()
         textView.updateCurrentLineHighlight()
@@ -2494,6 +2795,9 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Правка текста — ещё посреди её обработки, так что только считаем:
     /// сдвигаем покрашенное и запоминаем, что перекрасить.
     private func textEdited(_ range: NSRange, delta: Int, settled: Int) {
+        // Текст правят (набор, ⌘Z, перечитан с диска) — место перехода могло
+        // сдвинуться, и держать его по старым позициям нельзя.
+        cancelLanding()
         let oldLength = range.length - delta
         painted = painted.map { Self.shift($0, byEditAt: range.location, from: oldLength, to: range.length) }
         // Фон вхождений уехал вместе с текстом — пусть и они: снимать его
@@ -2568,11 +2872,15 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Красит строки целиком: лексер начинает с состояния на входе в строку.
     /// `afterEdit` — разбор отстаёт от текста: вхождения и подсказки по нему
     /// врут, их не трогаем (вхождения после правки и так сбрасываются).
+    ///
+    /// Токены — `colorTokens`: у C# это раскраска Rustlyn, перенесённая через
+    /// правки, поэтому перекраска после правки (строки или всего экрана, когда
+    /// догонит разбор) кладёт на нетронутый текст ровно те же цвета.
     @discardableResult
     private func paint(lines: ClosedRange<Int>, afterEdit: Bool) -> NSRange? {
         guard let model, let storage = textView.textStorage, let layout = textView.layoutManager,
               let range = textRange(lines: lines) else { return nil }
-        let tokens = model.tokens(fromLine: lines.lowerBound, toLine: lines.upperBound)
+        let tokens = model.colorTokens(fromLine: lines.lowerBound, toLine: lines.upperBound)
 
         var tips: [(range: NSRange, text: String)] = []
         textView.batchingDisplay {
@@ -2634,6 +2942,13 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 }
 
 // MARK: - Ошибки, подсказки, сворачивание
+
+/// Часть окна подсказки, пришедшая из фона после того, как окно показано.
+private enum InfoPart: Sendable {
+    case documentation(RustlynDocumentation?)
+    /// Первое исправление, которое предложит ⌘.; `nil` — исправлять нечем.
+    case fix(String?)
+}
 
 extension CodeViewController: NSLayoutManagerDelegate {
 
@@ -2862,11 +3177,12 @@ extension CodeViewController: NSLayoutManagerDelegate {
         }) {
             unfold(hidden)
         }
-        guard info.isVisible else { return }
-        if info.isSignatureHelp {
+        if info.isVisible && info.isSignatureHelp {
             requestSignatureHelp(manual: false, delay: 80_000_000)
         } else if !hoverShown {
-            info.hide()
+            // Окно с клавиатуры (⌃J, ⌘F1) — о месте, где курсор был: и
+            // показанное, и ещё не дождавшееся ответа.
+            dismissInfo()
         }
     }
 
@@ -2884,55 +3200,221 @@ extension CodeViewController: NSLayoutManagerDelegate {
                 if manual { NSSound.beep() }
                 return
             }
-            self.hoverShown = false
+            // Окно одно: ошибки и документация, что ещё дорисовывались, ему не нужны.
+            self.dismissInfo()
             self.info.show(.signatures(found), anchor: self.lineRect(at: offset), parent: window)
         }
     }
 
-    /// ⌃J или наведение: документация имени и ошибки в этом месте.
-    /// `index == nil` — у курсора.
-    fileprivate func showDocumentation(at index: Int?) {
-        documentationTask?.cancel()
-        let offset = index ?? textView.selectedRange().location
-        let problems = diagnostics.filter {
-            NSLocationInRange(offset, $0.range) || ($0.range.length == 0 && abs($0.range.location - offset) <= 1)
-        }
-        guard let request = requestDocumentation else { return }
-        documentationTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let documentation = await request(offset)
-            guard !Task.isCancelled, let window = self.view.window else { return }
-            if documentation == nil && problems.isEmpty {
-                if index == nil { NSSound.beep() }
-                return
-            }
-            self.hoverShown = index != nil
-            self.info.show(.documentation(documentation, problems: problems),
-                           anchor: self.lineRect(at: offset), parent: window)
+    /// ⌃J: документация имени у курсора, а над ней — почему это место
+    /// подчёркнуто, если оно подчёркнуто.
+    fileprivate func showDocumentation() {
+        cancelInfoWork()
+        let selection = textView.selectedRange()
+        let problems = RustlynDiagnostic.at(caret: selection.location, in: diagnostics, textLength: textLength)
+        documentationTask = presentInfo(problems: problems, documentationAt: selection.location, fixesAt: selection,
+                                        anchor: selection.location, hover: nil, beepIfEmpty: true)
+    }
+
+    /// ⌘F1, «Описание ошибки» (ShowErrorDescription в Rider): почему
+    /// подчёркнуто там, где курсор, — то же окно, что под мышью.
+    fileprivate func showProblemDescription() {
+        let selection = textView.selectedRange()
+        let problems = RustlynDiagnostic.at(caret: selection.location, in: diagnostics, textLength: textLength)
+        guard !problems.isEmpty else { NSSound.beep(); return }
+        cancelInfoWork()
+        // Курсор мог уехать за край экрана — окно у невидимой строки ни к чему.
+        textView.scrollRangeToVisible(NSRange(location: selection.location, length: 0))
+        documentationTask = presentInfo(problems: problems, documentationAt: nil, fixesAt: selection,
+                                        anchor: selection.location, hover: nil)
+    }
+
+    /// Мышь над символом `index` (`nil` — ушла с текста или нажата кнопка).
+    /// Остановилась над подчёркнутым или над именем — через полсекунды, как
+    /// в Rider, окно: почему подчёркнуто и что это за имя. Пока мышь
+    /// движется, окна нет; ушла с того, о чём окно, — окно прячется.
+    fileprivate func hovered(_ index: Int?) {
+        if let index, hoverShown, info.isVisible, !info.isSignatureHelp,
+           let range = hoverRange, NSLocationInRange(index, range) { return }
+        cancelHover()
+        guard let index else { return }
+        // Не над словом и не над ошибкой — показывать нечего.
+        guard wordRange(at: index) != nil
+                || !RustlynDiagnostic.under(index, in: diagnostics, textLength: textLength).isEmpty else { return }
+        hoverTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.showHover(at: index)
         }
     }
 
-    /// Мышь над символом: после паузы — документация и ошибка в нём.
-    fileprivate func hovered(_ index: Int?) {
+    /// Мышь остановилась над `index`: ошибки под ней — сразу, документация
+    /// имени и исправление — следом.
+    private func showHover(at index: Int) {
+        // Кнопка нажата — выделяют, а не читают; список дополнений и
+        // сигнатура вызова важнее.
+        guard NSEvent.pressedMouseButtons == 0, !popup.isVisible, !info.isSignatureHelp,
+              view.window?.isKeyWindow == true else { return }
+        let length = textLength
+        let problems = RustlynDiagnostic.under(index, in: diagnostics, textLength: length)
+        let word = wordRange(at: index)
+        guard word != nil || !problems.isEmpty else { return }
+        // Окно стоит, пока мышь над этим словом или над волной любой из ошибок.
+        var area = word ?? problems[0].underline(textLength: length)
+        for problem in problems { area = NSUnionRange(area, problem.underline(textLength: length)) }
+        // Окно с клавиатуры уступает место — и его дорисовка тоже.
+        cancelInfoWork()
+        hoverTask = presentInfo(problems: problems, documentationAt: word == nil ? nil : index,
+                                fixesAt: problems.first.map { NSRange(location: $0.range.location, length: 0) },
+                                anchor: index, hover: area)
+    }
+
+    /// Окно об ошибках и имени: ошибки — сразу, документация и исправление —
+    /// как ответят; окно при этом дорастает вниз, строка над ним открыта.
+    /// `fixesAt` — где ⌘. будет искать исправления; `hover` — о каком куске
+    /// текста окно, открытое мышью (`nil` — открыто с клавиатуры). Отдаёт
+    /// задачу дорисовки: её отмена — и отмена того, что ещё не показано.
+    private func presentInfo(problems: [RustlynDiagnostic], documentationAt offset: Int?, fixesAt fixRange: NSRange?,
+                             anchor: Int, hover: NSRange?, beepIfEmpty: Bool = false) -> Task<Void, Never> {
+        if !problems.isEmpty {
+            showInfo(documentation: nil, problems: problems, fix: nil, anchor: anchor, hover: hover)
+        }
+        // Исправления бывают только у компилятора, не у сверки с парой.
+        let fixRange = problems.contains { !$0.isPairCheck } ? fixRange : nil
+        return Task { @MainActor [weak self] in
+            guard let self else { return }
+            var documentation: RustlynDocumentation?
+            var fix: String?
+            var shown = !problems.isEmpty
+            await withTaskGroup(of: InfoPart.self) { group in
+                if let offset {
+                    group.addTask { .documentation(await self.fetchDocumentation(at: offset)) }
+                }
+                if let fixRange {
+                    group.addTask { .fix(await self.firstFix(at: fixRange)) }
+                }
+                for await part in group {
+                    switch part {
+                    case .documentation(let found):
+                        documentation = found
+                        guard found != nil else { continue }
+                    case .fix(let title):
+                        fix = title.map(Self.fixHint)
+                        guard fix != nil, shown else { continue }
+                    }
+                    // Окно успели спрятать или занять сигнатурой — не воскрешаем.
+                    guard !Task.isCancelled, !shown || (self.info.isVisible && !self.info.isSignatureHelp)
+                    else { continue }
+                    self.showInfo(documentation: documentation, problems: problems, fix: fix,
+                                  anchor: anchor, hover: hover)
+                    shown = true
+                }
+            }
+            if beepIfEmpty, !shown, !Task.isCancelled { NSSound.beep() }
+        }
+    }
+
+    private func showInfo(documentation: RustlynDocumentation?, problems: [RustlynDiagnostic], fix: String?,
+                          anchor: Int, hover: NSRange?) {
+        guard let window = view.window else { return }
+        hoverShown = hover != nil
+        hoverRange = hover
+        hoverProblem = hover == nil ? nil : problems.first?.range
+        info.show(.documentation(documentation, problems: problems, fix: fix),
+                  anchor: lineRect(at: anchor), parent: window)
+    }
+
+    private func fetchDocumentation(at offset: Int) async -> RustlynDocumentation? {
+        guard let requestDocumentation else { return nil }
+        return await requestDocumentation(offset)
+    }
+
+    /// Первое исправление, которое предложит ⌘. в этом месте: раздел
+    /// исправлений в меню — первый из ведущих (`ContextActionGroup.leading`).
+    private func firstFix(at range: NSRange) async -> String? {
+        guard let codeActions else { return nil }
+        let groups = await codeActions(range)
+        return groups.first(where: \.leading)?.actions.first?.title
+    }
+
+    /// «⌘. — исправить: Add using System.Linq».
+    private static func fixHint(_ title: String) -> String {
+        let keys = KeymapStore.shared.display(.contextActions)
+        let how = keys.isEmpty ? EditorCommand.contextActions.title : keys
+        return L("\(how) — исправить: \(title)")
+    }
+
+    /// Клавиша — человек вернулся к клавиатуре: окно, открытое мышью, прочь,
+    /// и остановки мыши больше не ждём. Открытое окно Esc прячет в
+    /// `doCommandBy` — там же он и не открывает после этого дополнение.
+    fileprivate func keyPressed(_ event: NSEvent) {
+        if hoverShown, event.charactersIgnoringModifiers == KeyShortcut.escape { return }
+        cancelHover()
+    }
+
+    /// Мышь ушла или занялась другим: остановки не ждём, окно, открытое
+    /// ею, прячем. Окно с клавиатуры не трогаем.
+    fileprivate func cancelHover() {
         hoverTask?.cancel()
+        hoverTask = nil
+        guard hoverShown else { return }
+        hoverShown = false
+        hoverRange = nil
+        hoverProblem = nil
+        if info.isVisible && !info.isSignatureHelp { info.hide() }
+    }
+
+    /// Мышь с зажатым ⌘ остановилась на слове — говорим о нём после короткой
+    /// паузы: проносясь над текстом, мышь задела бы десяток слов.
+    fileprivate func commandHovered(_ index: Int?) {
         guard let index else {
-            if hoverShown { info.hide(); hoverShown = false }
-            hoveredWord = nil
+            commandHoverTask?.cancel()
+            commandHoverTask = nil
+            guard commandHoverWord != nil else { return }
+            commandHoverWord = nil
+            onCommandHover?(nil)
             return
         }
         let word = wordRange(at: index)
-        if let word, word == hoveredWord { return }
-        hoveredWord = word
-        if hoverShown { info.hide(); hoverShown = false }
-        // Не над словом и не над ошибкой — показывать нечего.
-        let onProblem = diagnostics.contains { NSLocationInRange(index, $0.range) }
-        guard word != nil || onProblem else { return }
-        hoverTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 550_000_000)
-            guard let self, !Task.isCancelled, !self.popup.isVisible, !self.info.isSignatureHelp else { return }
-            self.showDocumentation(at: index)
+        guard word != commandHoverWord else { return }
+        guard let word else {
+            // Над пробелом или скобкой: сказанное остаётся — мышь могла лишь
+            // соскользнуть с имени, — а несказанное отменяется.
+            if let pending = commandHoverTask {
+                pending.cancel()
+                commandHoverTask = nil
+                commandHoverWord = nil
+            }
+            return
+        }
+        commandHoverWord = word
+        commandHoverTask?.cancel()
+        commandHoverTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.commandHoverTask = nil
+            self.onCommandHover?(index)
         }
     }
+
+    /// То, что ещё дорисовывает окно об ошибках и документации, — прочь;
+    /// само окно стоит, пока его не заменит новое.
+    private func cancelInfoWork() {
+        documentationTask?.cancel()
+        documentationTask = nil
+        hoverTask?.cancel()
+        hoverTask = nil
+    }
+
+    /// Окно об ошибках и документации — прочь, как бы его ни открыли, вместе
+    /// с тем, что его ещё дорисовывает. Сигнатуру вызова не трогает.
+    fileprivate func dismissInfo() {
+        cancelInfoWork()
+        cancelHover()
+        if info.isVisible && !info.isSignatureHelp { info.hide() }
+    }
+
+    private var textLength: Int { textView.textStorage?.length ?? 0 }
 
     private func wordRange(at index: Int) -> NSRange? {
         guard let model, index < model.units.count, WordCompletion.isIdentPart(model.units[index]) else { return nil }
@@ -3211,12 +3693,18 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
     var eventLines: Set<Int> = [] {
         didSet { if eventLines != oldValue { needsDisplay = true } }
     }
-    private lazy var markerImage: NSImage? = {
+    /// Цвет значка — из схемы, поэтому картинку помним вместе с ней:
+    /// сменили схему — строим заново.
+    private var marker: (scheme: String, image: NSImage?)?
+    private var markerImage: NSImage? {
+        if let marker, marker.scheme == Theme.current.id { return marker.image }
         let config = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
             .applying(.init(paletteColors: [Theme.unityEvent]))
-        return NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: L("Сообщение Unity"))?
+        let image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: L("Сообщение Unity"))?
             .withSymbolConfiguration(config)
-    }()
+        marker = (Theme.current.id, image)
+        return image
+    }
     /// Строка с курсором: её номер ярче, а полоса продолжается в гаттер.
     var currentLine = 0 {
         didSet { if currentLine != oldValue { needsDisplay = true } }
@@ -3655,6 +4143,8 @@ struct CodeView: NSViewControllerRepresentable {
     var editRequest: TextEditRequest? = nil
     let onCaretChange: (Int) -> Void
     let onGoToDefinition: (Int) -> Void
+    /// ⌘ над символом — клик по нему, скорее всего, будет.
+    var onCommandHover: ((Int?) -> Void)? = nil
     var onLineClick: ((Int) -> Void)? = nil
     var onCommentLine: ((Int) -> Void)? = nil
     /// Точки останова файла, строка выполнения и клик по номеру строки.
@@ -3664,6 +4154,8 @@ struct CodeView: NSViewControllerRepresentable {
     var onBreakpointCondition: ((Int, String?) -> Void)? = nil
     var contextActions: ((Int) -> [ContextActionGroup])? = nil
     var codeActions: ((NSRange) async -> [ContextActionGroup])? = nil
+    /// Пункты меню правого клика для символа под мышью.
+    var textMenuActions: ((Int) -> [ContextAction])? = nil
     let requestCompletions: (Int, String?, Bool) async -> CompletionList?
     /// Подсказка Copilot у курсора; nil — Copilot выключен.
     var requestSuggestion: ((Int) async -> CopilotSuggestion?)? = nil
@@ -3685,6 +4177,7 @@ struct CodeView: NSViewControllerRepresentable {
         let controller = CodeViewController()
         controller.onCaretChange = onCaretChange
         controller.onGoToDefinition = onGoToDefinition
+        controller.onCommandHover = onCommandHover
         controller.onLineClick = onLineClick
         controller.onCommentLine = onCommentLine
         controller.onBreakpointClick = onBreakpointClick
@@ -3695,12 +4188,14 @@ struct CodeView: NSViewControllerRepresentable {
     func updateNSViewController(_ controller: CodeViewController, context: Context) {
         controller.onCaretChange = onCaretChange
         controller.onGoToDefinition = onGoToDefinition
+        controller.onCommandHover = onCommandHover
         controller.onLineClick = onLineClick
         controller.onCommentLine = onCommentLine
         controller.onBreakpointClick = onBreakpointClick
         controller.onBreakpointCondition = onBreakpointCondition
         controller.contextActions = contextActions
         controller.codeActions = codeActions
+        controller.textMenuActions = textMenuActions
         controller.requestCompletions = requestCompletions
         controller.requestSuggestion = requestSuggestion
         controller.onSuggestionShown = onSuggestionShown
@@ -3713,23 +4208,28 @@ struct CodeView: NSViewControllerRepresentable {
         controller.completionTriggers = Set(completionTriggers).union(["."])
         controller.decorator = decorator
 
+        // Шрифт — до показа буфера: только что созданный редактор иначе
+        // набрал бы файл своим размером по умолчанию, а следом ещё раз
+        // настоящим — и место перехода, поставленное между ними, уехало бы.
+        if context.coordinator.fontSize != fontSize {
+            context.coordinator.fontSize = fontSize
+            controller.setFontSize(fontSize)
+        }
+
         // Буфер сравниваем по идентичности: тот же файл, перечитанный
         // с диска, — уже другой буфер.
         var documentChanged = false
+        // Место перехода, на котором вкладку сейчас показали.
+        var landed: NSRange?
         if let buffer {
             if context.coordinator.shown !== buffer {
                 context.coordinator.shown = buffer
-                controller.show(buffer)
+                landed = controller.show(buffer)
                 documentChanged = true
             }
         } else if context.coordinator.shown != nil {
             context.coordinator.shown = nil
             controller.showEmpty()
-        }
-
-        if context.coordinator.fontSize != fontSize {
-            context.coordinator.fontSize = fontSize
-            controller.setFontSize(fontSize)
         }
 
         // Разбор обновился — ссылки и значки перекрашиваются.
@@ -3814,14 +4314,26 @@ struct CodeView: NSViewControllerRepresentable {
         }
 
         // Переход применяем один раз на запрос; порядковый номер нужен,
-        // чтобы повторный прыжок в то же место тоже сработал.
+        // чтобы повторный прыжок в то же место тоже сработал. Раскладку,
+        // которая дойдёт позже, редактор догонит сам: он держит место, пока
+        // переход не встанет (Landing). Вкладку, только что показанную на
+        // этом самом месте (`buffer.landing`), не трогаем.
         if let reveal, let buffer, reveal.seq != context.coordinator.appliedReveal {
             context.coordinator.appliedReveal = reveal.seq
             let range = reveal.range.map { buffer.model.nsRange(for: $0) }
                 ?? NSRange(location: 0, length: 0)
-            // Документ только что заменён — даём раскладке дойти до конца.
-            if documentChanged {
-                DispatchQueue.main.async { controller.reveal(range: range) }
+            if landed == range {
+                // Уже на месте.
+            } else if documentChanged {
+                // Документ только что заменён, а переход пришёл не с ним
+                // (объявление в тексте сборки ищется после показа): на
+                // следующем витке — чтобы курсор не публиковался посреди
+                // обновления вьюхи. Второй проход восстановления вкладки
+                // встал в очередь раньше и его не перебьёт.
+                DispatchQueue.main.async { [weak buffer] in
+                    guard let buffer, controller.isShowing(buffer) else { return }
+                    controller.reveal(range: range)
+                }
             } else {
                 controller.reveal(range: range)
             }

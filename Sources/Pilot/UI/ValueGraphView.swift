@@ -35,9 +35,10 @@ struct ValueGraphScreen: View {
                 Text(L("Откуда берётся \(graph.title)"))
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
+                GraphLegend()
                 Button(L("Показать всё")) { fitRequest += 1 }
                     .controlSize(.small)
-                Text(L("«Кто пишет» — раскрыть · двойной клик — к коду · щипок — масштаб"))
+                Text(L("кнопка на узле — раскрыть · двойной клик — к коду · щипок — масштаб"))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -45,6 +46,10 @@ struct ValueGraphScreen: View {
             .frame(height: 34)
             .background(Color(nsColor: Theme.chromeBackground))
             Divider()
+            if !graph.sources.isEmpty {
+                SourcesStrip(graph: graph)
+                Divider()
+            }
             GeometryReader { geometry in
                 // Граф уже окна — прижат к правому краю: там исходное значение.
                 let layout = GraphLayout(graph, minWidth: geometry.size.width)
@@ -53,7 +58,7 @@ struct ValueGraphScreen: View {
                 }
             }
         }
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .onChange(of: graph.settled) { _, settled in
             if settled { fitRequest += 1 }
         }
@@ -125,12 +130,13 @@ struct GraphLayout {
 
     static func width(of node: ValueGraph.Node) -> CGFloat {
         switch node.kind {
-        case .site:
+        case .site, .data:
             let longest = (node.showsFull ? node.fullPreview : node.preview).map(\.text.count).max() ?? 40
             return min(760, max(380, CGFloat(longest) * 7.3 + 70))
         case .value, .component: return min(460, max(270, CGFloat(node.title.count) * 7.6 + 80))
+        case .source: return min(420, max(220, CGFloat(node.title.count) * 7.6 + 70))
         case .network, .arrival, .condition: return 260
-        case .call, .parameter, .unknown: return 240
+        case .call, .parameter, .unknown, .more: return 240
         }
     }
 
@@ -275,7 +281,7 @@ struct GraphNodeView: View {
             }
         }
         .padding(.vertical, 4)
-        .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: Theme.editorBackground)))
+        .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: Theme.swiftUIEditorBackground)))
         if !node.fullPreview.isEmpty, node.fullPreview.count > node.preview.count {
             Button(node.showsFull ? L("Свернуть") : L("Весь метод")) { graph.togglePreview(node.id) }
                 .buttonStyle(.link)
@@ -289,7 +295,7 @@ struct GraphNodeView: View {
         var result = AttributedString()
         for segment in line.segments {
             var part = AttributedString(segment.text.replacingOccurrences(of: "\t", with: "    "))
-            part.foregroundColor = Color(nsColor: Theme.color(segment.kind))
+            part.foregroundColor = Color(nsColor: Theme.swiftUIColor(segment.kind))
             result += part
         }
         return result
@@ -324,6 +330,8 @@ struct GraphNodeView: View {
         case .arrival: return L("Где её шлют")
         case .call: return L("Что возвращает")
         case .parameter: return L("Кто передаёт")
+        case .source: return L("Где задано")
+        case .more: return L("Показать все")
         default: return L("Кто пишет")
         }
     }
@@ -338,18 +346,114 @@ struct GraphNodeView: View {
         case .network: return "antenna.radiowaves.left.and.right"
         case .call: return "function"
         case .parameter: return "arrow.down.to.line"
+        case .source(let origin, _): return Self.icon(for: origin.kind)
+        case .data: return "doc.text"
+        case .more: return "ellipsis.circle"
         case .unknown: return "questionmark.circle"
         }
     }
 
-    /// Цвет проекта: своя половина — синяя, вторая — оранжевая.
+    /// Значок вида источника — в узле, в полосе источников и в легенде.
+    static func icon(for kind: ValueOrigin.Kind) -> String {
+        switch kind {
+        case .literal: return "textformat.123"
+        case .constant: return "pin"
+        case .enumValue: return "list.bullet"
+        case .initial: return "flag"
+        case .defaultValue: return "circle.dashed"
+        case .config: return "doc.badge.gearshape"
+        case .json: return "curlybraces"
+        case .database: return "cylinder"
+        case .network: return "antenna.radiowaves.left.and.right"
+        case .inspector: return "slider.horizontal.3"
+        case .injection: return "shippingbox"
+        case .time: return "clock"
+        case .random: return "dice"
+        case .input: return "keyboard"
+        case .external: return "externaldrive"
+        case .engine: return "gearshape.2"
+        case .library: return "books.vertical"
+        }
+    }
+
+    /// Цвет проекта: своя половина — синяя, вторая — оранжевая. Источники —
+    /// зелёные: на них граф и заканчивается.
     private var tint: Color {
         switch node.kind {
         case .network: return .orange
         case .condition, .arrival: return .purple
-        case .unknown: return .gray
+        case .unknown, .more: return .gray
+        case .source, .data: return .green
         default: return node.project.path == graph.nodes[graph.rootID]?.project.path ? .blue : .orange
         }
+    }
+}
+
+// MARK: - Легенда и источники
+
+/// Что значат цвета и линии графа.
+struct GraphLegend: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            item(L("значение"), color: .blue, symbol: "tag")
+            item(L("код"), color: .blue, symbol: "pencil")
+            item(L("источник"), color: .green, symbol: "leaf")
+            item(L("сеть"), color: .orange, symbol: "antenna.radiowaves.left.and.right")
+            item(L("условие"), color: .purple, symbol: "line.3.horizontal.decrease.circle")
+        }
+        .font(.system(size: 10.5))
+        .foregroundStyle(.secondary)
+        .help(L("Синие — эта половина пары, оранжевые — вторая. Зелёные — источники: литерал, константа, конфиг, инспектор, время, случайное число, ввод."))
+    }
+
+    private func item(_ title: String, color: Color, symbol: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: symbol).foregroundStyle(color)
+            Text(title)
+        }
+    }
+}
+
+/// Источники, до которых граф дошёл, — полосой под заголовком: клик
+/// выделяет узел, двойной — открывает место.
+struct SourcesStrip: View {
+    @ObservedObject var graph: ValueGraph
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(L("Источники:"))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(graph.sources) { node in
+                        if case .source(let origin, _) = node.kind {
+                            chip(node, origin)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 28)
+        .background(Color(nsColor: Theme.chromeBackground).opacity(0.6))
+    }
+
+    private func chip(_ node: ValueGraph.Node, _ origin: ValueOrigin) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: GraphNodeView.icon(for: origin.kind)).foregroundStyle(.green)
+            Text(node.title).lineLimit(1)
+            Text(origin.kind.label).foregroundStyle(.secondary)
+        }
+        .font(.system(size: 11))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(RoundedRectangle(cornerRadius: 5)
+            .strokeBorder(graph.selection == node.id ? Color.accentColor : Color.green.opacity(0.45)))
+        .contentShape(RoundedRectangle(cornerRadius: 5))
+        .onTapGesture(count: 2) { graph.open(node.id) }
+        .onTapGesture { graph.selection = node.id }
+        .help(node.subtitle)
     }
 }
 

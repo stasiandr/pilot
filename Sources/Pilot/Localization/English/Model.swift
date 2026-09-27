@@ -110,6 +110,7 @@ extension English {
         ("Объявление знает языковой сервер — он ещё запускается%@", "The language server knows the declaration — it’s still starting%@"),
         ("Объявление не найдено: языковой сервер не работает — %@", "Declaration not found: the language server isn’t running — %@"),
         ("Rustlyn ещё компилирует проект — ищу по тексту", "Rustlyn is still compiling the project — searching the text instead"),
+        ("Единственное использование", "Only one usage"),
         ("Сначала откройте ассет", "Open an asset first"),
         ("Нет файла %@", "No file %@"),
         ("Это версия файла из мерж-реквеста — она только для чтения", "This is the merge request’s version of the file — it’s read-only"),
@@ -133,6 +134,10 @@ extension English {
         // Слитые ветки: запуск, отладка, пара, переименование
         ("«%@» → «%@»: %@ в %@", "“%@” → “%@”: %@ in %@"),
         ("%@. Пропущены — текст ушёл от компиляции: %@", "%@. Skipped — the text changed since compilation: %@"),
+        // Отмена правки по проекту целиком (Workspace.swift, ProjectChange)
+        ("Отменено: %@ — %@", "Undone: %@ — %@"),
+        ("Повторено: %@ — %@", "Redone: %@ — %@"),
+        ("%@. Не тронуты — изменились с тех пор: %@", "%@. Left as they are — changed since: %@"),
         ("Все перегрузки", "All overloads"),
         ("И в комментариях и строках", "In comments and strings too"),
         ("И файл — вслед за типом", "The file too — to match the type"),
@@ -192,5 +197,30 @@ extension English {
         ("Наследники", "Subtypes"),
         ("Вызов через базовый метод или интерфейс — может дойти сюда, а может нет", "A call through a base method or interface — it may or may not reach here"),
         ("⌃H — иерархия типов, ⌃⌥⇧H — вызовов", "⌃H — type hierarchy, ⌃⌥⇧H — call hierarchy"),
+
+        // Конфиги у курсора: alias и модель (Workspace+Configs.swift)
+        ("Конфиг %@", "Config %@"),
+        ("Открыть конфиг %@", "Open Config %@"),
+        ("Открыть конфиг «%@»", "Open Config “%@”"),
+        ("Файлы конфига (%@)…", "Config Files (%@)…"),
+        ("Файлы конфига «%@» (%@)…", "Files of Config “%@” (%@)…"),
+        ("Конфиги модели %@", "Configs of %@"),
+        ("Конфиги модели (%@)…", "Configs of the Model (%@)…"),
+        ("Модель конфига", "Config Model"),
+        ("Алиас в коде", "Alias in Code"),
+        ("Алиасы в коде (%@)…", "Aliases in Code (%@)…"),
+        ("Где используется конфиг", "Where the Config Is Used"),
+        ("Сборка папки: %@", "Folder Build: %@"),
+        ("Запись в %@", "Entry in %@"),
+        ("Алиас «%@» в коде не объявлен", "Alias “%@” isn’t declared in code"),
+        ("Модель конфига «%@» не найдена", "Model of config “%@” not found"),
+        // Пара у курсора и по правому клику (Workspace+Pair.swift, PairQueries.swift)
+        ("Открыть в %@", "Open in %@"),
+        ("Сверить датаграмму…", "Check Datagram…"),
+        ("Датаграмма %@ на проводе сходится с %@", "Datagram %@ matches %@ on the wire"),
+        ("Датаграммы %@ в %@ нет — на проводе её там не узнают", "Datagram %@ isn’t in %@ — it won’t be recognized on the wire there"),
+        ("двойник", "counterpart"),
+        ("провод", "wire"),
+        ("имена", "names"),
     ]
 }

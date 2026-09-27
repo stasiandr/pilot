@@ -225,12 +225,12 @@ struct ConfigCatalog: Sendable {
     }
 
     /// Модель конфига из `[ConfigModel(typeof(Model))]` у объявления алиаса —
-    /// текст внутри `typeof(…)`, дженерики как есть.
+    /// текст внутри `typeof(…)`, дженерики как есть. После него у атрибута
+    /// бывают и другие аргументы: `[ConfigModel(typeof(Model), true)]`.
     static func modelType(in line: String, attribute name: String) -> String? {
-        guard let attribute = line.range(of: name + "(typeof("),
-              let close = line[attribute.upperBound...].range(of: "))") else { return nil }
-        let text = line[attribute.upperBound..<close.lowerBound].trimmingCharacters(in: .whitespaces)
-        return text.isEmpty ? nil : text
+        guard let attribute = line.range(of: name + "(typeof(") else { return nil }
+        let start = line.index(attribute.upperBound, offsetBy: -"typeof(".count)
+        return ConfigLinks.typeofTexts(in: String(line[start...])).first
     }
 
     /// Имена в тексте типа, последнее — первым: у `Dictionary<ElementModel,
@@ -317,5 +317,52 @@ final class ConfigCatalogCache {
                 }
             }
         }
+    }
+}
+
+/// Модели конфигов текущего проекта (`ConfigModels`) — из его класса
+/// алиасов. Меню у курсора спрашивает их при каждом открытии, поэтому
+/// разобранное хранится: файлы ищутся заново только в новом индексе
+/// файлов, а перечитываются, только когда поменялась их дата — её сверяют
+/// не чаще раза в секунду. Разбор класса на пятьсот alias'ов — единицы
+/// миллисекунд, и только после его правки: в фон его не уносим.
+@MainActor
+final class ConfigModelsCache {
+    private var root: URL?
+    private var rules: ConfigRules?
+    private weak var files: FileIndex?
+    /// Классы алиасов — пути от корня.
+    private var paths: [String] = []
+    private var stamps: [Date?] = []
+    private var checked = Date.distantPast
+    private var cached: ConfigModels?
+
+    func models(root: URL, rules: ConfigRules?, files: FileIndex?) -> ConfigModels? {
+        guard let rules, let files else { return nil }
+        if root != self.root || rules != self.rules || files !== self.files {
+            self.root = root
+            self.rules = rules
+            self.files = files
+            // Фильтр навигатора бежит по буферу индекса без аллокаций: у
+            // клиента Unity это сотни тысяч путей.
+            paths = files.filter(name: rules.aliasesFile, limit: 64, shouldStop: { false }).map(files.relPath)
+                .filter { ($0 as NSString).lastPathComponent == rules.aliasesFile }
+            stamps = []
+            cached = nil
+        }
+        guard !paths.isEmpty else { return nil }
+        let now = Date()
+        guard cached == nil || now.timeIntervalSince(checked) > 1 else { return cached }
+        checked = now
+        let current = paths.map { path in
+            (try? FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(path).path))?[.modificationDate] as? Date
+        }
+        if cached == nil || current != stamps {
+            stamps = current
+            cached = ConfigModels(files: paths.compactMap { path in
+                SymbolIndex.readSource(root.appendingPathComponent(path)).map { (path: path, text: $0) }
+            })
+        }
+        return cached
     }
 }

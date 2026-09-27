@@ -1750,6 +1750,10 @@ check(SearchScope.everything.includes(.text) && !SearchScope.files.includes(.typ
         && SearchScope.symbols.includes(.member) && SearchScope.text.includes(.text)
         && !SearchScope.text.includes(.file),
       "фильтр решает, каких источников спрашивать")
+check(SearchScope.everything.next() == .files && SearchScope.text.next() == .everything
+        && SearchScope.everything.next(backwards: true) == .text
+        && SearchScope.allCases.allSatisfy { $0.next().next(backwards: true) == $0 },
+      "Tab и ⇧Tab — соседний фильтр по кругу, в обе стороны")
 for mode in PaletteMode.allCases {
     check(!mode.placeholder.isEmpty, "у режима \(mode) есть подпись поля")
     check(!mode.icon.isEmpty, "у режима \(mode) есть иконка")
@@ -2577,12 +2581,421 @@ check(comment.tokens(fromLine: 2, toLine: 2).first?.kind == .comment, "откр�
 comment.replace(NSRange(location: 0, length: 2), with: [])
 check(comment.tokens(fromLine: 2, toLine: 2).first.map { $0.kind != .comment } == true, "убранный /* возвращает подсветку")
 
+// `\` в конце строки внутри литерала не съедает перевод строки: раньше
+// строк выходило меньше, чем в тексте, следующая строка красилась строкой,
+// а модель после набора `\` расходилась с построенной заново.
+let backslashText = "var a = \"x\\\nint b = 1;\n"
+let backslash = SyntaxModel(text: backslashText, spec: Languages.csharp)
+check(backslash.lineCount == 3 && backslash.lineStarts == [0, 12, 23], "`\\` в конце строки литерала: строки не теряются")
+check(kindOf("int", backslash, backslash.tokens(fromLine: 1, toLine: 1)) == .type, "…и следующая строка — код, а не строка")
+checkTwoPassConsistency(backslashText + "var s = \"\"\"\nq\\\n\"\"\";\n", Languages.csharp, "`\\` в конце строки")
+let backslashEdit = SyntaxModel(text: "var a = \"x\nint b = 1;\n", spec: Languages.csharp)
+backslashEdit.replace(NSRange(location: 10, length: 0), with: Array("\\".utf16))
+check(sameModel(backslashEdit, SyntaxModel(text: backslashEdit.text, spec: Languages.csharp)),
+      "набрали `\\` в конце строки литерала — модель как построенная заново")
+
 // Снимок не видит последующих правок.
 let snapModel = SyntaxModel(text: "abc", spec: nil)
 let snap = snapModel.snapshot()
 snapModel.replace(NSRange(location: 0, length: 3), with: Array("xyz\n".utf16))
 check(snap.text == "abc" && snap.lineCount == 1 && snapModel.version == snap.version + 1,
       "снимок неизменен после правки оригинала")
+
+// ────────────────────────── Карта правок ──────────────────────────
+section("Карта правок")
+
+func ccTok(_ start: Int, _ length: Int, _ kind: TokenKind = .type) -> Token {
+    Token(start: Int32(start), length: Int32(length), kind: kind)
+}
+func ccSpans(_ tokens: [Token]) -> [String] { tokens.map { "\($0.start)+\($0.length)" } }
+
+var ccMap = EditMap()
+ccMap.record(5..<5, length: 1)
+ccMap.record(6..<6, length: 1)
+check(ccMap.changes == [EditMap.Change(old: 5..<5, new: 5..<7)], "вставки подряд — один кусок")
+ccMap.record(5..<7, length: 0)
+check(ccMap.isEmpty, "набрали и стёрли — правки нет")
+
+ccMap = EditMap()
+ccMap.record(10..<10, length: 2)   // вставка
+ccMap.record(20..<23, length: 0)   // удаление дальше (в нынешних координатах)
+check(ccMap.changes.count == 2 && ccMap.changes[1].old == 18..<21 && ccMap.changes[1].new == 20..<20,
+      "второй кусок — в прежних координатах со сдвигом первого")
+let ccCarried = ccMap.carry([ccTok(0, 5), ccTok(8, 2), ccTok(9, 4), ccTok(10, 3), ccTok(15, 3), ccTok(17, 2), ccTok(21, 4)])
+check(ccSpans(ccCarried.kept) == ["0+5", "8+2", "12+3", "17+3", "20+4"],
+      "не задетые — на новых местах; вставка вплотную слово не задевает (\(ccSpans(ccCarried.kept)))")
+check(ccSpans(ccCarried.cut) == ["9+6", "19+1"], "задетые — вместе с правкой внутри (\(ccSpans(ccCarried.cut)))")
+check(ccMap.oldLineStart(13) == 11 && ccMap.oldLineStart(10) == 10,
+      "начало строки за правкой — сдвинуто, перед ней — как было")
+check(ccMap.oldLineStart(11) == nil && ccMap.oldLineStart(12) == nil,
+      "строка внутри вставки или сразу за ней — в прежнем тексте её начала нет")
+check(ccMap.oldRange(covering: 11..<30) == 10..<31, "окно в прежнем тексте берёт правку на границе целиком")
+
+// Главное свойство: токен переносится, только если все его символы уцелели
+// и стоят подряд, — и тогда ровно туда, где они теперь.
+var ccMapFailures = 0
+for round in 0..<300 {
+    let length = 60
+    var origin: [Int?] = Array(0..<length)
+    var map = EditMap()
+    for _ in 0..<Int.random(in: 1...6) {
+        let a = Int.random(in: 0...origin.count)
+        let b = min(origin.count, a + Int.random(in: 0...4))
+        let n = Int.random(in: 0...3)
+        origin.replaceSubrange(a..<b, with: [Int?](repeating: nil, count: n))
+        map.record(a..<b, length: n)
+    }
+    var tokens: [Token] = []
+    var s = 0
+    while s < length - 1 {
+        let l = Int.random(in: 1...5)
+        if s + l <= length { tokens.append(ccTok(s, l)) }
+        s += l + Int.random(in: 0...2)
+    }
+    let (kept, cut) = map.carry(tokens)
+    var position: [Int: Int] = [:]
+    for (i, o) in origin.enumerated() { if let o { position[o] = i } }
+    var expected: [String] = []
+    var expectedCut = 0
+    for t in tokens {
+        let at = (Int(t.start)..<Int(t.start + t.length)).map { position[$0] }
+        if at.allSatisfy({ $0 != nil }), zip(at, at.dropFirst()).allSatisfy({ $0! + 1 == $1! }) {
+            expected.append("\(at[0]!)+\(t.length)")
+        } else {
+            expectedCut += 1
+        }
+    }
+    if ccSpans(kept) != expected || cut.count != expectedCut {
+        ccMapFailures += 1
+        if ccMapFailures == 1 { print("     расхождение в раунде \(round): \(ccSpans(kept)) против \(expected)") }
+    }
+}
+check(ccMapFailures == 0, "300 случайных серий правок: перенос токенов совпадает с посимвольным (расхождений: \(ccMapFailures))")
+
+// ──────────────── Раскраска Rustlyn переносится через правки ────────────────
+section("Раскраска через правки")
+
+/// Раскраска «как у Rustlyn»: обычных имён нет, `Foo(` — тип, а не функция,
+/// escape — внутри строки, `$"…{x}…"` — куски строки и дыры с кодом,
+/// блочный комментарий — одним куском на все строки.
+func ccRustlynLike(_ text: String) -> [Token] {
+    let lexed = SyntaxModel(text: text, spec: Languages.csharp)
+    let u = lexed.units
+    func capital(_ i: Int) -> Bool { i < u.count && u[i] >= 0x41 && u[i] <= 0x5A }
+    var result: [Token] = []
+    func string(_ s: Int, _ e: Int, verbatim: Bool) {
+        result.append(ccTok(s, e - s, .string))
+        guard !verbatim else { return }
+        var i = s
+        while i < e - 1 {
+            if u[i] == 0x5C { result.append(ccTok(i, 2, .escape)); i += 2 } else { i += 1 }
+        }
+    }
+    for t in lexed.tokens(fromLine: 0, toLine: lexed.lineCount - 1) {
+        let s = Int(t.start), e = s + Int(t.length)
+        switch t.kind {
+        case .plain:
+            continue
+        case .function:
+            if capital(s) { result.append(ccTok(s, e - s, .type)) }
+        case .comment:
+            if let last = result.last, last.kind == .comment, Int(last.start + last.length) < s,
+               u[Int(last.start + last.length)..<s].allSatisfy({ $0 == 0x0A || $0 == 0x0D }),
+               LexState(packed: lexed.lineStates[lexed.line(containing: s)]).blockDepth > 0 {
+                result[result.count - 1].length = Int32(e) - last.start
+            } else {
+                result.append(t)
+            }
+        case .string where u[s] == 0x24:
+            var i = s, piece = s
+            while i < e {
+                guard u[i] == 0x7B else { i += 1; continue }
+                if i > piece { string(piece, i, verbatim: false) }
+                result.append(ccTok(i, 1, .punctuation))
+                var j = i + 1
+                while j < e, u[j] != 0x7D { j += 1 }
+                if j > i + 1, capital(i + 1) { result.append(ccTok(i + 1, j - i - 1, .type)) }
+                if j < e { result.append(ccTok(j, 1, .punctuation)) }
+                i = j + 1
+                piece = i
+            }
+            if e > piece { string(piece, e, verbatim: false) }
+        case .string:
+            string(s, e, verbatim: u[s] == 0x40)
+        default:
+            result.append(t)
+        }
+    }
+    return result
+}
+
+/// Как `rln_classify`: токены, задевающие строки окна. `extra` — то, чего
+/// лексер не знает (мёртвые ветки `#if`): под ним своих токенов нет.
+func ccClassifier(_ text: String, extra: [Token] = [], calls: AtomicCounter? = nil)
+    -> @Sendable (ClosedRange<Int>) -> [Token]? {
+    let lines = SyntaxModel(text: text, spec: nil)
+    let own = ccRustlynLike(text).filter { t in
+        !extra.contains { $0.start < t.start + t.length && t.start < $0.start + $0.length }
+    }
+    let all = (own + extra).sorted { $0.start != $1.start ? $0.start < $1.start : $0.length > $1.length }
+    let starts = lines.lineStarts, count = lines.units.count
+    return { range in
+        _ = calls?.bump()
+        let lower = Int(starts[range.lowerBound])
+        let upper = range.upperBound + 1 < starts.count ? Int(starts[range.upperBound + 1]) : count
+        return all.filter { Int($0.start) < upper && lower < Int($0.start + $0.length) }
+    }
+}
+
+/// Цвет каждого символа — как его оставит `paint`: токены по порядку,
+/// обычные не красят.
+func ccPainted(_ tokens: [Token], _ length: Int) -> [TokenKind] {
+    var kinds = [TokenKind](repeating: .plain, count: length)
+    for t in tokens where t.kind != .plain {
+        for i in max(0, Int(t.start))..<min(length, Int(t.start + t.length)) { kinds[i] = t.kind }
+    }
+    return kinds
+}
+
+/// Модель, которую красит «Rustlyn», и её текст, правленый вместе с ней,
+/// с памятью, откуда взялся каждый символ.
+final class ColoredModel {
+    let model: SyntaxModel
+    var units: [UInt16]
+    var origin: [Int?]
+    let before: [TokenKind]
+    init(_ text: String, extra: [Token] = [], calls: AtomicCounter? = nil) {
+        model = SyntaxModel(text: text, spec: Languages.csharp)
+        units = Array(text.utf16)
+        origin = Array(0..<units.count)
+        model.useColors(settled: URL(fileURLWithPath: "/tmp/Colors.cs"), ccClassifier(text, extra: extra, calls: calls))
+        before = ccPainted(model.colorTokens(fromLine: 0, toLine: model.lineCount - 1), units.count)
+    }
+    var text: String { String(decoding: units, as: UTF16.self) }
+    func at(_ needle: String) -> Int { (text as NSString).range(of: needle).location }
+    func edit(_ at: Int, _ length: Int, _ piece: String) {
+        let piece = Array(piece.utf16)
+        units.replaceSubrange(at..<(at + length), with: piece)
+        origin.replaceSubrange(at..<(at + length), with: [Int?](repeating: nil, count: piece.count))
+        model.replace(NSRange(location: at, length: length), with: piece)
+    }
+    func edit(_ needle: String, _ piece: String, offset: Int = 0, length: Int = 0) {
+        edit(at(needle) + offset, length, piece)
+    }
+    var colors: [TokenKind] { ccPainted(model.colorTokens(fromLine: 0, toLine: model.lineCount - 1), units.count) }
+    /// Символы, которые правка не трогала, но которые сменили цвет (пробелы не в счёт).
+    func moved(except skipped: Range<Int>? = nil) -> [Int] {
+        let now = colors
+        return origin.indices.filter { i in
+            guard let o = origin[i], units[i] != 0x20, units[i] != 0x0A, units[i] != 0x09 else { return false }
+            if let skipped, skipped.contains(i) { return false }
+            return now[i] != before[o]
+        }
+    }
+}
+
+let ccSource = """
+using System;
+
+class Player {
+    /// <summary>Док</summary>
+    void Tick(float dt) {
+        var hp = Clamp(value, 0);   // хвост
+        Log($"Player {name} has {Hp} HP\\n");
+        var path = @"C:\\dir";
+        /* блочный
+           комментарий */
+        Apply(hp);
+    }
+}
+"""
+
+// Устоявшийся файл: раскраска — ровно разбор, как и раньше.
+let ccSettled = ColoredModel(ccSource)
+check(ccSettled.before == ccPainted(ccRustlynLike(ccSource), ccSettled.units.count), "до правок — раскраска разбора")
+check(ccSettled.before[ccSettled.at("Clamp")] == .type, "`Clamp(` у разбора — тип")
+
+// Пробел — ничего не меняется: ни в строке правки, ни на экране вокруг.
+// Раньше первая правка отдавала файл своему лексеру: `Clamp(` становился
+// функцией по всему экрану.
+let ccSpace = ColoredModel(ccSource)
+ccSpace.edit("Clamp", " ")
+check(ccSpace.moved().isEmpty, "пробел перед словом: цвета на месте (сменили \(ccSpace.moved().count))")
+check(ccSpace.model.settledFile == nil
+      && ccPainted(ccSpace.model.tokens(fromLine: 0, toLine: 20), ccSpace.units.count)[ccSpace.at("Clamp")] == .function,
+      "свой лексер красит `Clamp(` иначе — вот что было видно раньше")
+ccSpace.edit("var hp", "    \n")
+ccSpace.edit("Apply", "\t")
+ccSpace.edit(";   //", "", offset: 1, length: 1)
+check(ccSpace.moved().isEmpty, "перевод строки, таб, удалённый пробел: цвета на месте")
+check(ccSpace.colors == ccPainted(ccRustlynLike(ccSpace.text), ccSpace.units.count),
+      "после пробельных правок — то же, что дал бы свежий разбор")
+
+// Пробелы внутри строки, комментария, дыры интерполяции — тоже.
+let ccInside = ColoredModel(ccSource)
+ccInside.edit("has", " ")
+ccInside.edit("хвост", " ")
+ccInside.edit("{name}", " ", offset: 1)
+ccInside.edit("<summary>", " ", offset: 1)
+ccInside.edit("комментарий */", " ")
+check(ccInside.moved().isEmpty, "пробелы в строке, дыре, комментариях: цвета на месте (сменили \(ccInside.moved().count))")
+check(ccInside.colors[ccInside.at("{Hp}") + 1] == .type && ccInside.colors[ccInside.at("\\n")] == .escape,
+      "дыра и escape в строке с правкой — как у разбора")
+
+// Случайные пробелы и табы между словами и внутри строк и комментариев.
+func ccOrdinary(_ unit: UInt16) -> Bool {
+    unit == 0x20 || (unit >= 0x30 && unit <= 0x39) || (unit >= 0x41 && unit <= 0x5A)
+        || (unit >= 0x61 && unit <= 0x7A) || unit > 0x7F
+}
+var ccSpaceFailures = 0
+let ccSpaced = ColoredModel(ccSource)
+for step in 0..<80 {
+    let lexed = ccSpaced.model.tokens(fromLine: 0, toLine: ccSpaced.model.lineCount - 1)
+    let fresh = ccRustlynLike(ccSpaced.text)
+    let u = ccSpaced.units
+    // Не внутри слова, числа, оператора, escape и не посреди `$"`, `//`, `*/`:
+    // там пробел меняет разбор. Внутри строк и комментариев — между буквами.
+    let candidates = (0...u.count).filter { p in
+        for t in lexed + fresh where Int(t.start) < p && p < Int(t.start + t.length) {
+            switch t.kind {
+            case .string, .comment, .docComment:
+                if !(ccOrdinary(u[p - 1]) && ccOrdinary(u[p])) { return false }
+            default:
+                return false
+            }
+        }
+        return true
+    }
+    ccSpaced.edit(candidates.randomElement()!, 0, ["  ", "\t", " "].randomElement()!)
+    if !ccSpaced.moved().isEmpty {
+        ccSpaceFailures += 1
+        if ccSpaceFailures == 1 { print("     цвет сменился на шаге \(step): \(ccSpaced.moved().prefix(5))") }
+    }
+}
+check(ccSpaceFailures == 0, "80 случайных пробелов: ни один символ не сменил цвет (сменили на \(ccSpaceFailures) шагах)")
+
+// Набранное слово красит свой лексер — только его; всё вокруг как было.
+let ccTyped = ColoredModel(ccSource)
+ccTyped.edit("Clamp", "x", offset: 5)
+let ccClampx = ccTyped.at("Clampx")
+check(ccTyped.moved(except: ccClampx..<(ccClampx + 6)).isEmpty, "набранное слово: остальное на месте")
+check(ccTyped.colors[ccClampx] == .function, "набранное слово — цветом своего лексера, пока нет разбора")
+ccTyped.edit("hp);", "p", offset: 2)
+check(ccTyped.moved(except: ccClampx..<(ccClampx + 6)).isEmpty, "вторая правка в другом месте: остальное на месте")
+
+// Кавычка и /* меняют разбор до конца изменённого, а убранные — возвращают.
+let ccQuote = ColoredModel(ccSource)
+ccQuote.edit("Apply", "\"")
+check(ccQuote.colors[ccQuote.at("Apply")] == .string && ccQuote.colors[ccQuote.at("hp);")] == .string,
+      "открытая кавычка: строка до конца строки")
+check(ccQuote.colors[ccQuote.at("Tick")] == .type, "строки выше не тронуты")
+
+// Перевод строки посреди `"…"`: остаток — уже код, а закрывающая кавычка
+// открывает новую строку до конца строки.
+let ccBroken = ColoredModel(ccSource)
+ccBroken.edit("Player {name", "\n    ", offset: 3)
+check(ccBroken.colors[ccBroken.at("has")] != .string && ccBroken.colors[ccBroken.at("Hp}")] == .type,
+      "перевод строки в строке: остаток строки — код")
+let ccBrokenEnd = ColoredModel(ccSource)
+ccBrokenEnd.edit("\");\n        var path", "\n    ")
+check(ccBrokenEnd.colors[ccBrokenEnd.at(");\n        var path")] == .string,
+      "перевод строки перед закрывающей кавычкой: она открывает строку до конца строки")
+
+let ccBlock = ColoredModel(ccSource)
+ccBlock.edit("        var hp", "/*")
+check(ccBlock.colors[ccBlock.at("Clamp")] == .comment && ccBlock.colors[ccBlock.at("path")] == .comment,
+      "открытый /*: ниже — комментарий")
+check(ccBlock.colors[ccBlock.at("Apply")] == .type, "за чужим */ — снова разбор")
+ccBlock.edit("/*", "", length: 2)
+check(ccBlock.moved().isEmpty, "убранный /*: всё, как было у разбора")
+ccBlock.edit("        var hp", "/*")
+ccBlock.edit("value", "*/")
+check(ccBlock.colors[ccBlock.at("Log")] == .type && ccBlock.colors[ccBlock.at("$\"Player")] == .string,
+      "/* … */ закрыли в той же строке: ниже снова разбор")
+
+// Мёртвая ветка `#if` остаётся серой, пока в неё не вписали директиву.
+let ccDeadText = "#if FALSE\nvoid Dead() { Call(1); }\n#endif\nvoid Live() {}\n"
+let ccDeadStart = (ccDeadText as NSString).range(of: "void Dead").location
+let ccDeadEnd = (ccDeadText as NSString).range(of: "#endif").location
+let ccDead = ColoredModel(ccDeadText, extra: [ccTok(ccDeadStart, ccDeadEnd - ccDeadStart, .disabled)])
+check(ccDead.before[ccDead.at("Call")] == .disabled, "мёртвая ветка серая у разбора")
+ccDead.edit("Call", "Foo")
+check(ccDead.colors[ccDead.at("FooCall")] == .disabled && ccDead.colors[ccDead.at("Dead")] == .disabled,
+      "набранное в мёртвой ветке — тоже серое")
+ccDead.edit("void Dead", "#endif\n")
+check(ccDead.colors[ccDead.at("#endif\nvoid")] == .preprocessor && ccDead.colors[ccDead.at("Dead")] == .disabled,
+      "вписанная директива — своим цветом, а ветку перекрасит свежий разбор, не догадка лексера")
+
+// Окно в несколько строк красит так же, как файл целиком: прокрутка после
+// правок кладёт те же цвета.
+let ccWindows = ColoredModel(ccSource)
+ccWindows.edit("Clamp", " ")
+ccWindows.edit("has", "x")
+ccWindows.edit("        var hp", "/*")
+let ccWhole = ccWindows.colors
+var ccWindowFailures = 0
+for first in 0..<ccWindows.model.lineCount {
+    let last = min(ccWindows.model.lineCount - 1, first + 3)
+    let part = ccPainted(ccWindows.model.colorTokens(fromLine: first, toLine: last), ccWindows.units.count)
+    let range = Int(ccWindows.model.lineStarts[first])..<ccWindows.model.lineRange(last).upperBound
+    if range.contains(where: { part[$0] != ccWhole[$0] }) { ccWindowFailures += 1 }
+}
+check(ccWindowFailures == 0, "окна по 4 строки красят как файл целиком (расходятся \(ccWindowFailures))")
+
+// Rustlyn спрашивают про окно один раз: основа не меняется, и ответ про неё
+// не стареет — набор букв его не переспрашивает.
+let ccCalls = AtomicCounter()
+let ccCached = ColoredModel(ccSource, calls: ccCalls)
+let ccCallsBefore = ccCalls.current
+for _ in 0..<20 {
+    ccCached.edit(ccCached.at("Tick") + 4, 0, "k")
+    _ = ccCached.model.colorTokens(fromLine: 4, toLine: 6)
+    _ = ccCached.model.colorTokens(fromLine: 0, toLine: ccCached.model.lineCount - 1)
+}
+check(ccCalls.current == ccCallsBefore, "20 правок и 40 перекрасок — Rustlyn не переспрашивали (\(ccCalls.current - ccCallsBefore))")
+
+// Свежий разбор правленого текста — и правок поверх него больше нет.
+ccCached.model.useColors(ccClassifier(ccCached.text))
+check(!ccCached.model.colorsLag && ccCached.colors == ccPainted(ccRustlynLike(ccCached.text), ccCached.units.count),
+      "новая основа: раскраска — ровно свежий разбор")
+
+// Журнал правок: места, посчитанные по версии постарше, — в нынешний текст.
+let ccJournal = SyntaxModel(text: "void Update() {}\nvoid Start() {}\n", spec: Languages.csharp)
+let ccJournalVersion = ccJournal.version
+ccJournal.replace(NSRange(location: 0, length: 0), with: Array("  ".utf16))
+ccJournal.replace(NSRange(location: 19, length: 0), with: Array("\n".utf16))
+check(ccJournal.edits(since: ccJournalVersion)?.carry(NSRange(location: 5, length: 6)) == NSRange(location: 7, length: 6)
+      && String(decoding: ccJournal.units[7..<13], as: UTF16.self) == "Update",
+      "имя из старой структуры — на своём месте в правленом тексте")
+check(ccJournal.edits(since: ccJournal.version)?.isEmpty == true && ccJournal.edits(since: -1) == nil,
+      "без правок — пустая карта; версия, которой не было, — nil")
+ccJournal.replace(NSRange(location: 8, length: 1), with: Array("x".utf16))
+check(ccJournal.edits(since: ccJournalVersion)?.carry(NSRange(location: 5, length: 6)) == nil,
+      "правка внутри имени — место не переносится")
+
+// Производительность: файл на 10 000 строк, набор посередине экрана.
+let ccPerfSource = String(repeating: "        var total = Compute(value, \"text\") + Other.Call(1); // note\n", count: 10_000)
+let ccPerf = SyntaxModel(text: ccPerfSource, spec: Languages.csharp)
+ccPerf.useColors(settled: URL(fileURLWithPath: "/tmp/Perf.cs"), ccClassifier(ccPerfSource))
+_ = ccPerf.colorTokens(fromLine: 4960, toLine: 5060)
+let ccPerfLine = Int(ccPerf.lineStarts[5000])
+let ccPerfStart = Date()
+for i in 0..<200 {
+    ccPerf.replace(NSRange(location: ccPerfLine + 20 + i, length: 0), with: [0x78])
+    _ = ccPerf.colorTokens(fromLine: 5000, toLine: 5000)
+}
+let ccPerfMs = Date().timeIntervalSince(ccPerfStart) * 1000 / 200
+let ccScreenStart = Date()
+_ = ccPerf.colorTokens(fromLine: 4960, toLine: 5060)
+let ccScreenMs = Date().timeIntervalSince(ccScreenStart) * 1000
+print(String(format: "  буква + перекраска строки на 10k строк: %.3f мс; экран после 200 букв: %.2f мс", ccPerfMs, ccScreenMs))
+check(ccPerfMs < 2 && ccScreenMs < 20, "набор с раскраской Rustlyn — доли миллисекунды на букву")
+
+// ──────────────── Вхождения при раскраске Rustlyn ────────────────
+section("Вхождения при раскраске Rustlyn")
+let ccOccurrences = ColoredModel("class C {\n    int count;\n    void M() { count++; Log(\"count\"); } // count\n}\n")
+check(Occurrences.find("count", in: ccOccurrences.model).count == 2,
+      "обычное имя без токена у Rustlyn — вхождение; в строке и комментарии — нет")
 
 // ────────────────────────── Правила редактирования ──────────────────────────
 section("Правила редактирования")
@@ -2949,7 +3362,64 @@ check(fallbackAnswer.declarations.first?.name == "Damage" && fallbackAnswer.decl
       "тип неизвестен, но объявление с таким именем одно — прыгаем (получено: \(landed(fallbackAnswer)))")
 check(jump("Log(\"Damage\")", "Damage").declarations.isEmpty, "слово в строке — не идентификатор")
 check(jump("// Damage в комментарии", "Damage").declarations.isEmpty, "слово в комментарии — не идентификатор")
-check(jump("public void Move", "Move").declarations.isEmpty, "на самом объявлении прыгать некуда")
+do {
+    // На самом объявлении ответ — оно само: ⌘B увидит, что стоит на нём, и
+    // покажет использования.
+    let onDeclaration = jump("public void Move", "Move")
+    let context = (playerSystemSource as NSString).range(of: "public void Move")
+    let name = playerModel.position(at: context.location + ("public void Move" as NSString).range(of: "Move").location)
+    check(onDeclaration.isExact && onDeclaration.declarations.count == 1
+            && onDeclaration.declarations.first?.target.range?.start == name
+            && onDeclaration.declarations.first?.target.url == navDocument.url,
+          "на самом объявлении ответ — оно само (получено: \(landed(onDeclaration)))")
+}
+
+// ⌘+клик по объявлению показывает использования: стоим ли на нём, решает
+// ответ ⌘B. Rustlyn отвечает именем, а у свойства и конструктора — объявлением
+// целиком: началом и длиной, даже если оно в несколько строк.
+do {
+    let source = """
+    class Node
+    {
+        public Node Parent;
+        public int Depth => Parent == null ? 0 : Parent.Depth + 1;
+        [Obsolete("x")]
+        public int Score { get { return Depth; } }
+        [field: SerializeField] public int Speed { get; private set; }
+        public Node() : this(0) { }
+        public Node(int depth) { if (depth > 0) Parent = new Node(depth - 1); }
+    }
+    """
+    let text = source as NSString
+    let model = SyntaxModel(text: source, spec: Languages.csharp)
+    let url = URL(fileURLWithPath: "/tmp/Node.cs")
+    let document = NavDocument(url: url, relPath: "Node.cs", model: model, outline: OutlineBuilder.build(model: model))
+    func at(_ context: String, _ word: String) -> Int {
+        text.range(of: context).location + (context as NSString).range(of: word).location
+    }
+    func target(_ range: NSRange) -> NavTarget {
+        let start = model.position(at: range.location)
+        return NavTarget(url: url, range: LSPRange(start: start,
+                                                   end: LSPPosition(line: start.line, character: start.character + range.length)))
+    }
+    let parent = target(NSRange(location: at("public Node Parent;", "Parent"), length: 6))
+    let depth = target(text.range(of: "public int Depth => Parent == null ? 0 : Parent.Depth + 1;"))
+    let score = target(text.range(of: "[Obsolete(\"x\")]\n    public int Score { get { return Depth; } }"))
+    let constructor = target(text.range(of: "public Node(int depth) { if (depth > 0) Parent = new Node(depth - 1); }"))
+    let speed = target(text.range(of: "[field: SerializeField] public int Speed { get; private set; }"))
+    let empty = target(text.range(of: "public Node() : this(0) { }"))
+    check(document.declares([speed], at: at("public int Speed", "Speed")), "свойство с атрибутом в той же строке")
+    check(document.declares([empty], at: at("public Node() :", "Node")), "перегрузка конструктора — тоже объявление")
+    check(document.declares([parent], at: at("public Node Parent;", "Parent")), "имя поля — его объявление")
+    check(!document.declares([parent], at: at("Parent == null", "Parent")), "обращение к полю — не объявление")
+    check(document.declares([depth], at: at("public int Depth", "Depth")), "имя свойства внутри объявления целиком")
+    check(!document.declares([depth], at: at("Parent.Depth", "Depth")), "свойство из собственного тела — не объявление")
+    check(document.declares([score], at: at("public int Score", "Score")), "свойство с атрибутом строкой выше")
+    check(document.declares([constructor], at: at("public Node(int", "Node")), "имя конструктора — его объявление")
+    check(!document.declares([constructor], at: at("new Node(depth", "Node")), "new Node() в самом конструкторе — не объявление")
+    check(!document.declares([NavTarget(url: URL(fileURLWithPath: "/tmp/Other.cs"), range: parent.range)],
+                             at: at("public Node Parent;", "Parent")), "то же место в другом файле — не это объявление")
+}
 
 let moveCandidates = LocalNavigator(index: symbolIndex, document: NavDocument(
     url: navRoot.appendingPathComponent("x.cs"), relPath: "x.cs",
@@ -3529,6 +3999,51 @@ let longName = "VeryLongGeneratedSerializationContractForPlayer.g.cs"
 let shortName = Tabs.shortened(longName)
 check(shortName.count == 36 && shortName.hasPrefix("VeryLong") && shortName.hasSuffix("Player.g.cs") && shortName.contains("…"),
       "длинное имя — многоточие посередине, конец с расширением цел (получено \(shortName))")
+
+// ─────────────────────── Куда попасть, открыв файл ───────────────────────
+section("Переход к месту")
+let landingTarget = NSRange(location: 4_000, length: 12)
+check(Landing.start(target: landingTarget, hasSaved: true) == .target(landingTarget),
+      "переход важнее места, где вкладку оставили")
+check(Landing.start(target: landingTarget, hasSaved: false) == .target(landingTarget), "новая вкладка — на месте перехода")
+check(Landing.start(target: nil, hasSaved: true) == .saved, "просто вкладка — где её оставили")
+check(Landing.start(target: nil, hasSaved: false) == .top, "новая без перехода — с начала")
+
+var landingState = Landing(range: landingTarget, now: 100)
+check(!landingState.needsFix(selection: landingTarget, onScreen: true), "место на экране и выделено — поправлять нечего")
+check(!landingState.isOver(now: 100.5), "пока не вышло время, место держится")
+check(landingState.needsFix(selection: landingTarget, onScreen: false),
+      "экран увели (восстановили прокрутку вкладки, прокрутили в начало) — поставить снова")
+check(landingState.needsFix(selection: NSRange(location: 0, length: 0), onScreen: false),
+      "выделение сбросили в начало файла — поставить снова")
+check(!landingState.isOver(now: 100.5), "после поправки место держится дальше")
+check(landingState.isOver(now: 100 + Landing.holdTime), "время вышло — переход встал")
+var stubbornLanding = Landing(range: landingTarget, now: 0)
+var landingFixes = 0
+while stubbornLanding.needsFix(selection: landingTarget, onScreen: false) { landingFixes += 1 }
+check(landingFixes == Landing.maxFixes && stubbornLanding.isOver(now: 0),
+      "с тем, кто уводит экран на каждом витке, не спорим без конца (поправок: \(landingFixes))")
+check(Landing.checkDelays.first == 0 && Landing.checkDelays.last == Landing.holdTime,
+      "первая проверка — на следующем витке, последняя — когда время вышло")
+
+// Прокрутка к цели, как в Rider: видна с запасом — не двигать, нет — посередине.
+check(Landing.isVisible(target: 400...415, visible: 300...900, margin: 30), "цель на экране — экран не двигается")
+check(!Landing.isVisible(target: 305...320, visible: 300...900, margin: 30),
+      "у самого верхнего края, в пределах запаса, — не считается видной")
+check(!Landing.isVisible(target: 880...895, visible: 300...900, margin: 30),
+      "у нижнего края, в пределах запаса, — тоже")
+check(!Landing.isVisible(target: 20_000...20_015, visible: 0...600, margin: 30), "далеко внизу — не видна")
+check(Landing.centeredTop(target: 20_000...20_015, height: 600, margin: 30) == 19_707.5, "невидимая — посередине")
+check(Landing.centeredTop(target: 305...320, height: 600, margin: 30) == 12.5, "у края — тоже к середине")
+check(Landing.centeredTop(target: 1_000...5_000, height: 600, margin: 30) == 970,
+      "блок выше экрана — его начало, с запасом сверху")
+check(Landing.isVisible(target: 1_000...5_000, visible: 970...1_570, margin: 30),
+      "блок выше экрана, начало видно с запасом — на месте, поправлять нечего")
+check(!Landing.isVisible(target: 100...115, visible: 0...0, margin: 30)
+      && Landing.centeredTop(target: 100...115, height: 0, margin: 30) == 100,
+      "у вьюхи ещё нет размера — к верхнему краю, поправит проверка после раскладки")
+check(Landing.isVisible(target: 100...115, visible: 100...100, margin: 30),
+      "без размера и уже у края — на месте, пока вьюха не получит размер")
 
 // ─────────────────────── Открытие снаружи ───────────────────────
 section("OpenRequest")
@@ -4483,6 +4998,19 @@ check(!Rename.isOccurrence("Ru", of: "Run") && !Rename.isOccurrence("un(", of: "
       "правка, съехавшая с имени, — не вхождение")
 check(Rename.apply([(NSRange(location: 0, length: 1), "BB"), (NSRange(location: 2, length: 1), "DD")], to: "a c") == "BB DD",
       "правки применяются с конца и не сдвигают друг друга")
+do {
+    // Отмена переименования по проекту: обратные правки — в тексте после прямых.
+    let before = "var hp = hp + hpMax; // hp"
+    let edits: [(range: NSRange, text: String)] = [(NSRange(location: 9, length: 2), "health"),
+                                                   (NSRange(location: 4, length: 2), "health")]
+    let after = Rename.apply(edits, to: before)
+    let inverse = Rename.inverse(of: edits, in: before as NSString)
+    check(after == "var health = health + hpMax; // hp", "прямые правки (получено \(after ?? "nil"))")
+    check(inverse.map { $0.range } == [NSRange(location: 4, length: 6), NSRange(location: 13, length: 6)]
+            && inverse.allSatisfy { $0.text == "hp" },
+          "обратные правки — в координатах текста после прямых, в каком порядке те ни пришли")
+    check(after.flatMap { Rename.apply(inverse, to: $0) } == before, "обратные правки возвращают текст как был")
+}
 
 section("Ошибки и сигнатуры: типы")
 
@@ -4498,6 +5026,31 @@ let diagnosticsSample = RustlynDiagnostics(items: [
     RustlynDiagnostic(range: NSRange(location: 2, length: 1), severity: .warning, code: "CS0168", message: "y"),
 ], semantic: true)
 check(diagnosticsSample.errors == 1 && diagnosticsSample.warnings == 1, "ошибки и предупреждения считаются порознь")
+// Почему подчёркнуто: под мышью и у курсора ошибку ищут там же, где нарисована волна.
+let missingSemicolon = RustlynDiagnostic(range: NSRange(location: 9, length: 0), severity: .error,
+                                         code: "CS1002", message: "; expected")
+check(missingSemicolon.underline(textLength: 20) == NSRange(location: 8, length: 1),
+      "пропущенная ; — волна под символом перед ней")
+let longWarning = RustlynDiagnostic(range: NSRange(location: 15, length: 10), severity: .warning,
+                                    code: "CS0168", message: "unused")
+check(longWarning.underline(textLength: 20) == NSRange(location: 15, length: 5), "волна — не дальше конца текста")
+check(RustlynDiagnostic(range: NSRange(location: 30, length: 0), severity: .error, code: "CS1513", message: "}")
+        .underline(textLength: 20) == NSRange(location: 19, length: 1), "ошибка за концом текста — под последним символом")
+let unknownName = RustlynDiagnostic(range: NSRange(location: 2, length: 3), severity: .error,
+                                    code: "CS0103", message: "The name 'foo' does not exist in the current context")
+let explicitType = RustlynDiagnostic(range: NSRange(location: 0, length: 6), severity: .info,
+                                     code: "IDE0008", message: "Use explicit type instead of 'var'")
+let fileProblems = [explicitType, unknownName, missingSemicolon, longWarning, unknownName]
+check(RustlynDiagnostic.under(3, in: fileProblems, textLength: 20).map(\.code) == ["CS0103", "IDE0008"],
+      "под мышью — все ошибки этого места, ошибка выше подсказки, повтор — один раз")
+check(RustlynDiagnostic.under(8, in: fileProblems, textLength: 20).map(\.code) == ["CS1002"]
+        && RustlynDiagnostic.under(9, in: fileProblems, textLength: 20).isEmpty,
+      "пропущенная ; — там, где волна, а не за ней")
+check(RustlynDiagnostic.at(caret: 5, in: fileProblems, textLength: 20).map(\.code) == ["CS0103", "IDE0008"],
+      "курсор сразу за словом с ошибкой — ошибка его")
+check(RustlynDiagnostic.at(caret: 9, in: fileProblems, textLength: 20).map(\.code) == ["CS1002"]
+        && RustlynDiagnostic.at(caret: 12, in: fileProblems, textLength: 20).isEmpty,
+      "курсор там, где не хватает ;, — она; мимо волн — ничего")
 
 section("Сочетания клавиш")
 
@@ -4857,6 +5410,174 @@ do {
           "версия из Directory.Packages.props, id без учёта регистра")
 }
 
+// ───────────────────────────── NuGet: restore ─────────────────────────────
+section("NuGet: restore")
+do {
+    let conditional = """
+    <Project Sdk="Microsoft.NET.Sdk">
+      <ItemGroup>
+        <PackageReference Include="Always" Version="1.0.0" />
+        <PackageReference Include="Own" Version="1.0.0" Condition="'$(OS)' == 'Windows_NT'" />
+      </ItemGroup>
+      <ItemGroup Condition=" '$(Configuration)' == 'Debug' ">
+        <PackageReference Include="InGroup" Version="1.0.0" />
+        <PackageReference Include="Twice" Version="1.0.0" />
+      </ItemGroup>
+      <ItemGroup><PackageReference Include="Twice" Version="1.0.0" /></ItemGroup>
+      <Choose>
+        <When Condition="'$(TargetFramework)' == 'net8.0'">
+          <ItemGroup><PackageReference Include="InWhen" Version="1.0.0" /></ItemGroup>
+        </When>
+        <Otherwise>
+          <ItemGroup><PackageReference Include="InOtherwise" Version="1.0.0" /></ItemGroup>
+        </Otherwise>
+      </Choose>
+      <Target Name="Late"><ItemGroup><PackageReference Include="InTarget" Version="1.0.0" /></ItemGroup></Target>
+      <ItemGroup><PackageReference Include="After" Version="1.0.0" /></ItemGroup>
+    </Project>
+    """
+    let marked = NuGetProjects.packageReferences(in: conditional)
+    check(marked.filter { !$0.isConditional }.map(\.id) == ["Always", "Twice", "After"]
+            && marked.filter(\.isConditional).map(\.id) == ["Own", "InGroup", "InWhen", "InOtherwise", "InTarget"],
+          "под условием: своё, ItemGroup, When/Otherwise, Target; повтор без условия — всегда (\(marked.map { "\($0.id):\($0.isConditional)" }))")
+    check(NuGetRestore.explicitIDs([NuGetReference(id: "A;B"), NuGetReference(id: "$(Name)"),
+                                    NuGetReference(id: "c", isConditional: true), NuGetReference(id: "a"),
+                                    NuGetReference(id: "Microsoft.AspNetCore.App")]) == ["A", "B"],
+          "прямо по имени: A;B — два пакета, без свойств, условных, повторов и того, что забирает SDK")
+    check(NuGetProjects.restoreCommand(project: "My App/App.csproj") == "dotnet restore 'My App/App.csproj'",
+          "restore — по проекту, путь в кавычках")
+    check(NuGetRestore.isAssets("/p/Server/obj/project.assets.json") && NuGetRestore.isRelevant("/p/Server/Server.csproj")
+            && NuGetRestore.isRelevant("/p/Directory.Packages.props") && !NuGetRestore.isRelevant("/p/Server/Program.cs")
+            && !NuGetRestore.isAssets("/p/Temp/obj/Debug/Game/project.assets.json"),
+          "что поменялось: проекты, props и project.assets.json рядом с проектом")
+
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("pilot-restore-\(getpid())")
+    try? fm.removeItem(at: dir)
+    defer { try? fm.removeItem(at: dir) }
+    func put(_ path: String, _ text: String) {
+        let url = dir.appendingPathComponent(path)
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+    }
+    func touch(_ path: String, secondsAgo: TimeInterval) {
+        try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -secondsAgo)],
+                              ofItemAtPath: dir.appendingPathComponent(path).path)
+    }
+    let packages = dir.appendingPathComponent("packages").path
+    try? fm.createDirectory(atPath: packages + "/newtonsoft.json/13.0.3", withIntermediateDirectories: true)
+    // Что restore оставляет, когда пакет не нашёлся и лента не пустила:
+    // файл есть, пакета в нём нет, а причина — в logs.
+    let assets = """
+    {
+      "version": 3,
+      "targets": { "net8.0": { "Newtonsoft.Json/13.0.3": { "type": "package" }, "Lib/1.0.0": { "type": "project" } } },
+      "libraries": {
+        "Newtonsoft.Json/13.0.3": { "type": "package", "path": "newtonsoft.json/13.0.3" },
+        "Gone.Pkg/1.0.0": { "type": "package", "path": "gone.pkg/1.0.0" },
+        "Lib/1.0.0": { "type": "project", "path": "../Lib/Lib.csproj" }
+      },
+      "packageFolders": { "\(packages)/": {} },
+      "project": { "frameworks": { "net8.0": { "dependencies": {
+        "Newtonsoft.Json": { "target": "Package", "version": "[13.0.3, )" },
+        "Missing.Pkg": { "target": "Package", "version": "[1.0.0, )" },
+        "gone.pkg": { "target": "Package", "version": "[1.0.0, )" }
+      } } } },
+      "logs": [
+        { "code": "NU1101", "level": "Error", "libraryId": "Missing.Pkg",
+          "message": "Unable to find package Missing.Pkg. No packages exist with this id in source(s): nuget.org" },
+        { "code": "NU1301", "level": "Error",
+          "message": "Unable to load the service index for source https://feed/index.json.\\n  Response status code does not indicate success: 401 (Unauthorized)." },
+        { "code": "NU1603", "level": "Warning", "libraryId": "Newtonsoft.Json", "message": "approximate best match" }
+      ]
+    }
+    """
+    let parsed = NuGetAssets(Data(assets.utf8))
+    check(parsed?.requested.count == 3 && parsed?.found == ["newtonsoft.json", "gone.pkg", "lib"]
+            && parsed?.packages.map(\.id) == ["Gone.Pkg", "Newtonsoft.Json"] && parsed?.failures.count == 2,
+          "project.assets.json: что просили, что нашлось, папки пакетов и ошибки без предупреждений")
+    check(NuGetAssets(Data("{\"version\": 3, \"libr".utf8)) == nil, "недописанный файл — nil")
+
+    let server = """
+    <Project Sdk="Microsoft.NET.Sdk">
+      <ItemGroup>
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+        <PackageReference Include="Missing.Pkg" Version="1.0.0" />
+        <PackageReference Include="Gone.Pkg" Version="1.0.0" />
+        <PackageReference Include="New.Pkg" Version="2.0.0" />
+        <PackageReference Include="Windows.Only" Version="1.0.0" Condition="'$(OS)' == 'Windows_NT'" />
+        <PackageReference Include="Microsoft.AspNetCore.App" />
+      </ItemGroup>
+    </Project>
+    """
+    let sdk = { (id: String) in "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><PackageReference Include=\"\(id)\" Version=\"1.0.0\" /></ItemGroup></Project>" }
+    put("Server/Server.csproj", server)
+    put("Server/obj/project.assets.json", assets)
+    // .csproj правили после restore.
+    touch("Server/obj/project.assets.json", secondsAgo: 60)
+    put("Server.Tests/Server.Tests.csproj", sdk("xunit"))
+    put("Plain/Plain.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+    // obj/ переназначен — где restore оставил файл, неизвестно.
+    put("Artifacts/Tool/Tool.csproj", sdk("Tool.Pkg"))
+    put("Artifacts/Directory.Build.props", "<Project><PropertyGroup><UseArtifactsOutput>true</UseArtifactsOutput></PropertyGroup></Project>")
+    // Генератор внутри Unity-проекта: его здесь не восстанавливают, и это не повод.
+    put("Client/ProjectSettings/ProjectVersion.txt", "m_EditorVersion: 6000.0.1f1\n")
+    try? fm.createDirectory(at: dir.appendingPathComponent("Client/Assets"), withIntermediateDirectories: true)
+    put("Client/Generators/Generators.csproj", sdk("Microsoft.CodeAnalysis.CSharp"))
+
+    let report = NuGetRestore.check(root: dir, projects: NuGetProjects.discover(root: dir))
+    let shape = report.problems.map { "\($0.project) \($0.reason) \($0.packages.joined(separator: ","))" }
+    check(report.projectCount == 5 && report.hasProjects && report.restoredSomewhere, "проекты посчитаны (\(report.projectCount))")
+    check(shape == ["Server/Server.csproj failed Missing.Pkg", "Server/Server.csproj missing Gone.Pkg",
+                    "Server/Server.csproj outdated New.Pkg", "Server.Tests/Server.Tests.csproj notRestored xunit"],
+          "не нашёлся, пропал с диска, добавлен после restore, restore не было; Unity и артефакты не в счёт (\(shape))")
+    check(report.problems.first?.messages == [
+            "NU1101: Unable to find package Missing.Pkg. No packages exist with this id in source(s): nuget.org",
+            "NU1301: Unable to load the service index for source https://feed/index.json. Response status code does not indicate success: 401 (Unauthorized).",
+          ], "что сказал restore: сперва о пакете, потом о ленте, одной строкой")
+    check(report.needsAttention && report.projects == ["Server/Server.csproj", "Server.Tests/Server.Tests.csproj"],
+          "повод открыть окно; restore — сперва там, где он не удался")
+    check(report.headline == "Не восстановлены пакеты: Missing.Pkg, Gone.Pkg, New.Pkg, xunit"
+            && report.reasons == ["Server: restore не смог их найти", "Server: их папок нет в кэше NuGet",
+                                  "Server: добавлены после последнего restore", "Server.Tests: restore здесь ещё не запускался"]
+            && report.details == "Server: Missing.Pkg, Gone.Pkg, New.Pkg\nServer.Tests: xunit",
+          "словами: пакеты, причины по проектам, подсказка (\(report.headline); \(report.reasons))")
+    check(NuGetRestoreReport.list(["a", "b", "c", "d", "e"]) == "a, b, c и ещё 2" && NuGetRestoreReport.list(["a", "b", "c", "d"]) == "a, b, c, d",
+          "длинный список — первые три и число")
+    // restore видел ровно этот .csproj: ссылки, которой нет в его файле, лишил
+    // restore сам SDK или Directory.Build.targets, — это не «добавлена после».
+    touch("Server/Server.csproj", secondsAgo: 120)
+    let seen = NuGetRestore.check(root: dir, projects: NuGetProjects.discover(root: dir))
+    check(seen.problems.map(\.reason) == [.failed, .missing, .notRestored],
+          ".csproj старше restore — ссылки не устарели (\(seen.problems.map(\.reason)))")
+
+    // Собранный проект в порядке, а тесты рядом не восстанавливали — их здесь не собирают.
+    // Пакет, найденный как проект, — тоже найден.
+    put("Server/obj/project.assets.json", """
+    { "libraries": { "Newtonsoft.Json/13.0.3": { "type": "package", "path": "newtonsoft.json/13.0.3" },
+                     "Gone.Pkg/1.0.0": { "type": "package", "path": "gone.pkg/1.0.0" },
+                     "New.Pkg/2.0.0": { "type": "package", "path": "new.pkg/2.0.0" },
+                     "Missing.Pkg/1.0.0": { "type": "project", "path": "../Missing/Missing.csproj" } },
+      "packageFolders": { "\(packages)/": {} },
+      "project": { "frameworks": { "net8.0": { "dependencies": {
+        "Newtonsoft.Json": { "target": "Package" }, "Missing.Pkg": { "target": "Package" },
+        "Gone.Pkg": { "target": "Package" }, "New.Pkg": { "target": "Package" } } } } } }
+    """)
+    try? fm.createDirectory(atPath: packages + "/gone.pkg/1.0.0", withIntermediateDirectories: true)
+    try? fm.createDirectory(atPath: packages + "/new.pkg/2.0.0", withIntermediateDirectories: true)
+    let quiet = NuGetRestore.check(root: dir, projects: NuGetProjects.discover(root: dir))
+    check(quiet.problems.map(\.reason) == [.notRestored] && !quiet.needsAttention,
+          "остались только тесты без restore — не повод (\(quiet.problems.map { "\($0.project) \($0.reason)" }))")
+    try? fm.removeItem(at: dir.appendingPathComponent("Server/obj"))
+    let fresh = NuGetRestore.check(root: dir, projects: NuGetProjects.discover(root: dir))
+    check(fresh.problems.count == 2 && fresh.problems.allSatisfy { $0.reason == .notRestored } && !fresh.restoredSomewhere
+            && fresh.needsAttention, "restore не было нигде — свежий клон: повод")
+    put("Server/obj/project.assets.json", "{\"version\": 3, \"libr")
+    let writing = NuGetRestore.check(root: dir, projects: NuGetProjects.discover(root: dir))
+    check(writing.problems.map(\.project) == ["Server.Tests/Server.Tests.csproj"] && !writing.needsAttention,
+          "файл дописывают прямо сейчас — проект пропускается, но restore у него был")
+}
+
 // ───────────────────────────── NuGet.Config ─────────────────────────────
 section("NuGet.Config")
 do {
@@ -5085,6 +5806,9 @@ let generic = #"[ConfigModel(typeof(Dictionary<ElementModel, VehicleParametersIt
 check(ConfigCatalog.modelType(in: generic, attribute: "ConfigModel").map(ConfigCatalog.typeNames(in:))
         == ["VehicleParametersItemModel", "ElementModel", "Dictionary"], "имена типа модели, последнее первым")
 check(ConfigCatalog.modelType(in: #"public const string X = "Y";"#, attribute: "ConfigModel") == nil, "без атрибута — модели нет")
+check(ConfigCatalog.modelType(in: #"[ConfigModel(typeof(Dictionary<string, VehiclesTemporaryModel>), true)] public const string X = "X";"#,
+                              attribute: "ConfigModel") == "Dictionary<string, VehiclesTemporaryModel>",
+      "у атрибута модели и другие аргументы после typeof")
 
 // ─────────────────────────── Отладка ───────────────────────────
 section("Отладка: протокол Mono")
@@ -5377,6 +6101,48 @@ do {
           "тесты, бенчмарки и библиотеки — нет")
 }
 
+section("Отладка: вывод программы")
+do {
+    // Так netcoredbg шлёт вывод запущенной программы и свой.
+    check(DebugOutputSource(dapOutput: ["category": "stdout", "output": "[23:45:12 INF] Player stas joined\n"]) == .program
+            && DebugOutputSource(dapOutput: ["category": "stderr", "output": "plain stderr line\n"]) == .program,
+          "stdout и stderr процесса — в лог программы")
+    let debugWriteLine: [String: Any] = ["category": "stdout", "output": "Debug.WriteLine message\n",
+                                         "source": ["name": "Program.cs", "path": "/src/Program.cs"]]
+    check(DebugOutputSource(dapOutput: debugWriteLine) == .debugger(category: "stdout"),
+          "Debug.WriteLine (stdout с source) — отладчику: при ▶ его не видно")
+    check(DebugOutputSource(dapOutput: ["output": "x\n"]) == .debugger(category: "console")
+            && DebugOutputSource(dapOutput: ["category": "important", "output": "x\n"]) == .debugger(category: "important"),
+          "сообщения отладчика и без категории — отладчику")
+    check(DebugOutputSource(dapOutput: ["category": "telemetry", "output": "{}"]) == .ignored, "телеметрия не показывается")
+
+    check(DebugTarget.dotnetLaunch(project: URL(fileURLWithPath: "/w/Server/Server.csproj")).hasProgramOutput
+            && !DebugTarget.dotnetAttach(pid: 1, name: "Server").hasProgramOutput
+            && !DebugTarget.unityEditor(pid: 1, port: 56001).hasProgramOutput,
+          "вывод программы есть, только когда Pilot запускает её сам")
+
+    // Куски, как их режет netcoredbg: строка рвётся посреди, длинная — по
+    // 4 КБ, событие со стеком приходит одним куском. Разбор — тот же, что у ▶.
+    var parser = ServerLogParser(timeZone: TimeZone(identifier: "UTC")!)
+    var entries: [ServerLogEntry] = []
+    let chunks = [
+        "plain stdout line\n",
+        "[23:45:12 INF] Player stas joined with 3 items\n",
+        "[23:45:12 ERR] Failed to handle GET /x\nSystem.InvalidOperationException: boom\n   at Program.<Main>$(String[] args) in /src/Program.cs:line 16\n",
+        "partial ", "line end\n",
+        String(repeating: "x", count: 4096), String(repeating: "x", count: 100) + "\n",
+        #"{"@t":"2026-09-27T19:45:33.5323110Z","@m":"Low memory 12MB","@i":"11218d88","@l":"Warning","Free":12}"# + "\n",
+    ]
+    for chunk in chunks {
+        for e in parser.feed(chunk) { if entries.last?.id == e.id { entries[entries.count - 1] = e } else { entries.append(e) } }
+    }
+    for e in parser.finish() { if entries.last?.id == e.id { entries[entries.count - 1] = e } else { entries.append(e) } }
+    check(entries.map(\.level) == [.output, .info, .error, .output, .output, .warning],
+          "уровни событий из кусков отладчика (\(entries.map(\.level)))")
+    check(entries[2].frames.first?.line == 16 && entries[3].message == "partial line end" && entries[4].message.count == 4196,
+          "стек прилип к событию, разорванные строки склеены")
+}
+
 
 section("Пара проектов")
 let pairParent = URL(fileURLWithPath: "/work")
@@ -5508,11 +6274,17 @@ public static class ConfigNames
     public const string RARE_TYPES = "RareTypes";
 }
 """
-check(ConfigLinks.declaration(of: "UserLevels", in: aliasesSource) == .init(constant: "UserLevels", model: "UserLevelsModel", line: 3),
-      "alias с моделью")
-check(ConfigLinks.declaration(of: "RareTypes", in: aliasesSource) == .init(constant: "RARE_TYPES", model: nil, line: 4),
+let aliasDeclarations = ConfigLinks.declarations(in: aliasesSource)
+let userLevelsAlias = aliasDeclarations.first { $0.alias == "UserLevels" }
+check(userLevelsAlias?.constant == "UserLevels" && userLevelsAlias?.line == 3
+        && userLevelsAlias?.types == ["Server.Models.UserLevelsModel"]
+        && userLevelsAlias.flatMap { ConfigLinks.model(inTypeof: $0.types[0], isType: { $0 == "UserLevelsModel" }) } == "UserLevelsModel",
+      "alias с моделью: модель — без пространства имён")
+check(aliasDeclarations.first { $0.alias == "RareTypes" }.map { "\($0.constant):\($0.line):\($0.types)" } == "RARE_TYPES:4:[]",
       "константа названа иначе, модели нет")
-check(ConfigLinks.declaration(of: "GeoPresets", in: aliasesSource)?.model == "Dictionary", "обобщённая модель — короткое имя")
+check(aliasDeclarations.first { $0.alias == "GeoPresets" }
+        .flatMap { ConfigLinks.model(inTypeof: $0.types[0], isType: { $0 == "UserLevelsModel" }) } == nil,
+      "у Dictionary<string, string[]> модели нет: словарь — не тип проекта")
 check(ConfigLinks.alias(declaredIn: "    public const string RARE_TYPES = \"RareTypes\";") == "RareTypes", "alias из строки")
 check(ConfigLinks.jsonProperty(in: "[JsonProperty(\"max_num\")] public int Max;", attribute: "JsonProperty") == "max_num"
         && ConfigLinks.jsonProperty(in: "[JsonProperty(PropertyName = \"x\")] int X;", attribute: "JsonProperty") == "x"
@@ -5522,6 +6294,236 @@ let keyOffset = (configText as NSString).range(of: "max_num").location + 2
 check(ConfigLinks.jsonKey(at: keyOffset, in: configText) == "max_num", "ключ под курсором")
 let valueOffset = (configText as NSString).range(of: "\"max_num\"\n").location + 3
 check(ConfigLinks.jsonKey(at: valueOffset, in: configText) == nil, "строка-значение — не ключ")
+
+section("Конфиги: модель → alias")
+do {
+    // Атрибут модели на той же строке и строками выше; их бывает несколько,
+    // между ними — пустая строка и закомментированный атрибут.
+    let source = """
+    namespace Server.Configs
+    {
+        public static class ConfigAliases
+        {
+            [JsonType(typeof(LevelsModel))] public const string Levels = "Levels";
+            [JsonType(typeof(Dictionary<ElementModel, VehicleItemModel>))]
+            public const string Vehicles = "VehicleParameters";
+            [ConfigPrewarm(typeof(PositionsItemModel))]
+
+            // [ConfigPrewarm(typeof(OldModel))]
+            [ConfigPrewarm(typeof(DirectedPositionsItemModel))]
+            public const string TradePoints = "TradeVehiclePoints"; // typeof(CommentModel)
+            [JsonType(typeof(JobData))] public const string CourierJobData = "CourierJobData";
+            [JsonType(typeof(List<JobData>))] public const string BusJobData = "BusDriverJobData";
+            [JsonType(typeof(global::Server.Jobs.JobData[]))] public const string TAXI_JOB_DATA = "TaxiDriverJobData";
+            [JsonType(typeof(Dictionary<ElementModel, int>))] public const string Prohibited = "ProhibitedVehicles";
+            [JsonType(typeof(Dictionary<string, string[]>))] public const string GeoPresets = "GeoPresets";
+            [JsonType(typeof(UserLevelsModel))] public const string UserLevels = "UserLevels";
+            [JsonType(typeof(Outer.NestedModel))] public const string Nested = "Nested";
+            public static readonly string NotConst = "NotConst";
+            [JsonType(typeof(StaleModel))]
+            private static int counter;
+            public const string Plain = "Plain";
+        }
+    }
+    """
+    let declared = ConfigLinks.declarations(in: source)
+    check(declared.map(\.alias) == ["Levels", "VehicleParameters", "TradeVehiclePoints", "CourierJobData", "BusDriverJobData",
+                                    "TaxiDriverJobData", "ProhibitedVehicles", "GeoPresets", "UserLevels", "Nested", "Plain"],
+          "объявления alias'ов: только const, по порядку (получено \(declared.map(\.alias)))")
+    let levelsLine = "        [JsonType(typeof(LevelsModel))] public const string Levels = \"Levels\";"
+    check(declared.first.map { "\($0.constant):\($0.line):\($0.column)" }
+            == "Levels:4:\((levelsLine as NSString).range(of: "Levels =").location)"
+            && declared.first?.types == ["LevelsModel"], "константа, строка, колонка имени и модель на той же строке")
+    check(declared[1].types == ["Dictionary<ElementModel, VehicleItemModel>"] && declared[1].line == 6,
+          "атрибут строкой выше")
+    check(declared[2].types == ["PositionsItemModel", "DirectedPositionsItemModel"],
+          "несколько атрибутов выше, через пустую строку; закомментированный и typeof в комментарии — не в счёт (получено \(declared[2].types))")
+    check(declared.last?.types == [], "атрибут чужого объявления до константы не доходит")
+    let crlf = ConfigLinks.declarations(in: "[JsonType(typeof(A))]\r\npublic const string X = \"X\";\r\npublic const string Y = \"Y\";")
+    check(crlf.map { "\($0.alias):\($0.line):\($0.types)" } == ["X:1:[\"A\"]", "Y:2:[]"], "\\r\\n — тоже перевод строки")
+
+    check(ConfigLinks.typeNames(inTypeof: "Dictionary<ElementModel, VehicleItemModel>") == ["VehicleItemModel", "ElementModel", "Dictionary"]
+            && ConfigLinks.typeNames(inTypeof: "global::Server.Jobs.JobData[]") == ["JobData"]
+            && ConfigLinks.typeNames(inTypeof: "Dictionary<string, Dictionary<string, int>>") == ["Dictionary", "Dictionary"]
+            && ConfigLinks.typeNames(inTypeof: "Outer.NestedModel") == ["NestedModel"],
+          "имена в typeof: последнее первым, без пространств имён, внешних типов и встроенных")
+    let projectTypes: Set<String> = ["LevelsModel", "LevelsModelBase", "UserLevelsModel", "ElementModel", "VehicleItemModel",
+                                     "PositionsItemModel", "DirectedPositionsItemModel", "JobData", "Outer", "NestedModel", "OldModel",
+                                     "CommentModel", "StaleModel"]
+    let isProjectType = { (name: String) in projectTypes.contains(name) }
+    check(ConfigLinks.model(inTypeof: "Dictionary<ElementModel, VehicleItemModel>", isType: isProjectType) == "VehicleItemModel"
+            && ConfigLinks.model(inTypeof: "Dictionary<ElementModel, int>", isType: isProjectType) == "ElementModel"
+            && ConfigLinks.model(inTypeof: "Dictionary<string, string[]>", isType: isProjectType) == nil,
+          "модель — последнее имя, которое тип проекта: значение словаря, а не ключ")
+
+    let models = ConfigModels(files: [(path: "Server/Configs/ConfigAliases.cs", text: source)])
+    func aliases(_ model: String) -> [String] { models.uses(ofModel: model, isType: isProjectType).map(\.alias) }
+    check(aliases("LevelsModel") == ["Levels"], "модель из typeof в атрибуте → её alias")
+    check(aliases("UserLevelsModel") == ["UserLevels"] && aliases("LevelsModelBase").isEmpty && aliases("Levels").isEmpty,
+          "похожие имена — не она: UserLevelsModel, LevelsModelBase и сама константа Levels")
+    check(aliases("JobData") == ["CourierJobData", "BusDriverJobData", "TaxiDriverJobData"],
+          "несколько alias'ов у одной модели — по порядку; List<…>, массив и полное имя тоже она (получено \(aliases("JobData")))")
+    check(aliases("VehicleItemModel") == ["VehicleParameters"] && aliases("ElementModel") == ["ProhibitedVehicles"],
+          "ключ словаря — не модель, если значение — тип проекта")
+    check(aliases("PositionsItemModel") == ["TradeVehiclePoints"] && aliases("DirectedPositionsItemModel") == ["TradeVehiclePoints"],
+          "у alias'а несколько моделей")
+    check(aliases("OldModel").isEmpty && aliases("CommentModel").isEmpty && aliases("StaleModel").isEmpty,
+          "закомментированное и чужой атрибут — не модели")
+    check(aliases("NestedModel") == ["Nested"] && aliases("Outer").isEmpty, "вложенный тип — модель, внешний — нет")
+    check(models.uses(ofModel: "ElementModel", isType: { _ in false }).map(\.alias) == ["VehicleParameters", "ProhibitedVehicles"],
+          "без индекса типов сам спрошенный тип всё равно считается типом")
+    let courier = models.uses(ofModel: "JobData", isType: isProjectType).first
+    check(courier?.target(root: URL(fileURLWithPath: "/p")).url.path == "/p/Server/Configs/ConfigAliases.cs"
+            && courier?.target(root: URL(fileURLWithPath: "/p")).range?.start.line == 12
+            && courier.map { $0.target(root: URL(fileURLWithPath: "/p")).range?.end.character
+                == ($0.target(root: URL(fileURLWithPath: "/p")).range?.start.character ?? 0) + "CourierJobData".utf16.count } == true,
+          "«Алиас в коде» ведёт к имени константы")
+    check(models.uses(ofAlias: "GeoPresets").count == 1 && models.uses(ofAlias: "Nope").isEmpty, "объявление по alias'у")
+    let sourceLines = ConfigLinks.lines(of: source)
+    let tradeAttributes = ConfigLinks.attributeLines(endingAt: 11, in: sourceLines)
+    check(tradeAttributes.count == 3 && tradeAttributes.compactMap { ConfigCatalog.modelType(in: $0, attribute: "ConfigPrewarm") }
+            == ["DirectedPositionsItemModel", "PositionsItemModel"],
+          "строки атрибутов над константой — для «Модели конфига» (получено \(tradeAttributes))")
+    check(ConfigLinks.attributeLines(endingAt: 6, in: sourceLines).compactMap { ConfigCatalog.modelType(in: $0, attribute: "JsonType") }
+            == ["Dictionary<ElementModel, VehicleItemModel>"]
+            && ConfigLinks.attributeLines(endingAt: 4, in: sourceLines).count == 1,
+          "атрибут строкой выше; над первой константой атрибутов нет")
+
+    check(ConfigLinks.isKey("salary", in: "\"salary\" : 5,") && !ConfigLinks.isKey("salary", in: "\"title\": \"salary\",")
+            && ConfigLinks.isKey("salary", in: "{\"name\": \"salary\", \"salary\": 5}"), "ключ JSON, а не такое значение")
+}
+
+section("Конфиги: модель в паре")
+do {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("pilot-config-models-\(getpid())")
+    try? FileManager.default.removeItem(at: root)
+    let files: [String: String] = [
+        "Configs/meta.json": #"{"shared": [{"path": "levels/levels.json", "alias": "Levels"}, {"path": "jobs/courier.json", "alias": "CourierJobData"}, {"path": "jobs/bus.json", "alias": "BusDriverJobData"}]}"#,
+        "Configs/levels/levels.json": "{\n  \"max_level\": 10\n}",
+        "Configs/jobs/courier.json": "{ \"salary\": 5, \"name\": \"courier\" }",
+        "Configs/jobs/bus.json": "{\n  \"title\": \"salary\",\n  \"salary\": 7\n}",
+        "Server/Configs/ConfigAliases.cs": """
+            public static class ConfigAliases
+            {
+                [JsonType(typeof(LevelsModel))] public const string Levels = "Levels";
+                [JsonType(typeof(JobData))] public const string CourierJobData = "CourierJobData";
+                [JsonType(typeof(List<JobData>))]
+                public const string BusJobData = "BusDriverJobData";
+            }
+            """,
+        "Server/Models/LevelsModel.cs": "public class LevelsModel\n{\n    [JsonProperty(\"max_level\")] public int MaxLevel;\n}",
+        "Server/Jobs/JobData.cs": "public class JobData\n{\n    [JsonProperty(\"salary\")] public int Salary;\n}",
+        "Server/Levels.cs": "class Levels { void Load() { var levels = Config.Get<LevelsModel>(ConfigAliases.Levels); } }",
+    ]
+    for (path, text) in files {
+        let url = root.appendingPathComponent(path)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+    }
+    let csharp = files.keys.filter { $0.hasSuffix(".cs") }.sorted()
+    let side = PairIndex(root: root, label: "server",
+                         symbols: SymbolIndex.build(root: root, files: csharp, shouldStop: { false }),
+                         files: FileIndex(root: root, paths: files.keys.sorted()))
+    var pairRules = ConfigRules()
+    pairRules.registry = "meta.json"
+    pairRules.aliases = "ConfigAliases"
+    func links(_ file: String, line: String, model: String?) -> [PaletteItem] {
+        PairQueries.configLinks(file: root.appendingPathComponent(file), text: files[file] ?? "", offset: 0, line: line,
+                                model: model, sides: [side], rules: pairRules)
+    }
+    func describe(_ items: [PaletteItem]) -> [String] {
+        items.map { "\($0.target.url.lastPathComponent):\($0.target.range?.start.line ?? -1):\($0.trailing ?? "")" }
+    }
+
+    let levels = describe(links("Server/Models/LevelsModel.cs", line: "public class LevelsModel", model: "LevelsModel"))
+    check(levels.first == "levels.json:-1:конфиг" && levels.contains("LevelsModel.cs:0:модель")
+            && levels.contains("ConfigAliases.cs:2:alias") && levels.contains { $0.hasPrefix("Levels.cs:0:читает") },
+          "объявление модели: её конфиг первым, она сама, alias и кто читает (получено \(levels))")
+    let jobs = describe(links("Server/Jobs/JobData.cs", line: "public class JobData", model: "JobData"))
+    check(Array(jobs.prefix(2)) == ["courier.json:-1:конфиг", "bus.json:-1:конфиг"]
+            && jobs.contains("ConfigAliases.cs:3:alias") && jobs.contains("ConfigAliases.cs:5:alias"),
+          "модель нескольких alias'ов — все их конфиги и alias'ы (получено \(jobs))")
+    let key = describe(links("Server/Jobs/JobData.cs", line: "    [JsonProperty(\"salary\")] public int Salary;", model: "JobData"))
+    check(Array(key.prefix(2)) == ["courier.json:0:конфиг · :1", "bus.json:2:конфиг · :3"],
+          "поле модели: первыми — ключ в её конфигах, а не такое же значение (получено \(key))")
+    let unowned = describe(links("Server/Jobs/JobData.cs", line: "    [JsonProperty(\"salary\")] public int Salary;", model: nil))
+    check(unowned.first == "JobData.cs:2:поле · :3", "без модели — как раньше: сначала поля с этим ключом (получено \(unowned))")
+    let busAlias = describe(links("Server/Configs/ConfigAliases.cs",
+                                  line: "    public const string BusJobData = \"BusDriverJobData\";", model: nil))
+    check(busAlias.first == "bus.json:-1:конфиг" && busAlias.contains("JobData.cs:0:модель"),
+          "строка alias'а: модель из List<…> в атрибуте строкой выше (получено \(busAlias))")
+    try? FileManager.default.removeItem(at: root)
+}
+
+section("Датаграммы: одна")
+do {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("pilot-datagram-\(getpid())")
+    try? FileManager.default.removeItem(at: root)
+    let theirText = """
+    namespace Client.Net
+    {
+        public struct HitPacket : IPacket
+        {
+            public int Damage;
+            public void Write(PacketWriter w) { w.WriteInt(Damage); }
+            public void Read(ref PacketReader r) { Damage = r.ReadInt(); }
+        }
+        public interface IPacketExtra : IPacket { }
+        public struct Ping : IPacket
+        {
+            public int Stamp;
+            public void Write(PacketWriter w) { w.WriteInt(Stamp); }
+            public void Read(ref PacketReader r) { Stamp = r.ReadInt(); }
+        }
+    }
+    """
+    let theirURL = root.appendingPathComponent("Net/Packets.cs")
+    try? FileManager.default.createDirectory(at: theirURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? theirText.write(to: theirURL, atomically: true, encoding: .utf8)
+    let theirs = SymbolIndex.build(root: root, files: ["Net/Packets.cs"], shouldStop: { false }) ?? SymbolIndex(root: root)
+    check(PairQueries.isDatagram("HitPacket", in: theirs, rules: packetRules)
+            && !PairQueries.isDatagram("IPacketExtra", in: theirs, rules: packetRules)
+            && !PairQueries.isDatagram("Nope", in: theirs, rules: packetRules),
+          "датаграмма — тип, который реализует интерфейс, но не сам интерфейс")
+
+    let ownText = """
+    namespace Server.Net
+    {
+        public struct HitPacket : IPacket
+        {
+            public uint Damage;
+            public void Write(PacketWriter w) { w.WriteUInt(Damage); }
+            public void Read(ref PacketReader r) { Damage = r.ReadUInt(); }
+        }
+        public struct Ping : IPacket
+        {
+            public int Stamp;
+            public void Write(PacketWriter w) { w.WriteInt(Stamp); }
+            public void Read(ref PacketReader r) { Stamp = r.ReadInt(); }
+        }
+    }
+    """
+    let ownURL = URL(fileURLWithPath: "/own/Net/Packets.cs")
+    func report(_ name: String) -> [PaletteItem]? {
+        PairQueries.datagramReport(named: name, ownText: ownText, ownURL: ownURL, ownPath: "Net/Packets.cs", ownLabel: "server",
+                                   theirs: theirs, label: "client", rules: packetRules)
+    }
+    let hit = report("HitPacket") ?? []
+    check(hit.first?.target.url.standardizedFileURL == theirURL.standardizedFileURL && hit.first?.trailing == "двойник"
+            && hit.first?.target.range?.start.line == 2,
+          "первая строка — сама датаграмма во второй половине")
+    let wire = hit.dropFirst().map { $0.trailing ?? "" }
+    check(wire.first == "провод" && wire.last == "имена" && wire.firstIndex(of: "имена")! > wire.lastIndex(of: "провод")!,
+          "расхождения: сначала те, что ломают провод (получено \(wire))")
+    check(hit.count > 1 && hit[1].target.url == ownURL && hit[1].target.range?.start.line == 5,
+          "расхождение ведёт к шагу в своём файле (получено \(hit.dropFirst().map { $0.target.range?.start.line ?? -1 }))")
+    check(report("Ping")?.count == 1, "сходится — только двойник")
+    check(report("Missing") == nil, "во второй половине нет — nil")
+    check(PairQueries.position(of: 4, in: "ab\ncd") == LSPPosition(line: 1, character: 1)
+            && PairQueries.position(of: 0, in: "ab") == LSPPosition(line: 0, character: 0),
+          "смещение → строка и колонка")
+    try? FileManager.default.removeItem(at: root)
+}
 section("Импорт из Rider")
 
 check(RiderKeystroke.shortcut("meta alt B") == Shortcut("b", command: true, option: true)
@@ -5550,6 +6552,14 @@ check(swapTest.keystrokes("X", in: "mine") == [RiderKeystroke(first: "meta shift
       "у маковской раскладки ctrl родителя становится ⌘")
 check(swapTest.keystrokes("X", in: "$default") == [RiderKeystroke(first: "control shift K")]
         && swapTest.keystrokes("Y", in: "mine") == nil, "у самой $default — как записано")
+let errorDescription = RiderKeymaps(keymaps: [
+    "mine": RiderKeymap(name: "mine", parent: nil,
+                        actions: ["ShowErrorDescription": [RiderKeystroke(first: "meta alt F1")]]),
+])
+check(EditorCommand.problemDescription.defaultShortcut == Shortcut("f1", command: true)
+        && RiderImport.keymap("mine", from: errorDescription, over: Keymap()).keymap
+            .shortcut(for: .problemDescription) == Shortcut("f1", command: true, option: true),
+      "описание ошибки — ⌘F1, как в Rider, и переносится из его ShowErrorDescription")
 let macSave = bundled.keystrokes("SaveAll", in: "Mac OS X 10.5+")?.first?.shortcut
 check(macSave == Shortcut("s", command: true), "macOS: сохранить всё — ⌘S (получено \(macSave?.display ?? "nil"))")
 
@@ -6143,6 +7153,319 @@ do {
           "сборка файла — из свежего графа, .mvfrm.rsp мимо")
     check(UnityGenerators.responseFile(for: "Assets/Game/Other.cs", project: dir) == nil,
           "файла, который Unity не компилировала, нет ни в одной сборке")
+    try? "-target:library\n\"Assets/Tools/Menu.cs\"".write(to: new.appendingPathComponent("Tools.rsp"),
+                                                          atomically: true, encoding: .utf8)
+    let found = UnityGenerators.responseFiles(for: ["Assets/Game/Gifts.cs", "Assets/Tools/Menu.cs", "Assets/Tools/Men"],
+                                              project: dir)
+    check(found["Assets/Game/Gifts.cs"]?.lastPathComponent == "Game.rsp"
+            && found["Assets/Tools/Menu.cs"]?.lastPathComponent == "Tools.rsp"
+            && found["Assets/Tools/Men"] == nil,
+          "сборки многих файлов за один проход; последняя строка без перевода строки, начало имени — не совпадение")
+    check(UnityGenerators.responseFile(assembly: "Game", project: dir)?.resolvingSymlinksInPath().path
+            == new.appendingPathComponent("Game.rsp").resolvingSymlinksInPath().path,
+          "rsp сборки по имени — из свежего графа")
+    check(UnityGenerators.declaredTypes(in: "public partial record class Order(int Id);") == ["Order"],
+          "record class: тип — Order, а не class")
+}
+
+section("Unity: сгенерированный код — прогон, отметка, раскладка")
+do {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("pilot-generated-runs-\(getpid())")
+    try? fm.removeItem(at: dir)
+    defer { try? fm.removeItem(at: dir) }
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    func write(_ text: String, _ url: URL) {
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+    }
+    func read(_ url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
+    func modified(_ url: URL) -> Date? {
+        (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+    /// Редактор с компилятором: у поддельного `dotnet` — текст скрипта.
+    func makeEditor(_ base: URL, dotnet script: String = "#!/bin/sh\n", executable: Bool = true) {
+        write(script, base.appendingPathComponent("NetCoreRuntime/dotnet"))
+        try? fm.setAttributes([.posixPermissions: executable ? 0o755 : 0o644],
+                              ofItemAtPath: base.appendingPathComponent("NetCoreRuntime/dotnet").path)
+        write("", base.appendingPathComponent("DotNetSdkRoslyn/csc.dll"))
+    }
+
+    let unity2022 = dir.appendingPathComponent("U2022/Contents")
+    makeEditor(unity2022)
+    check(UnityGenerators.compiler(in: unity2022)?.csc.path == unity2022.appendingPathComponent("DotNetSdkRoslyn/csc.dll").path,
+          "Unity 2022: компилятор прямо в Contents")
+    let unity6 = dir.appendingPathComponent("U6/Contents")
+    makeEditor(unity6.appendingPathComponent("Resources/Scripting"))
+    check(UnityGenerators.compiler(in: unity6)?.dotnet.path
+            == unity6.appendingPathComponent("Resources/Scripting/NetCoreRuntime/dotnet").path,
+          "Unity 6: компилятор в Resources/Scripting")
+    let broken = dir.appendingPathComponent("Broken/Contents")
+    makeEditor(broken, executable: false)
+    check(UnityGenerators.compiler(in: broken) == nil, "dotnet, который не запустить, — компилятора нет")
+
+    check(UnityGenerators.optionName("-out:\"Library/A.dll\"") == "out"
+            && UnityGenerators.optionName("/debug:portable") == "debug"
+            && UnityGenerators.optionName("-refonly") == "refonly"
+            && UnityGenerators.optionName("-skipanalyzers+") == "skipanalyzers"
+            && UnityGenerators.optionName("-warnaserror+:CS0168") == "warnaserror"
+            && UnityGenerators.optionName("/Out:x.dll") == "out",
+          "имя ключа csc: с - и /, с :, + и -, регистр не важен")
+    check(UnityGenerators.optionName("\"Assets/A.cs\"") == nil && UnityGenerators.optionName("/Users/me/A.cs") == nil
+            && UnityGenerators.optionName("/out/x.cs") == nil,
+          "исходник и абсолютный путь — не ключи")
+    check(UnityGenerators.optionValue("-r:\"/a b/c.dll\"") == "/a b/c.dll", "значение ключа — без кавычек")
+
+    // Аргументы прогона. У rsp Unity нет перевода строки в конце.
+    let rsp = """
+    -target:library
+    -out:"Library/Bee/artifacts/1.dag/Game.dll"
+    -refout:"Library/Bee/artifacts/1.dag/Game.ref.dll"
+    -define:UNITY_2022
+    -r:"/Editor/UnityEngine.dll"
+    -analyzer:"Assets/Plugins/Gen.dll"
+    /doc:"Library/Bee/artifacts/1.dag/Game.xml"
+    -warnaserror+
+    /debug:portable
+    /additionalfile:"Library/Bee/artifacts/1.dag/Game.UnityAdditionalFile.txt"
+    "Assets/A.cs"
+    "Assets/Gone.cs"
+    "Assets/B.cs"
+    """
+    let scratch = URL(fileURLWithPath: "/s/out.dll")
+    let arguments = UnityGenerators.arguments(rspText: rsp, output: scratch, generated: URL(fileURLWithPath: "/s/gen"),
+                                              skipAnalyzers: true, sourceExists: { $0 != "Assets/Gone.cs" })
+    check(arguments == [
+        "-target:library", "-define:UNITY_2022", "-r:\"/Editor/UnityEngine.dll\"", "-analyzer:\"Assets/Plugins/Gen.dll\"",
+        "/debug:portable", "/additionalfile:\"Library/Bee/artifacts/1.dag/Game.UnityAdditionalFile.txt\"",
+        "\"Assets/A.cs\"", "\"Assets/B.cs\"",
+        "-out:\"/s/out.dll\"", "-refonly", "-skipanalyzers+", "-doc:\"/s/out.xml\"", "-generatedfilesout:\"/s/gen\"",
+    ], "аргументы: выходы Unity, -warnaserror и пропавший исходник — долой; -refonly, -skipanalyzers+, -doc и вывод — свои")
+    check(!UnityGenerators.arguments(rspText: rsp, output: scratch, generated: scratch, skipAnalyzers: false,
+                                     sourceExists: { _ in true }).contains("-skipanalyzers+"),
+          "csc, который не знает -skipanalyzers, — без него")
+    check(UnityGenerators.rejected("skipanalyzers", in: "error CS2007: Unrecognized option: '-skipanalyzers+'")
+            && !UnityGenerators.rejected("skipanalyzers", in: "Assets/A.cs(1,1): warning CS0618: obsolete"),
+          "незнакомый ключ узнаётся по CS2007")
+
+    // Отметка: с чего собран вывод.
+    let inputs = UnityGenerators.inputs(rspText: rsp)
+    check(inputs.sources == ["Assets/A.cs", "Assets/Gone.cs", "Assets/B.cs"], "исходники rsp")
+    check(inputs.files == ["/Editor/UnityEngine.dll", "Assets/Plugins/Gen.dll",
+                           "Library/Bee/artifacts/1.dag/Game.UnityAdditionalFile.txt"],
+          "и то, что читают генераторы: ссылки, их сборки, дополнительные файлы")
+    let t0 = Date(timeIntervalSince1970: 1_000_000)
+    let times: [String: Date] = ["Assets/A.cs": t0, "Assets/B.cs": t0, "Assets/Plugins/Gen.dll": t0]
+    let stamp = UnityGenerators.stamp(rspDate: t0, inputs: inputs, modified: times)
+    var edited = times
+    edited["Assets/B.cs"] = t0.addingTimeInterval(5)
+    var rebuilt = times
+    rebuilt["Assets/Plugins/Gen.dll"] = t0.addingTimeInterval(5)
+    var deleted = times
+    deleted["Assets/B.cs"] = nil
+    check(stamp == UnityGenerators.stamp(rspDate: t0, inputs: inputs, modified: times)
+            && stamp != UnityGenerators.stamp(rspDate: t0, inputs: inputs, modified: edited)
+            && stamp != UnityGenerators.stamp(rspDate: t0, inputs: inputs, modified: rebuilt)
+            && stamp != UnityGenerators.stamp(rspDate: t0, inputs: inputs, modified: deleted)
+            && stamp != UnityGenerators.stamp(rspDate: t0.addingTimeInterval(1), inputs: inputs, modified: times),
+          "отметка меняется от правки исходника, новой сборки генератора, удалённого файла и нового rsp")
+    check(UnityGenerators.freshness(stored: "a", current: "a", hasOutput: false) == .fresh,
+          "та же отметка и пустой вывод — свежий: генераторы ничего не написали")
+    check(UnityGenerators.freshness(stored: "a", current: "b", hasOutput: true) == .stale
+            && UnityGenerators.freshness(stored: nil, current: "b", hasOutput: true) == .stale
+            && UnityGenerators.freshness(stored: "a", current: nil, hasOutput: true) == .stale,
+          "другая отметка, её нет или rsp не прочитать — вывод устарел, но его можно показать")
+    check(UnityGenerators.freshness(stored: nil, current: "b", hasOutput: false) == .missing,
+          "ни вывода, ни отметки — ждать первого прогона")
+
+    // Имена без случайной части.
+    let g1 = "0541eb7f97c74a2f9ac66a89f5a13c03", g2 = "3204ba9fbcd8423e8de4745f3d4cf593"
+    let g3 = "9391f40f740f4961ad8b0f0d1caa3dca", g4 = "dbb7a7b6f9cd4200b9f0a025b60d1667"
+    check(UnityGenerators.stableName("P/Row.component_\(g1).g.cs") == "P/Row.component_*.g.cs"
+            && UnityGenerators.stableName("Row_0541eb7f-97c7-4a2f-9ac6-6a89f5a13c03.g.cs") == "Row_*.g.cs",
+          "GUID в имени — из 32 знаков или с дефисами")
+    check(UnityGenerators.stableName("Gifts.system_0123abcd.g.cs") == "Gifts.system_0123abcd.g.cs"
+            && UnityGenerators.stableName("X_\(g1)ab.g.cs") == "X_\(g1)ab.g.cs",
+          "короткая или длинная шестнадцатеричная строка — часть имени")
+
+    // План раскладки: одинаковые тексты не трогаются, новые ложатся под прежние имена.
+    let oldTexts = ["G/Row.c_\(g1).g.cs": "row", "G/Col.c_\(g2).g.cs": "col", "G/Registry.g.cs": "reg",
+                    "G/Same.g.cs": "same", "H/Gone.g.cs": "gone"]
+    let newTexts = ["G/Row.c_\(g3).g.cs": "row", "G/Col.c_\(g4).g.cs": "col 2", "G/Registry.g.cs": "reg 2",
+                    "G/Same.g.cs": "same", "G/New.g.cs": "new"]
+    let plan = UnityGenerators.syncPlan(old: Array(oldTexts.keys), new: Array(newTexts.keys)) { oldTexts[$0] == newTexts[$1] }
+    check(plan.kept == 2, "тот же текст — файл не трогается, и под новым GUID тоже")
+    check(Set(plan.write) == [UnityGenerators.Move(from: "G/Col.c_\(g4).g.cs", to: "G/Col.c_\(g2).g.cs"),
+                              UnityGenerators.Move(from: "G/Registry.g.cs", to: "G/Registry.g.cs"),
+                              UnityGenerators.Move(from: "G/New.g.cs", to: "G/New.g.cs")],
+          "новый текст — под прежним именем, новый файл — под своим")
+    check(plan.remove == ["H/Gone.g.cs"], "файл, которого больше нет, — долой")
+    let pair = UnityGenerators.syncPlan(old: ["A_\(g1).g.cs", "A_\(g2).g.cs"], new: ["A_\(g3).g.cs", "A_\(g4).g.cs"]) {
+        ["A_\(g2).g.cs": "y", "A_\(g1).g.cs": "x"][$0] == ["A_\(g3).g.cs": "y", "A_\(g4).g.cs": "z"][$1]
+    }
+    check(pair.kept == 1 && pair.write == [UnityGenerators.Move(from: "A_\(g4).g.cs", to: "A_\(g1).g.cs")] && pair.remove.isEmpty,
+          "два файла под одним именем: совпавший остаётся, второй получает новый текст")
+
+    // Раскладка на диске.
+    let folder = dir.appendingPathComponent("Out")
+    let staging = dir.appendingPathComponent("Staging")
+    for (path, text) in oldTexts { write(text, folder.appendingPathComponent(path)) }
+    for (path, text) in newTexts { write(text, staging.appendingPathComponent(path)) }
+    let past = Date(timeIntervalSinceNow: -3600)
+    try? fm.setAttributes([.modificationDate: past], ofItemAtPath: folder.appendingPathComponent("G/Row.c_\(g1).g.cs").path)
+    let changes = try? UnityGenerators.sync(from: staging, files: UnityGenerators.relativeFiles(in: staging), to: folder)
+    check(UnityGenerators.relativeFiles(in: folder)
+            == ["G/Col.c_\(g2).g.cs", "G/New.g.cs", "G/Registry.g.cs", "G/Row.c_\(g1).g.cs", "G/Same.g.cs"],
+          "в папке — прежние имена и новый файл")
+    check(read(folder.appendingPathComponent("G/Col.c_\(g2).g.cs")) == "col 2"
+            && read(folder.appendingPathComponent("G/Registry.g.cs")) == "reg 2",
+          "новые тексты на месте")
+    check(abs((modified(folder.appendingPathComponent("G/Row.c_\(g1).g.cs")) ?? Date()).timeIntervalSince(past)) < 1,
+          "совпавший файл не переписан")
+    check(!fm.fileExists(atPath: folder.appendingPathComponent("H").path), "опустевшая папка — долой")
+    check(changes?.written.count == 3 && changes?.removed == ["H/Gone.g.cs"], "что записано и что убрано")
+
+    // Индекс папки вывода.
+    check(UnityGenerators.partialTypes(in: Data("""
+        namespace N { public partial class A<T> : B {} partial record struct R; partial void M();
+        internal partial interface I {} partial record Rec(int X); impartial class X {} partials struct Y {} }
+        """.utf8)) == ["A", "R", "I", "Rec"],
+          "partial-типы: класс, record struct, интерфейс, record; partial-метод и чужие слова — нет")
+    let index = UnityGenerators.GeneratedIndex(entries: [
+        .init(path: "Gen/P/UpdateGiftsSystem.system_0123abcd.g.cs", partials: []),
+        .init(path: "Gen/P/Registry.g.cs", partials: ["Row", "Col"]),
+        .init(path: "Gen/P/Other.g.cs", partials: ["UpdateGiftsSystemX"]),
+    ])
+    check(index.files(about: ["UpdateGiftsSystem", "Row"]) == ["Gen/P/UpdateGiftsSystem.system_0123abcd.g.cs", "Gen/P/Registry.g.cs"],
+          "по индексу: по имени файла и по partial, похожее имя — нет")
+    let saved = index.serialized(stamp: "1 2 3")
+    check(UnityGenerators.GeneratedIndex.parse(saved)?.stamp == "1 2 3"
+            && UnityGenerators.GeneratedIndex.parse(saved)?.index == index,
+          "индекс записывается и читается")
+    check(UnityGenerators.GeneratedIndex.parse("что-то\n1 2 3\n") == nil, "чужой файл — не индекс")
+    let built = UnityGenerators.GeneratedIndex.build(folder: folder)
+    check(built.entries.count == 5 && built.files(about: ["Row"]) == ["G/Row.c_\(g1).g.cs"], "индекс собирается по папке")
+    let reused = UnityGenerators.GeneratedIndex.build(
+        folder: folder, reusing: UnityGenerators.GeneratedIndex(entries: [.init(path: "G/Same.g.cs", partials: ["Cached"])]),
+        rewritten: [])
+    check(reused.entries.first { $0.path == "G/Same.g.cs" }?.partials == ["Cached"],
+          "непереписанный файл берётся из прежнего индекса, а не читается")
+    write(UnityGenerators.GeneratedIndex(entries: []).serialized(stamp: "old"), folder.appendingPathComponent(".pilot-types"))
+    check(UnityGenerators.GeneratedIndex.load(folder: folder, stamp: "old").entries.isEmpty,
+          "индекс при той же отметке — как записан")
+    check(UnityGenerators.GeneratedIndex.load(folder: folder, stamp: "new").entries.count == 5
+            && UnityGenerators.GeneratedIndex.parse(read(folder.appendingPathComponent(".pilot-types")) ?? "")?.stamp == "new",
+          "отметка другая — папку писал кто-то ещё: индекс собирается заново и записывается")
+
+    // Заранее: что компилировала Unity, в каком порядке обновлять, когда начинать.
+    check(UnityGenerators.recompiledAssembly("/p/Library/Bee/artifacts/900b0aEDbg.dag/Assembly-CSharp.dll") == "Assembly-CSharp"
+            && UnityGenerators.recompiledAssembly("/p/Library/Bee/artifacts/1.dag/Game.rsp") == "Game",
+          "Unity компилировала сборку: её .dll или .rsp в графе")
+    check(UnityGenerators.recompiledAssembly("/p/Library/Bee/artifacts/1.dag/Game.ref.dll") == nil
+            && UnityGenerators.recompiledAssembly("/p/Library/Bee/artifacts/1.dag/Game.dll.mvfrm.rsp") == nil
+            && UnityGenerators.recompiledAssembly("/p/Library/Bee/artifacts/mvdfrm/Game.dll") == nil
+            && UnityGenerators.recompiledAssembly("/p/Library/Bee/tundra.log.json") == nil,
+          "прочее в Library/Bee — не сборка")
+    check(UnityGenerators.outputAssembly("/p/Temp/GeneratedCode/Game/G/X.g.cs") == "Game"
+            && UnityGenerators.outputAssembly("/p/Temp/Other/X.cs") == nil,
+          "чей вывод лежит по пути")
+    let main = URL(fileURLWithPath: "/p/1.dag/Assembly-CSharp.rsp"), game = URL(fileURLWithPath: "/p/1.dag/Game.rsp")
+    let tools = URL(fileURLWithPath: "/p/1.dag/Tools.rsp"), extra = URL(fileURLWithPath: "/p/1.dag/Extra.rsp")
+    check(UnityGenerators.precomputeOrder([game, main, game, tools, extra], limit: 3) == [main, game, tools],
+          "заранее: Assembly-CSharp первой, остальные по порядку, каждая раз и не больше предела")
+    let now = Date()
+    check(UnityGenerators.backgroundDelay(now: now, lastBee: nil, busy: false, quiet: 20, retry: 10) == nil
+            && UnityGenerators.backgroundDelay(now: now, lastBee: now.addingTimeInterval(-30), busy: false, quiet: 20, retry: 10) == nil,
+          "тихо и свободно — фон начинает сразу")
+    check(UnityGenerators.backgroundDelay(now: now, lastBee: now.addingTimeInterval(-5), busy: false, quiet: 20, retry: 10) == 15,
+          "Unity компилировала 5 с назад — ждать ещё 15")
+    check(UnityGenerators.backgroundDelay(now: now, lastBee: nil, busy: true, quiet: 20, retry: 10) == 10,
+          "Pilot занят — проверить снова через 10 с")
+
+    // Прогон целиком — с поддельным csc: генератор пишет Row под новым GUID
+    // на каждый прогон и Registry с текстом из файла проекта.
+    let project = dir.appendingPathComponent("Game")
+    let responseFile = project.appendingPathComponent("Library/Bee/artifacts/1.dag/Game.rsp")
+    write("class A {}", project.appendingPathComponent("Assets/A.cs"))
+    write("v1", project.appendingPathComponent("generator-version"))
+    write("-target:library\n-out:\"Library/Bee/artifacts/1.dag/Game.dll\"\n\"Assets/A.cs\"\n\"Assets/Gone.cs\"", responseFile)
+    let editor = dir.appendingPathComponent("Fake/Contents")
+    makeEditor(editor, dotnet: """
+        #!/bin/sh
+        rsp="${4#@}"
+        cp "$rsp" "\(dir.path)/last.rsp"
+        out=$(sed -n 's/^-generatedfilesout:"\\(.*\\)"$/\\1/p' "$rsp")
+        guid=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \\n')
+        mkdir -p "$out/Gen/Gen.Pipeline"
+        printf 'partial struct Row {}' > "$out/Gen/Gen.Pipeline/Row.component_$guid.g.cs"
+        cat "\(project.path)/generator-version" > "$out/Gen/Gen.Pipeline/Registry.g.cs"
+        echo "Assets/A.cs(1,1): warning CS0618: obsolete"
+        """)
+    check(UnityGenerators.snapshot(rsp: responseFile, project: project).freshness == .missing, "до первого прогона вывода нет")
+    let first = try? UnityGenerators.refresh(rsp: responseFile, project: project, editor: editor)
+    check(first?.files.count == 2 && first?.changed == 2, "первый прогон: два файла")
+    let passed = read(dir.appendingPathComponent("last.rsp")) ?? ""
+    check(passed.contains("\n-refonly\n") && passed.contains("\n-skipanalyzers+\n")
+            && !passed.contains("1.dag/Game.dll") && !passed.contains("Gone.cs") && passed.contains("\"Assets/A.cs\""),
+          "csc получил -refonly и -skipanalyzers+, без выхода Unity и пропавшего исходника")
+    let fresh = UnityGenerators.snapshot(rsp: responseFile, project: project)
+    let row = fresh.index.files(about: ["Row"])
+    check(fresh.freshness == .fresh && row.count == 1 && fresh.generated != nil, "после прогона вывод свежий, Row — по индексу")
+    let second = try? UnityGenerators.refresh(rsp: responseFile, project: project, editor: editor)
+    check(second?.changed == 0 && UnityGenerators.snapshot(rsp: responseFile, project: project).index.files(about: ["Row"]) == row,
+          "новый GUID, тот же текст: ничего не переписано, имя прежнее")
+    write("v2", project.appendingPathComponent("generator-version"))
+    let third = try? UnityGenerators.refresh(rsp: responseFile, project: project, editor: editor)
+    check(third?.changed == 1 && read(fresh.folder.appendingPathComponent("Gen/Gen.Pipeline/Registry.g.cs")) == "v2",
+          "поменялся один файл — переписан один")
+    try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 120)],
+                          ofItemAtPath: project.appendingPathComponent("Assets/A.cs").path)
+    let stale = UnityGenerators.snapshot(rsp: responseFile, project: project)
+    check(stale.freshness == .stale && stale.index.entries.count == 2, "правка исходника: вывод устарел, но на месте")
+
+    // csc постарше не знает -skipanalyzers — прогон повторяется без него.
+    let older = dir.appendingPathComponent("Older/Contents")
+    makeEditor(older, dotnet: """
+        #!/bin/sh
+        rsp="${4#@}"
+        cp "$rsp" "\(dir.path)/older.rsp"
+        if grep -q -- '-skipanalyzers+' "$rsp"; then echo "error CS2007: Unrecognized option: '-skipanalyzers+'"; exit 1; fi
+        out=$(sed -n 's/^-generatedfilesout:"\\(.*\\)"$/\\1/p' "$rsp")
+        mkdir -p "$out/G/T"
+        printf 'class X {}' > "$out/G/T/X.g.cs"
+        """)
+    let olderFolder = dir.appendingPathComponent("OlderOut")
+    let viaOlder = try? UnityGenerators.refresh(rsp: responseFile, project: project, editor: older, folder: olderFolder)
+    check(viaOlder?.files.count == 1 && !(read(dir.appendingPathComponent("older.rsp")) ?? "-skipanalyzers+").contains("-skipanalyzers+"),
+          "незнакомый -skipanalyzers — второй прогон без него")
+
+    // Ни одного файла и ошибки — прежний вывод остаётся как был.
+    let failing = dir.appendingPathComponent("Failing/Contents")
+    makeEditor(failing, dotnet: "#!/bin/sh\necho \"Assets/A.cs(1,1): error CS1002: ; expected\"\nexit 1\n")
+    do {
+        _ = try UnityGenerators.refresh(rsp: responseFile, project: project, editor: failing)
+        check(false, "прогон без вывода и с ошибкой — неудача")
+    } catch let failure as UnityGenerators.Failure {
+        check(failure.message.contains("CS1002"), "неудача — с первой ошибкой компилятора")
+    } catch {
+        check(false, "неудача — Failure, а не \(error)")
+    }
+    check(UnityGenerators.relativeFiles(in: fresh.folder).count == 2, "прежний вывод на месте")
+
+    // Отмена останавливает компилятор, не дожидаясь его.
+    let slow = dir.appendingPathComponent("Slow/Contents")
+    makeEditor(slow, dotnet: "#!/bin/sh\nexec sleep 20\n")
+    let run = UnityGenerators.Run(background: true)
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { run.cancel() }
+    let started = Date()
+    do {
+        _ = try UnityGenerators.refresh(rsp: responseFile, project: project, editor: slow, run: run)
+        check(false, "отменённый прогон не заканчивается успехом")
+    } catch is UnityGenerators.Cancelled {
+        check(Date().timeIntervalSince(started) < 10, "отмена — сразу, а не когда компилятор закончит")
+    } catch {
+        check(false, "отмена — Cancelled, а не \(error)")
+    }
 }
 
 section("Кэши на диске")
@@ -6505,6 +7828,544 @@ do {
     let use = (code as NSString).range(of: "hp.Regen").location
     check(ValueFlow.stashOfLocal(in: units, local: "hp", method: body, before: use) == "_health", "ref-локальная из стэша")
     check(ValueFlow.stashOfLocal(in: units, local: "copy", method: body, before: use) == nil, "копия — не ref")
+}
+
+// ─────────────────────────── SQL (окно базы) ───────────────────────────
+section("SQL: подсветка MariaDB")
+do {
+    let sample = """
+    SELECT u.`select`, COUNT(*) AS n, @x, @@global.max_connections -- комментарий
+    FROM `users` u # тоже комментарий
+    WHERE u.name = 'it''s \\' ещё' AND u.id IN (0x1F, 1.5e3) /* блок
+    на две строки */ AND note = "многострочная
+    строка";
+    select varchar_col, CAST(x AS UNSIGNED) from t where x is null;
+    """
+    checkTwoPassConsistency(sample, SQLDialect.mariadb, "MariaDB")
+    let model = SyntaxModel(text: sample, spec: SQLDialect.mariadb)
+    let toks = model.tokens(fromLine: 0, toLine: model.lineCount - 1)
+    check(kindOf("SELECT", model, toks) == .keyword && kindOf("select", model, toks) == .keyword,
+          "ключевые слова в любом регистре")
+    check(kindOf("`select`", model, toks) == .plain, "`select` в обратных кавычках — имя, а не ключевое слово")
+    check(kindOf("`users`", model, toks) == .plain, "`users` — одна лексема цвета текста")
+    check(kindOf("COUNT", model, toks) == .function, "COUNT( — функция")
+    check(kindOf("@x", model, toks) == .attribute, "@x — переменная")
+    check(kindOf("@@global", model, toks) == .attribute, "@@global — одна лексема, а не @ и @global")
+    check(kindOf("-- комментарий", model, toks) == .comment && kindOf("# тоже комментарий", model, toks) == .comment,
+          "комментарии -- и #")
+    check(kindOf("'it'", model, toks) == .string && kindOf("0x1F", model, toks) == .number
+            && kindOf("1.5e3", model, toks) == .number, "строки и числа")
+    check(kindOf("\"многострочная", model, toks) == .string && kindOf("строка\"", model, toks) == .string,
+          "строка на две строки")
+    check(kindOf("на две строки */", model, toks) == .comment, "блочный комментарий на две строки")
+    check(kindOf("UNSIGNED", model, toks) == .keyword && kindOf("null", model, toks) == .constant,
+          "UNSIGNED — ключевое слово, null — константа")
+    check(kindOf("varchar_col", model, toks) == .plain && kindOf("note", model, toks) == .plain, "имена — обычный текст")
+    let types = SyntaxModel(text: "CREATE TABLE t (id INT, name VARCHAR(64), status TEXT)", spec: SQLDialect.mariadb)
+    let typeToks = types.tokens(fromLine: 0, toLine: 0)
+    check(kindOf("INT", types, typeToks) == .type && kindOf("TEXT", types, typeToks) == .type, "типы столбцов")
+    check(kindOf("status", types, typeToks) == .plain && kindOf("name", types, typeToks) == .plain,
+          "status и name — не ключевые слова: чаще это столбцы")
+
+    // Общий SQL для файлов .sql: заглавные ключевые слова тоже красятся.
+    let generic = SyntaxModel(text: "SELECT id FROM t WHERE x IS NULL", spec: Languages.sql)
+    let genericToks = generic.tokens(fromLine: 0, toLine: 0)
+    check(kindOf("SELECT", generic, genericToks) == .keyword && kindOf("NULL", generic, genericToks) == .constant,
+          "общий SQL: ключевые слова без учёта регистра")
+    // Сдвоенный префикс атрибута — одна лексема и в YAML Unity.
+    let yamlModel = SyntaxModel(text: "a: !!str x", spec: Languages.unityYAML)
+    check(kindOf("!!str", yamlModel, yamlModel.tokens(fromLine: 0, toLine: 0)) == .attribute, "!!str — одна лексема")
+}
+
+section("SQL: лексемы и запросы")
+do {
+    let lexed = SQLLexer.tokens("SELECT `a``b`, 'x''y', @v, 2fa, 1.5, 0b101 -- c\n#d\n/* e */ t.c;")
+    let kinds: [SQLToken.Kind] = [.word, .quoted, .symbol, .string, .symbol, .variable, .symbol, .word, .symbol,
+                                  .number, .symbol, .number, .comment, .comment, .comment, .word, .symbol, .word, .symbol]
+    check(lexed.map(\.kind) == kinds, "лексемы MariaDB (получено \(lexed.map(\.kind)))")
+    check(lexed.count > 7 && lexed[1].text == "a`b" && lexed[7].text == "2fa",
+          "`a``b` — имя с кавычкой, 2fa — имя, а не число")
+    check(SQLLexer.tokens("'не закрыта").first?.closed == false && SQLLexer.tokens("/* a").first?.closed == false,
+          "незакрытые строка и комментарий")
+    check(SQLLexer.tokens("1e5 1e-5 1.5e3 1e").map(\.kind) == [.number, .number, .number, .word],
+          "порядок числа; 1e без цифр — имя")
+
+    let heads = SQLStatement.heads("use `my db`; -- x\nCREATE TABLE t (a int);\n/* c */ select created_at from t")
+    check(heads.map(\.keyword) == ["USE", "CREATE", "SELECT"] && heads.first?.name == "my db",
+          "первые слова запросов и имя за USE (получено \(heads))")
+
+    func refs(_ sql: String) -> [String] {
+        SQLStatement.tableRefs(SQLLexer.tokens(sql).filter { $0.kind != .comment }).map { ref in
+            (ref.schema.map { $0 + "." } ?? "") + (ref.name.isEmpty ? "(…)" : ref.name) + (ref.alias.map { " " + $0 } ?? "")
+        }
+    }
+    check(refs("SELECT * FROM users u JOIN clm.orders AS o ON o.user_id = u.id LEFT JOIN `items` WHERE 1")
+            == ["users u", "clm.orders o", "items"], "FROM, JOIN, база.таблица, AS и без псевдонима")
+    check(refs("SELECT * FROM a, b x, (SELECT id FROM c) sub") == ["a", "b x", "c", "(…) sub"],
+          "таблицы через запятую и подзапрос с псевдонимом (получено \(refs("SELECT * FROM a, b x, (SELECT id FROM c) sub")))")
+    check(refs("UPDATE LOW_PRIORITY t SET a = 1") == ["t"] && refs("INSERT INTO db.t (a) VALUES (1)") == ["db.t"],
+          "UPDATE и INSERT INTO")
+    check(refs("SELECT EXTRACT(YEAR FROM created) FROM t") == ["t"], "FROM внутри EXTRACT — не таблица")
+    check(refs("SELECT * FROM t FORCE INDEX (i) JOIN u USE KEY FOR JOIN (k) ON 1") == ["t", "u"], "подсказки индексов")
+    check(refs("DELETE FROM t WHERE id IN (SELECT id FROM u)") == ["t", "u"], "таблицы подзапроса тоже видны")
+    check(refs("ALTER TABLE users MODIFY name TEXT") == ["users"], "MODIFY — не псевдоним")
+    check(SQLStatement.cteNames(SQLLexer.tokens("WITH RECURSIVE a (x) AS (SELECT 1), b AS (SELECT 2) SELECT 1"))
+            == ["a", "b"], "имена из WITH")
+
+    let parsed = SQLCatalog.Schema(tableRows: [["t", "BASE TABLE"], ["v", "VIEW"]],
+                                   columnRows: [["t", "id", "int"], ["t", "x", "text"], ["v", "id", "int"]],
+                                   routineRows: [["p", "PROCEDURE"], ["f", "FUNCTION"]])
+    check(parsed.tables.map(\.name) == ["t", "v"] && parsed.tables[1].isView
+            && parsed.tables[0].columns.map(\.name) == ["id", "x"], "таблицы и столбцы из information_schema")
+    check(parsed.routines == [.init(name: "p", isProcedure: true), .init(name: "f", isProcedure: false)],
+          "процедуры и функции")
+    check(SQLDialect.quoted("order") == "`order`" && SQLDialect.quoted("users") == "users"
+            && SQLDialect.quoted("my table") == "`my table`" && SQLDialect.quoted("2fa") == "`2fa`"
+            && SQLDialect.quoted("a`b") == "`a``b`" && SQLDialect.quoted("user") == "user",
+          "кавычки — только когда без них нельзя")
+}
+
+section("SQL: дополнение")
+do {
+    var db = SQLCatalog()
+    db.schemaNames = ["clm", "other", "information_schema"]
+    db.current = "clm"
+    db.schemas["clm"] = SQLCatalog.Schema(
+        tableRows: [["users", "BASE TABLE"], ["orders", "BASE TABLE"], ["order", "BASE TABLE"], ["active_users", "VIEW"]],
+        columnRows: [["users", "id", "int(11)"], ["users", "name", "varchar(64)"], ["users", "created_at", "datetime"],
+                     ["orders", "id", "int(11)"], ["orders", "user_id", "int(11)"], ["orders", "total", "decimal(10,2)"],
+                     ["order", "key", "int"], ["active_users", "id", "int(11)"]],
+        routineRows: [["recalc", "PROCEDURE"], ["score", "FUNCTION"]])
+
+    /// Варианты в месте `‸`.
+    func at(_ marked: String, _ catalog: SQLCatalog? = nil) -> SQLCompletion.Result {
+        let caret = (marked as NSString).range(of: "‸").location
+        let text = (marked as NSString).replacingCharacters(in: NSRange(location: caret, length: 1), with: "")
+        return SQLCompletion.complete(text, caret: caret, catalog: catalog ?? db)
+    }
+    func names(_ r: SQLCompletion.Result, _ kind: Int) -> [String] { r.items.filter { $0.kind == kind }.map(\.label) }
+    func item(_ r: SQLCompletion.Result, _ label: String) -> CompletionItem? { r.items.first { $0.label == label } }
+    let tableKind = 25, columnKind = 5, keywordKind = 14, databaseKind = 9
+
+    let fromTables = at("SELECT * FROM ‸")
+    check(Set(names(fromTables, tableKind)) == ["users", "orders", "order", "active_users"]
+            && names(fromTables, databaseKind).contains("other"), "после FROM — таблицы текущей базы и базы")
+    check(names(fromTables, keywordKind).isEmpty && names(fromTables, columnKind).isEmpty,
+          "после FROM ни ключевых слов, ни столбцов")
+    check(item(fromTables, "active_users")?.detail == L("представление"), "представление подписано")
+    check(!names(at("SELECT * FROM users u LEFT JOIN ‸"), tableKind).isEmpty
+            && !names(at("SELECT 1; SELECT * FROM a, ‸"), tableKind).isEmpty, "JOIN и таблица через запятую")
+
+    check(names(at("SELECT u.‸ FROM users u JOIN orders o ON o.user_id = u.id"), columnKind) == ["id", "name", "created_at"],
+          "u. — столбцы таблицы с псевдонимом u, по порядку в таблице")
+    check(names(at("SELECT o.us‸ FROM users u JOIN orders o"), columnKind) == ["id", "user_id", "total"],
+          "o. — столбцы orders, псевдоним объявлен после курсора")
+    check(names(at("SELECT users.‸ FROM users"), columnKind) == ["id", "name", "created_at"], "таблица. — её столбцы")
+    check(names(at("SELECT orders.‸"), columnKind) == ["id", "user_id", "total"], "таблица базы без FROM — тоже")
+    check(names(at("SELECT clm.users.‸ FROM clm.users"), columnKind) == ["id", "name", "created_at"], "база.таблица.")
+    check(Set(names(at("SELECT * FROM clm.‸"), tableKind)) == ["users", "orders", "order", "active_users"],
+          "база. после FROM — её таблицы")
+    let other = at("SELECT * FROM other.‸")
+    check(other.items.isEmpty && other.missingSchemas == ["other"], "база не прочитана — просим прочитать")
+    let unloaded = at("SELECT * FROM ‸", SQLCatalog(schemaNames: ["clm"], schemas: [:], current: "clm"))
+    check(unloaded.missingSchemas == ["clm"], "текущая база не прочитана — тоже")
+
+    let select = at("SELECT ‸ FROM users u")
+    check(names(select, columnKind) == ["id", "name", "created_at"], "в SELECT — столбцы таблиц запроса, чужих нет")
+    check(item(select, "u")?.detail == "users" && item(select, "COUNT") != nil && item(select, "DISTINCT") != nil,
+          "псевдонимы, функции и ключевые слова")
+    let ranked = CompletionRanking.rank(select.items, prefix: "").map { select.items[$0].label }
+    check(Array(ranked.prefix(3)) == ["id", "name", "created_at"], "без набранного — сперва столбцы (получено \(ranked.prefix(5)))")
+    let typed = at("SELECT us‸ FROM users u JOIN orders o")
+    check(CompletionRanking.rank(typed.items, prefix: "us").first.map { typed.items[$0].label } == "user_id",
+          "набранное начало: столбец выше ключевых слов и функций")
+    let noFrom = at("SELECT na‸")
+    check(Set(names(noFrom, columnKind)).isSuperset(of: ["name", "user_id", "total"]), "без FROM — столбцы всей базы")
+    check(item(noFrom, "id")?.detail == "int(11) · users +2",
+          "одинаковые столбцы — одной строкой (получено \(item(noFrom, "id")?.detail ?? "nil"))")
+    check(names(at("SELECT * FROM users u WHERE u.id = 1 AND ‸"), columnKind) == ["id", "name", "created_at"],
+          "в WHERE после AND")
+    check(names(at("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.‸)"), columnKind)
+            == ["id", "name", "created_at"], "внешний псевдоним в подзапросе")
+    check(names(at("SELECT TRIM(LEADING 'x' FROM ‸) FROM users"), columnKind) == ["id", "name", "created_at"],
+          "FROM внутри TRIM — выражение, а не таблица")
+    check(Set(names(at("SELECT * FROM users GROUP BY ‸"), columnKind)) == ["id", "name", "created_at"], "GROUP BY")
+
+    check(at("INSERT INTO orders (‸").items.map(\.label) == ["id", "user_id", "total"]
+            && at("INSERT INTO clm.orders (id, ‸").items.map(\.label) == ["id", "user_id", "total"],
+          "INSERT INTO t (…) — только её столбцы")
+    let values = at("INSERT INTO orders (id) VALUES (1, ‸")
+    check(names(values, columnKind).isEmpty && item(values, "NOW") != nil, "в VALUES — функции, без столбцов")
+    check(names(at("UPDATE users SET ‸"), columnKind) == ["id", "name", "created_at"], "UPDATE … SET — столбцы таблицы")
+    check(names(at("ALTER TABLE users MODIFY ‸"), columnKind) == ["id", "name", "created_at"]
+            && item(at("ALTER TABLE users MODIFY ‸"), "COLUMN") != nil, "ALTER TABLE … MODIFY — столбцы и COLUMN")
+
+    check(names(at("USE ‸"), databaseKind) == ["clm", "other", "information_schema"] && at("USE ‸").items.count == 3,
+          "USE — только базы")
+    check(Set(names(at("SHOW TABLES FROM ‸"), databaseKind)) == ["clm", "other", "information_schema"]
+            && !names(at("SHOW COLUMNS FROM ‸"), tableKind).isEmpty, "SHOW TABLES FROM — базы, SHOW COLUMNS FROM — таблицы")
+    check(!names(at("DROP TABLE IF EXISTS ‸"), tableKind).isEmpty && at("CREATE TABLE ‸").items.isEmpty,
+          "DROP TABLE IF EXISTS — таблицы, CREATE TABLE — новое имя")
+    check(names(at("CALL ‸"), 2) == ["recalc"], "CALL — процедуры")
+    check(item(at("WITH recent AS (SELECT * FROM orders) SELECT * FROM ‸"), "recent")?.detail == "WITH",
+          "имена из WITH — как таблицы")
+
+    check(at("SELECT * FROM users wh‸").items.map(\.label) == ["WHEN", "WHERE", "WHILE"],
+          "после таблицы — ключевые слова по началу (получено \(at("SELECT * FROM users wh‸").items.map(\.label)))")
+    check(at("SELECT * FROM user_accounts ua‸").items.isEmpty, "псевдоним ua — не UPDATE: ключевые слова только по началу")
+    check(at("SELECT a AS ‸").items.isEmpty && at("SELECT * FROM t LIMIT ‸").items.isEmpty, "новое имя и LIMIT — ничего")
+    check(at("SELECT 'na‸'").items.isEmpty && at("SELECT 1 -- na‸").items.isEmpty && at("SELECT 1‸").items.isEmpty
+            && at("SELECT @na‸").items.isEmpty && at("SELECT /* na‸").items.isEmpty,
+          "в строке, комментарии, числе и переменной — ничего")
+    check(!at("SELECT /* x */ ‸ FROM users").items.isEmpty, "после закрытого комментария — дополняем")
+
+    check(item(at("SELECT * FROM ord‸"), "order")?.insertText == "`order`"
+            && item(at("SELECT * FROM ord‸"), "orders")?.insertText == "orders", "зарезервированное имя — в кавычках")
+    let inQuotes = at("SELECT * FROM `ord‸`")
+    check(item(inQuotes, "order")?.insertText == "order" && names(inQuotes, keywordKind).isEmpty,
+          "внутри `…` — имя как есть, без ключевых слов")
+    check(item(at("SELECT `order`.‸ FROM `order`"), "key")?.insertText == "`key`", "столбец-ключевое слово — в кавычках")
+
+    let start = at("‸")
+    check(start.items.contains { $0.label == "SELECT" } && !start.items.contains { $0.label == "WHERE" },
+          "начало запроса — только слова, с которых он начинается")
+    check(at("SELECT 1; sel‸").items.first?.label == "SELECT", "ключевые слова — заглавными")
+    check(at("select * from users where id = 1; sel‸").items.first?.label == "select",
+          "текст строчными — и слова строчными")
+    let count = item(at("SELECT cou‸"), "COUNT")
+    check(count?.isSnippet == true && count.map { Snippet.expand($0.textToInsert).text } == "COUNT()",
+          "функция — со скобками и курсором внутри")
+    check(item(at("SELECT no‸"), "NOW")?.insertText == "NOW()", "функция без аргументов — курсор за скобками")
+    check(item(at("SELECT cou‸(x)"), "COUNT")?.insertText == "COUNT", "скобка уже есть — только имя")
+    check(item(at("SELECT sc‸"), "score")?.detail == L("функция"), "хранимая функция базы")
+
+    // Порядок в списке — как его выстроит редактор: вероятные здесь слова первыми.
+    func top(_ marked: String, _ count: Int = 1) -> [String] {
+        let result = at(marked)
+        let chars = Array(marked.utf16)
+        let caret = (marked as NSString).range(of: "‸").location
+        var start = caret
+        while start > 0, WordCompletion.isIdentPart(chars[start - 1]) { start -= 1 }
+        let typed = String(decoding: chars[start..<caret], as: UTF16.self)
+        return CompletionRanking.rank(result.items, prefix: typed).prefix(count).map { result.items[$0].label }
+    }
+    check(top("s‸") == ["SELECT"], "начало запроса: s — SELECT, а не более короткий SET")
+    check(top("SELECT * FROM users u w‸") == ["WHERE"], "после таблицы w — WHERE, а не WAIT")
+    check(top("SELECT * F‸") == ["FROM"], "после SELECT * — FROM")
+    check(top("SELECT * FROM users ORDER BY id d‸") == ["DESC"], "после ORDER BY x — DESC")
+    check(top("SELECT * FROM users u JOIN orders o o‸") == ["ON"], "после таблицы JOIN — ON")
+    check(top("INSERT ‸", 2) == ["INTO", "IGNORE"], "после INSERT — INTO")
+    check(top("SET ‸", 3) == ["GLOBAL", "SESSION", "NAMES"], "SET в начале — GLOBAL, SESSION, NAMES")
+    check(top("CREATE TABLE t (id ‸", 3) == ["INT", "BIGINT", "VARCHAR"], "за именем столбца — типы")
+    check(top("CREATE TABLE t (id INT ‸", 3) == ["NOT", "NULL", "DEFAULT"], "за типом — ограничения столбца")
+    check(top("CREATE TABLE t (id INT, ‸", 2) == ["PRIMARY", "KEY"], "в начале элемента — ограничения таблицы")
+    check(top("CREATE TABLE t (id INT NOT ‸") == ["NULL"], "NOT в определении столбца — NULL")
+    check(top("SELECT * FROM users WHERE df‸") == ["DATE_FORMAT"], "df — DATE_FORMAT по началам частей")
+    check(top("SELECT * FROM users WHERE na‸") == ["name"] && !top("SELECT * FROM users WHERE na‸", 30).contains("CONCAT"),
+          "столбец выше слов языка; na не находит CONCAT по одним заглавным")
+    let whole = at("SELECT * FROM users WHERE‸")
+    check(whole.items.count == 1 && whole.items[0].matchText == "WHERE",
+          "слово набрано целиком — совпадение точное: список закроется сам, Return переведёт строку")
+    check(names(at("SELECT sub.‸ FROM (SELECT u.*, o.total AS t FROM users u JOIN orders o ON 1) sub"), columnKind)
+            == ["id", "name", "created_at", "t"], "подзапрос: столбцы его SELECT, * раскрыта по его таблицам")
+    check(SQLStatement.selectNames(SQLLexer.tokens("SELECT DISTINCT a, t.b, c + 1 AS d, e f, COUNT(*), x.* FROM t"))
+            == ["a", "b", "d", "f", "x.*"], "имена списка SELECT")
+
+    // Длинный текст: разбирается окно у курсора, и в нём не теряется, где строка.
+    let big = String(repeating: "SELECT 1;\n", count: 20_000) + "SELECT * FROM ‸"
+    check(!names(at(big), tableKind).isEmpty, "большой текст — дополнение работает")
+    let bigModel = SyntaxModel(text: big.replacingOccurrences(of: "‸", with: ""), spec: SQLDialect.mariadb)
+    check(SQLCompletion.scanRange(bigModel, caret: bigModel.units.count).lowerBound > 0, "разбирается только окно")
+    let inString = "SELECT 'start\n" + String(repeating: "x\n", count: 70_000) + "end' AS s FROM ‸"
+    check(!names(at(inString), tableKind).isEmpty, "окно не начинается посреди многострочной строки")
+}
+
+section("Граф значения: лямбды, switch и члены выражений")
+do {
+    func sources(_ expr: String) -> [ValueFlow.Source] {
+        let units = Array(expr.utf16)
+        return ValueFlow.sources(in: units, range: NSRange(location: 0, length: units.count))
+    }
+    func chains(_ expr: String) -> [String] { sources(expr).map { $0.chain + ($0.call ? "()" : "") } }
+    check(chains("Load(path, static (s, x) => { if (x) return; s.Done(); }) + bonus") == ["Load()", "path", "bonus"],
+          "параметры и тело лямбды — не источники")
+    check(chains("items.Find(i => i.Alive)") == ["items.Find()"], "лямбда-выражение без скобок")
+    check(chains("state switch { State.Idle => idle, _ => busy }") == ["state", "idle", "busy"],
+          "ветки switch — источники, шаблоны — нет")
+    check(chains("this.speed * base.Scale") == ["speed", "Scale"], "this. и base. отброшены")
+    check(chains("TryGet(key, out _) ? hit : _ + miss") == ["TryGet()", "key", "hit", "miss"], "_ — не источник")
+    check(chains("new Dictionary<(Rarity rarity, int size), int>(capacity)") == ["Dictionary()", "capacity"],
+          "аргументы дженерика — типы, не источники")
+    check(chains("new Health { Value = max, Regen = rate }") == ["Health", "max", "rate"],
+          "цели в инициализаторе — не источники")
+    check(chains("Spawn(model: m, radius: alive ? r : 0)") == ["Spawn()", "m", "alive", "r"],
+          "имена аргументов — не источники, ветки ?: — да")
+    check(sources("new Vector3(x, 0)").first?.constructs == true, "new T(…) помечен")
+    let member = sources("_hp.Get(e).Value")
+    check(member.map(\.chain) == ["e", "Value"] && member.last?.receiver == "_hp.Get" && member.last?.member == true,
+          "член у результата вызова: вызов — не источник, помнится как получатель")
+    let chain = Array("a.b.c".utf16)
+    check(sources("a.b.c").first?.head.map { ValueFlow.string(chain, $0) } == "a", "голова цепочки")
+}
+
+section("Граф значения: параметры, локальные и свойства")
+do {
+    func units(_ s: String) -> [UInt16] { Array(s.utf16) }
+    func range(_ s: String, _ what: String, from: Int = 0) -> NSRange {
+        (s as NSString).range(of: what, range: NSRange(location: from, length: (s as NSString).length - from))
+    }
+    func text(_ u: [UInt16], _ r: NSRange?) -> String? { r.map { ValueFlow.string(u, $0) } }
+    /// Имя длиной `length` в начале первого `pattern`.
+    func name(_ s: String, _ pattern: String, _ length: Int, from: Int = 0) -> NSRange {
+        NSRange(location: range(s, pattern, from: from).location, length: length)
+    }
+
+    let method = "void Apply<T>(int amount, ref Stats s) where T : struct { }"
+    check(text(units(method), ValueFlow.parameterList(in: units(method), after: range(method, "Apply")))
+            == "int amount, ref Stats s", "список параметров после дженерика")
+    check(ValueFlow.isTypeParameter(in: units(method), name: name(method, "T>", 1)), "T в <T> — параметр типа")
+    check(!ValueFlow.isTypeParameter(in: units(method), name: name(method, "amount", 6)), "параметр — не параметр типа")
+
+    let loop = "foreach (ref var hp in _healths) { }"
+    check(text(units(loop), ValueFlow.foreachCollection(in: units(loop), variable: range(loop, "hp"))) == "_healths",
+          "переменная foreach — из коллекции")
+    check(ValueFlow.foreachCollection(in: units("var hp = x;"), variable: range("var hp = x;", "hp")) == nil,
+          "не foreach")
+
+    let out = "if (_map.TryGetValue(key, out var found)) { }"
+    check(ValueFlow.isOutArgument(in: units(out), name: range(out, "found")), "out var — из вызова")
+    check(ValueFlow.enclosingCall(in: units(out), at: range(out, "found").location)?.chain == "_map.TryGetValue",
+          "вызов вокруг out")
+    check(!ValueFlow.isOutArgument(in: units("Use(key, found)"), name: range("Use(key, found)", "found")), "не out")
+
+    let lambda = "list.ForEach((a, b) => Sum(a, b)); Apply(x => x.Hp);"
+    check(ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "a,", 1)), "(a, b) =>")
+    check(ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "x =>", 1)), "x =>")
+    check(!ValueFlow.isLambdaParameter(in: units(lambda), name: name(lambda, "a, b)", 1, from: 24)), "аргумент — не параметр")
+
+    let pattern = "if (item.Parameters is not WeaponParameters weapon) return;"
+    check(text(units(pattern), ValueFlow.patternSubject(in: units(pattern), name: range(pattern, "weapon)")
+                .intersection(range(pattern, "weapon"))!)) == "item.Parameters", "x is not T name — из x")
+    let pairLoop = "foreach (var (key, count) in _stock) { }"
+    check(text(units(pairLoop), ValueFlow.foreachCollection(in: units(pairLoop), variable: range(pairLoop, "count"))) == "_stock",
+          "разбор кортежа в foreach — из коллекции")
+    let localFunction = "void Run() { void Add(int id, Item item) { Use(item); } Add(1, first); Add(2, second); }"
+    let lu = units(localFunction)
+    if let parameter = ValueFlow.localFunctionParameter(in: lu, name: range(localFunction, "item)")
+        .intersection(range(localFunction, "item"))!) {
+        check(ValueFlow.string(lu, parameter.function) == "Add" && parameter.index == 1, "параметр локальной функции: имя и номер")
+        let calls = ValueFlow.calls(of: "Add", in: lu, range: NSRange(location: 0, length: lu.count), except: parameter.function.location)
+        check(calls.compactMap { ValueFlow.argument(in: lu, after: $0, index: 1) }.map { ValueFlow.string(lu, $0) } == ["first", "second"],
+              "аргументы вызовов локальной функции")
+    } else {
+        check(false, "параметр локальной функции: имя и номер")
+    }
+    check(ValueFlow.localFunctionParameter(in: lu, name: range(localFunction, "first")) == nil, "аргумент вызова — не параметр")
+
+    let optional = "void Update(Model m, List<string> variants = null, int n = Max(1, 2)) { }"
+    let ou = units(optional)
+    let update = range(optional, "Update")
+    check(ValueFlow.argument(in: ou, after: update, index: 1).flatMap { ValueFlow.defaultValue(in: ou, parameter: $0) }
+            .map { ValueFlow.string(ou, $0) } == "null", "значение по умолчанию")
+    check(ValueFlow.argument(in: ou, after: update, index: 2).flatMap { ValueFlow.defaultValue(in: ou, parameter: $0) }
+            .map { ValueFlow.string(ou, $0) } == "Max(1, 2)", "умолчание с вызовом")
+    check(ValueFlow.argument(in: ou, after: update, index: 0).flatMap { ValueFlow.defaultValue(in: ou, parameter: $0) } == nil,
+          "без умолчания")
+
+    let tuple = "var (hp, mana) = LoadStats(id);"
+    check(text(units(tuple), ValueFlow.deconstruction(in: units(tuple), name: range(tuple, "mana"))) == "LoadStats(id)",
+          "разбор кортежа — из правой части")
+    check(ValueFlow.deconstruction(in: units("Use(hp, mana);"), name: range("Use(hp, mana);", "mana")) == nil,
+          "аргументы вызова — не разбор")
+
+    let arrow = "public int Max => _base * 2;"
+    check(ValueFlow.getterExpressions(in: units(arrow), property: NSRange(location: 0, length: arrow.utf16.count),
+                                      name: range(arrow, "Max")).map { ValueFlow.string(units(arrow), $0) } == ["_base * 2"],
+          "свойство-выражение")
+    let accessors = "public int Hp { get { if (dead) return 0; return _hp; } set { _hp = value; } }"
+    let whole = NSRange(location: 0, length: accessors.utf16.count)
+    check(ValueFlow.getterExpressions(in: units(accessors), property: whole, name: range(accessors, "Hp"))
+            .map { ValueFlow.string(units(accessors), $0) } == ["0", "_hp"], "return геттера")
+    let setter = ValueFlow.setter(in: units(accessors), property: whole, name: range(accessors, "Hp"))
+    check(setter.map { NSLocationInRange(range(accessors, "value").location, $0) } == true
+            && setter.map { NSLocationInRange(range(accessors, "dead").location, $0) } == false, "сеттер — только set")
+    let auto = "public float Speed { get; private set; } = 5f;"
+    check(text(units(auto), ValueFlow.propertyInitializer(in: units(auto), property: NSRange(location: 0, length: auto.utf16.count),
+                                                         name: range(auto, "Speed"))) == "5f", "начальное значение автосвойства")
+}
+
+section("Граф значения: стэши")
+do {
+    let code = """
+    void OnUpdate() {
+        ref var hp = ref _health.Get(e);
+        hp.Value -= damage;
+        var copy = _health.Get(e);
+        copy.Value = 0;
+        _health.Get(other).Value = max;
+        hp.Regen = 1;
+    }
+    """
+    let units = Array(code.utf16)
+    let body = NSRange(location: 0, length: units.count)
+    let writes = ValueFlow.stashFieldWrites(in: units, stash: "_health", field: "Value") { _ in body }
+    check(writes.map { $0.rhs.map { ValueFlow.string(units, $0) } ?? "" } == ["damage", "max"],
+          "через ref-локальную и прямо в Get(); копия — не запись в компонент")
+    check(writes.first?.compound == true, "-= — составная")
+    let use = (code as NSString).range(of: "hp.Regen").location
+    check(ValueFlow.stashOfLocal(in: units, local: "hp", method: body, before: use) == "_health", "ref-локальная из стэша")
+    check(ValueFlow.stashOfLocal(in: units, local: "copy", method: body, before: use) == nil, "копия — не ref")
+}
+
+section("Граф значения: источники — литералы")
+do {
+    func literals(_ expr: String) -> [String] {
+        let units = Array(expr.utf16)
+        return ValueFlow.literalAlternatives(in: units, range: NSRange(location: 0, length: units.count))
+            .map { ValueFlow.string(units, $0) }
+    }
+    check(literals("0") == ["0"] && literals("-1.5f") == ["-1.5f"] && literals("1e-3") == ["1e-3"], "число — литерал")
+    check(literals("\"idle\"") == ["\"idle\""] && literals("'x'") == ["'x'"], "строка и символ")
+    check(literals("crit ? 2 : 1") == ["2", "1"], "ветки ?: — возможные значения, условие — нет")
+    check(literals("a > 0 ? a : 0") == ["0"], "ветка-имя — не литерал")
+    check(literals("x ?? 0") == ["0"], "?? — умолчание справа")
+    check(literals("(int)5") == ["5"] && literals("(float?)null") == ["null"], "приведение снимается")
+    check(literals("hp - 1").isEmpty && literals("Mathf.Clamp(x, 0, 1)").isEmpty, "литерал в арифметике и аргументом — не значение")
+    check(literals("(a) - 1").isEmpty, "(a) - 1 — вычитание, а не приведение")
+    check(literals("state switch { State.Idle => 1, _ => 2 }") == ["1", "2"], "ветки switch")
+    check(literals("null") == ["null"] && literals("default") == ["default"] && literals("default(int)") == ["default(int)"],
+          "null и default")
+    check(literals("new List<int>()") == ["new List<int>()"] && literals("new()") == ["new()"], "new без аргументов — умолчание")
+    check(literals("new Vector3(1, 2, 3)").isEmpty, "new с аргументами — объект из них, а не литерал")
+    check(literals("$\"hp {hp}\"").isEmpty && literals("$\"hp\"") == ["$\"hp\""], "интерполяция со вставкой — не литерал")
+    check(literals("() => 5").isEmpty, "тело лямбды — не значение выражения")
+    check(ValueFlow.isDefaultLiteral("null") && ValueFlow.isDefaultLiteral("new()") && !ValueFlow.isDefaultLiteral("0"),
+          "умолчание отличается от литерала")
+}
+
+section("Граф значения: источники — звенья и вызовы вокруг")
+do {
+    func sources(_ expr: String) -> (units: [UInt16], found: [ValueFlow.Source]) {
+        let units = Array(expr.utf16)
+        return (units, ValueFlow.sources(in: units, range: NSRange(location: 0, length: units.count)))
+    }
+    let chain = sources("stats.Damage.ToString()")
+    check(chain.found.first?.links.count == 3 && chain.found.first?.receiverChain?.chain == "stats.Damage"
+            && chain.found.first?.receiverChain.map { ValueFlow.string(chain.units, $0.range) } == "Damage",
+          "получатель последнего звена — цепочка без него")
+    let nested = sources("Clamp(Get(x), 0, 1)")
+    let x = nested.found.first { $0.chain == "x" }
+    check(x.map { $0.calls.map { ValueFlow.string(nested.units, $0) } } == ["Clamp", "Get"], "вызовы вокруг имени — снаружи внутрь")
+    let constructed = sources("new Vector3(x, 0)")
+    check(constructed.found.first { $0.chain == "x" }?.calls.isEmpty == true, "аргумент конструктора — сам объект, не вызов")
+    let plain = sources("(a + b) * c")
+    check(plain.found.allSatisfy { $0.calls.isEmpty }, "скобки выражения — не вызов")
+    func receiver(_ code: String, _ name: String) -> String? {
+        let units = Array(code.utf16)
+        let at = (code as NSString).range(of: name, options: .backwards)
+        return ValueFlow.receiverExpression(in: units, before: at).map { ValueFlow.string(units, $0) }
+    }
+    check(receiver("if (player.TryGet(a, out b))", "TryGet") == "player", "получатель вызова — имя")
+    check(receiver("x = GetPlayer(id)?.Stats[0].TryGet(a)", "TryGet") == "GetPlayer(id)?.Stats[0]", "получатель — цепочка со скобками")
+    check(receiver("TryGet(a)", "TryGet") == nil, "вызов без получателя")
+    func element(_ code: String, _ name: String) -> String? {
+        let units = Array(code.utf16)
+        let at = (code as NSString).range(of: name)
+        return ValueFlow.elementWrite(in: units, name: at).map { "\($0.method) " + ValueFlow.string(units, $0.value) }
+    }
+    check(element("_map[peer] = player;", "_map") == "[] player", "запись по индексу")
+    check(element("_map.Add(peer, player);", "_map") == "Add player" && element("_queue.Enqueue(item);", "_queue") == "Enqueue item",
+          "Add и Enqueue — последний аргумент")
+    check(element("_map[peer] == player", "_map") == nil && element("_map.Remove(peer);", "_map") == nil
+            && element("var x = _map[peer];", "_map") == nil, "чтение и Remove — не запись элемента")
+    let indexed = sources("data[index] + list[i].Value + new[] { a }")
+    check(indexed.found.filter(\.isIndexKey).map(\.chain) == ["index", "i"], "ключ элемента — не значение, массив — не обращение")
+    func lambda(_ code: String, _ name: String) -> String? {
+        let units = Array(code.utf16)
+        return ValueFlow.lambdaCall(in: units, parameter: (code as NSString).range(of: name)).map(\.chain)
+    }
+    check(lambda("items.ForEach(x => Use(x));", "x") == "items.ForEach", "вызов, которому отдали лямбду")
+    check(lambda("db.QueryAsync(sql, (model, vehicle) => model)", "vehicle") == "db.QueryAsync", "параметр в скобках списка")
+    let stash = Array("_stash.Get(e)".utf16)
+    check(ValueFlow.chain(in: stash, endingWith: NSRange(location: 7, length: 3)) == "_stash.Get", "цепочка до имени вызова")
+}
+
+section("Граф значения: источники — библиотеки")
+do {
+    check(ValueOrigins.classify(type: "UnityEngine.Time", member: "deltaTime") == .origin(.time), "Time.deltaTime — время")
+    check(ValueOrigins.classify(type: "System.DateTime", member: "UtcNow") == .origin(.time)
+            && ValueOrigins.classify(type: "System.DateTime", member: "AddSeconds") == .transform, "DateTime.UtcNow — время, AddSeconds — нет")
+    check(ValueOrigins.classify(type: "Stopwatch", member: "Frequency") == .origin(.time), "Stopwatch по короткому имени")
+    check(ValueOrigins.classify(type: "UnityEngine.Random", member: "Range") == .origin(.random)
+            && ValueOrigins.classify(type: "Random", member: "Next") == .origin(.random)
+            && ValueOrigins.classify(type: "System.Guid", member: "NewGuid") == .origin(.random), "случайное")
+    check(ValueOrigins.classify(type: "UnityEngine.Input", member: "GetAxis") == .origin(.input), "ввод игрока")
+    check(ValueOrigins.classify(type: "Newtonsoft.Json.JsonConvert", member: "DeserializeObject") == .origin(.json), "JSON")
+    check(ValueOrigins.classify(type: "System.Environment", member: "GetEnvironmentVariable") == .origin(.external)
+            && ValueOrigins.classify(type: "UnityEngine.PlayerPrefs", member: "GetInt") == .origin(.external)
+            && ValueOrigins.classify(type: "System.IO.File", member: "ReadAllText") == .origin(.external), "файлы и окружение")
+    check(ValueOrigins.classify(type: "UnityEngine.Mathf", member: "Clamp") == .transform
+            && ValueOrigins.classify(type: "Math", member: "Min") == .transform
+            && ValueOrigins.classify(type: "System.Collections.Generic.Dictionary`2", member: "TryGetValue") == .transform,
+          "математика и коллекции — преобразование")
+    check(ValueOrigins.classify(type: "UnityEngine.Vector3", member: "zero") == .constant
+            && ValueOrigins.classify(type: "int", member: "MaxValue") == .constant, "постоянные библиотеки")
+    check(ValueOrigins.classify(type: "UnityEngine.Transform", member: "up") == .origin(.engine), "transform.up — движок, не постоянная")
+    check(ValueOrigins.classify(type: "Scellecs.Morpeh.World", member: "Default") == .unknown, "чужая сборка — неизвестно")
+    check(ValueOrigins.cleanType("List<int>") == "List" && ValueOrigins.cleanType("Dictionary`2") == "Dictionary"
+            && ValueOrigins.cleanType("int?") == "int" && ValueOrigins.cleanType("Item[]") == "Item", "тип без обобщений и ?")
+}
+
+section("Граф значения: источники — конфиги и инспектор")
+do {
+    let aliases = """
+    public static partial class ConfigAliases
+    {
+        [JsonType(typeof(JobData))] public const string CourierJobData = "CourierJobData";
+        [ConfigPrewarm(typeof(RandomNamesModel))]
+        public const string MaleRandomNames = "MaleRandomNames";
+        [JsonType(typeof(Dictionary<string, JobReward[]>))] public const string Rewards = "JobRewards";
+        public const string Plain = "Plain";
+    }
+    """
+    let models = ConfigLinks.aliasModels(in: aliases)
+    check(models.map(\.alias) == ["CourierJobData", "MaleRandomNames", "JobRewards", "Plain"], "все алиасы класса")
+    check(models[0].models == ["JobData"] && models[1].models == ["RandomNamesModel"] && models[1].constant == "MaleRandomNames",
+          "модель в той же строке и в атрибуте над константой")
+    check(models[2].models.contains("JobReward") && models[3].models.isEmpty, "аргументы обобщения — тоже модели")
+    let json = """
+    {
+      "name": "courier",
+      "car_spawn_check_radius": 25.5,
+      "label": "a, b",
+      "nested": { "car_spawn_check_radius": 3 },
+      "car_spawn_check_radius_extra": 1,
+      "list": [
+        1
+      ]
+    }
+    """
+    let values = ConfigLinks.jsonValues(ofKey: "car_spawn_check_radius", in: json)
+    check(values.map(\.line) == [2, 4] && values.map(\.value) == ["25.5", "3"], "значения ключа: строка и число, соседний ключ — нет")
+    check(ConfigLinks.jsonValues(ofKey: "label", in: json).first?.value == "\"a, b\"", "строка с запятой целиком")
+    check(ConfigLinks.jsonValues(ofKey: "list", in: json).first?.value == "[…]", "массив на несколько строк")
+
+    let yaml = """
+    --- !u!114 &11400000
+    MonoBehaviour:
+      m_Script: {fileID: 11500000, guid: abc, type: 3}
+      m_Name:
+      speed: 5.5
+      targets:
+      - {fileID: 0}
+    --- !u!114 &2
+    MonoBehaviour:
+      speed: 1
+    """.split(separator: "\n", omittingEmptySubsequences: false)
+    let speed = UnityYAMLFile.serializedField("speed", afterLine: 2, lines: yaml)
+    check(speed?.line == 4 && speed?.value == "5.5", "поле скрипта в его блоке")
+    check(UnityYAMLFile.serializedField("targets", afterLine: 2, lines: yaml)?.value == "…", "список — многоточием")
+    check(UnityYAMLFile.serializedField("missing", afterLine: 2, lines: yaml) == nil, "за блок объекта не выходит")
 }
 
 print("\n════════════════════════════════════")

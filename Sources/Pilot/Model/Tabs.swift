@@ -67,3 +67,85 @@ enum Tabs {
         return String(name.prefix(limit - tail - 1)) + "…" + String(name.suffix(tail))
     }
 }
+
+// MARK: - Куда попасть, открыв файл
+
+/// Переход к месту в файле — поиск, ⌘B, использования, история, Unity, —
+/// пока он «встаёт». Правила без AppKit, чтобы гонять их в тестах ядра;
+/// применяет их CodeViewController.
+///
+/// После перехода экран ещё может уехать: раскладка досчитывает высоту
+/// текста, SwiftUI даёт редактору размер, вкладка восстанавливает свою
+/// прокрутку, над строками появляются счётчики использований. Поэтому место
+/// держится, пока человек сам не тронул текст: увели — ставим снова.
+struct Landing: Equatable {
+    /// Что выделить: имя объявления, найденный текст или место курсора.
+    let range: NSRange
+    /// До какого момента держим место (по часам того, кто проверяет).
+    let until: TimeInterval
+    /// Сколько раз ещё можно поставить заново — чтобы не спорить без конца
+    /// с тем, кто уводит экран на каждом витке.
+    private(set) var fixesLeft: Int
+
+    static let holdTime: TimeInterval = 1.2
+    static let maxFixes = 8
+    /// Когда проверять после перехода: следующий виток, потом по мере того,
+    /// как доходят раскладка, размер вьюхи и поздние обновления.
+    static let checkDelays: [TimeInterval] = [0, 0.05, 0.15, 0.3, 0.6, 1.2]
+
+    init(range: NSRange, now: TimeInterval) {
+        self.range = range
+        until = now + Self.holdTime
+        fixesLeft = Self.maxFixes
+    }
+
+    /// С чего показать вкладку. Переход важнее места, где её оставили:
+    /// иначе уже открытый файл показался бы там, где его читали в прошлый
+    /// раз. Без перехода — где оставили; новая — с начала.
+    enum Start: Equatable {
+        case target(NSRange)
+        case saved
+        case top
+    }
+
+    static func start(target: NSRange?, hasSaved: Bool) -> Start {
+        if let target { return .target(target) }
+        return hasSaved ? .saved : .top
+    }
+
+    /// Очередная проверка: true — место увели (выделение не то или цель не
+    /// на экране), и его надо поставить снова.
+    mutating func needsFix(selection: NSRange, onScreen: Bool) -> Bool {
+        guard selection != range || !onScreen, fixesLeft > 0 else { return false }
+        fixesLeft -= 1
+        return true
+    }
+
+    /// Держать дальше незачем: время вышло или поправки кончились.
+    func isOver(now: TimeInterval) -> Bool { now >= until || fixesLeft == 0 }
+
+    // Прокрутка к цели, как в Rider. Всё — по вертикали, в координатах текста.
+
+    /// Цель видна с запасом `margin` — экран не двигается. Цель выше экрана
+    /// целиком не увидеть — достаточно её начала.
+    static func isVisible(target: ClosedRange<CGFloat>, visible: ClosedRange<CGFloat>, margin: CGFloat) -> Bool {
+        let height = visible.upperBound - visible.lowerBound
+        let pad = padding(margin, height: height)
+        let tall = target.upperBound - target.lowerBound > height - 2 * pad
+        let bottom = tall ? target.lowerBound : target.upperBound
+        return target.lowerBound >= visible.lowerBound + pad && bottom <= visible.upperBound - pad
+    }
+
+    /// Верх видимой области высотой `height`, при котором цель посередине.
+    /// Цель выше экрана (блок на несколько экранов) — её начало, с запасом.
+    static func centeredTop(target: ClosedRange<CGFloat>, height: CGFloat, margin: CGFloat) -> CGFloat {
+        let pad = padding(margin, height: height)
+        if target.upperBound - target.lowerBound > height - 2 * pad { return target.lowerBound - pad }
+        return (target.lowerBound + target.upperBound) / 2 - height / 2
+    }
+
+    /// Запас не больше четверти экрана: на низком окне два поля съели бы всё.
+    private static func padding(_ margin: CGFloat, height: CGFloat) -> CGFloat {
+        min(margin, max(0, height / 4))
+    }
+}

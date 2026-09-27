@@ -3,8 +3,10 @@ import SwiftUI
 
 /// Что показывает окно подсказки у текста.
 enum InfoContent {
-    /// Документация имени (⌃J, мышь над именем) и ошибки в этом месте.
-    case documentation(RustlynDocumentation?, problems: [RustlynDiagnostic])
+    /// Ошибки в этом месте — почему оно подчёркнуто — и документация имени:
+    /// мышь над ним, ⌃J, ⌘F1 (там — только ошибки). `fix` — строка о том,
+    /// чем их исправит ⌘., если есть чем.
+    case documentation(RustlynDocumentation?, problems: [RustlynDiagnostic], fix: String? = nil)
     /// Перегрузки набираемого вызова: подходящая выделена, параметр под
     /// курсором — жирным.
     case signatures(RustlynSignatures)
@@ -95,8 +97,8 @@ struct InfoView: View {
     var body: some View {
         Group {
             switch model.content {
-            case .documentation(let documentation, let problems):
-                DocumentationView(documentation: documentation, problems: problems)
+            case .documentation(let documentation, let problems, let fix):
+                DocumentationView(documentation: documentation, problems: problems, fix: fix)
             case .signatures(let signatures):
                 SignaturesView(signatures: signatures)
             case nil:
@@ -118,17 +120,28 @@ struct InfoView: View {
 private struct DocumentationView: View {
     let documentation: RustlynDocumentation?
     let problems: [RustlynDiagnostic]
+    let fix: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(Array(problems.enumerated()), id: \.offset) { _, problem in
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: problem.severity == .error ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(Color(nsColor: problem.severity == .error ? Theme.diagnosticError
-                                                                                   : Theme.diagnosticWarning))
+                    Image(systemName: problem.severity.symbolName)
+                        .foregroundStyle(Color(nsColor: problem.severity.color))
                     Text(problem.message).font(.system(size: 12))
-                    Text(problem.code).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                    // Код — моноширинным, как в тексте; имя источника — обычным.
+                    Text(problem.origin)
+                        .font(.system(size: 10, design: problem.origin == problem.code ? .monospaced : .default))
+                        .foregroundStyle(.tertiary)
                 }
+            }
+            if let fix {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "wand.and.stars")
+                    Text(fix)
+                }
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
             }
             if let documentation {
                 if !problems.isEmpty { Divider().opacity(0.4) }
@@ -160,6 +173,39 @@ private struct DocumentationView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Как выглядит ошибка
+
+extension RustlynDiagnostic.Severity {
+    /// Цвет волны под текстом и значка в окне подсказки — один на двоих.
+    var color: NSColor {
+        switch self {
+        case .error: return Theme.diagnosticError
+        case .warning: return Theme.diagnosticWarning
+        case .info, .hidden: return Theme.foldMarker
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .error: return "xmark.octagon.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .info, .hidden: return "info.circle.fill"
+        }
+    }
+}
+
+extension RustlynDiagnostic {
+    /// Замечание сверки с парой (`PairQueries.pairDiagnostics`), а не компилятора.
+    var isPairCheck: Bool { code == "PAIR" }
+
+    /// Подпись справа от сообщения: код компилятора (`CS0103`), а где кода,
+    /// понятного человеку, нет, — кто так считает.
+    var origin: String {
+        if isPairCheck { return L("сверка с парой") }
+        return code.isEmpty ? "Rustlyn" : code
     }
 }
 

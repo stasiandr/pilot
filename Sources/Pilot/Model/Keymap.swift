@@ -208,6 +208,7 @@ enum EditorCommand: String, CaseIterable {
     case previousOccurrence = "nav.previousOccurrence"
     case nextProblem = "nav.nextProblem"
     case previousProblem = "nav.previousProblem"
+    case problemDescription = "nav.problemDescription"
     case rename = "refactor.rename"
     case formatCode = "refactor.format"
     case callHierarchy = "nav.callHierarchy"
@@ -222,6 +223,8 @@ enum EditorCommand: String, CaseIterable {
     case fontBigger = "view.fontBigger"
     case fontSmaller = "view.fontSmaller"
     case fontReset = "view.fontReset"
+    case nextProject = "view.nextProject"
+    case previousProject = "view.previousProject"
     // Git и ревью
     case nextChange = "git.nextChange"
     case previousChange = "git.previousChange"
@@ -317,6 +320,7 @@ enum EditorCommand: String, CaseIterable {
         case .previousOccurrence: return L("Предыдущее вхождение")
         case .nextProblem: return L("Следующая ошибка")
         case .previousProblem: return L("Предыдущая ошибка")
+        case .problemDescription: return L("Описание ошибки")
         case .rename: return L("Переименовать")
         case .formatCode: return L("Форматировать код")
         case .callHierarchy: return L("Иерархия вызовов")
@@ -330,6 +334,8 @@ enum EditorCommand: String, CaseIterable {
         case .fontBigger: return L("Шрифт крупнее")
         case .fontSmaller: return L("Шрифт мельче")
         case .fontReset: return L("Исходный размер шрифта")
+        case .nextProject: return L("Следующий проект")
+        case .previousProject: return L("Предыдущий проект")
         case .nextChange: return L("Следующее изменение")
         case .previousChange: return L("Предыдущее изменение")
         case .reviews: return L("Ревью мерж-реквестов")
@@ -445,6 +451,8 @@ enum EditorCommand: String, CaseIterable {
         case .previousOccurrence: return Shortcut("up", option: true)
         case .nextProblem: return Shortcut("f2")
         case .previousProblem: return Shortcut("f2", shift: true)
+        // Как «Error Description» в Rider.
+        case .problemDescription: return Shortcut("f1", command: true)
         case .rename: return Shortcut("f6", shift: true)
         case .formatCode: return Shortcut("l", command: true, option: true)
         case .callHierarchy: return Shortcut("h", option: true, control: true, shift: true)
@@ -458,6 +466,10 @@ enum EditorCommand: String, CaseIterable {
         case .fontBigger: return Shortcut("=", command: true)
         case .fontSmaller: return Shortcut("-", command: true)
         case .fontReset: return Shortcut("0", command: true)
+        // Как Next Project Window в Rider. Штатный ⌘` macOS перебирает все
+        // окна, а пункт меню с тем же сочетанием AppKit спрашивает раньше.
+        case .nextProject: return Shortcut("`", command: true)
+        case .previousProject: return Shortcut("`", command: true, shift: true)
         case .nextChange: return Shortcut("down", option: true, control: true)
         case .previousChange: return Shortcut("up", option: true, control: true)
         case .reviews: return Shortcut("r", command: true, option: true)

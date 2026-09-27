@@ -575,3 +575,29 @@ final class UnityYAMLFile: @unchecked Sendable {   // неизменяем по�
         return s < e ? string(u, s, e) : ""
     }
 }
+
+// MARK: - Значение поля скрипта
+
+extension UnityYAMLFile {
+    /// Значение сериализованного поля `field` у объекта, чей `m_Script`
+    /// стоит в строке `scriptLine`: строка `  field: …` того же блока (до
+    /// следующего `--- !u!`). Вложенное — список или структура на следующих
+    /// строках — `…`. `lines` — строки файла.
+    static func serializedField(_ field: String, afterLine scriptLine: Int,
+                                lines: [Substring]) -> (line: Int, value: String)? {
+        let key = "  \(field):"
+        var index = scriptLine + 1
+        while index < lines.count, !lines[index].hasPrefix("--- ") {
+            let line = lines[index]
+            if line.hasPrefix(key) {
+                let value = line.dropFirst(key.count).trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty { return (index, value) }
+                // Значение ниже: `  - a` списка или `    x: 1` структуры.
+                let next = index + 1 < lines.count ? lines[index + 1] : ""
+                return (index, next.hasPrefix("  - ") || next.hasPrefix("    ") ? "…" : "")
+            }
+            index += 1
+        }
+        return nil
+    }
+}

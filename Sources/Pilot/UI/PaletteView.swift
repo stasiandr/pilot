@@ -22,7 +22,9 @@ struct PaletteView: View {
             VStack(spacing: 0) {
                 queryField
                 if workspace.paletteMode == .search { scopeBar }
-                if !workspace.items.isEmpty {
+                if workspace.paletteMode == .generated, !workspace.items.isEmpty,
+                   !workspace.generatedStatus.isEmpty { generatedStatusLine }
+                if !workspace.items.isEmpty || showsPreview {
                     Divider().opacity(0.35)
                     results
                 } else if shouldShowEmptyState {
@@ -44,7 +46,14 @@ struct PaletteView: View {
 
     // MARK: - Раскладка
 
-    private var showsPreview: Bool { previewEnabled && !workspace.items.isEmpty }
+    private var showsPreview: Bool { previewEnabled && (!workspace.items.isEmpty || awaitsUsages) }
+
+    /// Использования ищутся долго, и палитра открыта со спиннером: она сразу
+    /// того размера, какой будет со списком и предпросмотром, — иначе,
+    /// открывшись узкой, раздувалась бы под пришедшие строки.
+    private var awaitsUsages: Bool {
+        workspace.paletteMode == .references && workspace.paletteBusy && workspace.items.isEmpty
+    }
 
     /// Предпросмотр справа, если окно позволяет; иначе — под списком.
     private var isWide: Bool { available.width == 0 || available.width >= 1060 }
@@ -75,7 +84,7 @@ struct PaletteView: View {
             }
             .frame(height: bodyHeight)
         } else {
-            let listHeight = min(resultListHeight, bodyHeight * 0.42)
+            let listHeight = awaitsUsages ? bodyHeight * 0.42 : min(resultListHeight, bodyHeight * 0.42)
             resultList(height: listHeight)
             Divider().opacity(0.35)
             previewPane.frame(height: bodyHeight - listHeight)
@@ -145,7 +154,7 @@ struct PaletteView: View {
 
     /// Всё, файлы, типы, символы, текст. Фильтр — не другой поиск, а сужение
     /// этого: набранное остаётся. Те же сочетания, что открывают палитру,
-    /// переключают его, пока она открыта.
+    /// переключают его, пока она открыта, а Tab и ⇧Tab — на соседний по кругу.
     private var scopeBar: some View {
         HStack(spacing: 6) {
             ForEach(SearchScope.allCases, id: \.self) { scope in
@@ -184,7 +193,7 @@ struct PaletteView: View {
                 }
                 .buttonStyle(.plain)
                 .focusable(false)
-                .help(KeymapStore.shared.help("Искать и в \(label)", .pairSearch))
+                .help(KeymapStore.shared.help(L("Искать и в \(label)"), .pairSearch))
             }
         }
         .padding(.horizontal, 16)
@@ -235,6 +244,19 @@ struct PaletteView: View {
                     .foregroundStyle(.tertiary)
             }
         }
+    }
+
+    /// Сгенерированный код: от какого времени список и не устарел ли он.
+    private var generatedStatusLine: some View {
+        HStack {
+            Text(workspace.generatedStatus)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer()
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 10)
     }
 
     private var emptyState: some View {
@@ -336,6 +358,7 @@ struct PaletteView: View {
                 .padding(.vertical, 8)
             }
             .frame(height: height)
+            .overlay(alignment: .topLeading) { if awaitsUsages { emptyState } }
             .onChange(of: workspace.selection) { _, new in
                 if selectedByClick { selectedByClick = false; return }
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(new, anchor: .center) }
@@ -450,6 +473,9 @@ struct PaletteRow: View {
 
             Spacer(minLength: 6)
 
+            if let pair = item.pairLabel {
+                pairTag(pair)
+            }
             if let trailing = item.trailing, !trailing.isEmpty {
                 Text(trailing)
                     .font(.system(size: 10, design: .monospaced))
@@ -465,8 +491,34 @@ struct PaletteRow: View {
                     .fill(Color.accentColor.opacity(0.85))
             }
         }
+        // Вторая половина пары — ещё и полоской её цвета у левого края:
+        // свои и чужие строки различимы, даже не читая меток.
+        .overlay(alignment: .leading) {
+            if item.pairLabel != nil {
+                Capsule()
+                    .fill(pairColor)
+                    .frame(width: 3)
+                    .padding(.vertical, 6)
+                    .padding(.leading, 2)
+            }
+        }
         .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
     }
+
+    /// Метка второй половины пары: `server`, `client`. На выделенной строке —
+    /// сплошная: полупрозрачная потерялась бы на цвете выделения.
+    private func pairTag(_ label: String) -> some View {
+        Text(label)
+            .font(.system(size: 10, weight: .semibold))
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(isSelected ? pairColor : pairColor.opacity(0.2)))
+            .foregroundStyle(isSelected ? Color(nsColor: Theme.badgeText) : pairColor)
+            .fixedSize()
+    }
+
+    private var pairColor: Color { Color(nsColor: Theme.pairProject) }
 
     /// Файлы — цветной иконкой, как в навигаторе; остальное приглушённо.
     private var iconStyle: AnyShapeStyle {
@@ -496,7 +548,8 @@ struct PaletteRow: View {
                 t = t.bold()
                 if !isSelected { t = t.foregroundColor(.accentColor) }
             } else if !runInName && !isSelected {
-                t = t.foregroundColor(.secondary)
+                // Путь во второй половине пары — на ступень тише своего.
+                t = item.pairLabel == nil ? t.foregroundColor(.secondary) : t.foregroundStyle(.tertiary)
             }
             result = result + t
             runText = ""

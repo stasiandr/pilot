@@ -35,5 +35,11 @@ extension English {
         ("Unity ещё не компилировала %@ — откройте проект в Unity", "Unity has not compiled %@ yet — open the project in Unity"),
         ("Для типов этого файла генераторы ничего не написали", "Generators wrote nothing for the types in this file"),
         ("Для типов этого файла генераторы ничего не написали (всего в %@: %@)", "Generators wrote nothing for the types in this file (%@ has %@ in total)"),
+        ("Не удалось прочитать %@", "Couldn't read %@"),
+        ("Собрано в %@ — исходники с тех пор не менялись", "Generated at %@ — the sources haven't changed since"),
+        ("Собрано в %@, исходники с тех пор менялись — обновляю…", "Generated at %@; the sources have changed since — refreshing…"),
+        ("Собрано в %@ и может быть устаревшим: %@", "Generated at %@ and may be outdated: %@"),
+        ("Собрано в %@, исходники с тех пор менялись", "Generated at %@; the sources have changed since"),
+        ("Обновлено в %@", "Refreshed at %@"),
     ]
 }

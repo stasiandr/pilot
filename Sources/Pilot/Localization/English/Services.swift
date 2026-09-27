@@ -157,9 +157,11 @@ extension English {
         ("использование|использования|использований", "usage|usages"),
         ("Сообщение Unity", "Unity message"),
         ("Условие: %@", "Condition: %@"),
+        ("%@ — исправить: %@", "%@ — fix: %@"),
         // InfoPopup.swift
         ("в %@", "in %@"),
         ("Возвращает: ", "Returns: "),
+        ("сверка с парой", "pair check"),
         // Copilot
         ("Copilot не выдал код для входа", "Copilot didn’t provide a sign-in code"),
         ("Введите код на странице GitHub — он уже в буфере обмена:", "Enter the code on the GitHub page — it’s already on the clipboard:"),

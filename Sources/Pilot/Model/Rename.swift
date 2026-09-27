@@ -58,4 +58,19 @@ enum Rename {
         }
         return ns as String
     }
+
+    /// Обратные правки: что вписать, чтобы отменить `edits`, — те же места,
+    /// но в координатах текста после них. Правки не пересекаются.
+    static func inverse(of edits: [(range: NSRange, text: String)],
+                        in text: NSString) -> [(range: NSRange, text: String)] {
+        var inverse: [(range: NSRange, text: String)] = []
+        var shift = 0
+        for edit in edits.sorted(by: { $0.range.location < $1.range.location }) {
+            let length = (edit.text as NSString).length
+            inverse.append((NSRange(location: edit.range.location + shift, length: length),
+                            text.substring(with: edit.range)))
+            shift += length - edit.range.length
+        }
+        return inverse
+    }
 }

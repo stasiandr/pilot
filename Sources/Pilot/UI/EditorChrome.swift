@@ -58,6 +58,9 @@ struct WindowChrome: NSViewRepresentable {
             guard let window else { return }
             let style: NSWindow.ToolbarStyle = chrome.isCompact ? .unifiedCompact : .unified
             if window.toolbarStyle != style { window.toolbarStyle = style }
+            // Пункта «Скрыть панель инструментов» в меню больше нет: в ней
+            // проект, ветка и ▶. Спрятанную прежде — вернуть.
+            if let toolbar = window.toolbar, !toolbar.isVisible { toolbar.isVisible = true }
             // Вкладки проектов — штатные вкладки окон macOS. Выключены — новый
             // проект открывается своим окном; вкладкой — только по кнопке пары.
             // Уже собранные вкладки .disallowed не разбирает.

@@ -386,7 +386,7 @@ struct FontViewer: View {
                 }
             }
         }
-        .foregroundStyle(Color(nsColor: Theme.color(.plain)))
+        .foregroundStyle(Color(nsColor: Theme.swiftUIColor(.plain)))
     }
 
     /// Шрифт не регистрируется в системе: CTFont создаётся прямо из файла

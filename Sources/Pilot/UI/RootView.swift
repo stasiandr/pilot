@@ -33,9 +33,9 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(min: 275, ideal: 280, max: 480)
         } detail: {
             detail
-                .inspector(isPresented: inspectorVisibility) {
+                // Колонка и её ширины — рядом с самим инспектором (UnityInspectorView.swift).
+                .unityInspector(isPresented: inspectorVisibility) {
                     UnityInspectorView(workspace: workspace)
-                        .inspectorColumnWidth(min: 260, ideal: 330, max: 600)
                 }
                 .toolbar(id: toolbarID) { toolbar }
                 .pilotTransparentToolbar()
@@ -115,13 +115,21 @@ struct RootView: View {
                 MirrorBar(workspace: workspace, mirror: mirror)
             }
             content
+            // Панели снизу, как и консоль Unity, окно не раздвигают: в узком
+            // окне пары сплит становился шире окна, и инспектор уезжал за край.
             if workspace.root != nil, workspace.run.showsConsole {
-                RunConsole(run: workspace.run, logs: workspace.run.serverLog, root: workspace.root) { url, line in
+                RunConsole(run: workspace.run, root: workspace.root) { url, line in
                     workspace.openLogLocation(url, line: line, column: nil)
                 }
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .clipped()
             }
             if workspace.root != nil, workspace.debug.isPanelVisible {
-                DebugPanel(debug: workspace.debug)
+                DebugPanel(debug: workspace.debug, root: workspace.root) { url, line in
+                    workspace.openLogLocation(url, line: line, column: nil)
+                }
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .clipped()
             }
             if workspace.unity.isActive {
                 UnityConsoleSlot(workspace: workspace, console: workspace.unityConsole)
@@ -130,7 +138,7 @@ struct RootView: View {
                 statusBar
             }
         }
-        .background(Color(nsColor: Theme.editorBackground).ignoresSafeArea())
+        .background(Color(nsColor: Theme.swiftUIEditorBackground).ignoresSafeArea())
     }
 
     @ViewBuilder
@@ -178,6 +186,7 @@ struct RootView: View {
                          editRequest: workspace.editRequest,
                          onCaretChange: { workspace.caretMoved(to: $0) },
                          onGoToDefinition: { workspace.goToDefinition(at: $0) },
+                         onCommandHover: { workspace.prepareCommandClick(at: $0) },
                          onLineClick: { workspace.lineClicked($0) },
                          onCommentLine: workspace.isReviewDocument ? { workspace.commentOnLine($0) } : nil,
                          breakpoints: workspace.editorBreakpoints,
@@ -187,6 +196,7 @@ struct RootView: View {
                              ? { workspace.setBreakpointCondition(line: $0, $1) } : nil,
                          contextActions: { workspace.contextActions(at: $0) },
                          codeActions: { await workspace.codeActionGroups(selection: $0) },
+                         textMenuActions: { workspace.pairActions(at: $0) },
                          requestCompletions: { offset, trigger, retrigger in
                              await workspace.completions(at: offset, trigger: trigger, retrigger: retrigger)
                          },
@@ -291,11 +301,11 @@ struct RootView: View {
 
             ToolbarItem(id: "stop", placement: .automatic) {
                 if hasRunTargets {
-                    Button { workspace.run.stop() } label: {
+                    Button { workspace.stopRunOrDebug() } label: {
                         Label(L("Остановить"), systemImage: "stop.fill")
                     }
                     .help(KeymapStore.shared.help(L("Остановить"), .stop))
-                    .disabled(!workspace.run.isRunning)
+                    .disabled(!workspace.isRunningOrDebugging)
                 }
             }
 
@@ -313,7 +323,7 @@ struct RootView: View {
                     Label(label, systemImage: "arrow.left.arrow.right")
                         .labelStyle(.titleAndIcon)
                 }
-                .help(KeymapStore.shared.help("Вторая половина пары — \(workspace.partner?.lastPathComponent ?? label)",
+                .help(KeymapStore.shared.help(L("Вторая половина пары — \(workspace.partner?.lastPathComponent ?? label)"),
                                               .openPartner))
             }
         }
@@ -333,6 +343,13 @@ struct RootView: View {
             ToolbarItem(id: "database", placement: .automatic) {
                 if workspace.root != nil {
                     DatabaseToolbarButton()
+                }
+            }
+
+            // Пакеты NuGet — там, где есть проекты .NET в SDK-стиле.
+            ToolbarItem(id: "nuget", placement: .automatic) {
+                if workspace.root != nil, workspace.nuget.restore.hasProjects {
+                    NuGetToolbarButton(report: workspace.nuget.restore) { workspace.openNuGet() }
                 }
             }
 
@@ -483,7 +500,7 @@ struct RootView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .frame(height: 24)
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .overlay(alignment: .top) {
             Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
         }

@@ -15,8 +15,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/Sources/coretests"
-cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,AutoPairs,LocalHistory,Tabs,OpenRequest,FileChanges,UnifiedSearch,ContentSearch,NavigationHistory,LineEditing,FoldRegions,SelectionSteps,Rename,Keymap,RiderImport,RiderBundledKeymaps,MediaKind,FBX,Markdown,ProjectPair,DatagramContract,ConfigLinks,PairQueries,ValueFlow,CacheStore,IndexCache}.swift "$TMP/Sources/coretests/"
-cp Sources/Pilot/Highlight/{Language,Lexer,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,AutoPairs,LocalHistory,Tabs,OpenRequest,FileChanges,UnifiedSearch,ContentSearch,NavigationHistory,LineEditing,FoldRegions,SelectionSteps,Rename,Keymap,RiderImport,RiderBundledKeymaps,MediaKind,FBX,Markdown,ProjectPair,DatagramContract,ConfigLinks,PairQueries,ValueFlow,CacheStore,IndexCache,ValueOrigin}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Highlight/{Language,Lexer,EditMap,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,Completion}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Git/{LineDiff,GitParsing,Git,MergeConflicts,GitCommit}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Nav/{SymbolIndex,LocalNavigator}.swift "$TMP/Sources/coretests/"
@@ -24,9 +24,11 @@ cp Sources/Pilot/Decompile/{AssemblyMetadata,AssemblySignatures,AssemblySource,A
 cp Sources/Pilot/GitLab/{GitLabRemote,GitLabModels,UnifiedDiff,MergeRequestSearch}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Unity/{UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector,UnityHierarchy,UnityLog,UnityGenerators}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Archive/ArchiveLayout.swift "$TMP/Sources/coretests/"
-cp Sources/Pilot/Run/{RunTargets,ServerLog,LogSites}.swift Sources/Pilot/NuGet/{NuGetProjects,NuGetSources,NuGetClient}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Run/{RunTargets,ServerLog,LogSites}.swift Sources/Pilot/NuGet/{NuGetProjects,NuGetSources,NuGetClient,NuGetRestore}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Configs/ConfigCatalog.swift Sources/Pilot/Update/Release.swift Sources/Pilot/Extensions/ProjectRules.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Debug/{SoftDebuggerWire,DebugModels,DebugExpression,Breakpoints,DebugTargets}.swift "$TMP/Sources/coretests/"
+# Форк: SQL MariaDB в окне базы — диалект для подсветки и разбор запроса для дополнения.
+cp Sources/Pilot/Fork/Database/{SQLDialect,SQLCompletion}.swift "$TMP/Sources/coretests/"
 # Перевод: таблицы и проверка, что у каждой строки интерфейса он есть.
 cp Sources/Pilot/Localization/*.swift Sources/Pilot/Localization/English/*.swift CoreTests/LocalizationAudit.swift "$TMP/Sources/coretests/"
 # Типы Rustlyn и заглушка на случай, когда библиотеки нет. Здесь её нет

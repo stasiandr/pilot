@@ -41,9 +41,14 @@ final class DebugService: ObservableObject {
     @Published var isPanelVisible = false
     @Published private(set) var lastTarget: DebugTarget?
 
-    /// Вывод программы и отладчика. Отдельный объект: сервер пишет в лог
-    /// сотни строк в секунду, и перерисовывать из-за них всё окно незачем.
+    /// Сообщения отладчика: подключение, ошибки, `Debug.WriteLine`.
+    /// Отдельный объект, как и вывод программы: перерисовывать из-за них
+    /// всё окно незачем.
     let console = DebugConsole()
+    /// Вывод программы, которую Pilot запустил под отладчиком: сборка и
+    /// то, что пишет сама программа. Тот же разбор и вид, что у ▶, —
+    /// лог событиями, фильтры, свойства, стек и переход к коду.
+    let output = ProgramOutput()
 
     /// Показать место в редакторе: файл и строку с нуля.
     var onShowLocation: ((URL, Int) -> Void)?
@@ -75,6 +80,7 @@ final class DebugService: ObservableObject {
         targets = []
         lastTarget = nil
         console.clear()
+        output.clear()
     }
 
     private func persist() {
@@ -229,6 +235,10 @@ final class DebugService: ObservableObject {
         lastError = nil
         sessionTitle = target.title
         console.clear()
+        // Перезапуск — как у ▶: вывод с начала, первой строкой — команда.
+        if case .dotnetLaunch(let project) = target {
+            output.begin(target.id, command: "dotnet build \(project.lastPathComponent) -c Debug", root: root)
+        }
         clearStop()
         isPanelVisible = true
         state = .starting(target.isUnity ? "Подключаюсь…" : "Запускаю…")
@@ -300,16 +310,19 @@ final class DebugService: ObservableObject {
     private static let noAdapter = DebugError.message(
         "Нет netcoredbg — отладчика .NET. Его ставит ./build.sh (fetch-netcoredbg.sh).")
 
-    /// `dotnet build` с выводом в консоль панели и путь к собранной сборке.
+    /// `dotnet build` с выводом в вывод программы — как сборка у `dotnet run`
+    /// под ▶ — и путь к собранной сборке.
     private func build(_ project: URL, dotnet: URL, session: Int) async throws -> URL {
-        console.append("$ dotnet build \(project.lastPathComponent) -c Debug\n", category: "console")
         let status = try await run(dotnet, ["build", project.path, "-c", "Debug", "-nologo", "-clp:NoSummary"],
-                                   directory: project.deletingLastPathComponent(), echo: true)
+                                   directory: project.deletingLastPathComponent(), session: session, echo: true)
         guard generation == session else { throw CancellationError() }
-        guard status == 0 else { throw DebugError.message("Сборка не удалась — ошибки в выводе ниже") }
+        guard status == 0 else {
+            output.end(L("Сборка не удалась"))
+            throw DebugError.message("Сборка не удалась — ошибки в выводе ниже")
+        }
         var captured = ""
         _ = try await run(dotnet, ["msbuild", project.path, "-getProperty:TargetPath", "-p:Configuration=Debug"],
-                          directory: project.deletingLastPathComponent(), echo: false) { captured += $0 }
+                          directory: project.deletingLastPathComponent(), session: session, echo: false) { captured += $0 }
         let path = captured.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
             throw DebugError.message("Не нашлась собранная сборка \(project.deletingPathExtension().lastPathComponent).dll")
@@ -317,7 +330,7 @@ final class DebugService: ObservableObject {
         return URL(fileURLWithPath: path)
     }
 
-    private func run(_ executable: URL, _ arguments: [String], directory: URL, echo: Bool,
+    private func run(_ executable: URL, _ arguments: [String], directory: URL, session: Int, echo: Bool,
                      collect: ((String) -> Void)? = nil) async throws -> Int32 {
         let proc = Process()
         proc.executableURL = executable
@@ -330,14 +343,19 @@ final class DebugService: ObservableObject {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
-        let console = self.console
         let collected = collect
+        // Байтами, как у ▶: буква UTF-8 может разорваться между кусками.
+        // Сессию остановили — хвост сборки в вывод уже не пишем.
+        let echoed: @MainActor @Sendable (Data) -> Void = { [weak self] data in
+            guard echo, let self, self.generation == session else { return }
+            self.output.enqueue(data)
+        }
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
             let text = String(decoding: data, as: UTF8.self)
             Task { @MainActor in
-                if echo { console.append(text, category: "stdout") }
+                echoed(data)
                 collected?(text)
             }
         }
@@ -349,9 +367,8 @@ final class DebugService: ObservableObject {
                 let status = p.terminationStatus
                 Task { @MainActor in
                     if !rest.isEmpty {
-                        let text = String(decoding: rest, as: UTF8.self)
-                        if echo { console.append(text, category: "stdout") }
-                        collected?(text)
+                        echoed(rest)
+                        collected?(String(decoding: rest, as: UTF8.self))
                     }
                     continuation.resume(returning: status)
                 }
@@ -390,9 +407,15 @@ final class DebugService: ObservableObject {
             clearStop()
         case .output(let text, let category):
             console.append(text, category: category)
+        case .programOutput(let text):
+            output.enqueue(Data(text.utf8))
+        case .exited(let code):
+            output.end(ProgramOutput.exitNote(code))
+            console.append(L("Программа завершилась с кодом \(code)") + "\n", category: "console")
         case .breakpoints(let file, let list):
             applyStatuses(file, list)
         case .terminated(let message):
+            output.end(message ?? L("Завершилось"))
             finish(message)
         }
     }
@@ -415,6 +438,7 @@ final class DebugService: ObservableObject {
         if case .dotnetLaunch = lastTarget { terminate = true } else { terminate = false }
         buildProcess.map { if $0.isRunning { $0.terminate() } }
         generation += 1
+        output.end(L("Остановлено"))
         finish(nil)
         if let backend { Task { await backend.stop(terminate: terminate) } }
     }
@@ -432,9 +456,10 @@ final class DebugService: ObservableObject {
 
     private func fail(_ message: String) {
         let backend = self.backend
+        output.end(message)
         finish(nil)
         lastError = message
-        console.append(message + "\n", category: "stderr")
+        console.append(message + "\n", category: "important")
         if let backend { Task { await backend.stop(terminate: true) } }
     }
 
@@ -468,7 +493,7 @@ final class DebugService: ObservableObject {
     }
 
     private func report(_ error: Error) {
-        console.append(error.localizedDescription + "\n", category: "stderr")
+        console.append(error.localizedDescription + "\n", category: "important")
     }
 
     // MARK: Остановка: стек и переменные

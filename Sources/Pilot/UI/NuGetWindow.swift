@@ -32,6 +32,42 @@ struct NuGetWindow: View {
     }
 }
 
+// MARK: - Кнопка в тулбаре
+
+/// NuGet в тулбаре окна проекта — у проектов .NET. Точка на значке, как у
+/// кнопки базы: пакеты не восстановлены, и компиляция их не видит.
+///
+/// Отчёт приходит значением, а не подпиской на NuGetService: иначе каждая
+/// буква в поиске окна NuGet перестраивала бы тулбар окна проекта.
+struct NuGetToolbarButton: View {
+    let report: NuGetRestoreReport
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            Label {
+                Text(L("Пакеты NuGet"))
+            } icon: {
+                Image(systemName: "shippingbox")
+                    .overlay(alignment: .bottomTrailing) {
+                        if report.needsAttention {
+                            Circle()
+                                .fill(Color(nsColor: Theme.diagnosticWarning))
+                                .frame(width: 6, height: 6)
+                                .offset(x: 3, y: 2)
+                        }
+                    }
+            }
+        }
+        .help(help)
+    }
+
+    private var help: String {
+        let title = KeymapStore.shared.help(L("Пакеты NuGet"), .nuget)
+        return report.needsAttention ? title + "\n" + report.headline : title
+    }
+}
+
 struct NuGetView: View {
     @ObservedObject var nuget: NuGetService
     @Environment(\.dismiss) private var dismiss
@@ -41,6 +77,7 @@ struct NuGetView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            restoreBanner
             if nuget.tab != .sources { sourcesBanner }
             HSplitView {
                 Group {
@@ -61,11 +98,12 @@ struct NuGetView: View {
             Divider()
             statusBar
         }
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .onAppear {
             nuget.activate()
             filterFocused = true
         }
+        .onDisappear { nuget.deactivate() }
         .onChange(of: nuget.tab) { _, tab in
             nuget.selectedID = nil
             switch tab {
@@ -175,6 +213,44 @@ struct NuGetView: View {
         case .sources:
             let attention = nuget.missingSources.count + nuget.sourcesNeedingLogin.count
             return attention > 0 ? "\(tab.title) \(attention)" : tab.title
+        }
+    }
+
+    // MARK: - restore
+
+    /// Пакеты, которых компиляция не видит, — над всеми вкладками: на
+    /// «Источниках» чинят ленту, и restore после этого — тут же.
+    @ViewBuilder
+    private var restoreBanner: some View {
+        let report = nuget.restore
+        if !report.problems.isEmpty {
+            // Тесты и утилиты рядом с собранным проектом — спокойнее.
+            let tint = report.needsAttention ? Color(nsColor: Theme.diagnosticWarning) : Color.secondary
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: report.needsAttention ? "exclamationmark.triangle.fill" : "info.circle")
+                    .foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(report.headline)
+                        .lineLimit(2)
+                    ForEach(report.reasons + report.messages, id: \.self) { line in
+                        Text(line)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
+                }
+                .help(report.details)
+                Spacer(minLength: 8)
+                Button(L("Восстановить")) { nuget.restorePackages() }
+                    .disabled(nuget.isBusy)
+                    .help(L("dotnet restore этих проектов"))
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(report.needsAttention ? tint.opacity(0.12) : Color.clear)
+            Divider()
         }
     }
 

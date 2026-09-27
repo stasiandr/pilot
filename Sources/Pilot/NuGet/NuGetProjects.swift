@@ -84,6 +84,9 @@ struct NuGetReference: Hashable {
     var version: String?
     /// Версия из Directory.Packages.props — централизованное управление.
     var isCentral = false
+    /// Под условием — своим, `<ItemGroup Condition>`, `<When>`, или внутри
+    /// `<Target>`: пакет есть не при всякой сборке, и restore мог его не видеть.
+    var isConditional = false
 
     /// Версия, с которой можно сравнивать: точная, без диапазона и свойств.
     var resolved: NuGetVersion? {
@@ -162,16 +165,32 @@ enum NuGetProjects {
     /// с `<Version>` внутри. `Update=` не добавляет пакет — пропускается.
     static func packageReferences(in text: String) -> [NuGetReference] {
         let plain = withoutComments(text)
+        let conditional = conditionalRanges(in: plain)
         var out: [NuGetReference] = []
         for element in elements(named: "PackageReference", in: plain) {
             guard let id = element.attributes["include"], !id.isEmpty else { continue }
             let version = element.attributes["version"] ?? element.attributes["versionoverride"]
                 ?? element.body.flatMap { RunTargets.element("Version", in: $0) }
-            if !out.contains(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }) {
-                out.append(NuGetReference(id: id, version: version))
+            let isConditional = element.attributes["condition"] != nil
+                || conditional.contains { $0.contains(element.range.lowerBound) }
+            if let index = out.firstIndex(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }) {
+                // Та же ссылка ещё раз и без условия — пакет есть всегда.
+                if !isConditional { out[index].isConditional = false }
+            } else {
+                out.append(NuGetReference(id: id, version: version, isConditional: isConditional))
             }
         }
         return out
+    }
+
+    /// Где ссылки действуют не всегда: `<ItemGroup Condition>`, ветки
+    /// `<Choose>` и `<Target>` — его элементы появляются во время сборки.
+    private static func conditionalRanges(in text: String) -> [Range<String.Index>] {
+        ["ItemGroup", "When", "Otherwise", "Target"].flatMap { name in
+            elements(named: name, in: text)
+                .filter { name == "Otherwise" || name == "Target" || $0.attributes["condition"] != nil }
+                .map(\.range)
+        }
     }
 
     /// `<PackageVersion Include="Id" Version="1.0" />` — ключи в нижнем регистре:
@@ -207,6 +226,8 @@ enum NuGetProjects {
         var attributes: [String: String]
         /// Между открывающим и закрывающим тегом; nil — тег закрыт сам (`/>`).
         var body: String?
+        /// Весь элемент в тексте: от `<` до закрывающего тега.
+        var range: Range<String.Index>
     }
 
     static func elements(named name: String, in text: String) -> [Element] {
@@ -230,7 +251,7 @@ enum NuGetProjects {
                     body = ""
                 }
             }
-            out.append(Element(attributes: attributes, body: body))
+            out.append(Element(attributes: attributes, body: body, range: open.lowerBound..<cursor))
         }
         return out
     }
@@ -307,5 +328,10 @@ enum NuGetProjects {
 
     static func removeCommand(project: String, id: String) -> String {
         "dotnet remove " + RunTargets.shellQuoted(project) + " package " + RunTargets.shellQuoted(id)
+    }
+
+    /// Пакеты проекта и проектов, на которые он ссылается.
+    static func restoreCommand(project: String) -> String {
+        "dotnet restore " + RunTargets.shellQuoted(project)
     }
 }

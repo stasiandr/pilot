@@ -20,7 +20,7 @@ struct DebugToolbarControls: View {
                                           set: { debug.isTargetPickerOpen = $0 }),
                      arrowEdge: .bottom) {
                 DebugTargetPicker(debug: debug)
-                    .preferredColorScheme(.dark)
+                    .preferredColorScheme(Theme.current.isDark ? .dark : .light)
             }
         }
     }
@@ -163,10 +163,15 @@ struct DebugTargetPicker: View {
 
 // MARK: - Панель
 
-/// Нижняя панель отладки: слева стек, справа переменные или вывод.
+/// Нижняя панель отладки: слева стек, справа переменные, консоль программы
+/// или сообщения отладчика — как вкладки Debugger, Console и Debug Output в Rider.
 struct DebugPanel: View {
     @ObservedObject var debug: DebugService
+    /// Корень проекта и переход к месту — для лога программы, как у консоли ▶.
+    let root: URL?
+    let open: (URL, Int) -> Void
     @AppStorage("pilot.debugPanelHeight") private var height: Double = 240
+    /// 0 — переменные, 1 — консоль программы, 2 — сообщения отладчика.
     @AppStorage("pilot.debugPanelTab") private var tab = 0
     @State private var dragStart: Double?
 
@@ -180,25 +185,50 @@ struct DebugPanel: View {
                     .frame(width: 280)
                 Rectangle().fill(Color(nsColor: Theme.separator)).frame(width: 1)
                 VStack(spacing: 0) {
-                    Picker("", selection: $tab) {
-                        Text("Переменные").tag(0)
-                        Text("Вывод").tag(1)
+                    HStack(spacing: 8) {
+                        Picker("", selection: Binding(get: { shownTab }, set: { tab = $0 })) {
+                            Text(L("Переменные")).tag(0)
+                            if showsProgram { Text(L("Консоль")).tag(1) }
+                            Text(L("Отладчик")).tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .fixedSize()
+                        Spacer(minLength: 8)
+                        if shownTab == 1 { programControls }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 220)
+                    .padding(.horizontal, 10)
                     .padding(.vertical, 5)
-                    if tab == 0 {
-                        DebugVariablesView(debug: debug)
-                    } else {
-                        DebugConsoleView(console: debug.console)
+                    switch shownTab {
+                    case 0: DebugVariablesView(debug: debug)
+                    case 1: ProgramOutputView(output: debug.output, root: root, open: open)
+                    default: DebugConsoleView(console: debug.console)
                     }
                 }
             }
         }
         .frame(height: CGFloat(height))
-        .background(Color(nsColor: Theme.editorBackground))
-        .onChange(of: debug.lastError) { _, error in if error != nil { tab = 1 } }
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
+        // Итог и ошибки сборки — в выводе программы; где его нет — у отладчика.
+        .onChange(of: debug.lastError) { _, error in if error != nil { tab = showsProgram ? 1 : 2 } }
+    }
+
+    /// Консоль программы есть, только когда Pilot запускал её сам (.NET):
+    /// к Unity и к работающему процессу подключаются, их вывод идёт мимо.
+    private var showsProgram: Bool { debug.lastTarget?.hasProgramOutput == true }
+
+    /// Выбранная вкладка; консоли у этой сессии нет — сообщения отладчика.
+    private var shownTab: Int { tab == 1 && !showsProgram ? 2 : min(max(tab, 0), 2) }
+
+    /// «Лог | Вывод» и 🗑 — те же, что в шапке консоли ▶.
+    private var programControls: some View {
+        HStack(spacing: 8) {
+            ProgramOutputModePicker(logs: debug.output.serverLog)
+            Button { debug.output.clear() } label: { Image(systemName: "trash") }
+                .buttonStyle(.borderless)
+                .help(L("Очистить"))
+        }
+        .font(.system(size: 11))
     }
 
     private var resizeHandle: some View {
@@ -423,7 +453,7 @@ private struct VariableRow: View {
             .frame(width: 12)
             if !variable.name.isEmpty {
                 Text(variable.name)
-                    .foregroundStyle(Color(nsColor: Theme.color(.plain)))
+                    .foregroundStyle(Color(nsColor: Theme.swiftUIColor(.plain)))
                 Text("=").foregroundStyle(.tertiary)
             }
             if draft != nil {
@@ -445,12 +475,12 @@ private struct VariableRow: View {
                         .truncationMode(.tail)
                         .help(error)
                 }
+            } else if isClickable {
+                valueText
             } else {
-                Text(variable.value)
-                    .foregroundStyle(Color(nsColor: valueColor))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .textSelection(.enabled)
+                // Кликом тут ничего не сделать — пусть значение выделяется
+                // и копируется по частям.
+                valueText.textSelection(.enabled)
             }
             if loading { ProgressView().controlSize(.mini) }
             Spacer(minLength: 8)
@@ -467,9 +497,13 @@ private struct VariableRow: View {
         .padding(.trailing, 8)
         .frame(height: 19)
         .contentShape(Rectangle())
-        // Двойной клик — править, как в Rider и Xcode; одиночный — раскрыть.
-        .onTapGesture(count: 2) { if canEdit { beginEditing() } }
-        .onTapGesture { if variable.children > 0 { toggle() } }
+        // Клик в любом месте строки: узел раскрывается (править его — двойным
+        // кликом), у листа раскрывать нечего — он правится. Выделения текста
+        // у таких строк нет, чтобы оно не забирало клик у значения. Пока поле
+        // открыто, клики — его: строка их не ловит и черновик не сбрасывает.
+        .gesture(TapGesture(count: 2).onEnded { beginEditing() },
+                 including: draft == nil && canEdit && variable.children > 0 ? .all : .subviews)
+        .gesture(TapGesture().onEnded { click() }, including: draft == nil && isClickable ? .all : .subviews)
         .contextMenu {
             if canEdit {
                 Button("Изменить значение") { beginEditing() }
@@ -478,8 +512,34 @@ private struct VariableRow: View {
             Button("Скопировать значение") { copy(variable.value) }
             Button("Скопировать имя") { copy(variable.name) }
         }
-        .help(canEdit ? variable.value + "\nДвойной клик — изменить" : variable.value)
+        .help(helpText)
         .onChange(of: canEdit) { _, can in if !can { draft = nil; error = nil } }
+        .onChange(of: focused) { _, isFocused in
+            // Ушли из поля, ничего не поменяв, — оно закрывается: открывается
+            // оно одним кликом, и иначе забытые поля копились бы по списку.
+            guard !isFocused, !saving, let draft, draft == Self.editableText(variable.value) else { return }
+            self.draft = nil
+            error = nil
+        }
+    }
+
+    private var valueText: some View {
+        Text(variable.value)
+            .foregroundStyle(Color(nsColor: valueColor))
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
+    /// Клик по строке что-то делает: раскрывает узел или правит значение.
+    private var isClickable: Bool { variable.children > 0 || canEdit }
+
+    private func click() {
+        if variable.children > 0 { toggle() } else if canEdit { beginEditing() }
+    }
+
+    private var helpText: String {
+        guard canEdit else { return variable.value }
+        return variable.value + "\n" + (variable.children > 0 ? L("Двойной клик — изменить") : L("Клик — изменить"))
     }
 
     private func beginEditing() {
@@ -526,7 +586,7 @@ private struct VariableRow: View {
         if value.hasPrefix("\"") { return Theme.color(.string) }
         if value == "null" || value == "true" || value == "false" { return Theme.color(.keyword) }
         if let first = value.first, first.isNumber || first == "-" { return Theme.color(.number) }
-        return Theme.color(.plain)
+        return Theme.swiftUIColor(.plain)
     }
 
     private func copy(_ text: String) {

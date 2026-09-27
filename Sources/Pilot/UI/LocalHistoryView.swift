@@ -41,7 +41,7 @@ struct LocalHistoryView: View {
             }
         }
         .frame(minWidth: 860, idealWidth: 1000, minHeight: 520, idealHeight: 680)
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .preferredColorScheme(Theme.current.isDark ? .dark : .light)
         .onAppear(perform: load)
         .onChange(of: selection) { _, _ in loadVersion() }

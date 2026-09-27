@@ -240,7 +240,7 @@ private struct PreviewCode: View {
                 }
             }
         }
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
     }
 
     private func row(_ line: FilePreview.Line) -> some View {
@@ -269,7 +269,7 @@ private struct PreviewCode: View {
         var result = AttributedString()
         for segment in line.segments {
             var part = AttributedString(segment.text)
-            part.foregroundColor = Color(nsColor: Theme.color(segment.kind))
+            part.foregroundColor = Color(nsColor: Theme.swiftUIColor(segment.kind))
             if segment.focused {
                 part.backgroundColor = Color(nsColor: NSColor.findHighlightColor.withAlphaComponent(0.45))
             }

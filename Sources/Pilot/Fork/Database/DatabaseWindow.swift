@@ -10,6 +10,8 @@ struct DatabaseWindow: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openWindow) private var openWindow
     @State private var editor = SQLEditorState()
+    /// Размер шрифта редактора — общий с окнами проектов (⌘+ и ⌘− там).
+    @AppStorage("pilot.fontSize") private var fontSize = Double(Workspace.defaultFontSize)
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,15 +21,17 @@ struct DatabaseWindow: View {
                 sidebar
                     .frame(minWidth: 200, idealWidth: 260, maxWidth: 420)
                 VSplitView {
-                    SQLEditor(text: $browser.sql, state: editor) { run() }
-                        .frame(minHeight: 90, idealHeight: 180)
+                    SQLEditor(text: $browser.sql, state: editor, fontSize: CGFloat(fontSize)) { model, offset in
+                        await browser.completions(in: model, at: offset)
+                    }
+                    .frame(minHeight: 90, idealHeight: 180)
                     results
                         .frame(minHeight: 160)
                 }
                 .frame(minWidth: 480)
             }
         }
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .navigationTitle(L("База данных"))
         .frame(minWidth: 820, minHeight: 480)
         .id(language.current)
@@ -297,71 +301,6 @@ private struct TableRow: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(table.name, forType: .string)
             }
-        }
-    }
-}
-
-// MARK: - SQL-редактор
-
-/// Что выделено в редакторе — чтобы ⌘↩ выполнил только это.
-final class SQLEditorState {
-    weak var textView: NSTextView?
-
-    var selectedText: String? {
-        guard let view = textView else { return nil }
-        let range = view.selectedRange()
-        guard range.length > 0 else { return nil }
-        return (view.string as NSString).substring(with: range)
-    }
-}
-
-struct SQLEditor: NSViewRepresentable {
-    @Binding var text: String
-    let state: SQLEditorState
-    let run: () -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSTextView.scrollableTextView()
-        scroll.drawsBackground = false
-        let view = scroll.documentView as! NSTextView
-        view.font = Theme.editorFont(size: 13)
-        view.textColor = NSColor.labelColor
-        view.insertionPointColor = NSColor.labelColor
-        view.drawsBackground = false
-        view.isRichText = false
-        view.allowsUndo = true
-        view.usesFindBar = true
-        view.isAutomaticQuoteSubstitutionEnabled = false
-        view.isAutomaticDashSubstitutionEnabled = false
-        view.isAutomaticTextReplacementEnabled = false
-        view.isAutomaticSpellingCorrectionEnabled = false
-        view.isContinuousSpellCheckingEnabled = false
-        view.textContainerInset = NSSize(width: 8, height: 8)
-        view.string = text
-        view.delegate = context.coordinator
-        state.textView = view
-        return scroll
-    }
-
-    func updateNSView(_ scroll: NSScrollView, context: Context) {
-        context.coordinator.parent = self
-        let view = scroll.documentView as! NSTextView
-        state.textView = view
-        if view.string != text {
-            view.string = text
-        }
-    }
-
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        var parent: SQLEditor
-
-        init(_ parent: SQLEditor) { self.parent = parent }
-
-        func textDidChange(_ notification: Notification) {
-            guard let view = notification.object as? NSTextView else { return }
-            parent.text = view.string
         }
     }
 }

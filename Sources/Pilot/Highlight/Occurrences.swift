@@ -94,11 +94,17 @@ enum Occurrences {
 
             let tokens = model.tokens(fromLine: line, toLine: line)
             for hit in raw[position..<upper] {
-                if let token = tokens.first(where: { Int($0.start) == hit }),
-                   Int(token.length) == needle.count,
-                   isCodeToken(token.kind) {
-                    result.append(NSRange(location: hit, length: needle.count))
+                // Слово своим токеном — код, если это не строка, не комментарий
+                // и не число; внутри чужого (строки, директивы) — нет. Ни под
+                // каким — обычное имя: Rustlyn, который отвечает за устоявшийся
+                // C#, таким токенов не отдаёт вовсе, свой лексер отдаёт всем.
+                // Без этого `count` в только что открытом файле не
+                // подсвечивался, а после первой правки — подсвечивался.
+                if let token = tokens.first(where: { Int($0.start) <= hit && hit < Int($0.start + $0.length) }) {
+                    guard Int(token.start) == hit, Int(token.length) == needle.count,
+                          isCodeToken(token.kind) else { continue }
                 }
+                result.append(NSRange(location: hit, length: needle.count))
             }
             position = upper
         }

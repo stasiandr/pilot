@@ -17,7 +17,13 @@ extension Workspace {
         // Алиас конфига сервера: ⌘B ведёт в JSON, объявление константы —
         // отдельным пунктом ниже.
         let config = configActions(at: offset, in: document)
-        if let config { groups.append(config) }
+        if let config {
+            groups.append(config)
+        } else if let modelConfigs = configModelActions(at: offset, in: document) {
+            // Тип, который читают как модель конфига, открывает конфиг так
+            // же, как его alias; ⌘B по-прежнему ведёт к объявлению типа.
+            groups.append(modelConfigs)
+        }
 
         // Сцены и префабы ссылаются GUID и fileID — это не идентификаторы,
         // но ⌘B по ним переходит к ассету.
@@ -32,6 +38,9 @@ extension Workspace {
             groups.append(ContextActionGroup(title: symbol.text,
                                              actions: symbolActions(symbol.text, at: offset,
                                                                     definitionIsConfig: config != nil)))
+            // Двойник во второй половине пары; у датаграммы — и её сверка.
+            let pair = pairActions(for: symbol.text)
+            if !pair.isEmpty { groups.append(ContextActionGroup(title: L("Пара"), actions: pair)) }
         }
 
         if let conflict = MergeConflicts.conflict(atLine: line, in: conflicts) {

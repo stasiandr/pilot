@@ -26,6 +26,12 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     var viewState: ViewState?
     /// Где был курсор, когда ушли на другой файл.
     var lastCaret: Int { viewState?.selection.location ?? 0 }
+    /// Место перехода, ради которого вкладку сделали активной (поиск, ⌘B,
+    /// Unity), пока редактор её не показал. Важнее `viewState`: вкладка
+    /// откроется здесь, а не там, где её оставили, — даже если редактор
+    /// покажет её позже (после картинки, Markdown) или создастся заново.
+    /// nil — просто показать вкладку. Забирает редактор (см. Landing).
+    var landing: LSPRange?
     /// Когда вкладку последний раз делали активной. По этому порядку ходит
     /// ⌃Tab, и по нему же выбирается, какую вкладку закрыть сверх лимита.
     var lastActivated = 0
@@ -43,6 +49,11 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     /// Свёрнутые куски — то, что спрятано, в UTF-16. Живут с буфером:
     /// ушёл на другую вкладку и вернулся — свёрнуто, как было.
     var folded: [NSRange] = []
+    /// Подсказки в строках и счётчики использований, какими их посчитали в
+    /// последний раз, и версия текста, для которой. Тоже живут с буфером:
+    /// вернулся на вкладку — они на месте сразу, а не появляются через
+    /// секунду, сдвигая строки.
+    var insights: (version: Int, found: RustlynInsights)?
 
     private(set) var isDirty = false
     private var savedUnits: [UInt16]
@@ -54,6 +65,9 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     /// текст, `delta` — изменение длины, с `settled` токены прежние.
     /// Приходит посреди обработки правки: только запомнить, не рисовать.
     var onDisplayEdit: ((_ range: NSRange, _ delta: Int, _ settled: Int) -> Void)?
+    /// Раскраска сменила основу — Rustlyn разобрал текст заново: редактору
+    /// перекрасить видимое целиком, одним разом.
+    var onDisplayRecolor: (() -> Void)?
 
     var url: URL { document.url }
     var model: SyntaxModel { document.model }
@@ -143,6 +157,12 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
         document.semanticsVersion = version
     }
 
+    /// Файл переименовали вслед за типом: буфер тот же — история ⌘Z,
+    /// курсор и свёрнутое остаются, — меняется только путь.
+    func relocate(to url: URL) {
+        document = document.moved(to: url)
+    }
+
     // MARK: - Правки
 
     /// Сюда приходит любая правка текста: набор, вставка, ⌘Z, дополнение.
@@ -187,28 +207,31 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     /// Правки текста, которые пришли не с клавиатуры, — переименование по
     /// всему проекту. Одним шагом ⌘Z, и в той же истории, что набор: это
     /// тот же менеджер отмены, которым пользуется редактор.
-    func applyEdits(_ edits: [(range: NSRange, text: String)], actionName: String) {
+    ///
+    /// `registersUndo: false` — шаг отмены заводит тот, кто правит весь
+    /// проект (`Workspace.applyProjectEdits`): один на всю правку, а не свой
+    /// в каждой вкладке. Возвращает обратные правки — в координатах текста
+    /// после этих.
+    @discardableResult
+    func applyEdits(_ edits: [(range: NSRange, text: String)], actionName: String,
+                    registersUndo: Bool = true) -> [(range: NSRange, text: String)] {
         let valid = edits.filter { NSMaxRange($0.range) <= storage.length }
             .sorted { $0.range.location > $1.range.location }
-        guard !valid.isEmpty, !isReadOnly else { return }
+        guard !valid.isEmpty, !isReadOnly else { return [] }
         // Что вернуть при отмене: те же места, но в координатах после правки.
-        var inverse: [(range: NSRange, text: String)] = []
-        var shift = 0
-        for edit in valid.reversed() {
-            let old = (storage.string as NSString).substring(with: edit.range)
-            let length = (edit.text as NSString).length
-            inverse.append((NSRange(location: edit.range.location + shift, length: length), old))
-            shift += length - edit.range.length
+        let inverse = Rename.inverse(of: valid, in: storage.string as NSString)
+        if registersUndo {
+            undoManager.beginUndoGrouping()
+            undoManager.registerUndo(withTarget: self) { buffer in
+                MainActor.assumeIsolated { buffer.applyEdits(inverse, actionName: actionName) }
+            }
+            undoManager.setActionName(actionName)
+            undoManager.endUndoGrouping()
         }
-        undoManager.beginUndoGrouping()
-        undoManager.registerUndo(withTarget: self) { buffer in
-            MainActor.assumeIsolated { buffer.applyEdits(inverse, actionName: actionName) }
-        }
-        undoManager.setActionName(actionName)
-        undoManager.endUndoGrouping()
         for edit in valid {
             storage.replaceCharacters(in: edit.range, with: edit.text)
         }
+        return inverse
     }
 
     // MARK: - Файл поменяли снаружи

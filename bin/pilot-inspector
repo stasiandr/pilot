@@ -1,0 +1,25 @@
+#!/bin/bash
+# Инспектор Unity без окна — та же форма, что у ⌥⌘0, в PNG:
+#
+#   bin/pilot-inspector Файл.prefab[:строка] [--object fileID | --name GameObject]
+#                       [--width 330] [--height 1400] [--scale 1] [--out inspector.png] [--lang en]
+#                       [--expand] [--debug-fields] [--read-only] [--click x,y]… [--dump] [--list]
+#                       [--window 1496x938 [--compact] [--tabs] [--pair clm-server] [--console]]
+#
+# Окно не показывается, приложение не активируется, настройки Pilot не
+# меняются. Что сделали щелчки (`--click`), печатается в stdout. Индекс GUID
+# берётся из кэша: проект должен хоть раз открываться в Pilot. Подробно —
+# Sources/Pilot/Unity/HeadlessInspector.swift.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$ROOT/Pilot.app/Contents/MacOS/Pilot"
+DEBUG="$(cd "$ROOT" && swift build -c debug --show-bin-path 2>/dev/null)/Pilot"
+# Свежее из двух: debug-сборка обычно новее бандла.
+if [[ -x "$DEBUG" && ( ! -x "$BIN" || "$DEBUG" -nt "$BIN" ) ]]; then BIN="$DEBUG"; fi
+if [[ ! -x "$BIN" ]]; then
+    echo "Pilot не собран: ./build.sh debug" >&2
+    exit 2
+fi
+TARGET="$1"; shift
+# Строки NSLog (с датой) — шум для терминала; свои сообщения идут как "pilot: …".
+exec "$BIN" --render-inspector "$TARGET" "$@" 2> >(grep -v '^[0-9]\{4\}-' >&2)

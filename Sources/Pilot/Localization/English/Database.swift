@@ -6,7 +6,6 @@ extension English {
         ("Docker не отвечает", "Docker is not responding"),
         ("LOAD DATA LOCAL INFILE не поддерживается", "LOAD DATA LOCAL INFILE is not supported"),
         ("MariaDB в Docker", "MariaDB in Docker"),
-        ("MariaDB в Docker…", "MariaDB in Docker…"),
         ("База готовится…", "Database is initializing…"),
         ("База данных", "Database"),
         ("Базы", "Databases"),
@@ -33,7 +32,6 @@ extension English {
         ("Не следить за логами", "Stop Following Logs"),
         ("Непонятный ответ сервера при входе", "Unexpected server reply during login"),
         ("Нет подключения", "Not connected"),
-        ("Обозреватель базы…", "Database Browser…"),
         ("Образ", "Image"),
         ("Окружение clm-server", "clm-server environment"),
         ("Остановка…", "Stopping…"),
@@ -84,5 +82,10 @@ extension English {
         ("⌘↩ — выполнить запрос. Двойной щелчок по таблице — её строки.", "⌘↩ runs the query. Double-click a table to see its rows."),
         ("Имя базы", "Database name"),
         ("запись|записи|записей", "row|rows"),
+        // SQL-редактор: дополнение и замена текста из дерева.
+        ("Замена запроса", "Replace Query"),
+        ("представление", "view"),
+        ("процедура", "procedure"),
+        ("функция", "function"),
     ]
 }

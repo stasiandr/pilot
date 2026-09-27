@@ -273,9 +273,11 @@ final class NetcoredbgDebugger: DebugBackend, @unchecked Sendable {
         case "continued":
             emit(.resumed)
         case "output":
-            let category = body["category"] as? String ?? "console"
-            if let text = body["output"] as? String, category != "telemetry" {
-                emit(.output(text, category: category))
+            guard let text = body["output"] as? String else { return }
+            switch DebugOutputSource(dapOutput: body) {
+            case .program: emit(.programOutput(text))
+            case .debugger(let category): emit(.output(text, category: category))
+            case .ignored: break
             }
         case "breakpoint":
             guard let bp = body["breakpoint"] as? [String: Any], let id = bp["id"] as? Int else { return }
@@ -286,8 +288,7 @@ final class NetcoredbgDebugger: DebugBackend, @unchecked Sendable {
             }
             if let (file, list) = update { emit(.breakpoints(file: file, list)) }
         case "exited":
-            let code = body["exitCode"] as? Int ?? 0
-            emit(.output("Программа завершилась с кодом \(code)\n", category: "console"))
+            emit(.exited(Int32(clamping: body["exitCode"] as? Int ?? 0)))
         case "terminated":
             emit(.terminated(nil))
         default:

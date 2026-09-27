@@ -87,6 +87,93 @@ final class ServerLogStore: ObservableObject {
     }
 }
 
+/// Вывод запущенной программы: текст как есть (`RunLog`) и он же событиями
+/// лога (`ServerLogStore`). Свой у ▶ и у отладки, а разбор и вид
+/// (`ProgramOutputView`) — одни: под отладчиком лог выглядит так же.
+@MainActor
+final class ProgramOutput {
+    let log = RunLog()
+    let serverLog = ServerLogStore()
+
+    private var decoder = ConsoleDecoder()
+    private var parser = ServerLogParser()
+    /// Что запускали последним — перезапуск того же не сбрасывает вид.
+    private var target: String?
+    /// Запуск идёт, итога ещё не было.
+    private var isOpen = false
+
+    /// Вывод копится в фоне и уходит на главный поток пачками: при
+    /// сотне строк в секунду по одной задаче на кусок интерфейс бы встал.
+    private let lock = NSLock()
+    nonisolated(unsafe) private var queue: [Data] = []
+    nonisolated(unsafe) private var flushScheduled = false
+
+    /// Новый запуск: прежний вывод уходит, первой строкой — команда.
+    /// У той же цели события очищаются, но консоль остаётся логом, а не
+    /// прыгает на сырой вывод, пока идёт сборка (см. `ServerLogStore`).
+    func begin(_ target: String, command: String, root: URL) {
+        if target != self.target { serverLog.reset() } else { serverLog.clear() }
+        self.target = target
+        lock.withLock { queue = [] }
+        decoder = ConsoleDecoder()
+        parser = ServerLogParser()
+        serverLog.scanSites(root: root)
+        log.clear()
+        log.append("▶ \(command)\n\n")
+        isOpen = true
+    }
+
+    /// Кусок вывода — с любого потока.
+    nonisolated func enqueue(_ data: Data) {
+        lock.lock()
+        queue.append(data)
+        let schedule = !flushScheduled
+        flushScheduled = true
+        lock.unlock()
+        guard schedule else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            MainActor.assumeIsolated { self?.flush() }
+        }
+    }
+
+    private func flush() {
+        lock.lock()
+        let chunks = queue
+        queue = []
+        flushScheduled = false
+        lock.unlock()
+        guard !chunks.isEmpty else { return }
+        var data = Data()
+        chunks.forEach { data.append($0) }
+        let text = decoder.feed(data)
+        log.append(text)
+        serverLog.add(parser.feed(text))
+    }
+
+    /// Программа кончилась: недописанное — наружу, последней строкой — итог.
+    /// Итог у запуска один: второй раз ничего не пишет.
+    func end(_ note: String) {
+        guard isOpen else { return }
+        isOpen = false
+        flush()
+        serverLog.add(parser.finish())
+        log.append("\n■ \(note)\n")
+    }
+
+    /// 🗑: и текст, и события.
+    func clear() {
+        log.clear()
+        serverLog.clear()
+    }
+
+    /// Итог по коду выхода; для убитого сигналом код — 128 + сигнал, как у shell.
+    static func exitNote(_ code: Int32) -> String {
+        if code == 0 { return L("Завершилось") }
+        if code > 128 { return L("Завершилось сигналом \(code - 128)") }
+        return L("Завершилось с кодом \(code)")
+    }
+}
+
 /// Кнопка ▶: что в проекте можно запустить, что запущено сейчас и его вывод.
 @MainActor
 final class RunService: ObservableObject {
@@ -106,22 +193,14 @@ final class RunService: ObservableObject {
     @Published private(set) var current: RunTarget?
     @Published var showsConsole = false
 
-    let log = RunLog()
-    let serverLog = ServerLogStore()
+    /// Вывод цели: текст и события лога.
+    let output = ProgramOutput()
 
     private var root: URL?
     private var process: RunProcess?
     /// ▶ во время работы — перезапуск: сначала дождаться выхода старого.
     private var restartPending = false
-    private var decoder = ConsoleDecoder()
-    private var logParser = ServerLogParser()
     private var scanGeneration = 0
-
-    /// Вывод копится в фоне и уходит на главный поток пачками: при
-    /// сотне строк в секунду по одной задаче на кусок интерфейс бы встал.
-    private let outputLock = NSLock()
-    nonisolated(unsafe) private var outputQueue: [Data] = []
-    nonisolated(unsafe) private var flushScheduled = false
 
     var isRunning: Bool { state == .running || state == .stopping }
 
@@ -193,18 +272,14 @@ final class RunService: ObservableObject {
 
     private func launch() {
         guard let target = selected, let root else { return }
-        if current?.name != target.name { serverLog.reset() } else { serverLog.clear() }
         current = target
-        decoder = ConsoleDecoder()
-        logParser = ServerLogParser()
-        serverLog.scanSites(root: root)
-        log.clear()
+        output.begin(target.name, command: target.command, root: root)
         let directory = target.directory.isEmpty ? root : root.appendingPathComponent(target.directory)
-        log.append("▶ \(target.command)\n\n")
+        let output = self.output
         do {
             process = try RunProcess.start(
                 command: target.command, directory: directory, environment: target.environment,
-                onOutput: { [weak self] data in self?.enqueue(data) },
+                onOutput: { data in output.enqueue(data) },
                 onExit: { [weak self] code in
                     Task { @MainActor in self?.exited(code) }
                 })
@@ -212,64 +287,23 @@ final class RunService: ObservableObject {
         } catch {
             process = nil
             state = .failed(error.localizedDescription)
-            log.append("Не запустилось: \(error.localizedDescription)\n")
+            output.end(L("Не запустилось: \(error.localizedDescription)"))
         }
     }
 
     private func exited(_ code: Int32) {
-        flush()
-        serverLog.add(logParser.finish())
         process = nil
         let wasStopped = state == .stopping
         state = .exited(code)
-        let note: String
-        if wasStopped {
-            note = "Остановлено"
-        } else if code == 0 {
-            note = "Завершилось"
-        } else if code > 128 {
-            note = "Завершилось сигналом \(code - 128)"
-        } else {
-            note = "Завершилось с кодом \(code)"
-        }
-        log.append("\n■ \(note)\n")
+        output.end(wasStopped ? L("Остановлено") : ProgramOutput.exitNote(code))
         if restartPending {
             restartPending = false
             launch()
         }
     }
 
-    // MARK: - Вывод
-
-    nonisolated private func enqueue(_ data: Data) {
-        outputLock.lock()
-        outputQueue.append(data)
-        let schedule = !flushScheduled
-        flushScheduled = true
-        outputLock.unlock()
-        guard schedule else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            MainActor.assumeIsolated { self?.flush() }
-        }
-    }
-
-    private func flush() {
-        outputLock.lock()
-        let chunks = outputQueue
-        outputQueue = []
-        flushScheduled = false
-        outputLock.unlock()
-        guard !chunks.isEmpty else { return }
-        var data = Data()
-        chunks.forEach { data.append($0) }
-        let text = decoder.feed(data)
-        log.append(text)
-        serverLog.add(logParser.feed(text))
-    }
-
     /// 🗑 в консоли: и текст, и события.
     func clearOutput() {
-        log.clear()
-        serverLog.clear()
+        output.clear()
     }
 }

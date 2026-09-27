@@ -100,6 +100,14 @@ final class UnityService: ObservableObject {
         }
     }
 
+    /// Индекс GUID из кэша прошлого запуска — и только: без обхода проекта и
+    /// без записи кэша. Для инспектора без окна (`HeadlessInspector`), который
+    /// только читает.
+    func adoptCachedAssets() {
+        guard let project, assets == nil else { return }
+        assets = IndexCache.loadAssets(root: project.root)?.index
+    }
+
     // MARK: - Где что лежит
 
     func url(forAsset relPath: String) -> URL? {
@@ -272,13 +280,23 @@ final class UnityService: ObservableObject {
             let visible = range.location..<NSMaxRange(range)
 
             if document.model.spec?.name == Languages.csharp.name {
-                for item in document.outline where visible.contains(item.range.location) {
+                // Структура догоняет набор с задержкой. Её места — через правки
+                // с тех пор, иначе пробел перед `Update` красил бы имя со
+                // сдвигом, пока не догонит; задетое правкой ждёт разбора.
+                let moved = document.isSemanticsFresh ? nil : document.model.edits(since: document.semanticsVersion)
+                for item in document.outline {
+                    var place = item.range
+                    if let moved {
+                        guard let carried = moved.carry(place) else { continue }
+                        place = carried
+                    }
+                    guard visible.contains(place.location) else { continue }
                     switch item.kind {
                     case .unityMessage:
-                        result.append(TextDecoration(range: item.range, color: Theme.unityEvent,
+                        result.append(TextDecoration(range: place, color: Theme.unityEvent,
                                                      toolTip: L("Сообщение Unity — вызывает движок")))
                     case .serializedField:
-                        result.append(TextDecoration(range: item.range,
+                        result.append(TextDecoration(range: place,
                                                      toolTip: L("Сериализуется — видно в инспекторе")))
                     default:
                         break

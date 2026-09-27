@@ -60,6 +60,14 @@ enum DebugTarget: Identifiable, Hashable, Sendable {
         default: return false
         }
     }
+
+    /// Вывод программы виден Pilot, только когда он запускает её сам.
+    /// К работающему процессу и к Unity подключаются: их вывод идёт мимо
+    /// отладчика (у Unity — в её консоль).
+    var hasProgramOutput: Bool {
+        if case .dotnetLaunch = self { return true }
+        return false
+    }
 }
 
 enum DebugTargets {

@@ -24,6 +24,10 @@ struct StringSpec {
     let close: [UInt8]
     let escapes: Bool
     let multiline: Bool
+    /// Каким токеном красить. Не строка — например, `имя` в обратных
+    /// кавычках SQL: это идентификатор, но внутри него нет ни ключевых
+    /// слов, ни комментариев.
+    var kind: TokenKind = .string
 }
 
 struct LanguageSpec {
@@ -36,6 +40,9 @@ struct LanguageSpec {
     var keywords: Set<String> = []
     var constants: Set<String> = []
     var typeKeywords: Set<String> = []
+    /// Ключевые слова без учёта регистра (SQL: `SELECT`, `select`, `Select`).
+    /// Тогда слова в `keywords`, `constants` и `typeKeywords` — строчными.
+    var caseInsensitiveKeywords = false
     /// '#' в C#/C/Swift — директивы препроцессора или атрибуты
     var preprocessorPrefix: UInt8? = nil
     /// '@' в Swift/Java/Kotlin/C# — атрибуты/аннотации
@@ -580,6 +587,7 @@ enum Languages {
             "like","case","when","then","else","end","with","primary","key","foreign","references","constraint",
             "default","unique","check","cascade","returning","begin","commit","rollback","transaction"]
         l.constants = ["null","true","false"]
+        l.caseInsensitiveKeywords = true
         l.capitalizedIsType = false
         l.outline = .keyword
         l.declarationKeywords = ["table": .type, "view": .type, "index": .field, "function": .method]

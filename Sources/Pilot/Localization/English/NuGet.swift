@@ -5,7 +5,7 @@ extension English {
         ("обновление|обновления|обновлений", "update|updates"),
         ("проект|проекта|проектов", "project|projects"),
 
-        // PilotApp.swift, Keymap.swift
+        // PilotApp.swift, Keymap.swift, кнопка в тулбаре окна проекта
         ("Пакеты NuGet…", "NuGet Packages…"),
         ("Пакеты NuGet", "NuGet Packages"),
 
@@ -18,6 +18,7 @@ extension English {
         ("Установка %@", "Installing %@"),
         ("Удаление %@", "Removing %@"),
         ("Обновление пакетов", "Updating packages"),
+        ("Восстановление пакетов", "Restoring packages"),
         ("%@: готово", "%@: done"),
         ("Не найден dotnet — установите .NET SDK", "dotnet not found — install the .NET SDK"),
         ("%@: отменено", "%@: cancelled"),
@@ -25,6 +26,14 @@ extension English {
         ("Нужно имя", "A name is required"),
         ("Адрес — https://…/index.json или папка на диске", "The address is https://…/index.json or a folder on disk"),
         ("Лента «%@» уже есть", "There is already a source named “%@”"),
+
+        // NuGetRestore.swift
+        ("Не восстановлены пакеты: %@", "Packages aren’t restored: %@"),
+        ("%@: restore не смог их найти", "%@: restore couldn’t find them"),
+        ("%@: их папок нет в кэше NuGet", "%@: their folders are missing from the NuGet cache"),
+        ("%@: добавлены после последнего restore", "%@: added after the last restore"),
+        ("%@: restore здесь ещё не запускался", "%@: restore hasn’t run on this machine yet"),
+        ("и ещё %@", "and %@ more"),
 
         // NuGetClient.swift, NuGetSources.swift
         ("%@: нужен логин и токен", "%@: needs a user name and token"),
@@ -69,6 +78,8 @@ extension English {
         ("Сменить на %@", "Change to %@"),
         ("Удалить из %@", "Remove from %@"),
         ("Установить", "Install"),
+        ("Восстановить", "Restore"),
+        ("dotnet restore этих проектов", "Run dotnet restore for these projects"),
 
         // NuGetWindow.swift — ленты
         ("Перечитать NuGet.Config и проверить ленты", "Reload NuGet.Config and Check Sources"),

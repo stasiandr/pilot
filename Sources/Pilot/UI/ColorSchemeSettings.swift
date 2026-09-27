@@ -12,7 +12,7 @@ struct ColorSchemeSettingsView: View {
             VStack(alignment: .leading, spacing: 18) {
                 ForEach(EditorScheme.Family.allCases, id: \.self) { family in
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(family.rawValue)
+                        Text(family.title)
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.secondary)
                         LazyVGrid(columns: columns, spacing: 12) {
@@ -57,7 +57,7 @@ private struct SchemeCard: View {
         .overlay(RoundedRectangle(cornerRadius: 8)
             .strokeBorder(isSelected ? Color.accentColor : Color.primary.opacity(0.12), lineWidth: isSelected ? 2 : 1))
         .contentShape(Rectangle())
-        .help(scheme.isDark ? "Тёмная схема" : "Светлая схема")
+        .help(scheme.isDark ? L("Тёмная схема") : L("Светлая схема"))
     }
 
     /// Строчки на все главные роли: комментарий, ключевое слово, тип,
@@ -77,20 +77,19 @@ private struct SchemeCard: View {
     }
 }
 
-/// Вид → Цветовая схема: переключить, не открывая настроек.
+/// Вид → Цветовая схема: переключить, не открывая настроек. Семейства —
+/// через черту, без заголовков: имена схем и так говорят, чьи они, а
+/// заголовки секций SwiftUI обносит в меню двойными чертами.
 struct ColorSchemeMenu: View {
     private let store = ThemeStore.shared
 
     var body: some View {
-        Picker("Цветовая схема", selection: Binding(get: { store.scheme.id }, set: { store.select($0) })) {
-            ForEach(EditorScheme.Family.allCases, id: \.self) { family in
-                Section(family.rawValue) {
-                    ForEach(EditorScheme.all.filter { $0.family == family }) { scheme in
-                        Text(scheme.name).tag(scheme.id)
-                    }
-                }
+        ForEach(Array(EditorScheme.Family.allCases.enumerated()), id: \.element) { index, family in
+            if index > 0 { Divider() }
+            ForEach(EditorScheme.all.filter { $0.family == family }) { scheme in
+                Toggle(scheme.name, isOn: Binding(get: { store.scheme.id == scheme.id },
+                                                  set: { if $0 { store.select(scheme.id) } }))
             }
         }
-        .pickerStyle(.inline)
     }
 }

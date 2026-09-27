@@ -1,6 +1,7 @@
 #!/bin/bash
 # Эталонные цепочки графа значения. Строка —
 #   Файл.cs:строка:столбец | Значение <- Код <- Источник | ещё цепочка…
+# Часть, которая начинается с `--`, — флаги графа: `| --assets |`.
 # Случаи, файлов которых на этой машине нет, пропускаются. Эталоны проекта
 # удобно держать рядом с его расширением: .pilot/extensions/<имя>/graph-tests.txt.
 #
@@ -15,22 +16,34 @@ if [[ ${#FILES[@]} == 0 ]]; then
     shopt -s nullglob
     FILES=("$ROOT"/GraphTests/*.txt)
 fi
+# Без xargs: он разбирает кавычки, а в цепочке бывает литерал `""`.
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
 passed=0; failed=0; skipped=0
 while IFS= read -r line; do
     [[ -z "${line// }" || "$line" == \#* ]] && continue
     IFS='|' read -ra parts <<< "$line"
-    target="$(echo "${parts[0]}" | xargs)"
+    target="$(trim "${parts[0]}")"
     file="${target%:*:*}"
     if [[ ! -f "$file" ]]; then skipped=$((skipped + 1)); continue; fi
     args=()
-    for expect in "${parts[@]:1}"; do args+=(--expect "$(echo "$expect" | xargs)"); done
+    expected=0
+    for expect in "${parts[@]:1}"; do
+        expect="$(trim "$expect")"
+        if [[ "$expect" == --* ]]; then
+            read -ra flags <<< "$expect"
+            args+=("${flags[@]}")
+        else
+            args+=(--expect "$expect")
+            expected=$((expected + 1))
+        fi
+    done
     output="$("$ROOT/bin/pilot-graph" "$target" "${args[@]}" 2>/dev/null)"; code=$?
     echo "── $(basename "$file"):${target#"$file":}"
     if [[ $VERBOSE == 1 ]]; then echo "$output"; else echo "$output" | grep -E '^(✓|✗) '; fi
     # Прошёл — если каждая цепочка отметилась ✓. Код 0 с пустым выводом
     # значит, что граф не строился вовсе (Pilot отдал запрос открытому окну).
     confirmed=$(echo "$output" | grep -c '^✓ ')
-    if [[ $code == 0 && -n "$output" ]] && (( confirmed == ${#args[@]} / 2 )); then
+    if [[ $code == 0 && -n "$output" ]] && (( confirmed == expected )); then
         passed=$((passed + 1))
     else
         [[ $code == 0 ]] && echo "✗ граф не построился: $(echo "$output" | head -1)"

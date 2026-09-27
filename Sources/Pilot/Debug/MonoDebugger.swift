@@ -281,7 +281,7 @@ actor MonoDebugger: DebugBackend {
             let n = try r.count()
             types = try (0..<n).map { _ in try r.id() }
         } catch {
-            emit(.output("Типы для \(file): \(error.localizedDescription)\n", category: "stderr"))
+            emit(.output(L("Типы для \(file): \(error.localizedDescription)") + "\n", category: "important"))
         }
         var statuses: [BreakpointStatus] = []
         for spec in specs.sorted(by: { $0.line < $1.line }) where breakpoints[file]?[spec.line] == nil {

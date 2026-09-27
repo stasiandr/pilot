@@ -24,6 +24,14 @@ struct EditorScheme: Identifiable, Equatable {
         case rider = "Rider"
         case catppuccin = "Catppuccin"
         case popular = "Популярные"
+
+        /// Подпись в настройках — на языке интерфейса.
+        var title: String {
+            switch self {
+            case .rider, .catppuccin: return rawValue
+            case .popular: return L("Популярные")
+            }
+        }
     }
 
     let id: String
@@ -93,7 +101,7 @@ extension EditorScheme {
     static let `default` = catppuccinMacchiato
 
     static let all: [EditorScheme] = [
-        riderDark, riderLight, darcula, intellijLight,
+        riderDark, riderIslandsDark, riderLight, darcula, intellijLight,
         catppuccinLatte, catppuccinFrappe, catppuccinMacchiato, catppuccinMocha,
         oneDark, dracula, monokai, nord, gruvboxDark, tokyoNight,
         githubDark, githubLight, solarizedDark, solarizedLight,
@@ -119,6 +127,30 @@ extension EditorScheme {
             constant: rgb(0x66C3CC), operatorTok: rgb(0xD0D0D0), field: rgb(0x66C3CC), disabled: rgb(0x5C5C5C)),
         caret: rgb(0xD0D0D0), selection: rgb(0x214283), occurrence: rgb(0x373F4F),
         gutter: rgb(0x6E6E6E), gutterCurrent: rgb(0xC0C0C0))
+
+    /// «Rider Islands Dark» — схема Rider 2025.3+ под интерфейс Islands: цвета
+    /// ReSharper те же, что у Rider Dark, а фон #191A1C — как у островов.
+    /// Хром — из Islands Dark: рамка вокруг островов светлее их.
+    /// Цвета токенов, курсора и выделения — из RiderIslandsDark.xml в
+    /// github.com/JetBrains/rider-theme-pack; препроцессор там не задан и,
+    /// как в Rider, берёт цвет ключевого слова.
+    static let riderIslandsDark = EditorScheme(
+        id: "rider-islands-dark", name: "Rider Islands Dark", family: .rider, isDark: true,
+        p: Palette(
+            crust: rgb(0x191A1C), mantle: rgb(0x26282B), base: rgb(0x191A1C),
+            surface0: rgb(0x323438), surface1: rgb(0x43454A), overlay2: rgb(0x787878),
+            subtext0: rgb(0x9DA0A8), text: rgb(0xD0D0D0),
+            rosewater: rgb(0xE6C8B0), flamingo: rgb(0xE8A7A7), pink: rgb(0xED94C0), red: rgb(0xFF5647),
+            mauve: rgb(0xC191FF), peach: rgb(0xE0955A), yellow: rgb(0xF5D86A), green: rgb(0x85C46C),
+            teal: rgb(0x39CC9B), sky: rgb(0x66C3CC), sapphire: rgb(0x4FA8D8), blue: rgb(0x6C95EB),
+            lavender: rgb(0xA5B4F5)),
+        syntax: Syntax(
+            keyword: rgb(0x6C95EB), type: rgb(0xC191FF), string: rgb(0xC9A26D), escape: rgb(0xD688D4),
+            number: rgb(0xED94C0), comment: rgb(0x85C46C), docComment: rgb(0x85C46C), function: rgb(0x39CC9B),
+            punctuation: rgb(0xBDBDBD), preprocessor: rgb(0x6C95EB), attribute: rgb(0xC191FF),
+            constant: rgb(0x66C3CC), operatorTok: rgb(0xBDBDBD), field: rgb(0x66C3CC), disabled: rgb(0x787878)),
+        caret: rgb(0xF0F0F0), selection: rgb(0x08335E), occurrence: rgb(0x232E46),
+        gutter: rgb(0x808080), gutterCurrent: rgb(0x808080))
 
     static let riderLight = EditorScheme(
         id: "rider-light", name: "Rider Light", family: .rider, isDark: false,

@@ -48,7 +48,7 @@ struct CommitView: View {
             DiffPane(commits: commits)
                 .frame(minWidth: 480, maxWidth: .infinity)
         }
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .onAppear {
             commits.refresh()
             messageFocused = true

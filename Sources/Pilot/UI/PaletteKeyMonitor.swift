@@ -28,8 +28,16 @@ final class PaletteKeyMonitor {
         case 125: workspace.moveSelection(1);  return nil     // ↓
         case 36, 76: workspace.activateSelection(); return nil // Return
         case 53: workspace.isPaletteOpen = false; return nil   // Esc
-        case 48:                                               // Tab — как в fzf
-            workspace.moveSelection(event.modifierFlags.contains(.shift) ? -1 : 1)
+        case 48:                                               // Tab
+            let backwards = event.modifierFlags.contains(.shift)
+            // В поиске — соседний фильтр, как в Search Everywhere у JetBrains:
+            // набранное остаётся, выдача пересобирается. В остальных палитрах
+            // фильтров нет, и Tab ходит по строкам, как в fzf.
+            if workspace.paletteMode == .search {
+                workspace.setSearchScope(workspace.searchScope.next(backwards: backwards))
+            } else {
+                workspace.moveSelection(backwards ? -1 : 1)
+            }
             return nil
         default:
             break

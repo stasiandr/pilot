@@ -83,6 +83,38 @@ enum ValueFlow {
         return .read
     }
 
+    /// Запись в элемент коллекции у имени `name`: `map[key] = value`,
+    /// `list.Add(value)`, `map.Add(key, value)`, `queue.Enqueue(value)`.
+    /// `value` — новое значение элемента: правая часть или последний
+    /// аргумент; `method` — как пишут (`[]`, `Add`…).
+    static func elementWrite(in text: [UInt16], name: NSRange) -> (value: NSRange, method: String)? {
+        var i = skipSpace(text, from: NSMaxRange(name))
+        if i < text.count, text[i] == question { i = skipSpace(text, from: i + 1) }
+        guard i < text.count else { return nil }
+        if text[i] == openBracket {
+            let close = matching(text, open: i)
+            guard close > i, case .write(let value?, _) = directAccess(in: text, name: NSRange(location: close, length: 1)),
+                  value.length > 0 else { return nil }
+            return (value, "[]")
+        }
+        guard text[i] == dot else { return nil }
+        let start = skipSpace(text, from: i + 1)
+        var end = start
+        while end < text.count, isIdentPart(text[end]) { end += 1 }
+        let method = string(text, NSRange(location: start, length: end - start))
+        guard ["Add", "TryAdd", "Enqueue", "Push", "Insert", "AddRange", "AddLast", "AddFirst", "Append"].contains(method)
+        else { return nil }
+        let name = NSRange(location: start, length: end - start)
+        var last: NSRange?
+        var index = 0
+        while let argument = argument(in: text, after: name, index: index) {
+            last = argument
+            index += 1
+        }
+        guard let last else { return nil }
+        return (last, method)
+    }
+
     /// Правая часть присваивания от `start` до конца выражения: `;` или
     /// запятая и скобка инициализатора `{ A = 1, B = 2 }` на своём уровне.
     static func rhs(in text: [UInt16], from start: Int) -> NSRange {
@@ -129,10 +161,36 @@ enum ValueFlow {
         var member = false
         /// Вызов, у результата которого она взята: `_stash.Get(e).x` → `_stash.Get`.
         var receiver: String?
+        /// Звенья этого вызова: `_stash`, `Get` у `_stash.Get(e).x`.
+        var receiverLinks: [NSRange] = []
         /// Первое звено цепочки: `a` у `a.b.c`.
         var head: NSRange?
+        /// Все звенья цепочки по порядку: у `a.b.c` — `a`, `b`, `c`. Без
+        /// `this.` и `base.`. Предпоследнее — получатель последнего.
+        var links: [NSRange] = []
         /// `new T(…)`: объект строится здесь же, из аргументов.
         var constructs = false
+        /// Имя — ключ обращения к элементу: `index` у `data[index]`.
+        var isIndexKey = false
+        /// Вызовы, в скобках которых стоит имя, — имена этих методов,
+        /// от внешнего к внутреннему: у `x` в `Clamp(Get(x), 0, 1)` — `Clamp`
+        /// и `Get`. Конструктор `new T(…)` сюда не входит: его аргументы — сам
+        /// объект.
+        var calls: [NSRange] = []
+
+        /// Та же цепочка без последнего звена — то, у чего его берут:
+        /// `stats.Damage` у `stats.Damage.ToString()`. nil — звено одно.
+        var receiverChain: Source? {
+            guard links.count >= 2 else { return nil }
+            var receiver = Source(range: links[links.count - 2],
+                                  chain: chain.split(separator: ".").dropLast().joined(separator: "."), call: false)
+            receiver.member = member
+            receiver.receiver = self.receiver
+            receiver.receiverLinks = receiverLinks
+            receiver.head = head
+            receiver.links = Array(links.dropLast())
+            return receiver
+        }
     }
 
     static func sources(in text: [UInt16], range: NSRange) -> [Source] {
@@ -213,6 +271,7 @@ enum ValueFlow {
             if let first = words.first, !keywords.contains(first) {
                 var source = Source(range: parts.last!, chain: words.joined(separator: "."), call: call)
                 source.head = parts[parts.count - words.count]
+                source.links = Array(parts.suffix(words.count))
                 source.constructs = call && word(text, endingAt: skipSpaceBackward(text, from: i)) == "new"
                 // `…).x`, `…].x` — член того, что вернуло выражение слева.
                 let back = skipSpaceBackward(text, from: i)
@@ -223,6 +282,7 @@ enum ValueFlow {
                        let open = matchingBackward(text, close: close - 1),
                        let callee = enclosingCall(in: text, at: open + 1) {
                         source.receiver = callee.chain
+                        source.receiverLinks = callee.links
                         // Сам вызов — не источник: из его результата берут только этот член.
                         if let index = result.lastIndex(where: { $0.call && $0.range == callee.range }) {
                             result.remove(at: index)
@@ -234,7 +294,369 @@ enum ValueFlow {
             // Аргументы дженерика (`new Dictionary<(Rarity rarity, int n), T>()`) — типы, не значения.
             i = call && after < end && text[after] == lt ? genericEnd(text, from: after, limit: end) : j
         }
+        for index in result.indices {
+            let at = result[index].links.first?.location ?? result[index].range.location
+            result[index].calls = enclosingCallNames(in: text, at: at, from: range.location)
+            result[index].isIndexKey = isIndexKey(in: text, at: at, from: range.location)
+        }
         return result
+    }
+
+    /// Имена вызовов, в незакрытых скобках которых стоит `offset` (не левее
+    /// `from`), от внешнего к внутреннему. `new T(…)`, `if (…)`, `typeof(…)`
+    /// и скобки выражения — не вызовы.
+    static func enclosingCallNames(in text: [UInt16], at offset: Int, from: Int) -> [NSRange] {
+        var names: [NSRange] = []
+        var depth = 0
+        var i = offset - 1
+        while i >= from {
+            let c = text[i]
+            if c == closeParen || c == closeBracket || c == closeBrace {
+                depth += 1
+            } else if c == openBracket || c == openBrace {
+                if depth > 0 { depth -= 1 }
+            } else if c == openParen {
+                if depth > 0 {
+                    depth -= 1
+                } else if let name = callee(in: text, open: i, from: from) {
+                    names.insert(name, at: 0)
+                }
+            }
+            i -= 1
+        }
+        return names
+    }
+
+    /// Выражение, у которого вызывают метод `name`: `player` у
+    /// `player.TryGet(…)`, `GetPlayer()` у `GetPlayer()?.TryGet(…)`. nil —
+    /// вызов без получателя.
+    static func receiverExpression(in text: [UInt16], before name: NSRange) -> NSRange? {
+        let dotAt = skipSpaceBackward(text, from: name.location)
+        guard dotAt > 0, text[dotAt - 1] == dot else { return nil }
+        var e = dotAt - 1
+        if e > 0, text[e - 1] == question { e -= 1 }
+        let end = skipSpaceBackward(text, from: e)
+        var i = end
+        // Назад по цепочке: имена, точки, скобки вызовов и индексов.
+        while i > 0 {
+            let c = text[i - 1]
+            if isIdentPart(c) || c == dot || c == question {
+                i -= 1
+            } else if c == closeParen || c == closeBracket {
+                var depth = 0
+                var k = i - 1
+                while k >= 0 {
+                    if text[k] == closeParen || text[k] == closeBracket { depth += 1 } else if text[k] == openParen || text[k] == openBracket {
+                        depth -= 1
+                        if depth == 0 { break }
+                    }
+                    k -= 1
+                }
+                guard k >= 0 else { break }
+                i = k
+            } else if isSpace(c) {
+                // Пробелы — только вокруг точки цепочки.
+                let j = skipSpaceBackward(text, from: i)
+                guard (j > 0 && text[j - 1] == dot) || (i < end && text[i] == dot) else { break }
+                i = j
+            } else {
+                break
+            }
+        }
+        return i < end ? NSRange(location: i, length: end - i) : nil
+    }
+
+    /// Цепочка, которой кончается имя `name`: `_stash.Get` у `Get`, `this.` отброшено.
+    static func chain(in text: [UInt16], endingWith name: NSRange) -> String {
+        chainLinks(in: text, endingWith: name).map { string(text, $0) }.joined(separator: ".")
+    }
+
+    /// Звенья той же цепочки по порядку — диапазоны имён.
+    static func chainLinks(in text: [UInt16], endingWith name: NSRange) -> [NSRange] {
+        var links = [name]
+        var start = name.location
+        while true {
+            let dotAt = skipSpaceBackward(text, from: start)
+            guard dotAt > 0, text[dotAt - 1] == dot else { break }
+            let end = skipSpaceBackward(text, from: dotAt - 1)
+            var begin = end
+            while begin > 0, isIdentPart(text[begin - 1]) { begin -= 1 }
+            guard begin < end, isIdentStart(text[begin]) else { break }
+            links.insert(NSRange(location: begin, length: end - begin), at: 0)
+            start = begin
+        }
+        if links.count > 1, ["this", "base"].contains(string(text, links[0])) { links.removeFirst() }
+        return links
+    }
+
+    /// Имя вызова перед скобкой `open`: `Get` у `_stash.Get(`, `Max` у `Max<int>(`.
+    private static func callee(in text: [UInt16], open: Int, from: Int) -> NSRange? {
+        var end = skipSpaceBackward(text, from: open)
+        if end > from, text[end - 1] == gt {
+            var angle = 0
+            var k = end - 1
+            while k >= from {
+                if text[k] == gt { angle += 1 } else if text[k] == lt { angle -= 1; if angle == 0 { break } }
+                k -= 1
+            }
+            guard k >= from else { return nil }
+            end = skipSpaceBackward(text, from: k)
+        }
+        var start = end
+        while start > from, isIdentPart(text[start - 1]) { start -= 1 }
+        guard start < end, isIdentStart(text[start]) else { return nil }
+        let name = string(text, NSRange(location: start, length: end - start))
+        if keywords.contains(name) || ["if", "while", "for", "foreach", "switch", "using", "lock", "catch"].contains(name) {
+            return nil
+        }
+        // `new T(…)` — конструктор: аргументы и есть объект.
+        var head = start
+        while true {
+            let dotAt = skipSpaceBackward(text, from: head)
+            guard dotAt > from, text[dotAt - 1] == dot else { break }
+            var s = skipSpaceBackward(text, from: dotAt - 1)
+            while s > from, isIdentPart(text[s - 1]) { s -= 1 }
+            head = s
+        }
+        return word(text, endingAt: skipSpaceBackward(text, from: head)) == "new" ? nil
+            : NSRange(location: start, length: end - start)
+    }
+
+    // MARK: - Литералы
+
+    /// Литералы, которыми может оказаться значение выражения: оно само
+    /// (`0`, `"idle"`, `-1f`, `null`, `new()`), ветки `?:`, правая часть
+    /// `??`, ветки `switch`, приведение `(int)5` и скобки. Литерал внутри
+    /// арифметики или аргументом вызова значением не считается: `hp - 1`,
+    /// `Clamp(x, 0, 1)` — там значение из имён.
+    static func literalAlternatives(in text: [UInt16], range: NSRange) -> [NSRange] {
+        var result: [NSRange] = []
+        collectLiterals(text, trimmed(text, range), depth: 0, into: &result)
+        return result
+    }
+
+    private static func collectLiterals(_ text: [UInt16], _ range: NSRange, depth: Int, into result: inout [NSRange]) {
+        guard range.length > 0, depth < 8 else { return }
+        let start = range.location
+        let end = NSMaxRange(range)
+        // Скобки вокруг всего выражения и приведение `(int)x`.
+        if text[start] == openParen {
+            let close = matching(text, open: start)
+            if close == end - 1 {
+                collectLiterals(text, trimmed(text, NSRange(location: start + 1, length: close - start - 1)), depth: depth + 1,
+                                into: &result)
+                return
+            }
+            if close > start, close < end - 1, isCastType(text, NSRange(location: start + 1, length: close - start - 1)) {
+                let rest = trimmed(text, NSRange(location: close + 1, length: end - close - 1))
+                // После приведения — операнд, а не продолжение выражения: `(a) - b` — не приведение.
+                if rest.length > 0, !binaryOperatorStart(text[rest.location]) || text[rest.location] == minus {
+                    collectLiterals(text, rest, depth: depth + 1, into: &result)
+                    return
+                }
+            }
+        }
+        // `a ?? b`, `c ? a : b` и `x switch { … }` на верхнем уровне.
+        var level = 0
+        var i = start
+        while i < end {
+            let c = text[i]
+            if c == quote || c == apostrophe {
+                i = skipLiteral(text, from: i)
+                continue
+            }
+            let next = i + 1 < end ? text[i + 1] : 0
+            if c == openParen || c == openBracket || c == openBrace { level += 1 } else if c == closeParen || c == closeBracket || c == closeBrace {
+                level -= 1
+            } else if level == 0, c == eq, next == gt {
+                // Лямбда: её тело — не значение выражения.
+                return
+            } else if level == 0, c == question {
+                if next == question {
+                    // `??=` сюда не попадает: это запись, а не выражение.
+                    collectLiterals(text, trimmed(text, NSRange(location: start, length: i - start)), depth: depth + 1, into: &result)
+                    collectLiterals(text, trimmed(text, NSRange(location: i + 2, length: end - i - 2)), depth: depth + 1, into: &result)
+                    return
+                }
+                if next != dot, next != openBracket, let colonAt = ternaryColon(text, from: i + 1, end: end) {
+                    collectLiterals(text, trimmed(text, NSRange(location: i + 1, length: colonAt - i - 1)), depth: depth + 1,
+                                    into: &result)
+                    collectLiterals(text, trimmed(text, NSRange(location: colonAt + 1, length: end - colonAt - 1)), depth: depth + 1,
+                                    into: &result)
+                    return
+                }
+            } else if level == 0, c == 0x73, i + 6 <= end, string(text, NSRange(location: i, length: 6)) == "switch",
+                      i == 0 || !isIdentPart(text[i - 1]), i + 6 == end || !isIdentPart(text[i + 6]) {
+                let open = skipSpace(text, from: i + 6)
+                if open < end, text[open] == openBrace {
+                    let close = matching(text, open: open)
+                    if close > open {
+                        for arm in switchArms(text, NSRange(location: open + 1, length: close - open - 1)) {
+                            collectLiterals(text, arm, depth: depth + 1, into: &result)
+                        }
+                        return
+                    }
+                }
+            }
+            i += 1
+        }
+        if isLiteral(text, range) { result.append(range) }
+    }
+
+    /// Выражение целиком — литерал: число, строка без вставок, символ,
+    /// `true`/`false`/`null`/`default`, `new()` или `new T()` без аргументов.
+    static func isLiteral(_ text: [UInt16], _ range: NSRange) -> Bool {
+        guard range.length > 0 else { return false }
+        let start = range.location
+        let end = NSMaxRange(range)
+        let s = string(text, range)
+        if ["true", "false", "null", "default"].contains(s) { return true }
+        if s.hasPrefix("default("), text[end - 1] == closeParen, matching(text, open: start + 7) == end - 1 { return true }
+        // Строка и символ: одна, от начала до конца. `$"…"` — только без вставок.
+        var i = start
+        if text[i] == 0x40 || text[i] == dollar { i += 1 }
+        if i < end, text[i] == quote || text[i] == apostrophe {
+            if text[start] == dollar, s.contains("{") { return false }
+            if text[start] == 0x40 {
+                // `@"…"`: кавычка удваивается, обратная косая — просто символ.
+                var k = i + 1
+                while k < end {
+                    if text[k] == quote {
+                        if k + 1 < end, text[k + 1] == quote { k += 2; continue }
+                        return k == end - 1
+                    }
+                    k += 1
+                }
+                return false
+            }
+            return skipLiteral(text, from: i) == end
+        }
+        // Число: знак, цифры, точка, порядок, суффикс; 0x…, 0b…, `_` между цифрами.
+        i = start
+        if text[i] == minus || text[i] == plus { i = skipSpace(text, from: i + 1) }
+        guard i < end, (text[i] >= 0x30 && text[i] <= 0x39) || (text[i] == dot && i + 1 < end && text[i + 1] >= 0x30 && text[i + 1] <= 0x39)
+        else {
+            return isEmptyConstruction(text, range)
+        }
+        while i < end, isIdentPart(text[i]) || text[i] == dot
+                || ((text[i] == plus || text[i] == minus) && i > start && (text[i - 1] == 0x65 || text[i - 1] == 0x45)) {
+            i += 1
+        }
+        return i == end
+    }
+
+    /// Литерал-умолчание: `null`, `default`, `new()`, `new List<int>()`.
+    static func isDefaultLiteral(_ literal: String) -> Bool {
+        literal == "null" || literal == "default" || literal.hasPrefix("default(") || literal.hasPrefix("new")
+    }
+
+    /// `new()` и `new T()` — без аргументов и инициализатора.
+    private static func isEmptyConstruction(_ text: [UInt16], _ range: NSRange) -> Bool {
+        let end = NSMaxRange(range)
+        guard string(text, NSRange(location: range.location, length: min(3, range.length))) == "new",
+              range.length > 3, !isIdentPart(text[range.location + 3]) else { return false }
+        var i = skipSpace(text, from: range.location + 3)
+        while i < end, isIdentPart(text[i]) || text[i] == dot { i += 1 }
+        if i < end, text[i] == lt, let after = typeArguments(text, from: i, limit: end) { i = after }
+        i = skipSpace(text, from: i)
+        guard i + 1 < end, text[i] == openParen else { return false }
+        let close = skipSpace(text, from: i + 1)
+        return close == end - 1 && text[close] == closeParen
+    }
+
+    /// `(int)`, `(float?)`, `(Game.Kind)` — в скобках тип, а не выражение.
+    /// Имя с маленькой буквы — не тип: `(a) - 1` — это вычитание.
+    private static func isCastType(_ text: [UInt16], _ range: NSRange) -> Bool {
+        let inner = trimmed(text, range)
+        guard inner.length > 0, isIdentStart(text[inner.location]) else { return false }
+        for k in inner.location..<NSMaxRange(inner) {
+            let c = text[k]
+            guard isIdentPart(c) || c == dot || c == question || c == lt || c == gt || c == comma || c == openBracket
+                    || c == closeBracket || isSpace(c) else { return false }
+        }
+        let name = string(text, inner)
+        let base = name.split(whereSeparator: { $0 == "?" || $0 == "[" || $0 == "<" }).first.map(String.init) ?? name
+        if primitiveTypes.contains(base) { return true }
+        let last = base.split(separator: ".").last.map(String.init) ?? base
+        return last.first?.isUppercase == true
+    }
+
+    private static let primitiveTypes: Set<String> = [
+        "int", "float", "double", "bool", "string", "long", "short", "byte", "uint", "ulong", "ushort", "sbyte",
+        "char", "decimal", "object", "nint", "nuint",
+    ]
+
+    private static func binaryOperatorStart(_ c: UInt16) -> Bool {
+        [plus, minus, star, slash, percent, amp, bar, caret, lt, gt, eq, question, dot, 0x21].contains(c)
+    }
+
+    /// `:` тернарного оператора, чей `?` стоит перед `from`: вложенные `?:`
+    /// считаются, `::` и `x: 1` в скобках пропускаются.
+    private static func ternaryColon(_ text: [UInt16], from: Int, end: Int) -> Int? {
+        var level = 0
+        var pending = 0
+        var i = from
+        while i < end {
+            let c = text[i]
+            if c == quote || c == apostrophe { i = skipLiteral(text, from: i); continue }
+            if c == openParen || c == openBracket || c == openBrace { level += 1 } else if c == closeParen || c == closeBracket || c == closeBrace {
+                level -= 1
+            } else if level == 0, c == question, i + 1 < end, text[i + 1] != dot, text[i + 1] != question,
+                      text[i + 1] != openBracket, i == 0 || text[i - 1] != question {
+                pending += 1
+            } else if level == 0, c == colon, (i + 1 >= end || text[i + 1] != colon), i == 0 || text[i - 1] != colon {
+                if pending == 0 { return i }
+                pending -= 1
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    /// Результаты веток `switch`-выражения: `A => 1, _ => 2` → `1`, `2`.
+    private static func switchArms(_ text: [UInt16], _ body: NSRange) -> [NSRange] {
+        var arms: [NSRange] = []
+        var level = 0
+        var armStart = body.location
+        var i = body.location
+        let end = NSMaxRange(body)
+        func close(_ upTo: Int) {
+            let arm = NSRange(location: armStart, length: upTo - armStart)
+            var k = arm.location
+            var inner = 0
+            while k + 1 < NSMaxRange(arm) {
+                let c = text[k]
+                if c == openParen || c == openBracket || c == openBrace { inner += 1 } else if c == closeParen || c == closeBracket || c == closeBrace {
+                    inner -= 1
+                } else if inner == 0, c == eq, text[k + 1] == gt {
+                    let value = trimmed(text, NSRange(location: k + 2, length: NSMaxRange(arm) - k - 2))
+                    if value.length > 0 { arms.append(value) }
+                    return
+                }
+                k += 1
+            }
+        }
+        while i < end {
+            let c = text[i]
+            if c == quote || c == apostrophe { i = skipLiteral(text, from: i); continue }
+            if c == openParen || c == openBracket || c == openBrace { level += 1 } else if c == closeParen || c == closeBracket || c == closeBrace {
+                level -= 1
+            } else if level == 0, c == comma {
+                close(i)
+                armStart = i + 1
+            }
+            i += 1
+        }
+        close(end)
+        return arms
+    }
+
+    private static func trimmed(_ text: [UInt16], _ range: NSRange) -> NSRange {
+        var from = range.location
+        var to = NSMaxRange(range)
+        while from < to, isSpace(text[from]) { from += 1 }
+        while to > from, isSpace(text[to - 1]) { to -= 1 }
+        return NSRange(location: from, length: to - from)
     }
 
     /// Позиция сразу за `>`, закрывающей `<` в `start`.
@@ -432,11 +854,61 @@ enum ValueFlow {
         return arrow + 1 < text.count && text[arrow] == eq && text[arrow + 1] == gt
     }
 
+    /// Вызов, которому передали лямбду с параметром `name`: `list.ForEach`
+    /// у `list.ForEach(x => …)`, `QueryAsync` у `QueryAsync(sql, (m, v) => …)`.
+    static func lambdaCall(in text: [UInt16], parameter name: NSRange) -> Source? {
+        var start = name.location
+        // `(a, b) => …` — от скобки списка параметров.
+        let after = skipSpace(text, from: NSMaxRange(name))
+        if after < text.count, text[after] == comma || text[after] == closeParen {
+            var depth = 0
+            var i = name.location - 1
+            while i >= 0 {
+                let c = text[i]
+                if c == closeParen { depth += 1 } else if c == openParen {
+                    if depth == 0 { break }
+                    depth -= 1
+                } else if c == semicolon || c == openBrace || c == closeBrace { return nil }
+                i -= 1
+            }
+            guard i >= 0 else { return nil }
+            start = i
+        }
+        return enclosingCall(in: text, at: start)
+    }
+
+    /// Имя стоит в квадратных скобках обращения к элементу (`data[index]`):
+    /// это ключ, а не то, из чего значение.
+    static func isIndexKey(in text: [UInt16], at offset: Int, from: Int) -> Bool {
+        var depth = 0
+        var i = offset - 1
+        while i >= from {
+            let c = text[i]
+            if c == closeParen || c == closeBracket || c == closeBrace { depth += 1 } else if c == openParen || c == openBrace {
+                if depth > 0 { depth -= 1 }
+            } else if c == openBracket {
+                if depth > 0 {
+                    depth -= 1
+                } else {
+                    // `[` после имени или скобки — обращение к элементу, а не массив `new[] { }`.
+                    let before = skipSpaceBackward(text, from: i)
+                    if before > from, isIdentPart(text[before - 1]) || text[before - 1] == closeParen
+                        || text[before - 1] == closeBracket, word(text, endingAt: before) != "new" {
+                        return true
+                    }
+                }
+            }
+            i -= 1
+        }
+        return false
+    }
+
     /// Вызов, в скобках которого стоит `offset`: `_stash.Get(e, out x)` —
     /// источник `_stash.Get` с диапазоном имени `Get`.
     static func enclosingCall(in text: [UInt16], at offset: Int) -> Source? {
         guard let name = calledName(in: text, at: offset) else { return nil }
         var words = [string(text, name)]
+        var links = [name]
         var start = name.location
         while true {
             let dotAt = skipSpaceBackward(text, from: start)
@@ -446,10 +918,14 @@ enum ValueFlow {
             while begin > 0, isIdentPart(text[begin - 1]) { begin -= 1 }
             guard begin < end, isIdentStart(text[begin]) else { break }
             words.insert(string(text, NSRange(location: begin, length: end - begin)), at: 0)
+            links.insert(NSRange(location: begin, length: end - begin), at: 0)
             start = begin
         }
-        if words.count > 1, words[0] == "this" || words[0] == "base" { words.removeFirst() }
-        return Source(range: name, chain: words.joined(separator: "."), call: true)
+        if words.count > 1, words[0] == "this" || words[0] == "base" { words.removeFirst(); links.removeFirst() }
+        var source = Source(range: name, chain: words.joined(separator: "."), call: true)
+        source.links = links
+        source.head = links.first
+        return source
     }
 
     private static func calledName(in text: [UInt16], at offset: Int) -> NSRange? {

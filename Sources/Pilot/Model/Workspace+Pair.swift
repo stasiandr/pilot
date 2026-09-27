@@ -172,11 +172,12 @@ extension Workspace {
             }
             return
         }
-        // C#: строка с атрибутом ключа или alias конфига — это про конфиги.
+        // C#: строка с атрибутом ключа, alias конфига или объявление модели
+        // конфига — это про конфиги (двойник модели — в том же списке).
         let line = currentLineText()
         if let configs = rules.configs,
            ConfigLinks.jsonProperty(in: line, attribute: configs.keyAttribute) != nil
-            || ConfigLinks.alias(declaredIn: line) != nil {
+            || ConfigLinks.alias(declaredIn: line) != nil || declaredConfigModel(in: document) != nil {
             showConfigLinks()
             return
         }
@@ -184,19 +185,25 @@ extension Workspace {
             showNotice("Под курсором нет имени")
             return
         }
+        goToTwin(of: question.name, container: question.container)
+    }
+
+    /// Двойник имени во второй половине: единственный — переход, иначе список.
+    func goToTwin(of name: String, container: String?) {
+        guard let label = partnerLabel else { return }
         Task { [weak self] in
             guard let self else { return }
             guard let pair = await self.partnerIndex(), let symbols = pair.symbols else {
                 self.noPartnerIndex(label)
                 return
             }
-            let found = PairQueries.twins(of: question.name, container: question.container, in: symbols)
+            let found = PairQueries.twins(of: name, container: container, in: symbols)
             if found.count == 1 {
                 self.navigate(to: symbols.target(found[0]))
                 return
             }
             guard !found.isEmpty else {
-                self.showNotice("В \(label) нет «\(question.name)»")
+                self.showNotice("В \(label) нет «\(name)»")
                 return
             }
             self.presentList(found.prefix(200).enumerated().map { position, id in
@@ -276,6 +283,74 @@ extension Workspace {
         }
     }
 
+    /// Одна датаграмма против двойника: её расхождения списком, первой
+    /// строкой — сам двойник. Сверяется то, что на экране: открытый файл —
+    /// с несохранёнными правками.
+    func checkDatagram(named name: String) {
+        guard let label = partnerLabel, let root, let datagramRules = rules.datagrams,
+              let own = symbolIndex, let id = PairQueries.datagrams(in: own, rules: datagramRules)[name] else { return }
+        let target = own.target(id)
+        let path = own.relPath(id)
+        let ownLabel = ProjectPair.label(of: root)
+        let text = tab(for: target.url, revision: nil)?.document.model.text ?? SymbolIndex.readSource(target.url) ?? ""
+        presentList([], mode: .contract, busy: true)
+        Task { [weak self] in
+            guard let self else { return }
+            guard let pair = await self.partnerIndex(), let theirs = pair.symbols else {
+                self.presentList([], mode: .contract)
+                self.noPartnerIndex(label)
+                return
+            }
+            let report = await Task.detached(priority: .userInitiated) {
+                PairQueries.datagramReport(named: name, ownText: text, ownURL: target.url, ownPath: path,
+                                           ownLabel: ownLabel, theirs: theirs, label: label, rules: datagramRules)
+            }.value
+            guard self.paletteMode == .contract else { return }
+            self.presentList(report ?? [], mode: .contract)
+            if report == nil {
+                self.showNotice(L("Датаграммы \(name) в \(label) нет — на проводе её там не узнают"))
+            } else if report?.count == 1 {
+                self.showNotice(L("Датаграмма \(name) на проводе сходится с \(label)"))
+            }
+        }
+    }
+
+    // MARK: Пункты меню
+
+    /// Пункты «в паре» для имени — в меню у курсора (⌘.) и по правому
+    /// клику: открыть его двойника во второй половине, а датаграмму — ещё и
+    /// сверить. Датаграмма узнаётся по своему индексу (она по определению
+    /// есть в обеих половинах), любой другой тип этого проекта — если индекс
+    /// второй половины уже под рукой и в нём такой тип есть. Пусто — пары
+    /// нет или двойника у имени нет.
+    func pairActions(for name: String) -> [ContextAction] {
+        guard partner != nil, let label = partnerLabel, let own = symbolIndex,
+              own.typesByName[name]?.isEmpty == false else { return [] }
+        let isDatagram = rules.datagrams.map { PairQueries.isDatagram(name, in: own, rules: $0) } ?? false
+        let theirs = knownPartnerSymbols
+        // Индекса второй половины ещё нет — пусть будет к следующему разу.
+        if theirs == nil { Task { [weak self] in _ = await self?.partnerIndex() } }
+        var actions: [ContextAction] = []
+        if theirs.map({ $0.typesByName[name] != nil }) ?? isDatagram {
+            actions.append(ContextAction(title: L("Открыть в \(label)"), icon: "arrow.left.arrow.right",
+                                         shortcut: KeymapStore.shared.menuShortcut(.counterpart)) { [weak self] in
+                self?.goToTwin(of: name, container: nil)
+            })
+        }
+        if isDatagram {
+            actions.append(ContextAction(title: L("Сверить датаграмму…"), icon: "antenna.radiowaves.left.and.right") { [weak self] in
+                self?.checkDatagram(named: name)
+            })
+        }
+        return actions
+    }
+
+    /// Правый клик в тексте: пункты пары для имени под мышью, а не под курсором.
+    func pairActions(at offset: Int) -> [ContextAction] {
+        guard let document, let symbol = Occurrences.symbol(in: document.model, at: offset) else { return [] }
+        return pairActions(for: symbol.text)
+    }
+
     // MARK: Замечания в открытом файле
 
     /// Датаграмма в открытом файле сверяется с двойником: расхождения — волной
@@ -320,83 +395,68 @@ extension Workspace {
     // MARK: ⌘R через границу
 
     /// Использования имени во второй половине пары — по тексту, целым
-    /// словом, в её C#. Для датаграммы — кто её шлёт и кто ловит.
-    func findPartnerReferences(of word: String) {
-        let generation = pairReferenceGeneration.bump()
-        let counter = pairReferenceGeneration
+    /// словом, в её C#. Для датаграммы — кто её шлёт и кто ловит. Пусто —
+    /// искать там нечего. Поколение — поиска использований, частью которого
+    /// это идёт.
+    func partnerReferences(of word: String, generation: Int, counter: AtomicCounter) async -> [PaletteItem] {
         // Только имена типов: `Id` или `Write` нашлись бы в тысяче мест.
         guard partner != nil, let label = partnerLabel, let first = word.first, first.isUppercase,
-              symbolIndex?.typesByName[word] != nil || knownPartnerSymbols?.typesByName[word] != nil else { return }
+              symbolIndex?.typesByName[word] != nil || knownPartnerSymbols?.typesByName[word] != nil else { return [] }
         let isDatagram = datagramNames(in: symbolIndex).contains(word)
         let datagramRules = rules.datagrams
-        Task { [weak self] in
-            guard let self, let pair = await self.partnerIndex(), let files = pair.files,
-                  counter.isCurrent(generation) else { return }
-            let isPairType = pair.symbols?.typesByName[word] != nil
-            guard isPairType || isDatagram else { return }
-            let paths = files.display.filter { $0.hasSuffix(".cs") }
-            let found = await Task.detached(priority: .userInitiated) { () -> [PaletteItem] in
-                var options = ContentSearch.Options()
-                options.limit = 500
-                let hits = ContentSearch.search(word, root: pair.root, paths: paths, options: options,
-                                                shouldStop: { !counter.isCurrent(generation) })
-                return hits.filter(\.wholeWord).map { hit in
-                    let path = paths[Int(hit.file)]
-                    let usage = datagramRules.flatMap { DatagramContract.usage(of: hit.text, type: word, rules: $0) }
-                    let start = LSPPosition(line: hit.line, character: hit.column)
-                    let end = LSPPosition(line: hit.line, character: hit.column + hit.length)
-                    return PaletteItem(id: 0, icon: PairQueries.usageIcon(usage), primary: hit.text,
-                                       secondary: "\(label) · \(path)",
-                                       trailing: PairQueries.usageTrailing(usage, line: hit.line),
-                                       target: NavTarget(url: pair.root.appendingPathComponent(path),
-                                                         range: LSPRange(start: start, end: end)))
-                }
-            }.value
-            guard counter.isCurrent(generation), self.paletteMode == .references else { return }
-            self.pairReferenceItems = found
-            // Свои могли уже прийти — дописываем к ним; иначе их допишет showReferences.
-            let own = self.allReferences.filter { !($0.secondary?.hasPrefix(label + " · ") ?? false) }
-            self.allReferences = self.renumbered(own + found)
-            self.filterReferences()
-        }
+        guard let pair = await partnerIndex(), let files = pair.files, counter.isCurrent(generation) else { return [] }
+        let isPairType = pair.symbols?.typesByName[word] != nil
+        guard isPairType || isDatagram else { return [] }
+        let paths = files.display.filter { $0.hasSuffix(".cs") }
+        return await Task.detached(priority: .userInitiated) { () -> [PaletteItem] in
+            var options = ContentSearch.Options()
+            options.limit = 500
+            let hits = ContentSearch.search(word, root: pair.root, paths: paths, options: options,
+                                            shouldStop: { !counter.isCurrent(generation) })
+            return hits.filter(\.wholeWord).map { hit in
+                let path = paths[Int(hit.file)]
+                let usage = datagramRules.flatMap { DatagramContract.usage(of: hit.text, type: word, rules: $0) }
+                let start = LSPPosition(line: hit.line, character: hit.column)
+                let end = LSPPosition(line: hit.line, character: hit.column + hit.length)
+                return PaletteItem(id: 0, icon: PairQueries.usageIcon(usage), primary: hit.text,
+                                   secondary: "\(label) · \(path)",
+                                   trailing: PairQueries.usageTrailing(usage, line: hit.line),
+                                   target: NavTarget(url: pair.root.appendingPathComponent(path),
+                                                     range: LSPRange(start: start, end: end)))
+            }
+        }.value
     }
 
-    /// Свои использования датаграммы показаны — подписываем, какие шлют, а
-    /// какие ловят: строки читаются с диска фоном.
-    func ownReferencesShown(_ built: [PaletteItem]) {
-        guard partner != nil, let document,
-              let word = Occurrences.identifier(in: document.model, at: caretOffset)?.text,
-              let datagramRules = rules.datagrams,
-              datagramNames(in: symbolIndex).contains(word) else { return }
-        let generation = pairReferenceGeneration.current
-        let counter = pairReferenceGeneration
-        Task { [weak self] in
-            let roles = await Task.detached(priority: .userInitiated) { () -> [String: DatagramContract.Usage] in
-                var lines: [URL: [Substring]] = [:]
-                var result: [String: DatagramContract.Usage] = [:]
-                for item in built {
-                    guard let line = item.target.range?.start.line else { continue }
-                    if lines[item.target.url] == nil {
-                        let text = SymbolIndex.readSource(item.target.url) ?? ""
-                        lines[item.target.url] = text.split(separator: "\n", omittingEmptySubsequences: false)
-                    }
-                    guard let all = lines[item.target.url], line < all.count,
-                          let usage = DatagramContract.usage(of: String(all[line]), type: word,
-                                                                      rules: datagramRules) else { continue }
-                    result["\(item.target.url.path):\(line)"] = usage
+    /// Свои использования датаграммы — с подписью, какие шлют, а какие
+    /// ловят. Строки читаются с диска фоном, до показа списка: значки не
+    /// меняются у него на глазах.
+    func withDatagramRoles(_ built: [PaletteItem], word: String) async -> [PaletteItem] {
+        guard partner != nil, let datagramRules = rules.datagrams,
+              datagramNames(in: symbolIndex).contains(word) else { return built }
+        let roles = await Task.detached(priority: .userInitiated) { () -> [String: DatagramContract.Usage] in
+            var lines: [URL: [Substring]] = [:]
+            var result: [String: DatagramContract.Usage] = [:]
+            for item in built {
+                guard let line = item.target.range?.start.line else { continue }
+                if lines[item.target.url] == nil {
+                    let text = SymbolIndex.readSource(item.target.url) ?? ""
+                    lines[item.target.url] = text.split(separator: "\n", omittingEmptySubsequences: false)
                 }
-                return result
-            }.value
-            guard let self, counter.isCurrent(generation), self.paletteMode == .references, !roles.isEmpty else { return }
-            self.allReferences = self.allReferences.map { item in
-                guard let line = item.target.range?.start.line,
-                      let usage = roles["\(item.target.url.path):\(line)"] else { return item }
-                var item = item
-                item.icon = PairQueries.usageIcon(usage)
-                item.trailing = PairQueries.usageTrailing(usage, line: line)
-                return item
+                guard let all = lines[item.target.url], line < all.count,
+                      let usage = DatagramContract.usage(of: String(all[line]), type: word,
+                                                                  rules: datagramRules) else { continue }
+                result["\(item.target.url.path):\(line)"] = usage
             }
-            self.filterReferences()
+            return result
+        }.value
+        guard !roles.isEmpty else { return built }
+        return built.map { item in
+            guard let line = item.target.range?.start.line,
+                  let usage = roles["\(item.target.url.path):\(line)"] else { return item }
+            var item = item
+            item.icon = PairQueries.usageIcon(usage)
+            item.trailing = PairQueries.usageTrailing(usage, line: line)
+            return item
         }
     }
 
@@ -463,6 +523,7 @@ extension Workspace {
         let text = document.model.text
         let offset = caretOffset
         let line = currentLineText()
+        let model = configLineType(in: document)
         presentList([], mode: .counterparts, busy: true)
         Task { [weak self] in
             guard let self else { return }
@@ -470,12 +531,22 @@ extension Workspace {
             let sides = [PairIndex(root: root, label: ProjectPair.label(of: root), symbols: self.symbolIndex,
                                    files: self.fileIndex)] + (pair.map { [$0] } ?? [])
             let found = await Task.detached(priority: .userInitiated) {
-                PairQueries.configLinks(file: url, text: text, offset: offset, line: line, sides: sides,
-                                        rules: configRules)
+                PairQueries.configLinks(file: url, text: text, offset: offset, line: line, model: model,
+                                        sides: sides, rules: configRules)
             }.value
             guard self.paletteMode == .counterparts else { return }
             self.presentList(self.renumbered(found), mode: .counterparts)
         }
+    }
+
+    /// Тип строки курсора для связей конфига: модель, объявленная в ней,
+    /// или тип, чьё поле в ней (или строкой ниже, под атрибутом) объявлено.
+    private func configLineType(in document: LoadedDocument) -> String? {
+        if document.url.pathExtension != "cs" { return nil }
+        if let model = declaredConfigModel(in: document) { return model }
+        guard document.model.lineCount > 0 else { return nil }
+        let line = document.model.position(at: caretOffset).line
+        return document.outline.first { $0.kind != .type && ($0.line == line || $0.line == line + 1) }?.container
     }
 
     // MARK: Зеркала

@@ -2,7 +2,8 @@ import SwiftUI
 import AppKit
 
 /// Окна базы данных: контейнер MariaDB и обозреватель. Оба — по одному на
-/// приложение, а не на проект: база одна на машину.
+/// приложение, а не на проект: база одна на машину. Своего меню у них нет:
+/// SwiftUI сам ставит оба в меню «Окно».
 struct DatabaseScenes: Scene {
     var body: some Scene {
         Window(L("MariaDB в Docker"), id: MariaDBWindow.sceneID) {
@@ -13,26 +14,6 @@ struct DatabaseScenes: Scene {
             DatabaseWindow()
         }
         .defaultSize(width: 1200, height: 760)
-    }
-}
-
-/// Меню «База данных».
-struct DatabaseCommands: Commands {
-    var body: some Commands {
-        CommandMenu(L("База данных")) {
-            OpenWindowButton(title: L("MariaDB в Docker…"), id: MariaDBWindow.sceneID)
-            OpenWindowButton(title: L("Обозреватель базы…"), id: DatabaseWindow.sceneID)
-        }
-    }
-}
-
-private struct OpenWindowButton: View {
-    let title: String
-    let id: String
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        Button(title) { openWindow(id: id) }
     }
 }
 
@@ -154,7 +135,7 @@ struct MariaDBWindow: View {
             ConsoleTextView(log: container.log)
                 .background(Color(nsColor: Theme.chromeBackground))
         }
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .navigationTitle(L("MariaDB в Docker"))
         .frame(minWidth: 640, minHeight: 420)
         .id(language.current)

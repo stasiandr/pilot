@@ -26,7 +26,7 @@ struct ConflictStrip: View {
         .font(.system(size: 10.5, weight: .medium))
         .padding(.horizontal, 6)
         .padding(.vertical, 1)
-        .background(Capsule().fill(Color(nsColor: Theme.editorBackground).opacity(0.92)))
+        .background(Capsule().fill(Color(nsColor: Theme.swiftUIEditorBackground).opacity(0.92)))
         .overlay(Capsule().strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5))
         .fixedSize()
     }

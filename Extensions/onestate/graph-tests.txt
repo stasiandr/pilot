@@ -14,4 +14,38 @@
 /Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedsFeature/Components/Stamina.cs:12:20 | Stamina.value <- PedStaminaStateSyncSystem.OnUpdate <- PedStaminaStateDatagram.Value <- PedStaminaStateDatagram.Value <- PedStaminaStateSyncSystem.OnUpdate <- PedStaminaStateSync.Value <- SetStaminaCommand.Run | Stamina.value <- StaminaService.ConsumeStamina <- amount | Stamina.value <- PedFactorySystem.Create <- ElementConstants.MaxStamina <- ElementConstants.MaxStamina
 
 # Свойство: Rustlyn ставит его на начало объявления, а записи ищутся от имени.
-/Users/stas/work/clm-server/Server/GlobalUtils/ReliableTime.cs:13:34 | ReliableTime.TimeOffset <- SetReliableTimeOffsetCommand.Run <- TimeSpan.TryParse | ReliableTime.TimeOffset <- SuperSeasonCommandService.SetExactTime <- time
+# `TimeSpan.TryParse(time, out parsed)` — преобразование, а не источник:
+# цепочка идёт дальше, к тексту команды `message`. Источники значения —
+# время (`Stopwatch`) и переменная окружения `TIME_OFFSET` при старте.
+/Users/stas/work/clm-server/Server/GlobalUtils/ReliableTime.cs:13:34 | --limit 120 | ReliableTime.TimeOffset <- SetReliableTimeOffsetCommand.Run <- message | ReliableTime.TimeOffset <- SuperSeasonCommandService.SetExactTime <- time | ReliableTime.TimeOffset <- SuperSeasonCommandService.SetExactTime <- ReliableTime.GetDateTime() <- ReliableTime.GetDateTime <- _stopwatch.Elapsed | ReliableTime.TimeOffset <- StartUp.Main <- ServerEnvs.ReadTimeSpan() <- ServerEnvs.ReadTimeSpan <- Read() <- ServerEnvs.Read <- Environment.GetEnvironmentVariable
+
+# ── Источники значений: граф от любого значения под курсором ──
+
+# Локальная: её записи в методе и дальше к источникам — константе и
+# ключу конфига через параметр `amount` и его вызовы.
+/Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedsFeature/Utils/StaminaService.cs:58:17 | newValue <- StaminaService.ConsumeStamina <- GetStaminaMax() <- StaminaService.GetStaminaMax <- ElementConstants.MaxStamina <- ElementConstants.MaxStamina <- 1500 | newValue <- StaminaService.ConsumeStamina <- amount <- MeleeCombatStaminaUseSystem.OnUpdate <- MeleeCombatStaminaUse.Value <- MeleeAttackCoreState.UseStamina <- MeleeComboAttackParameters.StaminaUsage <- stamina_usage
+
+# Вызов: что метод возвращает. Стэш Morpeh — компонент, а не внутренности пакета.
+/Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedsFeature/Utils/StaminaService.cs:58:70 | StaminaService.GetStaminaMax() <- StaminaService.GetStaminaMax <- StaminaMaxMultiplier | StaminaService.GetStaminaMax() <- StaminaService.GetStaminaMax <- ElementConstants.MaxStamina
+
+# Параметр `override Run`: команду зовут через базовый класс.
+/Users/stas/work/clm-server/Server/GameScripts/Chat/Commands/SetReliableTimeOffsetCommand.cs:26:60 | message <- ChatSendSystem.ExecuteCommand <- commandMessage <- ChatSendSystem.TryExecuteExplicitCommand
+
+# Поле модели конфига: строки JSON, где задан его ключ (модель → алиасы → meta.json).
+/Users/stas/work/clm-server/Server/ECS/Morpeh/Features/JobFeature/Configs/Common/JobData.cs:30:60 | JobData.CarSpawnCheckRadius <- car_spawn_check_radius <- taxiDriverJobData.json | JobData.CarSpawnCheckRadius <- car_spawn_check_radius <- busDriverJobData.json
+
+# Поле инспектора: в коде `= 11f` — только умолчание, в ассете — 75.
+/Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/PedViewFeature/PedViewFeature/DataContainers/PedStaminaParameters.cs:11:40 | --assets | PedStaminaParameters.LoseSpeed <- LoseSpeed <- PedStaminaParameters.asset | PedStaminaParameters.LoseSpeed <- PedStaminaParameters.LoseSpeed <- 11f
+
+# `out` метода интерфейса — записи в реализации; словарь — то, что в него кладут.
+/Users/stas/work/clm-server/Server/ECS/Morpeh/Features/ClanBoxFeature/Systems/ClanGiveGiftsRequestSyncSystem.cs:46:78 | playerEntity <- ClanGiveGiftsRequestSyncSystem.OnUpdate <- TryGetByPeer.entity <- PlayerService.TryGetByPeer <- PlayerService._peerToPlayers <- PlayerService.CreateEntity
+
+# `out` метода-расширения: у `player.M(…)` номера аргументов сдвинуты на `this`.
+/Users/stas/work/clm-server/Server/ECS/Morpeh/Features/JobFeature/Systems/BusDriver/JobBusDriverRouteStartSystem.cs:106:118 | overrideRoutes <- JobBusDriverRouteStartSystem.OnUpdate <- TryGetJobOverrideRoute.overrideRoute <- JobPlayerExtensions.TryGetJobOverrideRoute <- default
+
+# Случайное число — источник, его границы — константы (net8.0: `Random` компилятор не знает).
+/Users/stas/work/clm-server/Server/ECS/Morpeh/Features/JobFeature/Components/Common/Tasks/JobTaskEnterCheckpoint.cs:27:16 | JobTaskEnterCheckpoint.PassengersCount <- JobBusDriverRouteStepInitializeSystem.OnUpdate <- _random.Next() | JobTaskEnterCheckpoint.PassengersCount <- JobBusDriverRouteStepInitializeSystem.OnUpdate <- MAX_PASSENGERS <- MAX_PASSENGERS <- 5
+
+# Член движка и значение перечисления — сразу источник.
+/Users/stas/work/clm-client/Assets/dev/Scripts/ECS/Morpeh/Features/MipMapStreamingFeature/Systems/MipMapStreamingInitializer.cs:73:32 | Time.deltaTime
+/Users/stas/work/clm-server/Server/ECS/Morpeh/Features/JobFeature/Systems/BusDriver/JobBusDriverRouteStartSystem.cs:62:54 | JobType.BusDriver

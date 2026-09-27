@@ -197,6 +197,7 @@ enum RiderImport {
         case .previousOccurrence: return ["GotoPrevElementUnderCaretUsage"]
         case .nextProblem: return ["GotoNextError"]
         case .previousProblem: return ["GotoPreviousError"]
+        case .problemDescription: return ["ShowErrorDescription"]
         case .rename: return ["RenameElement"]
         case .formatCode: return ["ReformatCode"]
         case .callHierarchy: return ["CallHierarchy"]
@@ -211,6 +212,8 @@ enum RiderImport {
         case .fontBigger: return ["EditorIncreaseFontSize"]
         case .fontSmaller: return ["EditorDecreaseFontSize"]
         case .fontReset: return ["EditorResetFontSize"]
+        case .nextProject: return ["NextProjectWindow"]
+        case .previousProject: return ["PreviousProjectWindow"]
         case .nextChange: return ["VcsShowNextChangeMarker"]
         case .previousChange: return ["VcsShowPrevChangeMarker"]
         case .reviews, .commentLine, .nextThread, .previousThread, .nextReviewFile, .previousReviewFile,

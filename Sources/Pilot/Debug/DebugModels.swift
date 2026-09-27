@@ -60,12 +60,40 @@ enum DebugEvent: Sendable {
     /// Остановка: точка останова, шаг, пауза, исключение.
     case stopped(thread: Int, reason: String, text: String?)
     case resumed
-    /// Вывод программы или сообщения самого отладчика.
+    /// Сообщение самого отладчика: подключение, ошибки, `Debug.WriteLine`.
+    /// Категория — как в DAP: `console`, `important` (ошибка) и прочие.
     case output(String, category: String)
+    /// stdout и stderr программы, которую отладчик запустил сам, — тот же
+    /// вывод, что у ▶, и разбирается он так же (`ProgramOutput`).
+    case programOutput(String)
+    /// Программа завершилась с этим кодом; сессия ещё может сказать своё.
+    case exited(Int32)
     /// Точки останова переразрешились: загрузился тип, перекомпилировался код.
     case breakpoints(file: URL, [BreakpointStatus])
     /// Сессия кончилась: программа вышла, редактор закрыли, связь оборвалась.
     case terminated(String?)
+}
+
+/// Чей текст в событии DAP `output`. netcoredbg отдаёт stdout и stderr
+/// запущенной им программы категориями `stdout` и `stderr`, а
+/// `Debug.WriteLine` (`Debugger.Log`) — тоже `stdout`, но с местом вызова
+/// в `source`: это уже не вывод процесса — при ▶ его не видно вовсе.
+enum DebugOutputSource: Equatable, Sendable {
+    /// Вывод процесса — в лог программы, как у ▶.
+    case program
+    /// Сообщение отладчика, со своей категорией.
+    case debugger(category: String)
+    /// Телеметрия адаптера — не показывается.
+    case ignored
+
+    init(dapOutput body: [String: Any]) {
+        let category = body["category"] as? String ?? "console"
+        switch category {
+        case "telemetry": self = .ignored
+        case "stdout", "stderr": self = body["source"] == nil ? .program : .debugger(category: category)
+        default: self = .debugger(category: category)
+        }
+    }
 }
 
 /// Бэкенд отладчика. Все вызовы асинхронные и не блокируют интерфейс:

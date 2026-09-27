@@ -43,6 +43,13 @@ struct UnityConsolePanel: View {
             Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
         }
         .overlay(alignment: .top) { resizeHandle }
+        // Консоль не раздвигает окно. Ей нужно ~430 pt, и в узком окне пары
+        // (навигатор + редактор + инспектор Unity) сплит из-за неё становился
+        // шире окна: SwiftUI центрировал его, и навигатор уезжал за левый край,
+        // а инспектор — за правый, вместе с кнопками. Не хватает места —
+        // консоль обрезается справа, колонки остаются целыми.
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        .clipped()
     }
 
     // MARK: - Шапка

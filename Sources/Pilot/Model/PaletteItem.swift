@@ -66,6 +66,9 @@ struct PaletteItem: Identifiable {
     var secondary: String?
     /// Правый край: номер строки, вид символа.
     var trailing: String?
+    /// Строка из второй половины пары — её подпись (`server`, `client`):
+    /// палитра помечает такие строки меткой и полоской.
+    var pairLabel: String? = nil
     var target: NavTarget
 }
 

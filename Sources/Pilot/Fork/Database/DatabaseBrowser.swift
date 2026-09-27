@@ -51,6 +51,10 @@ final class DatabaseBrowser: ObservableObject {
     @Published private(set) var isRunning = false
 
     private var session: MySQLSession?
+    /// Прочитанные из information_schema таблицы, столбцы и процедуры баз —
+    /// для дополнения в редакторе. Дереву они не нужны, поэтому не @Published.
+    private var metadata: [String: SQLCatalog.Schema] = [:]
+    private var metadataLoading: Set<String> = []
     private static let optionsKey = "pilot.database.options"
     private static let sqlKey = "pilot.database.sql"
 
@@ -114,6 +118,8 @@ final class DatabaseBrowser: ObservableObject {
         schemas = []
         currentSchema = nil
         isRunning = false
+        metadata = [:]
+        metadataLoading = []
     }
 
     func refresh() {
@@ -132,6 +138,74 @@ final class DatabaseBrowser: ObservableObject {
         } catch {
             fail(error)
         }
+        // Дополнению — заново всё, что уже читали, и обязательно текущую базу;
+        // удалённых баз больше нет.
+        let names = Set(schemas.map(\.name))
+        metadata = metadata.filter { names.contains($0.key) }
+        await loadMetadata(Array(Set(metadata.keys).union(currentSchema.map { [$0] } ?? [])), force: true)
+    }
+
+    // MARK: - Имена для дополнения
+
+    /// Что знает дополнение: базы сервера, прочитанные из них таблицы и текущая база.
+    var catalog: SQLCatalog {
+        SQLCatalog(schemaNames: schemas.map(\.name), schemas: metadata, current: currentSchema)
+    }
+
+    /// Таблицы и столбцы базы — одним запросом, процедуры — отдельным: ошибка
+    /// в середине пачки запросов съела бы и таблицы.
+    /// `force` — перечитать и уже прочитанные (после DDL, по «Обновить»).
+    func loadMetadata(_ names: [String], force: Bool = false) async {
+        guard let session else { return }
+        for name in names where (force || metadata[name] == nil) && !metadataLoading.contains(name) {
+            metadataLoading.insert(name)
+            let schema = Self.literal(name)
+            let sql = """
+            SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = \(schema) ORDER BY TABLE_NAME;
+            SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = \(schema) ORDER BY TABLE_NAME, ORDINAL_POSITION
+            """
+            let routinesSQL = """
+            SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES
+            WHERE ROUTINE_SCHEMA = \(schema) ORDER BY ROUTINE_NAME
+            """
+            do {
+                let results = try await session.query(sql)
+                let routines = (try? await session.query(routinesSQL))?.first?.rows ?? []
+                metadataLoading.remove(name)
+                guard self.session === session else { return }
+                func rows(_ i: Int) -> [[String?]] { i < results.count ? results[i].rows : [] }
+                metadata[name] = SQLCatalog.Schema(tableRows: rows(0), columnRows: rows(1), routineRows: routines)
+            } catch {
+                metadataLoading.remove(name)
+                // Нет прав на information_schema — пусто, а не новый запрос на каждую букву.
+                if self.session === session, !(error is MySQLConnection.ProtocolError) {
+                    metadata[name] = SQLCatalog.Schema()
+                }
+                fail(error)
+            }
+        }
+    }
+
+    /// Варианты дополнения в позиции `offset` текста редактора.
+    ///
+    /// Нужной базы ещё нет в памяти (`FROM other.`) — дочитываем её здесь же,
+    /// если сервер свободен: локальная база отвечает за миллисекунды. Занят
+    /// запросом — отвечаем без неё, она дочитается к следующей букве.
+    func completions(in model: SyntaxModel, at offset: Int) async -> CompletionList {
+        var result = SQLCompletion.complete(model, caret: offset, catalog: catalog)
+        let missing = result.missingSchemas.filter { metadata[$0] == nil }
+        if !missing.isEmpty, isConnected {
+            if isRunning {
+                Task { await loadMetadata(missing) }
+            } else {
+                await loadMetadata(missing)
+                result = SQLCompletion.complete(model, caret: min(offset, model.units.count), catalog: catalog)
+            }
+        }
+        // Ключевые слова отобраны по набранному началу — на следующей букве спросить заново.
+        return CompletionList(items: result.items, isIncomplete: true)
     }
 
     func loadTables(_ schema: String) async {
@@ -168,6 +242,7 @@ final class DatabaseBrowser: ObservableObject {
                 _ = try await session.query("USE " + Self.identifier(schema))
                 currentSchema = schema
                 if schemas.first(where: { $0.name == schema })?.tables == nil { await loadTables(schema) }
+                await loadMetadata([schema])
             } catch {
                 fail(error)
                 outcome = Outcome(error: error.localizedDescription, sql: "USE " + schema)
@@ -213,11 +288,13 @@ final class DatabaseBrowser: ObservableObject {
             // Первым показываем последнюю выборку: обычно ради неё и писали.
             selectedResult = outcome.results.lastIndex(where: \.isResultSet) ?? max(0, outcome.results.count - 1)
             self.outcome = outcome
-            // Сменили базу или создали/удалили таблицу — дерево должно это видеть.
-            let upper = text.uppercased()
-            if ["CREATE", "DROP", "ALTER", "RENAME", "USE "].contains(where: upper.contains) {
-                if upper.hasPrefix("USE "), outcome.error == nil {
-                    currentSchema = text.dropFirst(4).trimmingCharacters(in: CharacterSet(charactersIn: " `;\n"))
+            // Сменили базу или создали/удалили таблицу — дерево и дополнение
+            // должны это видеть. Смотрим на первые слова запросов, а не на
+            // весь текст: `created_at` в SELECT схему не меняет.
+            let heads = SQLStatement.heads(text)
+            if heads.contains(where: { ["CREATE", "DROP", "ALTER", "RENAME", "USE"].contains($0.keyword) }) {
+                if outcome.error == nil, let use = heads.last(where: { $0.keyword == "USE" }), let name = use.name {
+                    currentSchema = name
                 }
                 await loadSchemas()
             }

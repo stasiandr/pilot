@@ -18,6 +18,12 @@ extension Workspace {
         return configCatalogs.catalog(root: root, rules: rules.configs)
     }
 
+    /// Какой alias какую модель читает — по классу алиасов этого проекта.
+    var configModels: ConfigModels? {
+        guard let root else { return nil }
+        return configModelsCache.models(root: root, rules: rules.configs, files: fileIndex)
+    }
+
     /// ⌘B: `true` — под курсором алиас конфига, и переход сделан.
     func goToConfig(at offset: Int, in document: LoadedDocument) -> Bool {
         guard let catalog = configCatalog, document.revision == nil, document.decompiled == nil,
@@ -156,9 +162,11 @@ extension Workspace {
                 let target = NavTarget(url: url, range: LSPRange(
                     start: LSPPosition(line: hit.line, character: column),
                     end: LSPPosition(line: hit.line, character: column + constant.name.utf16.count)))
+                // Атрибут модели — на той же строке или строкой выше.
+                let model = ConfigLinks.attributeLines(endingAt: hit.line, in: all).lazy
+                    .compactMap { ConfigCatalog.modelType(in: $0, attribute: configRules.modelAttribute) }.first
                 found.append(FoundDeclaration(target: target, name: constant.name, kind: .field,
-                                              container: ConfigCatalog.modelType(in: text, attribute: configRules.modelAttribute),
-                                              path: path))
+                                              container: model, path: path))
                 values.append(constant.value)
             }
             // Точное совпадение важнее префикса; из префиксов — самый длинный.
@@ -172,19 +180,24 @@ extension Workspace {
         aliasDeclarations(alias) { [weak self] found in
             guard let self else { return }
             guard let first = found.first else {
-                self.showNotice("Алиас «\(alias)» в коде не объявлен")
+                self.showNotice(L("Алиас «\(alias)» в коде не объявлен"))
                 return
             }
             guard found.count == 1 else {
                 self.showDeclarations(found)
                 return
             }
-            self.navigate(to: first.target) { [weak self] in
-                guard thenFindUsages, let self, let document = self.document,
-                      document.url.standardizedFileURL == first.target.url.standardizedFileURL,
-                      let range = first.target.range else { return }
-                self.findReferences(at: document.model.offset(at: range.start))
-            }
+            self.openAlias(first.target, thenFindUsages: thenFindUsages)
+        }
+    }
+
+    /// К константе alias'а — и, если надо, к тем, кто её читает.
+    private func openAlias(_ target: NavTarget, thenFindUsages: Bool) {
+        navigate(to: target) { [weak self] in
+            guard thenFindUsages, let self, let document = self.document,
+                  document.url.standardizedFileURL == target.url.standardizedFileURL,
+                  let range = target.range else { return }
+            self.findReferences(at: document.model.offset(at: range.start))
         }
     }
 
@@ -202,7 +215,7 @@ extension Workspace {
                 }
             }.first
             guard let types, let first = types.first else {
-                self.showNotice("Модель конфига «\(alias)» не найдена")
+                self.showNotice(L("Модель конфига «\(alias)» не найдена"))
                 return
             }
             if types.count == 1 { self.navigate(to: first.target) } else { self.showDeclarations(types) }
@@ -218,8 +231,8 @@ extension Workspace {
             switch link {
             case .files(let urls, let alias):
                 let title = urls.count == 1
-                    ? "Открыть конфиг \(catalog.path(of: urls[0]) ?? urls[0].lastPathComponent)"
-                    : "Файлы конфига (\(urls.count))…"
+                    ? L("Открыть конфиг \(catalog.path(of: urls[0]) ?? urls[0].lastPathComponent)")
+                    : L("Файлы конфига (\(urls.count))…")
                 var actions = [
                     ContextAction(title: title, icon: "doc.text",
                                   shortcut: KeymapStore.shared.menuShortcut(.goToDefinition)) { [weak self] in
@@ -227,44 +240,131 @@ extension Workspace {
                     },
                 ]
                 if !catalog.isMeta(document.url) {
-                    actions.append(ContextAction(title: "Модель конфига", icon: "cube") { [weak self] in
+                    actions.append(ContextAction(title: L("Модель конфига"), icon: "cube") { [weak self] in
                         self?.goToConfigModel(alias)
                     })
                 }
-                return ContextActionGroup(title: "Конфиг \(alias)", actions: actions)
+                return ContextActionGroup(title: L("Конфиг \(alias)"), actions: actions)
             case .declaration(let alias):
-                return ContextActionGroup(title: "Конфиг \(alias)", actions: aliasActions(alias, catalog: catalog))
+                return ContextActionGroup(title: L("Конфиг \(alias)"), actions: aliasActions(alias, catalog: catalog))
             }
         }
         guard let alias = catalog.alias(of: document.url) else { return nil }
-        return ContextActionGroup(title: "Конфиг \(alias)", actions: aliasActions(alias, catalog: catalog, inConfig: true))
+        return ContextActionGroup(title: L("Конфиг \(alias)"), actions: aliasActions(alias, catalog: catalog, inConfig: true))
     }
 
     private func aliasActions(_ alias: String, catalog: ConfigCatalog, inConfig: Bool = false) -> [ContextAction] {
         var actions = [
-            ContextAction(title: "Где используется конфиг", icon: "arrow.triangle.branch") { [weak self] in
+            ContextAction(title: L("Где используется конфиг"), icon: "arrow.triangle.branch") { [weak self] in
                 self?.goToAliasDeclaration(alias, thenFindUsages: true)
             },
-            ContextAction(title: "Алиас в коде", icon: "arrow.forward.circle") { [weak self] in
+            ContextAction(title: L("Алиас в коде"), icon: "arrow.forward.circle") { [weak self] in
                 self?.goToAliasDeclaration(alias)
             },
-            ContextAction(title: "Модель конфига", icon: "cube") { [weak self] in
+            ContextAction(title: L("Модель конфига"), icon: "cube") { [weak self] in
                 self?.goToConfigModel(alias)
             },
         ]
         if inConfig, let document {
             if let folder = Self.folderConfig(of: document.url, catalog: catalog) {
-                actions.append(ContextAction(title: "Сборка папки: \(catalog.rules.folderConfig)",
+                actions.append(ContextAction(title: L("Сборка папки: \(catalog.rules.folderConfig)"),
                                              icon: "list.bullet.rectangle") { [weak self] in
                     self?.navigate(to: NavTarget(url: folder, range: nil))
                 })
             } else {
-                actions.append(ContextAction(title: "Запись в \(catalog.rules.registry)", icon: "list.bullet.rectangle") { [weak self] in
+                actions.append(ContextAction(title: L("Запись в \(catalog.rules.registry)"), icon: "list.bullet.rectangle") { [weak self] in
                     self?.goToMetaEntry(alias, catalog: catalog)
                 })
             }
         }
         return actions
+    }
+
+    // MARK: - Модель конфига → конфиг
+
+    /// Больше пунктов «Открыть конфиг «…»» меню не показывает: у общих
+    /// моделей (`JobData`) alias'ов десятки — тогда они одним списком.
+    private static let modelConfigsInMenu = 6
+
+    /// Тип у курсора: имя под ним, если это тип проекта, иначе тип,
+    /// объявленный в этой строке. `declared` — он объявлен именно здесь.
+    func caretType(at offset: Int, in document: LoadedDocument) -> (name: String, declared: Bool)? {
+        let model = document.model
+        guard model.lineCount > 0 else { return nil }
+        let line = model.line(containing: offset)
+        let outline = document.outline
+        let declaredHere = outline.first { $0.kind == .type && $0.line == line }
+        if let symbol = Occurrences.symbol(in: model, at: offset)?.text {
+            if symbol == declaredHere?.name { return (symbol, true) }
+            if symbolIndex?.typesByName[symbol] != nil || outline.contains(where: { $0.kind == .type && $0.name == symbol }) {
+                return (symbol, false)
+            }
+        }
+        return declaredHere.map { ($0.name, true) }
+    }
+
+    /// Alias'ы этого проекта, чья модель — тип `name`.
+    func configModelUses(of name: String) -> [ConfigModels.Use] {
+        configModels?.uses(ofModel: name) { symbolIndex?.typesByName[$0] != nil } ?? []
+    }
+
+    /// Модель конфига, объявленная в строке курсора: ⌃⌘T с неё ведёт к её
+    /// конфигам, как со строки alias'а.
+    func declaredConfigModel(in document: LoadedDocument) -> String? {
+        guard rules.configs != nil, document.url.pathExtension == "cs", document.decompiled == nil,
+              let type = caretType(at: caretOffset, in: document), type.declared,
+              !configModelUses(of: type.name).isEmpty else { return nil }
+        return type.name
+    }
+
+    /// Раздел меню у типа, который читают как модель конфига: те же
+    /// переходы, что у его alias'а, — в конфиг и к самому alias'у.
+    func configModelActions(at offset: Int, in document: LoadedDocument) -> ContextActionGroup? {
+        guard let catalog = configCatalog, let root, document.url.pathExtension == "cs", document.decompiled == nil,
+              let type = caretType(at: offset, in: document) else { return nil }
+        let uses = configModelUses(of: type.name)
+        let configs = uses.compactMap { use -> (use: ConfigModels.Use, urls: [URL])? in
+            let urls = catalog.files(forAlias: use.alias)
+            return urls.isEmpty ? nil : (use, urls)
+        }
+        guard !configs.isEmpty else { return nil }
+
+        var actions: [ContextAction] = []
+        if configs.count <= Self.modelConfigsInMenu {
+            for (use, urls) in configs {
+                let title = urls.count == 1 ? L("Открыть конфиг «\(use.alias)»")
+                                            : L("Файлы конфига «\(use.alias)» (\(urls.count))…")
+                actions.append(ContextAction(title: title, icon: "doc.text") { [weak self] in
+                    self?.openConfigFiles(urls, alias: use.alias, catalog: catalog)
+                })
+            }
+        } else {
+            actions.append(ContextAction(title: L("Конфиги модели (\(configs.count))…"), icon: "doc.text") { [weak self] in
+                self?.showDeclarations(configs.flatMap { use, urls in urls.map { url in
+                    FoundDeclaration(target: NavTarget(url: url, range: nil), name: url.lastPathComponent, kind: .field,
+                                     container: use.alias,
+                                     path: catalog.path(of: url).map { "\(catalog.rules.folder)/\($0)" } ?? url.path)
+                } })
+            })
+        }
+        if uses.count == 1, let use = uses.first {
+            let target = use.target(root: root)
+            actions.append(ContextAction(title: L("Алиас в коде"), icon: "arrow.forward.circle") { [weak self] in
+                self?.openAlias(target, thenFindUsages: false)
+            })
+            actions.append(ContextAction(title: L("Где используется конфиг"), icon: "arrow.triangle.branch") { [weak self] in
+                self?.openAlias(target, thenFindUsages: true)
+            })
+        } else {
+            actions.append(ContextAction(title: L("Алиасы в коде (\(uses.count))…"), icon: "arrow.forward.circle") { [weak self] in
+                self?.showDeclarations(uses.map { use in
+                    FoundDeclaration(target: use.target(root: root), name: use.declaration.constant, kind: .field,
+                                     container: use.declaration.types.joined(separator: ", "), path: use.file)
+                })
+            })
+        }
+        let title = uses.count == 1 ? L("Конфиг \(uses[0].alias)") : L("Конфиги модели \(type.name)")
+        return ContextActionGroup(title: title, actions: actions)
     }
 
     /// `folder.json` дерева, в которое входит файл: рядом (`by_files`) или

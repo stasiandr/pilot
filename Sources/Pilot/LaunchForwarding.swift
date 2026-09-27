@@ -14,6 +14,10 @@ enum LaunchForwarding {
     /// (`NSWorkspace.open`, `open -a`) он попадает самому отправителю —
     /// у двух процессов один бандл.
     static func forward(_ request: OpenRequest?) -> Bool {
+        // Запуск без окна (`HeadlessGraph`, `HeadlessInspector`) ничего не
+        // пересылает: иначе запущенный из того же бандла Pilot открыл бы файл
+        // из аргументов и вышел вперёд, а этот процесс молча закончился бы.
+        guard !CommandLine.arguments.contains(where: headlessFlags.contains) else { return false }
         guard let running = runningInstance() else { return false }
         guard let request else {
             running.activate()
@@ -33,6 +37,9 @@ enum LaunchForwarding {
         running.activate()
         return true
     }
+
+    /// Флаги запусков без окна.
+    private static let headlessFlags: Set<String> = ["--value-graph", "--render-inspector"]
 
     /// Только этот же бандл: сборки из соседних worktree с тем же
     /// идентификатором — чужие окна, в них не пересылаем.

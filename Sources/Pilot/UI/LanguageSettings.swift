@@ -85,10 +85,18 @@ struct GeneralSettingsView: View {
                     Text(item.nativeName).tag(AppLanguage?.some(item))
                 }
             }
+            // Заголовки «Файл», «Правка», «Окно» и штатные пункты SwiftUI
+            // берёт из локализации, выбранной при запуске, и переписывает
+            // их обратно при каждом обновлении меню — переименовать их на
+            // ходу не выйдет, только перезапуском.
             if language.needsRestart {
-                Text(L("Системные меню и диалоги macOS сменят язык после перезапуска Pilot."))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                HStack {
+                    Text(L("Системные меню и диалоги macOS сменят язык после перезапуска Pilot."))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button(L("Перезапустить")) { Updater.shared.relaunch() }
+                }
             }
             UpdateSettingsSection(updater: Updater.shared)
         }

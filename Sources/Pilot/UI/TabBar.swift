@@ -66,7 +66,7 @@ struct TabBar: View {
         }
         }
         .frame(height: barHeight)
-        .background(Color(nsColor: Theme.editorBackground))
+        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .overlay(alignment: .bottom) {
             Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
         }

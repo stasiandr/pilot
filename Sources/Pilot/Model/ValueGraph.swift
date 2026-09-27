@@ -1,11 +1,15 @@
 import AppKit
 
-/// Граф «откуда берётся значение»: поле, места, где в него пишут, и то, из
-/// чего складывается записанное, — дальше по тем же правилам. Через сеть
-/// тоже, если её описывает расширение проекта (`DatagramRules`): поле
-/// сетевой структуры в одной половине пары продолжается тем же полем в
-/// другой, где её заполняют перед отправкой, а цикл по типу-приёмнику
-/// (`PacketFilter<T>`) срабатывает, когда вторая половина шлёт `T`.
+/// Граф «откуда берётся значение»: значение под курсором — поле, свойство,
+/// переменная, параметр, результат вызова, — места, где его пишут, и то, из
+/// чего складывается записанное, — дальше по тем же правилам, пока не
+/// найдутся источники: литерал или константа в коде, значение
+/// перечисления, JSON конфига, инспектор Unity, время, случайное число,
+/// ввод игрока. Через сеть тоже, если её описывает расширение проекта
+/// (`DatagramRules`): поле сетевой структуры в одной половине пары
+/// продолжается тем же полем в другой, где её заполняют перед отправкой,
+/// а цикл по типу-приёмнику (`PacketFilter<T>`) срабатывает, когда вторая
+/// половина шлёт `T`.
 ///
 /// Раскрывается лениво: узел по клику спрашивает компилятор своего проекта.
 /// Всё статически, по коду.
@@ -29,7 +33,7 @@ extension Workspace: GraphProject {}
 @MainActor
 final class ValueGraph: ObservableObject {
 
-    struct Declaration: Equatable, Sendable {
+    struct Declaration: Equatable, Hashable, Sendable {
         var url: URL
         var line: Int
         var character: Int
@@ -46,9 +50,23 @@ final class ValueGraph: ObservableObject {
         var title: String { [typeName, shortName].compactMap { $0 }.joined(separator: ".") }
     }
 
+    /// С чего граф начинается — что стоит под курсором.
+    enum Root {
+        /// Поле, свойство или локальная переменная: кто их пишет.
+        case value(Declaration)
+        /// Тип-компонент: где его ставят и снимают.
+        case component(String)
+        /// Метод: что он возвращает.
+        case call(Declaration)
+        /// Параметр метода: что передают в вызовах.
+        case parameter(method: Declaration, index: Int, name: String)
+        /// Уже источник: значение перечисления, член сборки.
+        case origin(ValueOrigin, Declaration?)
+    }
+
     struct Node: Identifiable, Equatable {
         enum Kind: Equatable {
-            /// Поле или свойство — раскрывается в места записи.
+            /// Поле, свойство или локальная — раскрывается в места записи.
             case value(Declaration)
             /// Компонент целиком — раскрывается в Set, Add и Remove.
             case component(String)
@@ -64,6 +82,15 @@ final class ValueGraph: ObservableObject {
             case call(Declaration?)
             /// Параметр — раскрывается в аргументы в местах вызова.
             case parameter(method: Declaration?, index: Int)
+            /// Источник: литерал, константа, перечисление, конфиг, инспектор,
+            /// время движка — дальше идти не нужно. Конфиг и инспектор
+            /// раскрываются в строки данных, где значение задано; объявление —
+            /// значение, чьё это происхождение, или имя самого источника.
+            case source(ValueOrigin, Declaration?)
+            /// Строка данных: JSON конфига, YAML префаба или сцены.
+            case data
+            /// Места, которые не поместились в предел — раскрывается в них.
+            case more
             /// Имя, которое не удалось разрешить.
             case unknown
         }
@@ -93,15 +120,28 @@ final class ValueGraph: ObservableObject {
         var guessed = false
         /// Код значение не пишет, и известно откуда оно: база, конфиг, инспектор.
         var origin: String?
+        /// Узел — только аргумент вызова метода проекта (`entity` в
+        /// `GetMax(entity)`): его видно, но сам граф туда не идёт.
+        var weak = false
         var state: State = .collapsed
         /// Колонка: 0 — исходное значение (справа), дальше — к источникам.
         var depth: Int
 
         var isExpandable: Bool {
             switch kind {
-            case .value, .component, .arrival: return true
+            case .value, .component, .arrival, .more: return true
             case .call(let method): return method != nil
             case .parameter(let method, let index): return method != nil && index >= 0
+            case .source(let origin, let declaration):
+                return declaration != nil && [.config, .inspector].contains(origin.kind)
+            default: return false
+            }
+        }
+
+        /// Лист, который на предел раскрытия не влияет: источник и строка данных.
+        var isLeaf: Bool {
+            switch kind {
+            case .source, .data: return true
             default: return false
             }
         }
@@ -126,12 +166,23 @@ final class ValueGraph: ObservableObject {
 
     /// Докуда граф раскрывается сам.
     struct Reach {
-        /// Пока узлов меньше.
+        /// Пока узлов меньше (источники и строки данных — листья — не в счёт).
         var nodes = 40
         /// Колонок от исходного значения.
         var depth = 6
-        /// Вызовы и параметры тоже, а не только значения и приходы.
-        var calls = false
+        /// Вызовы и параметры тоже, а не только значения и приходы: вглубь
+        /// к источникам. Сначала всё равно «кто пишет».
+        var calls = true
+        /// Инспектор Unity — искать значение в префабах и сценах: это чтение
+        /// всех ассетов, секунды на большом проекте.
+        var assets = false
+        /// Мест у одного узла не больше — остальные за узлом «ещё N».
+        /// 0 — без предела.
+        var fanIn = 12
+        /// Раскрывать и значения, которые стоят только аргументом вызова
+        /// метода проекта. Окно — нет: значение вызова и так видно через его
+        /// return; обзор — да, как раньше, чтобы числа сравнивались.
+        var arguments = false
     }
 
     let rootID: String
@@ -141,38 +192,44 @@ final class ValueGraph: ObservableObject {
     /// Без окна: всё считается сразу, на этом же потоке.
     private let synchronous: Bool
     let reach: Reach
+    /// Узлов, которые считаются в предел.
+    private var counted = 0
+    /// Места за узлами «ещё N»: узел → места, куда и откуда.
+    private var hidden: [String: (sites: [ValueGraphAnalysis.Site], into: String, project: URL, datagrams: Set<String>)] = [:]
 
-    convenience init(workspace: Workspace, value: Declaration) {
-        self.init(home: workspace, lookup: Self.openProject, value: value)
+    convenience init(workspace: Workspace, root: Root) {
+        self.init(home: workspace, lookup: Self.openProject, root: root)
     }
 
-    convenience init(workspace: Workspace, component: String) {
-        self.init(home: workspace, lookup: Self.openProject, component: component)
-    }
-
-    init(home: any GraphProject, lookup: @escaping (URL) -> (any GraphProject)?, value: Declaration,
+    init(home: any GraphProject, lookup: @escaping (URL) -> (any GraphProject)?, root: Root,
          synchronous: Bool = false, reach: Reach = Reach()) {
         self.home = home
         self.lookup = lookup
         self.synchronous = synchronous
         self.reach = reach
-        let project = home.root ?? value.url.deletingLastPathComponent()
-        let node = Self.valueNode(value, project: project, depth: 0)
+        let project = home.root ?? URL(fileURLWithPath: "/")
+        let node: Node
+        switch root {
+        case .value(let declaration):
+            node = Self.valueNode(declaration, project: home.root ?? declaration.url.deletingLastPathComponent(), depth: 0)
+        case .component(let name):
+            node = Self.componentNode(name, project: project, depth: 0)
+        case .call(let method):
+            node = Node(id: "call|\(project.path)|\(method.name)", kind: .call(method), title: method.title + "()",
+                        subtitle: L("вызов · \(ProjectPair.label(of: project))"), project: project, url: method.url,
+                        line: method.line, depth: 0)
+        case .parameter(let method, let index, let name):
+            node = Node(id: "param|\(project.path)|\(method.name)|\(name)", kind: .parameter(method: method, index: index),
+                        title: name, subtitle: L("параметр \(method.title)"), project: project, url: method.url,
+                        line: method.line, depth: 0)
+        case .origin(let origin, let declaration):
+            node = Self.sourceNode(origin, at: declaration, id: "source|\(project.path)|\(origin.title)", project: project,
+                                   depth: 0)
+        }
         rootID = node.id
         add(node)
         expand(rootID)
-    }
-
-    init(home: any GraphProject, lookup: @escaping (URL) -> (any GraphProject)?, component: String,
-         synchronous: Bool = false, reach: Reach = Reach()) {
-        self.home = home
-        self.lookup = lookup
-        self.synchronous = synchronous
-        self.reach = reach
-        let node = Self.componentNode(component, project: home.root ?? URL(fileURLWithPath: "/"), depth: 0)
-        rootID = node.id
-        add(node)
-        expand(rootID)
+        if !node.isExpandable, !settled { settled = true }
     }
 
     /// Открытые окна проектов.
@@ -181,6 +238,11 @@ final class ValueGraph: ObservableObject {
     }
 
     var title: String { nodes[rootID]?.title ?? "" }
+
+    /// Источники, до которых граф дошёл, — в порядке появления.
+    var sources: [Node] {
+        order.compactMap { nodes[$0] }.filter { if case .source = $0.kind { return true }; return false }
+    }
 
     // MARK: - Узлы
 
@@ -195,10 +257,31 @@ final class ValueGraph: ObservableObject {
              subtitle: L("компонент · \(ProjectPair.label(of: project))"), project: project, depth: depth)
     }
 
+    /// Источник: подпись — его вид и где он (проект или сборка).
+    private static func sourceNode(_ origin: ValueOrigin, at declaration: Declaration?, id: String, project: URL,
+                                   depth: Int) -> Node {
+        var subtitle = "\(origin.kind.label) · \(ProjectPair.label(of: project))"
+        if let declaration, let library = ValueGraphAnalysis.Context.libraryName(declaration.url) {
+            subtitle = "\(origin.kind.label) · \(library)"
+        }
+        var node = Node(id: id, kind: .source(origin, declaration), title: origin.title, subtitle: subtitle,
+                        project: project, url: declaration?.url, line: declaration?.line, depth: depth)
+        if !node.isExpandable { node.state = .expanded }
+        return node
+    }
+
     private func add(_ node: Node) {
         guard nodes[node.id] == nil else { return }
         nodes[node.id] = node
         order.append(node.id)
+        if !node.isLeaf { counted += 1 }
+    }
+
+    private func remove(_ id: String) {
+        guard let node = nodes.removeValue(forKey: id) else { return }
+        order.removeAll { $0 == id }
+        edges.removeAll { $0.from == id || $0.to == id }
+        if !node.isLeaf { counted -= 1 }
     }
 
     private func link(_ from: String, _ to: String, _ kind: EdgeKind = .data) {
@@ -218,6 +301,12 @@ final class ValueGraph: ObservableObject {
         case .loading, .expanded: return
         default: break
         }
+        // «Ещё N»: места уже найдены — показать их.
+        if case .more = node.kind, let pending = hidden.removeValue(forKey: id) {
+            remove(id)
+            adopt(pending.sites, into: pending.into, project: pending.project, datagrams: pending.datagrams, all: true)
+            return
+        }
         // Приход датаграммы раскрывается во второй половине: там её шлют.
         var project = node.project
         if case .arrival = node.kind {
@@ -233,20 +322,30 @@ final class ValueGraph: ObservableObject {
             return
         }
         nodes[id]?.state = .loading
+        let partnerRoot = owner.partner
         let context = ValueGraphAnalysis.Context(root: project, rustlyn: rustlyn, texts: owner.openTexts(),
                                                  index: owner.symbolIndex, network: owner.rules.datagrams,
-                                                 configs: owner.rules.configs)
+                                                 configs: owner.rules.configs, partner: partnerRoot,
+                                                 partnerIndex: partnerRoot.flatMap { lookup($0)?.symbolIndex })
         let kind = node.kind
-        // Места и, если их нет, — откуда значение, которое код не пишет.
-        let analyze = { () -> ([ValueGraphAnalysis.Site], String?) in
+        // Места и откуда значение, если его дают данные: база, конфиг, инспектор.
+        let analyze = { () -> ([ValueGraphAnalysis.Site], ValueOrigin?) in
             switch kind {
             case .value(let declaration):
-                let sites = context.writes(to: declaration)
-                return (sites, sites.isEmpty ? context.origin(of: declaration) : nil)
+                // Откуда значение, известно и при записях: у поля инспектора или
+                // модели конфига объявление даёт только умолчание.
+                return (context.writes(to: declaration), context.origin(of: declaration))
             case .component(let name): return (context.componentChanges(of: name), nil)
             case .arrival(let datagram): return (context.sends(of: datagram), nil)
             case .call(let method?): return (context.returns(of: method), nil)
-            case .parameter(let method?, let index): return (context.callers(of: method, argument: index), nil)
+            case .parameter(let method?, let index):
+                // Вызовов нет — может быть, метод зовёт движок: `OnUpdate(deltaTime)`.
+                let sites = context.callers(of: method, argument: index)
+                return (sites, sites.isEmpty ? context.parameterOrigin(of: method, argument: index) : nil)
+            case .source(let origin, let declaration?) where origin.kind == .config:
+                return (context.configValues(of: declaration), nil)
+            case .source(let origin, let declaration?) where origin.kind == .inspector:
+                return (context.inspectorValues(of: declaration), nil)
             default: return ([], nil)
             }
         }
@@ -262,8 +361,8 @@ final class ValueGraph: ObservableObject {
         }
     }
 
-    private func adopt(_ sites: [ValueGraphAnalysis.Site], into id: String, project: URL, datagrams: Set<String>,
-                       origin: String? = nil) {
+    private func adopt(_ found: [ValueGraphAnalysis.Site], into id: String, project: URL, datagrams: Set<String>,
+                       origin: ValueOrigin? = nil, all: Bool = false) {
         guard let node = nodes[id] else { return }
         let depth = node.depth
         var declaration: Declaration?
@@ -271,16 +370,32 @@ final class ValueGraph: ObservableObject {
         let isDatagram = declaration?.typeName.map(datagrams.contains) ?? false
         var isArrival = false
         if case .arrival = node.kind { isArrival = true }
+        var isSource = false
+        if case .source = node.kind { isSource = true }
 
-        var shown = 0
-        for site in sites {
-            // Чтение из сети внутри самой датаграммы — это мост, а не код.
-            if isDatagram, site.isNetworkRead { continue }
-            shown += 1
+        // Чтение из сети внутри самой датаграммы — это мост, а не код.
+        let sites = found.filter { !(isDatagram && $0.isNetworkRead) }
+        // Много мест — одинаковые одним узлом, первые из остальных, прочие
+        // за узлом «ещё N»: граф должен читаться.
+        var shown = reach.fanIn > 0 ? Self.grouped(sites) : sites
+        if !all, reach.fanIn > 0, shown.count > reach.fanIn + 1 {
+            let rest = Array(shown.dropFirst(reach.fanIn))
+            shown = Array(shown.prefix(reach.fanIn))
+            let moreID = "more|\(id)"
+            let places = Localization.count(rest.count, "место", "места", "мест")
+            var more = Node(id: moreID, kind: .more, title: L("ещё \(places)"),
+                            subtitle: rest.prefix(3).map(\.title).joined(separator: ", "), project: project, depth: depth + 1)
+            more.note = L("не поместились в граф")
+            hidden[moreID] = (rest, id, project, datagrams)
+            add(more)
+            link(moreID, id)
+        }
+        for site in shown {
+            let siteProject = site.project ?? project
             let siteID = "site|\(site.url.path)|\(site.offset)"
-            var siteNode = Node(id: siteID, kind: .site, title: site.title,
-                                subtitle: "\(ProjectPair.label(of: project)) · \(site.url.lastPathComponent):\(site.line + 1)",
-                                project: project, url: site.url, line: site.line, depth: depth + 1)
+            var siteNode = Node(id: siteID, kind: site.isData ? .data : .site, title: site.title,
+                                subtitle: "\(ProjectPair.label(of: siteProject)) · \(site.url.lastPathComponent):\(site.line + 1)",
+                                project: siteProject, url: site.url, line: site.line, depth: depth + 1)
             siteNode.preview = site.preview
             siteNode.fullPreview = site.methodLines
             siteNode.note = site.note
@@ -289,44 +404,111 @@ final class ValueGraph: ObservableObject {
             link(siteID, id, isArrival ? .network : .data)
 
             for source in site.sources {
-                adoptSource(source, into: siteID, site: site, project: project, depth: depth + 2)
+                adoptSource(source, into: siteID, site: site, project: siteProject, depth: depth + 2)
             }
-            adoptTrigger(site.trigger, into: siteID, site: site, project: project, depth: depth + 2)
+            adoptTrigger(site.trigger, into: siteID, site: site, project: siteProject, depth: depth + 2)
         }
 
-        // Поле датаграммы, которое здесь только принимают, — продолжается
-        // во второй половине: там его заполняют перед Send.
-        if let declaration, isDatagram, !sites.contains(where: { !$0.isNetworkRead }) {
+        if let declaration, isDatagram, sites.isEmpty, !all {
+            // Поле датаграммы, которое здесь только принимают, — продолжается
+            // во второй половине: там его заполняют перед Send.
             bridge(from: id, declaration: declaration, project: project, depth: depth)
             nodes[id]?.state = .expanded
-            return
-        }
-        if shown == 0, let origin {
+        } else if sites.isEmpty, let origin {
             // Код его не пишет, и это ответ: значение из базы, конфига, инспектора.
             nodes[id]?.state = .expanded
-            nodes[id]?.origin = origin
-            nodes[id]?.note = [nodes[id]?.note, origin].compactMap { $0 }.joined(separator: " · ")
-        } else {
-            nodes[id]?.state = shown == 0 ? .failed(emptyReason(for: node.kind)) : .expanded
+            if declaration != nil { nodes[id]?.origin = Self.phrase(origin) }
+            let source = Self.sourceNode(origin, at: declaration, id: "source|\(id)", project: project, depth: depth + 1)
+            add(source)
+            link(source.id, id)
+        } else if sites.isEmpty, isSource {
+            // Строк данных не нашлось — источник всё равно известен.
+            nodes[id]?.state = .expanded
+            nodes[id]?.note = L("где задано — не нашлось")
+        } else if !all {
+            nodes[id]?.state = sites.isEmpty ? .failed(emptyReason(for: node.kind)) : .expanded
+            // Значение из данных, хотя в коде оно есть: у поля инспектора и
+            // модели конфига начальное значение в объявлении — только умолчание.
+            if let origin, !sites.isEmpty, [.inspector, .config, .json, .database].contains(origin.kind) {
+                var source = Self.sourceNode(origin, at: declaration, id: "source|\(id)", project: project, depth: depth + 1)
+                source.note = sites.allSatisfy(\.isDeclaration) ? L("код задаёт только умолчание") : L("и код его меняет")
+                add(source)
+                link(source.id, id)
+            }
         }
         autoExpand()
         if !settled, !nodes.values.contains(where: { $0.state == .loading }) { settled = true }
     }
 
-    /// Первые шаги граф делает сам: значения и приходы датаграмм на
-    /// несколько колонок вглубь, пока узлов немного. Дальше — по кнопкам.
-    private func autoExpand() {
-        for id in order {
-            guard nodes.count < reach.nodes else { return }
-            guard let node = nodes[id], node.state == .collapsed, node.depth <= reach.depth else { continue }
-            switch node.kind {
-            case .value, .arrival: expand(id)
-            case .call where reach.calls, .parameter where reach.calls: expand(id)
-            default: break
+    /// Одинаковые места — та же строка кода и те же источники, как у
+    /// `SessionStartTime = ReliableTime.GetUnixIntTimestamp()` в двенадцати
+    /// системах, — одним узлом: первое, с пометкой, где ещё.
+    private static func grouped(_ sites: [ValueGraphAnalysis.Site]) -> [ValueGraphAnalysis.Site] {
+        var result: [ValueGraphAnalysis.Site] = []
+        var others: [[String]] = []
+        var positions: [String: Int] = [:]
+        for site in sites {
+            let code = site.preview.first { $0.number == site.line }?.text.trimmingCharacters(in: .whitespaces) ?? ""
+            let sources = site.sources.map { "\($0.kind)|\($0.via)" }.sorted().joined(separator: ";")
+            let key = [code, site.note ?? "", sources, site.isData ? "data" : ""].joined(separator: "\n")
+            if !code.isEmpty, let at = positions[key] {
+                others[at].append(site.title)
+            } else {
+                positions[key] = result.count
+                result.append(site)
+                others.append([])
             }
+        }
+        for (index, titles) in others.enumerated() where !titles.isEmpty {
+            let shown = titles.prefix(3).joined(separator: ", ") + (titles.count > 3 ? "…" : "")
+            let note = L("так же ещё в \(titles.count): \(shown)")
+            result[index].note = [result[index].note, note].compactMap { $0 }.joined(separator: " · ")
+        }
+        return result
+    }
+
+    /// Как значение без записей называлось в заметке и в обзоре: «из конфига».
+    private static func phrase(_ origin: ValueOrigin) -> String {
+        switch origin.kind {
+        case .config: return L("из конфига")
+        case .json: return L("из JSON")
+        case .database: return L("из базы данных")
+        case .injection: return L("из контейнера зависимостей")
+        case .inspector: return L("из инспектора Unity")
+        default: return origin.kind.label
         }
     }
 
+    /// Первые шаги граф делает сам: сначала значения и приходы датаграмм
+    /// («кто пишет»), потом вызовы и параметры — глубже к источникам, потом
+    /// строки конфигов (и префабов, если разрешено), пока узлов немного.
+    /// Дальше — по кнопкам.
+    private func autoExpand() {
+        for pass in 0..<3 {
+            var started = false
+            for id in order {
+                guard counted < reach.nodes else { return }
+                guard let node = nodes[id], node.state == .collapsed, node.depth <= reach.depth,
+                      priority(of: node) == pass else { continue }
+                expand(id)
+                started = true
+            }
+            // Следующий шаг — когда предыдущий раскрыт целиком.
+            if started || nodes.values.contains(where: { $0.state == .loading }) { return }
+        }
+    }
+
+    private func priority(of node: Node) -> Int? {
+        switch node.kind {
+        case .value: return node.weak && !reach.arguments ? nil : 0
+        case .arrival: return 0
+        case .call, .parameter: return reach.calls && !node.weak ? 1 : nil
+        case .source(let origin, _):
+            if origin.kind == .config { return 2 }
+            return origin.kind == .inspector && reach.assets ? 2 : nil
+        default: return nil
+        }
+    }
 
     private func adoptSource(_ source: ValueGraphAnalysis.Source, into siteID: String, site: ValueGraphAnalysis.Site,
                              project: URL, depth: Int) {
@@ -345,20 +527,25 @@ final class ValueGraph: ObservableObject {
                               url: method?.url, line: method?.line, depth: depth)
         case .component(let name):
             sourceNode = Self.componentNode(name, project: project, depth: depth)
+        case .origin(let origin, let at):
+            // Именованный источник (значение перечисления, член сборки) — один
+            // на граф; литерал — свой у каждого места.
+            let id = at.map { "source|\(project.path)|\($0.name)" }
+                ?? "source|\(siteID)|\(origin.kind.rawValue)|\(origin.title)"
+            sourceNode = Self.sourceNode(origin, at: at, id: id, project: project, depth: depth)
         case .unknown(let chain, let reason):
             sourceNode = Node(id: "unknown|\(siteID)|\(chain)", kind: .unknown, title: chain,
                               subtitle: reason ?? L("компилятор не узнал имя"), project: project, depth: depth)
         }
         var notes: [String] = []
-        if let terminal = source.terminal {
-            // Дальше идти некуда, и это ответ, а не потеря.
-            notes.append(terminal)
-            sourceNode.state = .expanded
-        }
+        if let call = source.argumentOf { notes.append(call == "[]" ? L("ключ элемента") : L("аргумент \(call)")) }
         if !source.via.isEmpty { notes.append(L("через \(source.via.joined(separator: " ← "))")) }
         if source.byName { notes.append(L("найдено по имени — может быть неточно")) }
         if !notes.isEmpty, nodes[sourceNode.id] == nil { sourceNode.note = notes.joined(separator: " · ") }
         sourceNode.guessed = source.byName
+        sourceNode.weak = source.argumentOf != nil
+        // Тот же узел, но здесь он значение, а не аргумент, — раскрывать.
+        if source.argumentOf == nil, nodes[sourceNode.id]?.weak == true { nodes[sourceNode.id]?.weak = false }
         add(sourceNode)
         link(sourceNode.id, siteID)
     }
@@ -409,9 +596,16 @@ final class ValueGraph: ObservableObject {
         return home.root?.path == project.path ? home.partner : lookup(project)?.partner
     }
 
-    /// Та же датаграмма во второй половине пары.
+    /// Та же датаграмма во второй половине пары. Нет пары — источник «сеть».
     private func bridge(from id: String, declaration: Declaration, project: URL, depth: Int) {
-        guard let typeName = declaration.typeName, let partnerRoot = partner(of: project) else { return }
+        guard let typeName = declaration.typeName else { return }
+        guard let partnerRoot = partner(of: project) else {
+            let source = Self.sourceNode(ValueOrigin(kind: .network, title: typeName), at: nil, id: "source|\(id)|network",
+                                         project: project, depth: depth + 1)
+            add(source)
+            link(source.id, id, .network)
+            return
+        }
         let label = ProjectPair.label(of: partnerRoot)
         let bridgeID = "net|\(id)"
         add(Node(id: bridgeID, kind: .network, title: L("Сеть: \(typeName)"),
@@ -433,7 +627,6 @@ final class ValueGraph: ObservableObject {
         let value = Self.valueNode(theirs, project: partnerRoot, depth: depth + 2)
         add(value)
         link(value.id, bridgeID, .network)
-        autoExpand()
     }
 
     /// Открыть место в окне его проекта.
