@@ -5824,6 +5824,22 @@ check(catalog.isMeta(URL(fileURLWithPath: "/p/Configs/registry.json")), "registr
 check(ConfigCatalog.parse(Data("{\"name\": \"pkg\", \"version\": \"1\"}".utf8)) == nil, "чужой registry.json — не каталог")
 check(ConfigCatalog.parse(Data("[1, 2]".utf8)) == nil, "массив — не каталог")
 
+section("Конфиги: чьи у проекта")
+do {
+    let client = URL(fileURLWithPath: "/w/game-client"), server = URL(fileURLWithPath: "/w/game-server")
+    func root(own: URL, partner: URL?, registries: Set<String>) -> String {
+        ConfigCatalog.root(own: own, partner: partner, rules: configRules) { registries.contains($0) }.path
+    }
+    let serverRegistry = "/w/game-server/Configs/registry.json", clientRegistry = "/w/game-client/Configs/registry.json"
+    check(root(own: server, partner: client, registries: [serverRegistry]) == server.path, "свой реестр — свои конфиги")
+    check(root(own: client, partner: server, registries: [serverRegistry]) == server.path,
+          "своего реестра нет — конфиги второй половины пары")
+    check(root(own: client, partner: server, registries: [serverRegistry, clientRegistry]) == client.path,
+          "реестр у обеих — свой")
+    check(root(own: client, partner: server, registries: []) == client.path, "реестра нет ни у кого — свой корень")
+    check(root(own: client, partner: nil, registries: [serverRegistry]) == client.path, "без пары — свой корень")
+}
+
 section("Конфиги: деревья")
 let configsDir = FileManager.default.temporaryDirectory.appendingPathComponent("pilot-configs-\(getpid())")
 try? FileManager.default.removeItem(at: configsDir)

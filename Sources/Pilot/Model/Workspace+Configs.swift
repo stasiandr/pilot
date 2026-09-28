@@ -13,9 +13,20 @@ extension Workspace {
         case declaration(alias: String)
     }
 
+    /// Корень, чей каталог действует в этом окне: свой или, если своего
+    /// реестра нет, второй половины пары (`ConfigCatalog.root`). У clm-client
+    /// конфигов нет — его алиасы ведут в JSON clm-server, и открываются они
+    /// в окне сервера, как любой его файл.
+    var configRoot: URL? {
+        guard let root, let configRules = rules.configs else { return root }
+        return ConfigCatalog.root(own: root, partner: partner, rules: configRules) {
+            FileManager.default.fileExists(atPath: $0)
+        }
+    }
+
     var configCatalog: ConfigCatalog? {
-        guard let root else { return nil }
-        return configCatalogs.catalog(root: root, rules: rules.configs)
+        guard let configRoot else { return nil }
+        return configCatalogs.catalog(root: configRoot, rules: rules.configs)
     }
 
     /// Какой alias какую модель читает — по классу алиасов этого проекта.
@@ -74,9 +85,16 @@ extension Workspace {
         }
         showDeclarations(urls.map { url in
             FoundDeclaration(target: NavTarget(url: url, range: nil), name: url.lastPathComponent, kind: .field,
-                             container: alias,
-                             path: catalog.path(of: url).map { "\(catalog.rules.folder)/\($0)" } ?? url.path)
+                             container: alias, path: configListPath(url, catalog: catalog))
         })
+    }
+
+    /// Путь конфига в списке — от корня его проекта; конфиг второй половины
+    /// пары подписан её именем, как всё, что пришло оттуда.
+    private func configListPath(_ url: URL, catalog: ConfigCatalog) -> String {
+        let path = catalog.path(of: url).map { "\(catalog.rules.folder)/\($0)" } ?? url.path
+        guard let partner, let label = partnerLabel, configRoot == partner else { return path }
+        return "\(label) · \(path)"
     }
 
     /// Значение константы-алиаса с этим именем, если оно — алиас конфига.
@@ -340,10 +358,10 @@ extension Workspace {
             }
         } else {
             actions.append(ContextAction(title: L("Конфиги модели (\(configs.count))…"), icon: "doc.text") { [weak self] in
-                self?.showDeclarations(configs.flatMap { use, urls in urls.map { url in
+                guard let self else { return }
+                self.showDeclarations(configs.flatMap { use, urls in urls.map { url in
                     FoundDeclaration(target: NavTarget(url: url, range: nil), name: url.lastPathComponent, kind: .field,
-                                     container: use.alias,
-                                     path: catalog.path(of: url).map { "\(catalog.rules.folder)/\($0)" } ?? url.path)
+                                     container: use.alias, path: self.configListPath(url, catalog: catalog))
                 } })
             })
         }

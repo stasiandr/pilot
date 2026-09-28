@@ -68,6 +68,18 @@ struct ConfigCatalog: Sendable {
         return ConfigCatalog(directory: directory, rules: rules, entries: entries + trees(in: directory, rules: rules))
     }
 
+    /// Чьи конфиги у проекта: свои, если в нём есть реестр, а если нет —
+    /// второй половины пары, когда реестр есть у неё. Клиент читает те же
+    /// алиасы своим классом алиасов, а JSON лежит на сервере: так ⌘B по
+    /// алиасу в клиенте открывает конфиг сервера.
+    static func root(own: URL, partner: URL?, rules: ConfigRules, exists: (String) -> Bool) -> URL {
+        func hasRegistry(_ root: URL) -> Bool {
+            exists(root.appendingPathComponent(rules.folder).appendingPathComponent(rules.registry).path)
+        }
+        guard let partner, !hasRegistry(own), hasRegistry(partner) else { return own }
+        return partner
+    }
+
     init(directory: URL, rules: ConfigRules, entries: [(alias: String, path: String)]) {
         self.directory = directory
         self.rules = rules
