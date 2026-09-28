@@ -328,8 +328,16 @@ final class SyntaxModel: @unchecked Sendable {
     /// отдавала весь файл своему лексеру, у которого свои цвета (`Foo(` у
     /// него функция, у Rustlyn — тип), и экран перекрашивался целиком.
     ///
+    /// Виды — уже для цвета (`colorKinds`).
+    ///
     /// Только с главного потока: помнит последний ответ Rustlyn.
     func colorTokens(fromLine: Int, toLine: Int) -> [Token] {
+        colorKinds(carriedTokens(fromLine: fromLine, toLine: toLine))
+    }
+
+    /// То же, но виды — как их отдали разбор и свой лексер, до `colorKinds`:
+    /// по ним тесты видят, чей цвет на экране.
+    func carriedTokens(fromLine: Int, toLine: Int) -> [Token] {
         guard var base = colors, spec != nil, !lineStarts.isEmpty else {
             return tokens(fromLine: fromLine, toLine: toLine)
         }
@@ -409,6 +417,159 @@ final class SyntaxModel: @unchecked Sendable {
             }
         }
         return sink ?? []
+    }
+
+    // MARK: - Виды для цвета
+
+    /// Уточняет виды токенов для раскраски: `if`, `return` — управляющие
+    /// ключевые слова, `int`, `string` — типы, которые язык пишет ключевыми
+    /// словами. Зовут только там, где красят: остальным нужны ключевое слово
+    /// и тип, как их отдали лексер и Rustlyn.
+    ///
+    /// И имя перед скобкой. Rustlyn красит типом всякое имя с заглавной —
+    /// и `Parse(`, и `LoadAssetAtPath<T>(`, а свой лексер вызовом — и
+    /// `new Foo(`. Для цвета вызов и объявление метода — функция, а создание
+    /// объекта и конструктор — тип, какой бы разбор ни красил файл.
+    func colorKinds(_ tokens: [Token]) -> [Token] {
+        guard let spec else { return tokens }
+        var tokens = tokens
+        for i in tokens.indices {
+            let start = Int(tokens[i].start), end = start + Int(tokens[i].length)
+            guard start >= 0, start < end, end <= units.count else { continue }
+            switch tokens[i].kind {
+            case .keyword:
+                if isControlKeyword(word(start, end), start: start, end: end, spec) {
+                    tokens[i].kind = .controlKeyword
+                }
+            case .type:
+                // Слова-типы пишутся строчными — `Task` и `String` не смотрим.
+                let lowercase = units[start] >= 0x61 && units[start] <= 0x7A
+                if lowercase, spec.keywordTypes.contains(word(start, end)) {
+                    tokens[i].kind = .typeKeyword
+                } else if isCall(after: end), !isConstruction(start),
+                          !spec.typeKeywords.contains(word(start, end)) {
+                    tokens[i].kind = .function
+                }
+            case .function:
+                if isConstruction(start) { tokens[i].kind = .type }
+            default:
+                break
+            }
+        }
+        return tokens
+    }
+
+    /// За именем — скобка вызова, может быть, после аргументов дженерика:
+    /// `Parse(`, `GetComponent<Rigidbody>(`.
+    private func isCall(after end: Int) -> Bool {
+        var i = end
+        while i < units.count, units[i] == 0x20 || units[i] == 0x09 { i += 1 }
+        if i < units.count, units[i] == 0x3C {
+            var depth = 0
+            while i < units.count {
+                let c = units[i]
+                if c == 0x3C {
+                    depth += 1
+                } else if c == 0x3E {
+                    depth -= 1
+                    if depth == 0 { i += 1; break }
+                } else if !(isIdentPart(c) || c == 0x20 || c == 0x2C || c == 0x2E || c == 0x3F
+                            || c == 0x5B || c == 0x5D) {
+                    return false   // `a < b && c > (d)` — сравнение, а не дженерик
+                }
+                i += 1
+            }
+            guard depth == 0 else { return false }
+            while i < units.count, units[i] == 0x20 || units[i] == 0x09 { i += 1 }
+        }
+        return i < units.count && units[i] == 0x28
+    }
+
+    /// Имя перед скобкой — тип, а не метод: `new Foo(`, `new Game.Foo(`,
+    /// `x is Point(`, конструктор `public Foo(`, `~Foo(`, `record Point(`.
+    /// Модификатор перед именем с заглавной — конструктор: у метода между
+    /// ними стоял бы тип; строчное имя после модификатора — метод TypeScript.
+    /// `case Point(` с заглавной — позиционный образец C#.
+    private func isConstruction(_ start: Int) -> Bool {
+        // Квалифицированное имя — к его началу: `Game.Foo`, `global::Foo`.
+        var first = start
+        while true {
+            var dot = first
+            if dot > 0, units[dot - 1] == 0x2E { dot -= 1 }
+            else if dot > 1, units[dot - 1] == 0x3A, units[dot - 2] == 0x3A { dot -= 2 }
+            else { break }
+            var name = dot
+            while name > 0, isIdentPart(units[name - 1]) { name -= 1 }
+            // `).Foo(`, `?.Foo(` — вызов у значения, не имя типа.
+            guard name < dot else { return false }
+            first = name
+        }
+        var end = first
+        while end > 0, units[end - 1] == 0x20 || units[end - 1] == 0x09 { end -= 1 }
+        if end > 0, units[end - 1] == 0x7E { return true }
+        var from = end
+        while from > 0, isIdentPart(units[from - 1]) { from -= 1 }
+        switch word(from, end) {
+        case "new", "is", "record", "class", "struct", "interface", "operator":
+            return true
+        case "public", "private", "protected", "internal", "static", "extern", "unsafe", "case":
+            return units[start] >= 0x41 && units[start] <= 0x5A
+        default:
+            return false
+        }
+    }
+
+    /// Три слова ведут управление не везде, и Roslyn это различает по
+    /// разбору, а мы — по соседям: `default:` и `goto default` — переход к
+    /// ветке, а `default(T)` и `= default` — значение; `in` — только в
+    /// заголовке `foreach`, а не модификатор параметра и не `from x in xs`;
+    /// `await foreach` и `await using` — не управление.
+    private func isControlKeyword(_ word: String, start: Int, end: Int, _ spec: LanguageSpec) -> Bool {
+        guard spec.controlKeywords.contains(word) else { return false }
+        var next = end
+        while next < units.count, units[next] == 0x20 || units[next] == 0x09 { next += 1 }
+        switch word {
+        case "default":
+            if next < units.count && units[next] == 0x3A { return true }
+            var before = start
+            while before > 0, units[before - 1] == 0x20 || units[before - 1] == 0x09 { before -= 1 }
+            var from = before
+            while from > 0, isIdentPart(units[from - 1]) { from -= 1 }
+            return self.word(from, before) == "goto"
+        case "in":
+            return inForeachHeader(start)
+        case "await":
+            var after = next
+            while after < units.count, isIdentPart(units[after]) { after += 1 }
+            return !["foreach", "using"].contains(self.word(next, after))
+        default:
+            return true
+        }
+    }
+
+    /// `in` в `foreach (var x in xs)`: левее на той же строке — незакрытая
+    /// скобка, и перед ней `foreach`.
+    private func inForeachHeader(_ offset: Int) -> Bool {
+        let lineStart = Int(lineStarts[line(containing: offset)])
+        var i = offset - 1, depth = 0
+        while i >= lineStart {
+            if units[i] == 0x29 { depth += 1 }
+            if units[i] == 0x28 {
+                if depth == 0 { break }
+                depth -= 1
+            }
+            i -= 1
+        }
+        guard i >= lineStart else { return false }
+        var end = i
+        while end > lineStart, units[end - 1] == 0x20 || units[end - 1] == 0x09 { end -= 1 }
+        var start = end
+        while start > lineStart, isIdentPart(units[start - 1]) { start -= 1 }
+        return word(start, end) == "foreach"
+    }
+
+    private func word(_ start: Int, _ end: Int) -> String {
+        String(decoding: units[start..<end], as: UTF16.self)
     }
 
     // MARK: - Ядро лексера

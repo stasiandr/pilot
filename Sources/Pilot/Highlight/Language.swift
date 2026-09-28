@@ -11,11 +11,26 @@ enum TokenKind: UInt8, CaseIterable {
     /// и про живость веток не знает.
     case disabled
 
+    // Дальше — виды только для цвета. Ни лексер, ни Rustlyn их не ставят:
+    // для них это ключевое слово и тип, и структура файла, вхождения и
+    // навигация видят именно их. Уточняет вид `SyntaxModel.colorKinds`,
+    // и только там, где токены красят.
+
+    /// `if`, `return`, `throw` — ключевое слово, которое ведёт управление.
+    /// Visual Studio красит такие своим цветом.
+    case controlKeyword
+    /// `int`, `string`, `void` — тип, который язык пишет ключевым словом.
+    /// Visual Studio красит такие как ключевые слова, а не как типы.
+    case typeKeyword
+
+    /// Видов у `RlnClass`: до `disabled` включительно.
+    static let rustlynCount = Int(TokenKind.disabled.rawValue) + 1
+
     /// Вид из `RlnClass`. Значения совпадают по построению: обе таблицы
     /// выписаны вручную, и что они не разъехались, проверяет
     /// `Rustlyn.buildsAgree()` при запуске.
     init(_ raw: UInt8) {
-        self = TokenKind(rawValue: raw) ?? .plain
+        self = Int(raw) < Self.rustlynCount ? TokenKind(rawValue: raw) ?? .plain : .plain
     }
 }
 
@@ -40,6 +55,12 @@ struct LanguageSpec {
     var keywords: Set<String> = []
     var constants: Set<String> = []
     var typeKeywords: Set<String> = []
+    /// Ключевые слова, которые ведут управление: `if`, `return`, `throw`
+    /// (`TokenKind.controlKeyword`).
+    var controlKeywords: Set<String> = []
+    /// Типы, которые язык пишет ключевыми словами: `int`, `void` в C#, но не
+    /// `Task` оттуда же и не `str` в Python (`TokenKind.typeKeyword`).
+    var keywordTypes: Set<String> = []
     /// Ключевые слова без учёта регистра (SQL: `SELECT`, `select`, `Select`).
     /// Тогда слова в `keywords`, `constants` и `typeKeywords` — строчными.
     var caseInsensitiveKeywords = false
@@ -145,6 +166,11 @@ enum Languages {
         l.constants = ["true","false","null","default"]
         l.typeKeywords = ["bool","byte","char","decimal","double","dynamic","float","int","long","nint","nuint",
             "object","sbyte","short","string","uint","ulong","ushort","void","Task","List","Dictionary"]
+        // Как у Roslyn (`ClassificationHelpers.IsControlKeywordKind`). `default`,
+        // `in` и `await` ведут управление не везде — это решает `colorKinds`.
+        l.controlKeywords = ["if","else","switch","case","default","while","do","for","foreach","in","break",
+            "continue","goto","return","yield","throw","try","catch","finally","when","await"]
+        l.keywordTypes = l.typeKeywords.filter { $0.first?.isLowercase == true }
         l.outline = .cFamily
         l.declarationKeywords = [
             "class": .type, "struct": .type, "interface": .type, "record": .type,
@@ -182,6 +208,8 @@ enum Languages {
         l.constants = ["true","false","nil","self","Self"]
         l.typeKeywords = ["Int","Int8","Int16","Int32","Int64","UInt","UInt8","UInt16","UInt32","UInt64",
             "Double","Float","Bool","String","Character","Array","Dictionary","Set","Optional","Result","Void"]
+        l.controlKeywords = ["if","else","guard","switch","case","default","fallthrough","for","while","repeat",
+            "break","continue","return","throw","do","catch","try","defer","await"]
         l.outline = .keyword
         l.declarationKeywords = [
             "func": .method, "class": .type, "struct": .type, "enum": .type,
@@ -215,6 +243,11 @@ enum Languages {
         l.typeKeywords = ["bool","char","char8_t","char16_t","char32_t","double","float","int","long","short",
             "signed","unsigned","void","wchar_t","size_t","uint8_t","uint16_t","uint32_t","uint64_t",
             "int8_t","int16_t","int32_t","int64_t","id","instancetype","BOOL","NSInteger","NSUInteger"]
+        l.controlKeywords = ["if","else","switch","case","default","while","do","for","break","continue","goto",
+            "return","throw","try","catch","co_await","co_return","co_yield"]
+        // `size_t`, `uint8_t` — typedef'ы, а не слова языка.
+        l.keywordTypes = ["bool","char","char8_t","char16_t","char32_t","double","float","int","long","short",
+            "signed","unsigned","void","wchar_t"]
         l.outline = .cFamily
         l.declarationKeywords = [
             "class": .type, "struct": .type, "union": .type, "enum": .type,
@@ -243,6 +276,9 @@ enum Languages {
         l.constants = ["true","false","null","undefined","NaN","Infinity"]
         l.typeKeywords = ["any","bigint","boolean","never","number","object","string","symbol","unknown",
             "Array","Promise","Record","Partial","Map","Set"]
+        l.controlKeywords = ["if","else","switch","case","default","while","do","for","break","continue","return",
+            "throw","try","catch","finally","yield","await"]
+        l.keywordTypes = l.typeKeywords.filter { $0.first?.isLowercase == true }
         l.outline = .keyword
         l.declarationKeywords = [
             "function": .function, "class": .type, "interface": .type, "enum": .type,
@@ -270,6 +306,8 @@ enum Languages {
         l.constants = ["True","False","None","self","cls"]
         l.typeKeywords = ["int","float","str","bool","bytes","list","dict","tuple","set","frozenset","object",
             "Any","Optional","List","Dict","Tuple","Union","Callable"]
+        l.controlKeywords = ["if","elif","else","match","case","for","while","break","continue","pass","return",
+            "yield","raise","try","except","finally","with","await"]
         l.outline = .keyword
         l.indentBased = true
         l.declarationKeywords = ["def": .method, "class": .type, "async": .method]
@@ -293,6 +331,7 @@ enum Languages {
         l.constants = ["true","false","None","Some","Ok","Err"]
         l.typeKeywords = ["bool","char","f32","f64","i8","i16","i32","i64","i128","isize","str","u8","u16",
             "u32","u64","u128","usize","String","Vec","Option","Result","Box","Rc","Arc"]
+        l.controlKeywords = ["if","else","match","for","while","loop","break","continue","return"]
         l.outline = .keyword
         l.declarationKeywords = [
             "fn": .method, "struct": .type, "enum": .type, "trait": .type,
@@ -317,6 +356,8 @@ enum Languages {
         l.constants = ["true","false","nil","iota"]
         l.typeKeywords = ["bool","byte","complex64","complex128","error","float32","float64","int","int8","int16",
             "int32","int64","rune","string","uint","uint8","uint16","uint32","uint64","uintptr","any"]
+        l.controlKeywords = ["if","else","switch","select","case","default","fallthrough","for","break","continue",
+            "goto","return","go","defer"]
         l.outline = .keyword
         l.declarationKeywords = [
             "func": .method, "type": .type, "package": .namespace,
@@ -342,6 +383,9 @@ enum Languages {
         l.constants = ["true","false","null"]
         l.typeKeywords = ["boolean","byte","char","double","float","int","long","short","void","String",
             "Integer","Long","Double","Boolean","List","Map","Set","Optional"]
+        l.controlKeywords = ["if","else","switch","case","default","while","do","for","break","continue","return",
+            "yield","throw","try","catch","finally"]
+        l.keywordTypes = l.typeKeywords.filter { $0.first?.isLowercase == true }
         l.outline = .cFamily
         l.declarationKeywords = [
             "class": .type, "interface": .type, "enum": .type, "record": .type,
@@ -372,6 +416,8 @@ enum Languages {
         l.constants = ["true","false","null","it"]
         l.typeKeywords = ["Any","Boolean","Byte","Char","Double","Float","Int","Long","Nothing","Short","String",
             "Unit","List","Map","Set","Array","MutableList"]
+        l.controlKeywords = ["if","else","when","while","do","for","break","continue","return","throw","try","catch",
+            "finally"]
         l.outline = .keyword
         l.declarationKeywords = [
             "fun": .method, "class": .type, "interface": .type, "object": .type,
@@ -393,6 +439,8 @@ enum Languages {
             "ensure","for","if","in","module","next","not","or","redo","rescue","retry","return","self","super",
             "then","undef","unless","until","when","while","yield","require","attr_accessor","attr_reader"]
         l.constants = ["true","false","nil","__FILE__","__LINE__"]
+        l.controlKeywords = ["if","elsif","else","unless","case","when","then","while","until","for","break","next",
+            "redo","retry","return","yield","begin","rescue","ensure"]
         l.capitalizedIsType = true
         l.outline = .keyword
         l.declarationKeywords = ["def": .method, "class": .type, "module": .namespace]
@@ -414,6 +462,8 @@ enum Languages {
             "list","match","namespace","new","or","print","private","protected","public","readonly","require",
             "require_once","return","static","switch","throw","trait","try","unset","use","var","while","xor","yield"]
         l.constants = ["true","false","null","TRUE","FALSE","NULL","$this"]
+        l.controlKeywords = ["if","elseif","else","switch","case","default","match","while","do","for","foreach",
+            "break","continue","goto","return","yield","throw","try","catch","finally"]
         l.outline = .keyword
         l.declarationKeywords = [
             "function": .method, "class": .type, "interface": .type,
@@ -433,6 +483,8 @@ enum Languages {
         l.keywords = ["if","then","else","elif","fi","case","esac","for","select","while","until","do","done",
             "in","function","time","coproc","local","export","readonly","declare","typeset","return","source",
             "alias","unalias","set","unset","shift","trap","echo","cd","exit"]
+        l.controlKeywords = ["if","then","elif","else","fi","case","esac","for","select","while","until","do","done",
+            "break","continue","return"]
         l.constants = ["true","false"]
         l.capitalizedIsType = false
         l.outline = .keyword
@@ -529,6 +581,9 @@ enum Languages {
             }
         }
         l.typeKeywords = types
+        l.controlKeywords = ["if","else","switch","case","default","while","do","for","break","continue","return",
+            "discard"]
+        l.keywordTypes = types.filter { $0.first?.isLowercase == true }
         l.capitalizedIsType = false   // макросы SRP: TEXTURE2D, SAMPLE_TEXTURE2D — не типы
         l.outline = .cFamily
         l.declarationKeywords = ["struct": .type, "cbuffer": .type, "tbuffer": .type]

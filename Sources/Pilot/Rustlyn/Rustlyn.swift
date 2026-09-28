@@ -920,7 +920,7 @@ final class Rustlyn: @unchecked Sendable {
     /// запуске — это дешевле, чем искать потом, почему у полей иконка метода.
     static func buildsAgree() -> Bool {
         rln_declaration_kind_count() == UInt32(RustlynDeclarationKind.allCases.count)
-            && rln_class_count() == UInt32(TokenKind.allCases.count)
+            && rln_class_count() == UInt32(TokenKind.rustlynCount)
             && rln_completion_kind_count() == UInt32(RustlynCompletionKind.allCases.count)
     }
 }

@@ -27,6 +27,8 @@ enum Theme {
         case .constant:     return s.constant
         case .operatorTok:  return s.operatorTok
         case .disabled:     return s.disabled
+        case .controlKeyword: return s.controlKeyword ?? s.keyword
+        case .typeKeyword:  return s.typeKeyword ?? s.type
         }
     }
 
@@ -337,8 +339,7 @@ enum Theme {
         }
         let M = P
         var tokens = ""
-        for raw in 0...UInt8(13) {
-            guard let kind = TokenKind(rawValue: raw), kind != .plain else { continue }
+        for kind in TokenKind.allCases where kind != .plain {
             tokens += ".t-\(kind){color:\(hex(color(kind)))}"
             if kind == .comment || kind == .docComment { tokens += ".t-\(kind){font-style:italic}" }
         }

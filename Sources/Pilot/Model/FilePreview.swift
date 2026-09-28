@@ -47,7 +47,8 @@ struct FilePreview {
 
         // Токены приходят с абсолютными смещениями и никогда не переходят
         // через перевод строки — лексер режет по нему и комментарии, и литералы.
-        let tokens = model.tokens(fromLine: first, toLine: last)
+        // Виды — для цвета, как в редакторе.
+        let tokens = model.colorKinds(model.tokens(fromLine: first, toLine: last))
         var tokenIndex = 0
         var lines: [Line] = []
         lines.reserveCapacity(last - first + 1)

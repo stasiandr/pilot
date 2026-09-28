@@ -936,7 +936,7 @@ enum Markdown {
     static func highlight(_ code: String, language: String) -> String {
         guard let spec = spec(forLanguage: language), !code.isEmpty else { return escape(code) }
         let model = SyntaxModel(text: code, spec: spec)
-        let tokens = model.tokens(fromLine: 0, toLine: model.lineCount - 1)
+        let tokens = model.colorKinds(model.tokens(fromLine: 0, toLine: model.lineCount - 1))
         let units = model.units
         var out = ""
         var position = 0

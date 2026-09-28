@@ -18,17 +18,23 @@ struct EditorScheme: Identifiable, Equatable {
     struct Syntax {
         let keyword, type, string, escape, number, comment, docComment, function,
             punctuation, preprocessor, attribute, constant, operatorTok, field, disabled: NSColor
+        /// `if`, `return` (`TokenKind.controlKeyword`) и `int`, `string`
+        /// (`.typeKeyword`). Свои цвета у них в схемах Visual Studio, у
+        /// остальных — как у ключевых слов и типов.
+        var controlKeyword: NSColor? = nil
+        var typeKeyword: NSColor? = nil
     }
 
     enum Family: String, CaseIterable {
         case rider = "Rider"
+        case visualStudio = "Visual Studio"
         case catppuccin = "Catppuccin"
         case popular = "Популярные"
 
         /// Подпись в настройках — на языке интерфейса.
         var title: String {
             switch self {
-            case .rider, .catppuccin: return rawValue
+            case .rider, .visualStudio, .catppuccin: return rawValue
             case .popular: return L("Популярные")
             }
         }
@@ -102,6 +108,7 @@ extension EditorScheme {
 
     static let all: [EditorScheme] = [
         riderDark, riderIslandsDark, riderLight, darcula, intellijLight,
+        visualStudioDark, visualStudioLight,
         catppuccinLatte, catppuccinFrappe, catppuccinMacchiato, catppuccinMocha,
         oneDark, dracula, monokai, nord, gruvboxDark, tokyoNight,
         githubDark, githubLight, solarizedDark, solarizedLight,
@@ -207,6 +214,59 @@ extension EditorScheme {
             constant: rgb(0x871094), operatorTok: rgb(0x080808), field: rgb(0x871094), disabled: rgb(0xB0B0B0)),
         caret: rgb(0x000000), selection: rgb(0xA6D2FF), occurrence: rgb(0xEDEBFC),
         gutter: rgb(0xADADAD), gutterCurrent: rgb(0x505050))
+
+    // MARK: Visual Studio
+
+    /// Тёмная тема Visual Studio. Редактор у неё тот же с VS 2019 и до 2026:
+    /// цвета C# — из ColorSchemes/VisualStudio2019.xml в github.com/dotnet/roslyn
+    /// (классы 4EC9B0, методы DCDCAA, управляющие ключевые слова D8A0DF),
+    /// остальное — из встроенной темы: текст DCDCDC на 1E1E1E, выделение —
+    /// 3399FF на 40%, вхождения — 0E4583, у нас без рамки и тоже на 40%.
+    /// Номера строк, полоса строки с курсором и хром — как в VS 2026: 8A8A8A,
+    /// 272727, рамки 2E2E2E, акцент 9184EE; акценты палитры — из цветов
+    /// самой VS. Локальные переменные VS красит голубым 9CDCFE, но отличить
+    /// их от полей может только семантика — здесь они обычным текстом.
+    static let visualStudioDark = EditorScheme(
+        id: "visual-studio-dark", name: "Visual Studio Dark", family: .visualStudio, isDark: true,
+        p: Palette(
+            crust: rgb(0x141414), mantle: rgb(0x262626), base: rgb(0x1E1E1E),
+            surface0: rgb(0x2E2E2E), surface1: rgb(0x454545), overlay2: rgb(0x8A8A8A),
+            subtext0: rgb(0xA0A0A0), text: rgb(0xDCDCDC),
+            rosewater: rgb(0xD69D85), flamingo: rgb(0xF48771), pink: rgb(0xD8A0DF), red: rgb(0xFC3E36),
+            mauve: rgb(0xB180D7), peach: rgb(0xEE9D28), yellow: rgb(0xEFF284), green: rgb(0x57A64A),
+            teal: rgb(0x4EC9B0), sky: rgb(0x9CDCFE), sapphire: rgb(0x3399FF), blue: rgb(0x569CD6),
+            lavender: rgb(0x9184EE)),
+        syntax: Syntax(
+            keyword: rgb(0x569CD6), type: rgb(0x4EC9B0), string: rgb(0xD69D85), escape: rgb(0xFFD68F),
+            number: rgb(0xB5CEA8), comment: rgb(0x57A64A), docComment: rgb(0x608B4E), function: rgb(0xDCDCAA),
+            punctuation: rgb(0xDCDCDC), preprocessor: rgb(0x9B9B9B), attribute: rgb(0x4EC9B0),
+            constant: rgb(0x569CD6), operatorTok: rgb(0xB4B4B4), field: rgb(0xDCDCDC), disabled: rgb(0x9B9B9B),
+            controlKeyword: rgb(0xD8A0DF), typeKeyword: rgb(0x569CD6)),
+        caret: rgb(0xDCDCDC), selection: rgb(0x264F78), occurrence: rgb(0x182E46),
+        gutter: rgb(0x8A8A8A), gutterCurrent: rgb(0xCCCCCC))
+
+    /// Светлая тема Visual Studio — из тех же источников: ключевые слова
+    /// 0000FF, классы 2B91AF, методы 74531F, управляющие ключевые слова
+    /// 8F08C4, числа чёрные, как текст. Вхождения — DBE0CC, выделение —
+    /// 3399FF на 40% поверх белого; хром и номера строк — из VS 2026.
+    static let visualStudioLight = EditorScheme(
+        id: "visual-studio-light", name: "Visual Studio Light", family: .visualStudio, isDark: false,
+        p: Palette(
+            crust: rgb(0xFFFFFF), mantle: rgb(0xF7F7F7), base: rgb(0xFFFFFF),
+            surface0: rgb(0xF0F0F0), surface1: rgb(0xDCDCDC), overlay2: rgb(0x7A7A7A),
+            subtext0: rgb(0x5F5F5F), text: rgb(0x000000),
+            rosewater: rgb(0xA31515), flamingo: rgb(0xA1260D), pink: rgb(0x8F08C4), red: rgb(0xE51400),
+            mauve: rgb(0x652D90), peach: rgb(0xD67E00), yellow: rgb(0x996F00), green: rgb(0x008000),
+            teal: rgb(0x2B91AF), sky: rgb(0x1F377F), sapphire: rgb(0x007ACC), blue: rgb(0x0000FF),
+            lavender: rgb(0x5649B0)),
+        syntax: Syntax(
+            keyword: rgb(0x0000FF), type: rgb(0x2B91AF), string: rgb(0xA31515), escape: rgb(0xB776FB),
+            number: rgb(0x000000), comment: rgb(0x008000), docComment: rgb(0x008000), function: rgb(0x74531F),
+            punctuation: rgb(0x000000), preprocessor: rgb(0x808080), attribute: rgb(0x2B91AF),
+            constant: rgb(0x0000FF), operatorTok: rgb(0x000000), field: rgb(0x000000), disabled: rgb(0x808080),
+            controlKeyword: rgb(0x8F08C4), typeKeyword: rgb(0x0000FF)),
+        caret: rgb(0x000000), selection: rgb(0xADD6FF), occurrence: rgb(0xDBE0CC),
+        gutter: rgb(0x7A7A7A), gutterCurrent: rgb(0x1E1E1E))
 
     // MARK: Catppuccin
 

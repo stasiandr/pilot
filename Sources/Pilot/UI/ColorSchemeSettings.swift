@@ -61,19 +61,22 @@ private struct SchemeCard: View {
     }
 
     /// Строчки на все главные роли: комментарий, ключевое слово, тип,
-    /// атрибут, число, метод, строка.
+    /// атрибут, число, метод, строка. `int` и `void` — как в редакторе:
+    /// там они типы, кроме схем, которые красят их ключевыми словами.
     private var sample: Text {
         let s = scheme.syntax
         func t(_ text: String, _ color: NSColor) -> Text { Text(text).foregroundColor(Color(nsColor: color)) }
-        let plain = scheme.p.text
-        return t("// Игрок\n", s.comment)
+        let typeKeyword = s.typeKeyword ?? s.type
+        let head = t("// Игрок\n", s.comment)
             + t("class ", s.keyword) + t("Player", s.type) + t(" {\n", s.punctuation)
-            + t("  [", s.punctuation) + t("Header", s.attribute) + t("] ", s.punctuation)
-            + t("int ", s.keyword) + t("hp", s.field) + t(" = ", s.operatorTok) + t("5", s.number)
+        let field = t("  [", s.punctuation) + t("Header", s.attribute) + t("] ", s.punctuation)
+            + t("int ", typeKeyword) + t("hp", s.field) + t(" = ", s.operatorTok) + t("5", s.number)
             + t(";\n", s.punctuation)
-            + t("  void ", s.keyword) + t("Run", s.function) + t("() =>\n", plain)
-            + t("    Say", s.function) + t("(", s.punctuation) + t("\"hi\"", s.string) + t(");\n", s.punctuation)
-            + t("}", s.punctuation)
+        let method = t("  void ", typeKeyword) + t("Run", s.function) + t("() {\n", s.punctuation)
+            + t("    if ", s.controlKeyword ?? s.keyword) + t("(", s.punctuation) + t("hp", s.field)
+            + t(" > ", s.operatorTok) + t("0", s.number) + t(") ", s.punctuation)
+            + t("Say", s.function) + t("(", s.punctuation) + t("\"hi\"", s.string) + t(");\n", s.punctuation)
+        return head + field + method + t("  }\n}", s.punctuation)
     }
 }
 

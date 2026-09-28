@@ -224,6 +224,67 @@ check(kindOf("Bar", km, kt) == .function, "'Bar' -> function (перед ско�
 check(kindOf("int", km, kt) == .type, "'int' -> type")
 check(kindOf("42", km, kt) == .number, "'42' -> number")
 
+// виды для цвета: управляющие ключевые слова и типы-ключевые слова
+func colorKindsOf(_ word: String, _ text: String, _ spec: LanguageSpec) -> (raw: [TokenKind], painted: [TokenKind]) {
+    let model = SyntaxModel(text: text, spec: spec)
+    let raw = model.tokens(fromLine: 0, toLine: model.lineCount - 1)
+    let units = Array(model.units)
+    func of(_ tokens: [Token]) -> [TokenKind] {
+        tokens.filter { String(decoding: units[Int($0.start)..<Int($0.start + $0.length)], as: UTF16.self) == word }
+            .map(\.kind)
+    }
+    return (of(raw), of(model.colorKinds(raw)))
+}
+let controlSource = """
+    foreach (var x in xs) { if (x) break; else continue; }
+    switch (k) { case 1: goto default; default: return default(T); }
+    await foreach (var y in ys) await Go(y);
+    void M(in int a, Task t) => from b in c select b;
+    """
+check(colorKindsOf("if", controlSource, Languages.csharp) == ([.keyword], [.controlKeyword]),
+      "if: для цвета — управление, для логики — ключевое слово")
+check(colorKindsOf("foreach", controlSource, Languages.csharp).painted == [.controlKeyword, .controlKeyword], "foreach")
+check(colorKindsOf("in", controlSource, Languages.csharp).painted == [.controlKeyword, .controlKeyword, .keyword, .keyword],
+      "in ведёт управление только в заголовке foreach")
+check(colorKindsOf("default", controlSource, Languages.csharp).painted == [.controlKeyword, .controlKeyword, .keyword],
+      "goto default и default: — переход к ветке, default(T) — значение")
+check(colorKindsOf("await", controlSource, Languages.csharp).painted == [.keyword, .controlKeyword],
+      "await foreach — не управление, await Go() — управление")
+check(colorKindsOf("var", controlSource, Languages.csharp).painted == [.keyword, .keyword], "var — просто ключевое слово")
+check(colorKindsOf("int", controlSource, Languages.csharp) == ([.type], [.typeKeyword]), "int — тип-ключевое слово")
+check(colorKindsOf("void", controlSource, Languages.csharp).painted == [.typeKeyword], "void — тип-ключевое слово")
+check(colorKindsOf("Task", controlSource, Languages.csharp).painted == [.type], "Task — тип, а не слово языка")
+check(colorKindsOf("guard", "guard let a else { return }", Languages.swift).painted == [.controlKeyword], "Swift: guard")
+check(colorKindsOf("default", "A() = default; switch (x) { default: break; }", Languages.cfamily).painted
+      == [.keyword, .controlKeyword], "C++: = default — не метка")
+check(colorKindsOf("size_t", "size_t n; int i;", Languages.cfamily).painted == [.type], "C: size_t — typedef, а не слово")
+check(colorKindsOf("str", "def f(a: str): pass", Languages.python).painted == [.type], "Python: str — встроенный тип, не слово")
+check(colorKindsOf("elif", "if a: pass\nelif b: pass", Languages.python).painted == [.controlKeyword], "Python: elif")
+check(colorKindsOf("SELECT", "SELECT 1", Languages.sql).painted == [.keyword], "SQL управления не знает")
+
+// имя перед скобкой: вызов и объявление метода — функция, создание объекта — тип
+let callSource = """
+    var c = AssetDatabase.LoadAssetAtPath<ClientConfig>("a");
+    var v = SemVersion.Parse(s).WithMetadata(m);
+    throw new ArgumentNullException("x");
+    var g = new Game.Rules(1);
+    public Player(int hp) { }
+    if (x is Point(var a, var b)) Log(a);
+    """
+check(colorKindsOf("LoadAssetAtPath", callSource, Languages.csharp).painted == [.function], "вызов с дженериком — функция")
+check(colorKindsOf("ClientConfig", callSource, Languages.csharp).painted == [.type], "аргумент дженерика — тип")
+check(colorKindsOf("WithMetadata", callSource, Languages.csharp).painted == [.function], "вызов по цепочке — функция")
+check(colorKindsOf("ArgumentNullException", callSource, Languages.csharp) == ([.function], [.type]),
+      "new Foo( — тип, хотя свой лексер считает его вызовом")
+check(colorKindsOf("Rules", callSource, Languages.csharp).painted == [.type], "new Game.Rules( — тип")
+check(colorKindsOf("Player", callSource, Languages.csharp).painted == [.type], "конструктор public Player( — тип")
+check(colorKindsOf("Point", callSource, Languages.csharp).painted == [.type], "позиционный образец is Point( — тип")
+check(colorKindsOf("Log", callSource, Languages.csharp).painted == [.function], "обычный вызов — функция")
+check(colorKindsOf("getName", "class A { public getName() { return new Date(); } }", Languages.javascript).painted
+      == [.function], "TypeScript: public getName( — метод, а не конструктор")
+check(colorKindsOf("Foo", "class Foo(Base):\n    pass", Languages.python).painted == [.type], "Python: class Foo( — тип")
+check(colorKindsOf("String", "let s = String(x)", Languages.swift).painted == [.type], "Swift: String( — тип из typeKeywords")
+
 // незакрытая многострочная конструкция не должна уводить лексер в бесконечность
 let unterminated = SyntaxModel(text: "/* без закрытия\nвторая строка\nтретья", spec: Languages.csharp)
 check(unterminated.lineCount == 3, "незакрытый блочный комментарий: строки посчитаны")
@@ -2769,9 +2830,13 @@ final class ColoredModel {
         units = Array(text.utf16)
         origin = Array(0..<units.count)
         model.useColors(settled: URL(fileURLWithPath: "/tmp/Colors.cs"), ccClassifier(text, extra: extra, calls: calls))
-        before = ccPainted(model.colorTokens(fromLine: 0, toLine: model.lineCount - 1), units.count)
+        before = ccPainted(model.carriedTokens(fromLine: 0, toLine: model.lineCount - 1), units.count)
     }
     var text: String { String(decoding: units, as: UTF16.self) }
+    /// Как покрасил бы свежий разбор нынешнего текста.
+    var fresh: [TokenKind] { ccPainted(ccRustlynLike(text), units.count) }
+    /// Что на экране: перенесённое — с видами для цвета.
+    var painted: [TokenKind] { ccPainted(model.colorTokens(fromLine: 0, toLine: model.lineCount - 1), units.count) }
     func at(_ needle: String) -> Int { (text as NSString).range(of: needle).location }
     func edit(_ at: Int, _ length: Int, _ piece: String) {
         let piece = Array(piece.utf16)
@@ -2782,7 +2847,7 @@ final class ColoredModel {
     func edit(_ needle: String, _ piece: String, offset: Int = 0, length: Int = 0) {
         edit(at(needle) + offset, length, piece)
     }
-    var colors: [TokenKind] { ccPainted(model.colorTokens(fromLine: 0, toLine: model.lineCount - 1), units.count) }
+    var colors: [TokenKind] { ccPainted(model.carriedTokens(fromLine: 0, toLine: model.lineCount - 1), units.count) }
     /// Символы, которые правка не трогала, но которые сменили цвет (пробелы не в счёт).
     func moved(except skipped: Range<Int>? = nil) -> [Int] {
         let now = colors
@@ -2812,8 +2877,15 @@ class Player {
 
 // Устоявшийся файл: раскраска — ровно разбор, как и раньше.
 let ccSettled = ColoredModel(ccSource)
-check(ccSettled.before == ccPainted(ccRustlynLike(ccSource), ccSettled.units.count), "до правок — раскраска разбора")
-check(ccSettled.before[ccSettled.at("Clamp")] == .type, "`Clamp(` у разбора — тип")
+check(ccSettled.before == ccSettled.fresh, "до правок — раскраска разбора")
+check(ccSettled.painted[ccSettled.at("void")] == .typeKeyword && ccSettled.painted[ccSettled.at("class")] == .keyword,
+      "редактор красит видами для цвета: void — тип-ключевое слово, class — ключевое слово")
+check(ccSettled.before[ccSettled.at("Clamp")] == .type && ccSettled.painted[ccSettled.at("Clamp")] == .function,
+      "`Clamp(` у разбора — тип, а красится вызовом, как у своего лексера")
+let ccCalls2 = SyntaxModel(text: "throw new ArgumentNullException(Parse(x));", spec: Languages.csharp)
+let ccCalls2Kinds = ccPainted(ccCalls2.colorKinds(ccRustlynLike(ccCalls2.text)), ccCalls2.units.count)
+check(ccCalls2Kinds[6 + 4] == .type && ccCalls2Kinds[32] == .function,
+      "по разбору: new ArgumentNullException( — тип, Parse( — функция")
 
 // Пробел — ничего не меняется: ни в строке правки, ни на экране вокруг.
 // Раньше первая правка отдавала файл своему лексеру: `Clamp(` становился
@@ -2828,7 +2900,7 @@ ccSpace.edit("var hp", "    \n")
 ccSpace.edit("Apply", "\t")
 ccSpace.edit(";   //", "", offset: 1, length: 1)
 check(ccSpace.moved().isEmpty, "перевод строки, таб, удалённый пробел: цвета на месте")
-check(ccSpace.colors == ccPainted(ccRustlynLike(ccSpace.text), ccSpace.units.count),
+check(ccSpace.colors == ccSpace.fresh,
       "после пробельных правок — то же, что дал бы свежий разбор")
 
 // Пробелы внутри строки, комментария, дыры интерполяции — тоже.
@@ -2932,7 +3004,7 @@ let ccWindows = ColoredModel(ccSource)
 ccWindows.edit("Clamp", " ")
 ccWindows.edit("has", "x")
 ccWindows.edit("        var hp", "/*")
-let ccWhole = ccWindows.colors
+let ccWhole = ccWindows.painted
 var ccWindowFailures = 0
 for first in 0..<ccWindows.model.lineCount {
     let last = min(ccWindows.model.lineCount - 1, first + 3)
@@ -2956,7 +3028,7 @@ check(ccCalls.current == ccCallsBefore, "20 правок и 40 перекрас�
 
 // Свежий разбор правленого текста — и правок поверх него больше нет.
 ccCached.model.useColors(ccClassifier(ccCached.text))
-check(!ccCached.model.colorsLag && ccCached.colors == ccPainted(ccRustlynLike(ccCached.text), ccCached.units.count),
+check(!ccCached.model.colorsLag && ccCached.colors == ccCached.fresh,
       "новая основа: раскраска — ровно свежий разбор")
 
 // Журнал правок: места, посчитанные по версии постарше, — в нынешний текст.
@@ -4310,6 +4382,8 @@ check(md("- [x] done\n- [ ] todo").contains("<input type=\"checkbox\" checked di
 let tableHTML = md("| A | B |\n|:-|-:|\n| `x|y` | 2 |")
 check(tableHTML.contains("<th style=\"text-align:left\">A</th>") && tableHTML.contains("<code>x|y</code>"), "таблица")
 check(md("```cs\nclass A {}\n```").contains("<span class=\"t-keyword\">class</span>"), "подсветка кода")
+check(md("```cs\nif (a) return;\n```").contains("<span class=\"t-controlKeyword\">if</span>")
+      && md("```cs\nint a;\n```").contains("<span class=\"t-typeKeyword\">int</span>"), "код в Markdown — с видами для цвета")
 check(md("```\n<b>\n```").contains("&lt;b&gt;"), "код без языка экранирован")
 check(md("    code\n\ntext").contains("<pre data-line=\"0\"><code>code</code></pre>"), "код отступом")
 check(md("> [!WARNING]\n> Tss").contains("alert-warning"), "плашка GitHub")
@@ -4564,7 +4638,8 @@ check(RustlynDeclarationKind.indexer.outlineKind == .method, "индексато
 check(RustlynDeclarationKind.enumMember.outlineKind == .enumCase, "член перечисления")
 check(RustlynDeclarationKind.class.isType && !RustlynDeclarationKind.method.isType, "тип и не тип")
 check(RustlynDeclarationKind.allCases.count == 17, "видов столько же, сколько в библиотеке")
-check(TokenKind.allCases.count == 15, "цветов столько же, сколько в библиотеке")
+check(TokenKind.rustlynCount == 15, "цветов столько же, сколько в библиотеке")
+check(TokenKind(UInt8(TokenKind.rustlynCount)) == .plain, "вид сверх библиотечных — обычный текст, а не вид для цвета")
 
 // Типы параметров отделяются от имён: по ним навигатор различает перегрузки.
 let withParams = RustlynDeclaration(
