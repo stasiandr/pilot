@@ -104,7 +104,9 @@ enum HeadlessGraph {
             log(usage)
             return 2
         }
+        let loading = PerfSpan()
         guard let projects = load(from: start) else { return 2 }
+        let loaded = loading.finish()
         // Обзор — как раньше, чтобы числа сравнивались: вызовы только с `--calls`.
         let reach = ValueGraph.Reach(nodes: value("--limit").flatMap(Int.init) ?? 60,
                                      depth: value("--depth").flatMap(Int.init) ?? 6,
@@ -133,6 +135,7 @@ enum HeadlessGraph {
             if definition.targets.isEmpty { print("компилятор не знает этого имени") }
             return definition.targets.isEmpty ? 1 : 0
         }
+        let building = PerfSpan()
         guard let found = rustlyn.definition(location.url, offset: offset).targets.first else {
             log("под \(target) компилятор не нашёл имени")
             return 2
@@ -140,6 +143,13 @@ enum HeadlessGraph {
         guard let graph = graph(of: found, projects: projects, reach: reach) else {
             log("\(found.name) [\(found.kind)] — не значение: ни поле, ни переменная, ни параметр, ни метод, ни компонент")
             return 2
+        }
+        // Замер скорости (bin/pilot-perf): подъём проекта и сам граф — отдельно.
+        if PerfConfig.environment["PILOT_PERF_OUT"] != nil {
+            let built = building.finish()
+            PerfReport.emit("engine.graph",
+                            PerfReport.metrics("graph.load", loaded).merging(PerfReport.metrics("graph.build", built)) { $1 },
+                            info: ["target": target, "nodes": "\(graph.nodes.count)"])
         }
 
         if arguments.contains("--json") {

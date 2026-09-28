@@ -3836,7 +3836,8 @@ final class Workspace: ObservableObject {
     }
 
     func bringToFront() {
-        guard let window else { return }
+        // Замер скорости (PerfUI) идёт скрытым и фокус у пользователя не забирает.
+        guard let window, PerfConfig.mode == nil else { return }
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

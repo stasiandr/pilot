@@ -12,6 +12,10 @@ enum PilotMain {
         if HeadlessGraph.isRequested {
             exit(MainActor.assumeIsolated { HeadlessGraph.run() })
         }
+        // Замеры скорости без окна (bin/pilot-perf, PerfEngine).
+        if PerfEngine.isRequested {
+            exit(MainActor.assumeIsolated { PerfEngine.run() })
+        }
         if LaunchForwarding.forward(OpenRequest.launch) {
             exit(0)
         }
@@ -723,6 +727,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSApp.setActivationPolicy(.regular)
+        // Замеры в окне (bin/pilot-perf, PerfUI) идут скрытыми: вперёд не выходить.
+        if PerfUI.isRequested {
+            PerfUI.start()
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 

@@ -18,6 +18,8 @@ enum LaunchForwarding {
         // пересылает: иначе запущенный из того же бандла Pilot открыл бы файл
         // из аргументов и вышел вперёд, а этот процесс молча закончился бы.
         guard !CommandLine.arguments.contains(where: headlessFlags.contains) else { return false }
+        // Замер скорости (PILOT_PERF) — свой процесс со своим проектом.
+        guard PerfConfig.mode == nil else { return false }
         guard let running = runningInstance() else { return false }
         guard let request else {
             running.activate()

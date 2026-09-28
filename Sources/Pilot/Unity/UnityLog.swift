@@ -73,8 +73,13 @@ struct UnityLogEntry: Identifiable, Hashable {
 enum UnityLog {
     /// Лог редактора на macOS. Один на все открытые Unity: какой проект
     /// в нём пишет, видно по шапке.
+    /// `PILOT_UNITY_LOG` — другой файл: замеры скорости (bin/pilot-perf) не
+    /// должны зависеть от того, что сейчас пишет настоящий Unity.
     static var editorLog: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Unity/Editor.log")
+        if let own = ProcessInfo.processInfo.environment["PILOT_UNITY_LOG"], !own.isEmpty {
+            return URL(fileURLWithPath: own)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Unity/Editor.log")
     }
 
     /// Проект, чей это лог: `-projectpath` в аргументах командной строки

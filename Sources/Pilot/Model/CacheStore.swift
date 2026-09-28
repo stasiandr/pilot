@@ -234,7 +234,16 @@ enum CacheStore {
         var caches: URL
         var support: URL
 
+        /// `PILOT_CACHES` — своя папка вместо `~/Library`: замеры скорости
+        /// (`bin/pilot-perf`) открывают проект каждый раз с одних и тех же
+        /// кэшей и не трогают ни кэши, ни историю правок того Pilot, в
+        /// котором работают.
         static var standard: Locations {
+            if let own = ProcessInfo.processInfo.environment["PILOT_CACHES"], !own.isEmpty {
+                let base = URL(fileURLWithPath: own, isDirectory: true)
+                return Locations(caches: base.appendingPathComponent("Caches/Pilot"),
+                                 support: base.appendingPathComponent("Application Support/Pilot"))
+            }
             let fm = FileManager.default
             return Locations(
                 caches: fm.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Pilot"),
