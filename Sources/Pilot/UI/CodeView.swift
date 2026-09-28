@@ -1268,7 +1268,8 @@ final class CodeClipView: NSClipView {
 final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     /// Курсор поехал — обновляем позицию, от неё зависят все запросы к LSP.
-    var onCaretChange: ((Int) -> Void)?
+    /// Приходит выделение целиком: с выделенного начинают поиск.
+    var onCaretChange: ((NSRange) -> Void)?
     /// ⌘+клик по символу.
     var onGoToDefinition: ((Int) -> Void)?
     /// ⌘ зажат, и мышь остановилась на символе: клик по нему, скорее всего,
@@ -1511,9 +1512,20 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         cancelLanding()
         let clip = scrollView.contentView
         let insetBefore = clip.contentInsets.top
-        let sender = NSMenuItem()
-        sender.tag = action.rawValue
-        textView.performTextFinderAction(sender)
+        func perform(_ action: NSTextFinder.Action) {
+            let sender = NSMenuItem()
+            sender.tag = action.rawValue
+            textView.performTextFinderAction(sender)
+        }
+        // Выделенное — сразу в поле, как в Rider: ⌘F по выделенному слову
+        // ищет его. Выделенный блок кода запросом не бывает.
+        let selection = textView.selectedRange()
+        if action == .showFindInterface || action == .showReplaceInterface,
+           selection.length > 0, selection.length <= 256,
+           !(textView.string as NSString).substring(with: selection).contains(where: \.isNewline) {
+            perform(.setSearchString)
+        }
+        perform(action)
         // На macOS 26 панель не раздвигает текст, а ложится поверх него
         // отступом клипа, и первая строка файла пряталась под ней. Сдвигаем
         // текст на её высоту: видно ровно то же, что и до ⌘F.
@@ -1967,7 +1979,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
             }
         }
         caretMovedForHelpers()
-        onCaretChange?(textView.selectedRange().location)
+        onCaretChange?(textView.selectedRange())
     }
 
     /// Что сейчас набирают — нужно, чтобы решить, открывать ли дополнение.
@@ -2473,7 +2485,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         guard let storage = textView.textStorage, storage.length > 0 else { return }
         let safe = Self.clamped(range, to: storage.length)
         land(on: safe)
-        onCaretChange?(safe.location)
+        onCaretChange?(safe)
     }
 
     /// Встать на место перехода и держать его. После перехода раскладка
@@ -4141,7 +4153,7 @@ struct CodeView: NSViewControllerRepresentable {
     var decorationsVersion: Int = 0
     /// Правки инспектора Unity к применению.
     var editRequest: TextEditRequest? = nil
-    let onCaretChange: (Int) -> Void
+    let onCaretChange: (NSRange) -> Void
     let onGoToDefinition: (Int) -> Void
     /// ⌘ над символом — клик по нему, скорее всего, будет.
     var onCommandHover: ((Int?) -> Void)? = nil

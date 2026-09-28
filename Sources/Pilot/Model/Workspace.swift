@@ -152,6 +152,9 @@ final class Workspace: ObservableObject {
     /// Не @Published — см. EditorCaret.
     let caret = EditorCaret()
     var caretOffset: Int { caret.offset }
+    /// Выделение в редакторе: с выделенного начинается поиск. Не @Published —
+    /// читают его только тогда.
+    private(set) var editorSelection = NSRange(location: 0, length: 0)
     /// Ветка git — подзаголовок окна, как в Xcode.
     @Published private(set) var branch: String?
 
@@ -1445,9 +1448,14 @@ final class Workspace: ObservableObject {
 
     // MARK: - Палитра
 
-    func openPalette(mode: PaletteMode) {
+    /// Запрос, который палитра подставила сама, из выделения в редакторе:
+    /// поле выделяет его целиком, и первая же буква его заменит.
+    private(set) var querySeed: String?
+
+    func openPalette(mode: PaletteMode, query seed: String = "") {
         paletteMode = mode
-        query = ""
+        querySeed = seed.isEmpty ? nil : seed
+        query = seed
         selection = 0
         isPaletteOpen = true
         switch mode {
@@ -1591,7 +1599,9 @@ final class Workspace: ObservableObject {
 
     // MARK: - Положение курсора
 
-    func caretMoved(to offset: Int) {
+    func caretMoved(to offset: Int, selection: NSRange? = nil) {
+        // Выделение растёт и без движения начала — его запоминаем до проверки.
+        if let selection { editorSelection = selection }
         guard offset != caretOffset else { return }
         recordCaret(offset)
         caret.setOffset(offset)
@@ -1754,14 +1764,25 @@ final class Workspace: ObservableObject {
     private var pairTextCandidates: [SearchCandidate] = []
 
     /// ⌘P, ⇧⇧, ⌘T, ⇧⌘F. Повторное нажатие того же сочетания переключает
-    /// между его фильтром и `again`; набранное остаётся.
+    /// между его фильтром и `again`; набранное остаётся. Выделенное в
+    /// редакторе сразу становится запросом, как в Rider.
     func openSearch(_ scope: SearchScope, again: SearchScope = .everything) {
         if isPaletteOpen && paletteMode == .search {
             setSearchScope(searchScope == scope ? again : scope)
             return
         }
         searchScope = scope
-        openPalette(mode: .search)
+        openPalette(mode: .search, query: selectedSearchText ?? "")
+    }
+
+    /// Выделенное в редакторе — запросом поиска. Только одна строка:
+    /// выделенный блок кода запросом не бывает.
+    private var selectedSearchText: String? {
+        guard editorSelection.length > 0, editorSelection.length <= 256, let model = document?.model,
+              NSMaxRange(editorSelection) <= model.units.count else { return nil }
+        let text = String(decoding: model.units[editorSelection.location..<NSMaxRange(editorSelection)],
+                          as: UTF16.self).trimmingCharacters(in: .whitespaces)
+        return text.isEmpty || text.contains(where: \.isNewline) ? nil : text
     }
 
     func setSearchScope(_ scope: SearchScope) {
@@ -3373,6 +3394,8 @@ final class Workspace: ObservableObject {
     }
 
     private func setBuffer(_ new: TextBuffer?) {
+        // Своё выделение новая вкладка пришлёт сама, когда редактор её покажет.
+        if new !== buffer { editorSelection = NSRange(location: 0, length: 0) }
         buffer = new
         updateConflicts()
         scheduleDiagnostics(delay: 0.05)

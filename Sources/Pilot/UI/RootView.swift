@@ -184,7 +184,7 @@ struct RootView: View {
                          decorationsVersion: workspace.unity.decorationsVersion
                              &+ workspace.archive.decorationsVersion,
                          editRequest: workspace.editRequest,
-                         onCaretChange: { workspace.caretMoved(to: $0) },
+                         onCaretChange: { workspace.caretMoved(to: $0.location, selection: $0) },
                          onGoToDefinition: { workspace.goToDefinition(at: $0) },
                          onCommandHover: { workspace.prepareCommandClick(at: $0) },
                          onLineClick: { workspace.lineClicked($0) },

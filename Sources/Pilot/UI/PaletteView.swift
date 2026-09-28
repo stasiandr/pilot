@@ -125,7 +125,7 @@ struct PaletteView: View {
                 .foregroundStyle(.secondary)
 
             // Return, стрелки и Esc ловит PaletteKeyMonitor.
-            PaletteQueryField(text: $workspace.query, placeholder: placeholder)
+            PaletteQueryField(text: $workspace.query, placeholder: placeholder, seed: workspace.querySeed)
 
             if workspace.paletteBusy || isIndexingForMode {
                 ProgressView().controlSize(.small).scaleEffect(0.8)
@@ -383,6 +383,8 @@ struct PaletteView: View {
 struct PaletteQueryField: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
+    /// Запрос, подставленный из выделения в редакторе, — `Workspace.querySeed`.
+    var seed: String? = nil
 
     func makeNSView(context: Context) -> Field {
         let field = Field()
@@ -403,6 +405,7 @@ struct PaletteQueryField: NSViewRepresentable {
         context.coordinator.text = $text
         if field.stringValue != text { field.stringValue = text }
         if field.placeholderString != placeholder { field.placeholderString = placeholder }
+        field.offer(seed)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
@@ -432,11 +435,31 @@ struct PaletteQueryField: NSViewRepresentable {
             window.makeFirstResponder(self)
         }
 
+        /// Подставленный запрос выделен целиком — буква его заменит, стрелка
+        /// оставит. Выделяем раз, пока в поле он и ничего не допечатано.
+        private var seed: String?
+
+        func offer(_ seed: String?) {
+            guard seed != self.seed else { return }
+            self.seed = seed
+            selectSeed()
+        }
+
+        @discardableResult
+        private func selectSeed() -> Bool {
+            guard let seed, stringValue == seed, let editor = currentEditor() else { return false }
+            editor.selectedRange = NSRange(location: 0, length: stringValue.utf16.count)
+            return true
+        }
+
         override func becomeFirstResponder() -> Bool {
             guard super.becomeFirstResponder() else { return false }
             // NSTextField при фокусе выделяет всё, и набранное до появления
-            // поля стёрла бы следующая буква. Курсор — в конец.
-            currentEditor()?.selectedRange = NSRange(location: stringValue.utf16.count, length: 0)
+            // поля стёрла бы следующая буква. Курсор — в конец; выделен
+            // только запрос, подставленный из выделения.
+            if !selectSeed() {
+                currentEditor()?.selectedRange = NSRange(location: stringValue.utf16.count, length: 0)
+            }
             return true
         }
     }
