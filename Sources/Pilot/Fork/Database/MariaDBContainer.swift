@@ -38,9 +38,12 @@ final class MariaDBContainer: ObservableObject {
         var ports = ""
     }
 
+    /// Сохраняются после паузы в наборе: запись в UserDefaults на каждую
+    /// букву перерисовывала все окна (DeferredSave).
     @Published var settings: Settings {
-        didSet { save() }
+        didSet { settingsSave.schedule() }
     }
+    private lazy var settingsSave = DeferredSave { [unowned self] in self.save() }
     @Published private(set) var state = State.unknown
     @Published private(set) var details = Details()
     /// Что делается сейчас: «Запуск…», «Загрузка дампа…» — кнопки ждут.

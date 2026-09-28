@@ -33,8 +33,20 @@ final class Workspace: ObservableObject {
     private(set) var rustlyn: Rustlyn?
     /// Дерево папок для боковой панели. Строится из того же индекса, что и ⌘P.
     @Published private(set) var fileTree: FileTree?
-    @Published var query = "" { didSet { queryChanged() } }
-    @Published private(set) var items: [PaletteItem] = []
+    /// Запрос, выдача, выделенная строка и спиннер палитры живут в
+    /// `palette`: их наблюдает только она, а не всё окно (см. PaletteState).
+    let palette = PaletteState()
+    var query: String {
+        get { palette.query }
+        set {
+            palette.query = newValue
+            queryChanged()
+        }
+    }
+    private(set) var items: [PaletteItem] {
+        get { palette.items }
+        set { palette.items = newValue }
+    }
     /// Открытые вкладки, слева направо. У каждой свой буфер: текст, история
     /// отмены, выделение и прокрутка — ушёл на другую и вернулся, всё на месте.
     @Published private(set) var tabs: [TextBuffer] = []
@@ -53,7 +65,10 @@ final class Workspace: ObservableObject {
     @Published private(set) var unsavedCount = 0
     private var activationCounter = 0
     @Published private(set) var loadError: String?
-    @Published var selection: Int = 0
+    var selection: Int {
+        get { palette.selection }
+        set { palette.selection = newValue }
+    }
     /// Закрылась палитра — фокус возвращается в текст: иначе он остаётся
     /// у окна, и до клика мышью ни набор, ни ⌘F никуда не попадают.
     @Published var isPaletteOpen = false {
@@ -62,7 +77,10 @@ final class Workspace: ObservableObject {
     @Published private(set) var paletteMode: PaletteMode = .search
     /// Фильтр единого поиска.
     @Published private(set) var searchScope: SearchScope = .everything
-    @Published private(set) var paletteBusy = false
+    private(set) var paletteBusy: Bool {
+        get { palette.busy }
+        set { palette.busy = newValue }
+    }
     /// Размер шрифта редактора — общий на все проекты и переживает перезапуск.
     @Published private(set) var fontSize: CGFloat = Workspace.loadFontSize()
 

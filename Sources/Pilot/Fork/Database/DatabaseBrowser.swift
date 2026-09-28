@@ -36,15 +36,17 @@ final class DatabaseBrowser: ObservableObject {
         var sql = ""
     }
 
+    /// Поля подключения и текст запроса сохраняются после паузы в наборе:
+    /// запись в UserDefaults на каждую букву перерисовывала все окна (DeferredSave).
     @Published var options: MySQLConnection.Options {
-        didSet { save() }
+        didSet { optionsSave.schedule() }
     }
     @Published private(set) var state = ConnectionState.disconnected
     @Published private(set) var schemas: [Schema] = []
     /// База по умолчанию для запросов (`USE`).
     @Published private(set) var currentSchema: String?
     @Published var sql: String {
-        didSet { UserDefaults.standard.set(sql, forKey: Self.sqlKey) }
+        didSet { sqlSave.schedule() }
     }
     @Published private(set) var outcome: Outcome?
     @Published var selectedResult = 0
@@ -57,6 +59,10 @@ final class DatabaseBrowser: ObservableObject {
     private var metadataLoading: Set<String> = []
     private static let optionsKey = "pilot.database.options"
     private static let sqlKey = "pilot.database.sql"
+    private lazy var optionsSave = DeferredSave { [unowned self] in self.save() }
+    private lazy var sqlSave = DeferredSave { [unowned self] in
+        UserDefaults.standard.set(self.sql, forKey: Self.sqlKey)
+    }
 
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.optionsKey),

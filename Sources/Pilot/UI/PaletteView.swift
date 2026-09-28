@@ -9,6 +9,8 @@ import AppKit
 /// он справа от списка, в узком — под ним.
 struct PaletteView: View {
     @ObservedObject var workspace: Workspace
+    /// Запрос и выдача: меняются на каждую букву, и будят только палитру.
+    @ObservedObject private var palette: PaletteState
     /// Сколько места под палитрой: от этого зависит, куда встанет предпросмотр.
     var available: CGSize = .zero
     @StateObject private var preview = PreviewLoader()
@@ -17,14 +19,20 @@ struct PaletteView: View {
     /// увела бы из-под курсора и второй клик двойного попал бы в соседнюю.
     @State private var selectedByClick = false
 
+    init(workspace: Workspace, available: CGSize = .zero) {
+        self.workspace = workspace
+        self.palette = workspace.palette
+        self.available = available
+    }
+
     var body: some View {
         PilotGlassGroup(spacing: 14) {
             VStack(spacing: 0) {
                 queryField
                 if workspace.paletteMode == .search { scopeBar }
-                if workspace.paletteMode == .generated, !workspace.items.isEmpty,
+                if workspace.paletteMode == .generated, !palette.items.isEmpty,
                    !workspace.generatedStatus.isEmpty { generatedStatusLine }
-                if !workspace.items.isEmpty || showsPreview {
+                if !palette.items.isEmpty || showsPreview {
                     Divider().opacity(0.35)
                     results
                 } else if shouldShowEmptyState {
@@ -46,13 +54,13 @@ struct PaletteView: View {
 
     // MARK: - Раскладка
 
-    private var showsPreview: Bool { previewEnabled && (!workspace.items.isEmpty || awaitsUsages) }
+    private var showsPreview: Bool { previewEnabled && (!palette.items.isEmpty || awaitsUsages) }
 
     /// Использования ищутся долго, и палитра открыта со спиннером: она сразу
     /// того размера, какой будет со списком и предпросмотром, — иначе,
     /// открывшись узкой, раздувалась бы под пришедшие строки.
     private var awaitsUsages: Bool {
-        workspace.paletteMode == .references && workspace.paletteBusy && workspace.items.isEmpty
+        workspace.paletteMode == .references && palette.busy && palette.items.isEmpty
     }
 
     /// Предпросмотр справа, если окно позволяет; иначе — под списком.
@@ -97,8 +105,8 @@ struct PaletteView: View {
     }
 
     private var selectedTarget: NavTarget? {
-        guard workspace.items.indices.contains(workspace.selection) else { return nil }
-        return workspace.items[workspace.selection].target
+        guard palette.items.indices.contains(palette.selection) else { return nil }
+        return palette.items[palette.selection].target
     }
 
     private func refreshPreview() {
@@ -107,10 +115,10 @@ struct PaletteView: View {
     }
 
     private var shouldShowEmptyState: Bool {
-        if workspace.paletteBusy { return true }
+        if palette.busy { return true }
         if workspace.paletteMode == .search {
             let scope = workspace.searchScope
-            return !workspace.query.isEmpty || (scope != .everything && scope != .files)
+            return !palette.query.isEmpty || (scope != .everything && scope != .files)
         }
         return true
     }
@@ -127,7 +135,7 @@ struct PaletteView: View {
             // Return, стрелки и Esc ловит PaletteKeyMonitor.
             PaletteQueryField(text: $workspace.query, placeholder: placeholder, seed: workspace.querySeed)
 
-            if workspace.paletteBusy || isIndexingForMode {
+            if palette.busy || isIndexingForMode {
                 ProgressView().controlSize(.small).scaleEffect(0.8)
             }
             counter
@@ -226,20 +234,20 @@ struct PaletteView: View {
     @ViewBuilder
     private var counter: some View {
         switch workspace.paletteMode {
-        case .search where workspace.query.isEmpty && workspace.searchScope == .files:
+        case .search where palette.query.isEmpty && workspace.searchScope == .files:
             Text("\(workspace.fileCount)")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help(L("Файлов в индексе"))
-        case .search where workspace.query.isEmpty && workspace.searchScope == .types:
+        case .search where palette.query.isEmpty && workspace.searchScope == .types:
             Text("\(workspace.typeCount)")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .help(L("Типов в индексе"))
         case .search, .references, .declarations, .implementations, .outline, .changes, .assetUsages, .recentLocations,
              .counterparts, .contract, .mirrors, .generated:
-            if !workspace.items.isEmpty {
-                Text("\(workspace.items.count)")
+            if !palette.items.isEmpty {
+                Text("\(palette.items.count)")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
@@ -271,7 +279,7 @@ struct PaletteView: View {
     }
 
     private var emptyMessage: String {
-        if workspace.paletteBusy {
+        if palette.busy {
             return workspace.paletteMode == .generated && !workspace.generatedStatus.isEmpty
                 ? workspace.generatedStatus : L("Ищу…")
         }
@@ -292,23 +300,23 @@ struct PaletteView: View {
                 : L("В этом файле объявлений не найдено")
         case .changes:
             if workspace.git.repository == nil { return L("Проект не под git") }
-            return workspace.query.isEmpty ? L("Изменений нет — всё закоммичено") : L("Ничего не найдено")
+            return palette.query.isEmpty ? L("Изменений нет — всё закоммичено") : L("Ничего не найдено")
         case .recentLocations:
-            return workspace.query.isEmpty
+            return palette.query.isEmpty
                 ? L("Здесь будут места, где вы были и что правили")
                 : L("Ничего не найдено")
         case .assetUsages:
-            return workspace.query.isEmpty
+            return palette.query.isEmpty
                 ? L("На \(workspace.usagesTitle) не ссылается ни одна сцена, префаб или ассет")
                 : L("Ничего не найдено")
         case .counterparts:
             return L("Во второй половине пары ничего не нашлось")
         case .contract:
-            return workspace.query.isEmpty ? L("Датаграммы клиента и сервера сходятся") : L("Ничего не найдено")
+            return palette.query.isEmpty ? L("Датаграммы клиента и сервера сходятся") : L("Ничего не найдено")
         case .mirrors:
-            return workspace.query.isEmpty ? L("Зеркальные файлы одинаковы в обеих половинах") : L("Ничего не найдено")
+            return palette.query.isEmpty ? L("Зеркальные файлы одинаковы в обеих половинах") : L("Ничего не найдено")
         case .generated:
-            return workspace.query.isEmpty
+            return palette.query.isEmpty
                 ? (workspace.generatedStatus.isEmpty ? L("Для типов этого файла генераторы ничего не написали")
                                                      : workspace.generatedStatus)
                 : L("Ничего не найдено")
@@ -316,7 +324,7 @@ struct PaletteView: View {
     }
 
     private var searchEmptyMessage: String {
-        let query = workspace.query.trimmingCharacters(in: .whitespaces)
+        let query = palette.query.trimmingCharacters(in: .whitespaces)
         switch workspace.searchScope {
         case .everything, .files:
             return L("Ничего не найдено")
@@ -339,15 +347,15 @@ struct PaletteView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 1) {
-                    ForEach(Array(workspace.items.enumerated()), id: \.element.id) { index, item in
-                        PaletteRow(item: item, isSelected: index == workspace.selection)
+                    ForEach(Array(palette.items.enumerated()), id: \.element.id) { index, item in
+                        PaletteRow(item: item, isSelected: index == palette.selection)
                             .id(index)
                             .contentShape(Rectangle())
                             // Клик выделяет — видно предпросмотр, двойной открывает.
                             // Не onTapGesture(count: 2): одиночный ждал бы второго.
                             .onTapGesture {
-                                selectedByClick = index != workspace.selection
-                                workspace.selection = index
+                                selectedByClick = index != palette.selection
+                                palette.selection = index
                                 if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
                                     workspace.activateSelection()
                                 }
@@ -359,7 +367,7 @@ struct PaletteView: View {
             }
             .frame(height: height)
             .overlay(alignment: .topLeading) { if awaitsUsages { emptyState } }
-            .onChange(of: workspace.selection) { _, new in
+            .onChange(of: palette.selection) { _, new in
                 if selectedByClick { selectedByClick = false; return }
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(new, anchor: .center) }
             }
@@ -370,8 +378,8 @@ struct PaletteView: View {
     /// результатом стеклянная панель висела бы полупустой. Поэтому высоту
     /// считаем по строкам: однострочная ~29 pt, с подписью ~43 pt.
     private var resultListHeight: CGFloat {
-        let rowHeight: CGFloat = workspace.items.first?.secondary?.isEmpty == false ? 43 : 29
-        return min(420, CGFloat(workspace.items.count) * rowHeight + 16)
+        let rowHeight: CGFloat = palette.items.first?.secondary?.isEmpty == false ? 43 : 29
+        return min(420, CGFloat(palette.items.count) * rowHeight + 16)
     }
 }
 

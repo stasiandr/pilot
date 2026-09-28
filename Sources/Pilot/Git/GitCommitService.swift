@@ -23,8 +23,10 @@ final class GitCommitService: ObservableObject {
     @Published private(set) var patch: GitFilePatch?
     /// Текст неотслеживаемого файла — у него диффа с индексом нет.
     @Published private(set) var untrackedText: String?
+    /// Черновик сохраняется после паузы в наборе: запись в UserDefaults на
+    /// каждую букву перерисовывала все окна (DeferredSave).
     @Published var message = "" {
-        didSet { saveDraft() }
+        didSet { if !amend { draftSave.schedule() } }
     }
     @Published var amend = false {
         didSet { amendChanged(from: oldValue) }
@@ -44,6 +46,7 @@ final class GitCommitService: ObservableObject {
     private var messageBeforeAmend: String?
 
     private static let draftsKey = "pilot.commitDrafts"
+    private lazy var draftSave = DeferredSave { [weak self] in self?.saveDraft() }
 
     var canCommit: Bool {
         busy == nil && !CommitMessage.isEmpty(message) && (amend || !tree.staged.isEmpty)
@@ -52,6 +55,8 @@ final class GitCommitService: ObservableObject {
     // MARK: - Проект
 
     func workspaceChanged(to repository: URL?) {
+        // Недописанное — черновиком прежнего репозитория, пока он ещё тот.
+        draftSave.flush()
         self.repository = repository
         tree = GitWorkingTree()
         isLoaded = false
@@ -239,6 +244,8 @@ final class GitCommitService: ObservableObject {
     private func amendChanged(from old: Bool) {
         guard amend != old, let repository else { return }
         if amend {
+            // С amend черновик не пишется — набранное до него сохраняем сейчас.
+            draftSave.flush()
             messageBeforeAmend = message
             if let output = Git.run(["log", "-1", "--format=%B"], in: repository), output.status == 0 {
                 message = String(decoding: output.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -271,8 +278,10 @@ final class GitCommitService: ObservableObject {
     // MARK: - Черновик
 
     /// Недописанное сообщение переживает закрытие окна и перезапуск Pilot.
+    /// Сообщение amend черновиком не бывает: пока amend включён, запись не
+    /// планируется, а набранное до него записано при включении.
     private func saveDraft() {
-        guard let repository, !amend else { return }
+        guard let repository else { return }
         var drafts = UserDefaults.standard.dictionary(forKey: Self.draftsKey) as? [String: String] ?? [:]
         drafts[repository.path] = message.isEmpty ? nil : message
         UserDefaults.standard.set(drafts, forKey: Self.draftsKey)
