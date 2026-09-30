@@ -5381,6 +5381,16 @@ do {
     check(Merge3.split("a\r\nb\r\n") == ["a", "b"], "CRLF")
 }
 
+section("Строка под редактором")
+do {
+    check(StatusBarLayout.decode("") == StatusBarLayout.defaults, "пусто — как по умолчанию")
+    check(StatusBarLayout.decode("branch, caret,branch,nonsense,space") == [.branch, .caret, .space],
+          "повторы и неизвестное пропускаются")
+    check(StatusBarLayout.decode(StatusBarLayout.encode([])) == [.space], "всё скрыли — остаётся растяжка, не умолчания")
+    check(StatusBarLayout.hidden([.branch, .space]).contains(.caret) && !StatusBarLayout.hidden([.branch]).contains(.branch),
+          "скрытые — всё, чего нет в строке")
+}
+
 section("Git: слияния и MR")
 do {
     func merge(_ subject: String, body: String? = nil) -> GitCommitInfo {

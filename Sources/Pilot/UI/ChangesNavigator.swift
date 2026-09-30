@@ -100,9 +100,9 @@ struct ChangesNavigator: View {
             } else {
                 Button(L("Подготовить к коммиту")) { commits.stage([change.path]) }
             }
-            Button(L("Дифф в окне git")) {
+            Button(L("Дифф в панели git")) {
                 commits.selection = GitCommitService.Selection(path: change.path, staged: staged)
-                workspace.openGitWindow(tab: .commit)
+                workspace.openGitPanel(tab: .commit)
             }
             Button(L("История файла")) { workspace.showHistory(path: change.path) }
                 .disabled(change.isUntracked)

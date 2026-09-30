@@ -336,7 +336,7 @@ struct PilotApp: App {
     private var gitMenu: some View {
         Menu("Git") {
             let noRepository = workspace.git.repository == nil
-            Button(L("Коммит…")) { workspace.openGitWindow(tab: .commit) }
+            Button(L("Коммит…")) { workspace.openCommitWindow() }
                 .keyboardShortcut(keys.keyboardShortcut(.commit))
                 .disabled(noRepository)
             Button(L("Отправить (push)")) { workspace.gitClient.push() }
@@ -352,13 +352,13 @@ struct PilotApp: App {
             Button(L("Ветки…")) { workspace.branchPopoverRequest += 1 }
                 .keyboardShortcut(keys.keyboardShortcut(.branches))
                 .disabled(noRepository)
-            Button(L("История git")) { workspace.openGitWindow(tab: .history) }
+            Button(workspace.showsGitPanel ? L("Скрыть панель git") : L("Панель git")) { workspace.toggleGitPanel() }
                 .keyboardShortcut(keys.keyboardShortcut(.gitLog))
                 .disabled(noRepository)
             Button(L("История файла или выделения")) { workspace.showCurrentFileHistory() }
                 .keyboardShortcut(keys.keyboardShortcut(.fileHistory))
                 .disabled(noRepository || workspace.document == nil)
-            Button("Stash…") { workspace.openGitWindow(tab: .stash) }
+            Button("Stash…") { workspace.openGitPanel(tab: .stash) }
                 .disabled(noRepository)
             Divider()
             Button(L("Изменённые файлы…")) { workspace.openPalette(mode: .changes) }
@@ -630,11 +630,6 @@ struct PilotApp: App {
             NuGetWindow(rootPath: rootPath)
         }
         .defaultSize(width: 1000, height: 640)
-        // Окно коммита — так же, своё у каждого проекта.
-        WindowGroup(id: CommitWindow.sceneID, for: String.self) { $rootPath in
-            CommitWindow(rootPath: rootPath)
-        }
-        .defaultSize(width: 1100, height: 700)
         // Окно слияния — своё у каждого файла в конфликте.
         WindowGroup(id: MergeWindow.sceneID, for: String.self) { $target in
             MergeWindow(target: target)

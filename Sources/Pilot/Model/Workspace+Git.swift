@@ -7,14 +7,20 @@ extension Workspace {
 
     // MARK: - Окно
 
-    func openGitWindow(tab: GitWindowTab) {
-        guard let root, git.repository != nil else {
+    /// Панель git под редактором на нужной вкладке.
+    func openGitPanel(tab: GitWindowTab) {
+        guard git.repository != nil else {
             showNotice(L("Проект не в git-репозитории"))
             return
         }
         gitClient.windowTab = tab
         if tab == .history { gitHistory.open(repository: git.repository) }
-        ProjectWindows.shared.openWindow?(id: CommitWindow.sceneID, value: root.path)
+        if !showsGitPanel { showsGitPanel = true }
+    }
+
+    /// ⌘9, как панель Git в Rider: открыть на логе или спрятать.
+    func toggleGitPanel() {
+        if showsGitPanel { showsGitPanel = false } else { openGitPanel(tab: gitClient.windowTab) }
     }
 
     /// История файла или папки (путь от корня репозитория); с `lines` —
@@ -28,7 +34,7 @@ extension Workspace {
         filter.lines = lines
         filter.scope = .current
         gitHistory.filter = filter
-        openGitWindow(tab: .history)
+        openGitPanel(tab: .history)
     }
 
     /// Путь открытого файла от корня его репозитория.
@@ -112,7 +118,7 @@ extension Workspace {
         var filter = GitHistoryModel.Filter()
         filter.text = commit.sha
         gitHistory.filter = filter
-        openGitWindow(tab: .history)
+        openGitPanel(tab: .history)
     }
 
     // MARK: - После операций

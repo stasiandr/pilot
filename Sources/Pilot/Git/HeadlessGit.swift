@@ -3,7 +3,7 @@ import AppKit
 
 /// Окно git без окна — вкладка в PNG, как `--render-inspector`:
 ///
-///     Pilot --render-git Репозиторий [--tab commit|history|branches|stash|journal|changes|popover|merge]
+///     Pilot --render-git Репозиторий [--tab commit|history|stash|journal|changes|popover|merge]
 ///           [--path файл] [--select хэш] [--width 1100] [--height 700] [--out git.png]
 ///           [--mode mine|mainline|graph] [--expand first|хэш]
 ///           [--lang en] [--wait 4] [--click x,y]… [--dump]
@@ -81,7 +81,7 @@ enum HeadlessGit {
                     : workspace.gitHistory.mainline.first(where: { $0.id.hasPrefix(expand) })?.id
                 if let target { workspace.gitHistory.expanded.insert(target) }
             }
-            content = AnyView(GitWindowView(workspace: workspace, client: workspace.gitClient))
+            content = AnyView(GitPanel(workspace: workspace, client: workspace.gitClient, fixedHeight: size.height))
         }
 
         let host = NSHostingView(rootView: content
@@ -97,7 +97,7 @@ enum HeadlessGit {
         func loaded() -> Bool {
             switch tab {
             case "history": return workspace.gitHistory.details != nil
-            case "branches", "popover": return !workspace.gitClient.branches.isEmpty
+            case "popover": return !workspace.gitClient.branches.isEmpty
             default: return workspace.commits.isLoaded
             }
         }

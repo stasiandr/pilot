@@ -1,32 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// Окно git проекта: коммит, история, ветки, stash, журнал команд. Одно
-/// окно на проект — так же, как Commit и Git в Rider, только вкладками.
-struct CommitWindow: View {
-    static let sceneID = "commit"
-
-    let rootPath: String?
-    @ObservedObject private var language = LanguageStore.shared
-
-    var body: some View {
-        Group {
-            if let workspace = ProjectWindows.shared.workspaces.first(where: { $0.root?.path == rootPath }) {
-                GitWindowView(workspace: workspace, client: workspace.gitClient)
-                    .navigationTitle(L("Git — \(workspace.root?.lastPathComponent ?? "")"))
-            } else {
-                Text(L("Проект этого окна закрыт"))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .navigationTitle("Git")
-            }
-        }
-        .id(language.current)
-        .frame(minWidth: 900, minHeight: 540)
-        .preferredColorScheme(Theme.current.isDark ? .dark : .light)
-    }
-}
-
+/// Вкладка «Коммит» панели git: слева подготовленное и нет, под ними —
+/// сообщение; справа — дифф выбранного файла, куски и строки которого
+/// подготавливаются по одному.
 struct CommitView: View {
     let workspace: Workspace
     @ObservedObject var commits: GitCommitService

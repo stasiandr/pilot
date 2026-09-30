@@ -24,9 +24,9 @@ struct GitHistoryView: View {
             } else {
                 HSplitView {
                     leftPane
-                        .frame(minWidth: 460, idealWidth: 620, maxWidth: .infinity)
+                        .frame(minWidth: 360, idealWidth: 500, maxWidth: .infinity)
                     details
-                        .frame(minWidth: 380, idealWidth: 520, maxWidth: .infinity)
+                        .frame(minWidth: 520, idealWidth: 760, maxWidth: .infinity)
                 }
             }
         }
@@ -170,15 +170,16 @@ struct GitHistoryView: View {
     @ViewBuilder
     private var details: some View {
         if let details = history.details {
-            VSplitView {
+            // Панель низкая и широкая: файлы и дифф — рядом, а не друг под другом.
+            HSplitView {
                 VStack(alignment: .leading, spacing: 0) {
                     CommitHeader(details: details)
                     Divider()
                     fileList(details.files, revision: details.commit.hash)
                 }
-                .frame(minHeight: 160, idealHeight: 260)
+                .frame(minWidth: 200, idealWidth: 260, maxWidth: 420)
                 PatchView(patch: history.selectedFile == nil ? GitFilePatch() : history.filePatch)
-                    .frame(minHeight: 200)
+                    .frame(minWidth: 380, maxWidth: .infinity)
             }
         } else if history.selection != nil {
             ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -397,9 +398,9 @@ private struct CommitHeader: View {
                 }
                 .foregroundStyle(.secondary)
             }
-            .padding(12)
+            .padding(10)
         }
-        .frame(maxHeight: 150)
+        .frame(maxHeight: 96)
     }
 }
 

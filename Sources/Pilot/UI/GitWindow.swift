@@ -1,15 +1,21 @@
 import SwiftUI
 import AppKit
 
-/// Окно git: вкладки сверху, под ними — полосы незаконченной операции и
-/// ускорения большого репозитория, снизу — что делается и чем кончилось.
-struct GitWindowView: View {
+/// Панель git под редактором, как панель Git в Rider: вкладки «Коммит»,
+/// «Лог» (слева ветки, дальше история, файлы и дифф), «Stash» и
+/// «Консоль» — команды, которые выполнил Pilot. Высоту тянут за верхний
+/// край, как консоль запуска.
+struct GitPanel: View {
     let workspace: Workspace
     @ObservedObject var client: GitClient
-    @Environment(\.dismiss) private var dismiss
+    @AppStorage("pilot.gitPanelHeight") private var height: Double = 340
+    @State private var dragStart: Double?
+    /// Без окна (`--render-git`) высота задаётся снаружи.
+    var fixedHeight: Double? = nil
 
     var body: some View {
         VStack(spacing: 0) {
+            header
             GitOperationBar(workspace: workspace, client: client)
             if let tuning = client.tuning, !tuning.isComplete {
                 TuningBanner(client: client, state: tuning)
@@ -21,41 +27,22 @@ struct GitWindowView: View {
                 GitClientStatus(client: client)
             }
         }
+        .frame(height: fixedHeight ?? height)
         .background(Color(nsColor: Theme.swiftUIEditorBackground))
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                Picker("", selection: $client.windowTab) {
-                    ForEach(GitWindowTab.allCases, id: \.self) { tab in
-                        Label(tab.title, systemImage: tab.icon).tag(tab)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-            }
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button { client.fetch() } label: { Label(L("Получить"), systemImage: "arrow.down.circle") }
-                    .help("git fetch --all --prune")
-                Button { client.pull() } label: { Label(L("Обновить ветку"), systemImage: "arrow.down.to.line") }
-                    .help("git pull --autostash")
-                Button { client.push() } label: { Label(L("Отправить"), systemImage: "arrow.up.circle") }
-                    .help("git push")
-            }
+        .overlay(alignment: .top) {
+            Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
         }
-        .onAppear { client.refresh() }
+        .overlay(alignment: .top) { resizeHandle }
+        .onAppear {
+            client.refresh()
+            if client.windowTab == .history { workspace.gitHistory.open(repository: client.repository) }
+        }
+        .onChange(of: client.windowTab) { _, tab in
+            if tab == .history { workspace.gitHistory.open(repository: client.repository) }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             client.refresh()
             client.refreshOperation()
-        }
-        .background {
-            Button("") { dismiss() }
-                .keyboardShortcut("w", modifiers: .command)
-                .hidden()
-            // ⌘1…⌘5 — вкладки.
-            ForEach(Array(GitWindowTab.allCases.enumerated()), id: \.offset) { index, tab in
-                Button("") { client.windowTab = tab }
-                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
-                    .hidden()
-            }
         }
         .alert(client.offer?.message ?? "", isPresented: Binding(get: { client.offer != nil },
                                                                  set: { if !$0 { client.offer = nil } }),
@@ -77,15 +64,71 @@ struct GitWindowView: View {
         }
     }
 
+    private var header: some View {
+        HStack(spacing: 4) {
+            Text("Git").font(.system(size: 12, weight: .semibold)).padding(.trailing, 6)
+            ForEach(GitWindowTab.allCases, id: \.self) { tab in
+                let selected = client.windowTab == tab
+                Button { client.windowTab = tab } label: {
+                    Text(tab.title)
+                        .font(.system(size: 12))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5)
+                            .fill(selected ? Color.accentColor.opacity(0.22) : .clear))
+                        .overlay(RoundedRectangle(cornerRadius: 5)
+                            .stroke(selected ? Color.accentColor.opacity(0.6) : .clear))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+            Button { client.fetch() } label: { Image(systemName: "arrow.down.circle") }
+                .help(L("Получить с сервера") + " — git fetch --all --prune")
+            Button { client.pull() } label: { Image(systemName: "arrow.down.to.line") }
+                .help(KeymapStore.shared.help(L("Обновить ветку (pull)"), .pull))
+            Button { client.push() } label: { Image(systemName: "arrow.up.circle") }
+                .help(KeymapStore.shared.help(L("Отправить (push)"), .push))
+            Divider().frame(height: 14).padding(.horizontal, 4)
+            Button { workspace.showsGitPanel = false } label: { Image(systemName: "xmark") }
+                .help(KeymapStore.shared.help(L("Скрыть панель git"), .gitLog))
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+    }
+
     @ViewBuilder
     private var content: some View {
         switch client.windowTab {
         case .commit: CommitView(workspace: workspace, commits: workspace.commits)
-        case .history: GitHistoryView(workspace: workspace, history: workspace.gitHistory, client: client)
-        case .branches: GitBranchesView(workspace: workspace, client: client)
+        case .history:
+            HSplitView {
+                GitBranchTree(workspace: workspace, client: client, history: workspace.gitHistory)
+                    .frame(minWidth: 160, idealWidth: 200, maxWidth: 320)
+                GitHistoryView(workspace: workspace, history: workspace.gitHistory, client: client)
+                    .frame(minWidth: 600, maxWidth: .infinity)
+            }
         case .stash: GitStashView(client: client)
         case .journal: GitJournalView(client: client)
         }
+    }
+
+    /// Полоска у верхнего края: тянешь — панель выше, редактор ниже.
+    private var resizeHandle: some View {
+        Color.clear
+            .frame(height: 6)
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { value in
+                    let start = dragStart ?? height
+                    dragStart = start
+                    height = min(max(start - value.translation.height, 140), 1200)
+                }
+                .onEnded { _ in dragStart = nil })
     }
 }
 
@@ -138,24 +181,25 @@ private struct TuningBanner: View {
 
     var body: some View {
         if dismissed != client.repository?.path {
-            HStack(spacing: 10) {
+            // Одной строкой: панель низкая, а баннер — не главное в ней.
+            HStack(spacing: 8) {
                 Image(systemName: "hare").foregroundStyle(Color.accentColor)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(L("Большой репозиторий")).fontWeight(.medium)
-                    Text(L("Включить fsmonitor, кэш неотслеживаемых, split index и commit-graph: git status и запись индекса станут в разы быстрее и в терминале."))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer()
+                Text(L("Большой репозиторий")).fontWeight(.medium)
+                Text(L("Включить fsmonitor, кэш неотслеживаемых, split index и commit-graph: git status и запись индекса станут в разы быстрее и в терминале."))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(L("Включить fsmonitor, кэш неотслеживаемых, split index и commit-graph: git status и запись индекса станут в разы быстрее и в терминале."))
+                Spacer(minLength: 8)
                 Button(L("Не сейчас")) { dismissed = client.repository?.path ?? "" }
+                    .buttonStyle(.borderless)
                 Button(L("Ускорить")) { client.enableTuning() }
-                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
                     .disabled(client.busy != nil)
             }
-            .font(.system(size: 12))
+            .font(.system(size: 11))
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .frame(height: 26)
             .background(Color.accentColor.opacity(0.08))
         }
     }

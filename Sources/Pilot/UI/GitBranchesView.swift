@@ -1,105 +1,6 @@
 import SwiftUI
 import AppKit
 
-/// Ветки: поиск, недавние сверху, действия с выбранной. В clm-client
-/// 7,5 тыс. удалённых веток — показываем найденное, а не всё подряд.
-struct GitBranchesView: View {
-    let workspace: Workspace
-    @ObservedObject var client: GitClient
-    @State private var query = ""
-    @State private var selection: String?
-    @State private var newBranchFrom: GitBranch?
-    @State private var renaming: GitBranch?
-    @State private var confirmDelete: GitBranch?
-
-    private var selected: GitBranch? { client.branches.first { $0.id == selection } }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField(L("Найти ветку"), text: $query).textFieldStyle(.plain)
-                Spacer()
-                Button(L("Новая ветка…")) { newBranchFrom = client.currentBranch }
-                    .disabled(client.currentBranch == nil)
-            }
-            .font(.system(size: 12))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            Divider()
-            BranchList(client: client, query: query, selection: $selection, limit: 400) { branch in
-                client.checkout(branch)
-            } menu: { branch in
-                branchMenu(branch)
-            }
-            if let selected {
-                Divider()
-                HStack(spacing: 8) {
-                    Text(selected.subject).lineLimit(1).foregroundStyle(.secondary)
-                    Spacer()
-                    if !selected.isCurrent {
-                        Button(L("Сравнить")) { compare(selected) }
-                        Button(L("Влить в текущую")) { client.merge(selected.name) }
-                        Button(L("Переключиться")) { client.checkout(selected) }
-                            .buttonStyle(.borderedProminent)
-                    }
-                }
-                .font(.system(size: 12))
-                .disabled(client.busy != nil)
-                .padding(10)
-            }
-        }
-        .sheet(item: $newBranchFrom) { branch in
-            BranchNameSheet(title: L("Новая ветка от \(branch.name)"), initial: "") { name in
-                client.createBranch(name, from: branch.isCurrent ? nil : branch.name)
-            }
-        }
-        .sheet(item: $renaming) { branch in
-            BranchNameSheet(title: L("Переименовать \(branch.name)"), initial: branch.name) { name in
-                client.renameBranch(branch, to: name)
-            }
-        }
-        .confirmationDialog(L("Удалить ветку \(confirmDelete?.name ?? "")?"),
-                            isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
-                            presenting: confirmDelete) { branch in
-            Button(L("Удалить"), role: .destructive) { client.deleteBranch(branch) }
-        } message: { _ in
-            Text(L("Только локальную; на сервере ветка останется."))
-        }
-    }
-
-    @ViewBuilder
-    private func branchMenu(_ branch: GitBranch) -> some View {
-        if !branch.isCurrent {
-            Button(L("Переключиться")) { client.checkout(branch) }
-        }
-        Button(L("Новая ветка отсюда…")) { newBranchFrom = branch }
-        Divider()
-        if !branch.isCurrent, let current = client.currentBranch {
-            Button(L("Влить \(branch.name) в \(current.name)")) { client.merge(branch.name) }
-            Button(L("Перенести \(current.name) на \(branch.name) (rebase)")) { client.rebase(onto: branch.name) }
-            Button(L("Сравнить с \(current.name)")) { compare(branch) }
-            Divider()
-        }
-        Button(L("История ветки")) {
-            workspace.gitHistory.filter.scope = .ref(branch.name)
-            client.windowTab = .history
-        }
-        if !branch.isRemote {
-            Button(L("Переименовать…")) { renaming = branch }
-            if !branch.isCurrent {
-                Button(L("Удалить…"), role: .destructive) { confirmDelete = branch }
-            }
-        }
-    }
-
-    private func compare(_ branch: GitBranch) {
-        workspace.gitHistory.open(repository: client.repository)
-        workspace.gitHistory.comparison = GitHistoryModel.Comparison(base: "HEAD", target: branch.name)
-        client.windowTab = .history
-    }
-}
-
 /// Список веток с поиском: локальные, затем удалённые. Без запроса —
 /// все локальные и последние удалённые; с запросом — подходящие по
 /// словам (`feat ui` найдёт `feature/new-ui`).
@@ -216,8 +117,8 @@ struct BranchPopover: View {
                     .help(L("Обновить ветку (pull)"))
                 Button { client.push(); dismiss() } label: { Image(systemName: "arrow.up.circle") }
                     .help(L("Отправить (push)"))
-                Button(L("Окно git…")) {
-                    workspace.openGitWindow(tab: .branches)
+                Button(L("Панель git…")) {
+                    workspace.openGitPanel(tab: .history)
                     dismiss()
                 }
             }

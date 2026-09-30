@@ -2,15 +2,14 @@ import SwiftUI
 import AppKit
 
 enum GitWindowTab: String, CaseIterable, Hashable {
-    case commit, history, branches, stash, journal
+    case commit, history, stash, journal
 
     var title: String {
         switch self {
         case .commit: return L("Коммит")
-        case .history: return L("История")
-        case .branches: return L("Ветки")
+        case .history: return L("Лог")
         case .stash: return "Stash"
-        case .journal: return L("Журнал")
+        case .journal: return L("Консоль")
         }
     }
 
@@ -18,7 +17,6 @@ enum GitWindowTab: String, CaseIterable, Hashable {
         switch self {
         case .commit: return "checkmark.circle"
         case .history: return "clock.arrow.circlepath"
-        case .branches: return "arrow.triangle.branch"
         case .stash: return "tray.full"
         case .journal: return "terminal"
         }
@@ -50,7 +48,7 @@ final class GitClient: ObservableObject {
     @Published private(set) var tuning: Git.Tuning.State?
     @Published private(set) var journal: [Git.Journal.Entry] = []
     /// Вкладка окна git.
-    @Published var windowTab: GitWindowTab = .commit
+    @Published var windowTab: GitWindowTab = .history
 
     struct Offer: Identifiable, Equatable {
         enum Kind: Equatable { case stashAndSwitch(GitBranch), forceDelete(String) }

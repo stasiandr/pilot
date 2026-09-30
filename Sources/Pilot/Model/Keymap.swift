@@ -366,7 +366,7 @@ enum EditorCommand: String, CaseIterable {
         case .pull: return L("Обновить ветку (pull)")
         case .fetch: return L("Получить с сервера (fetch)")
         case .branches: return L("Ветки")
-        case .gitLog: return L("История git")
+        case .gitLog: return L("Панель git")
         case .fileHistory: return L("История файла или выделения")
         case .annotate: return L("Авторы строк (blame)")
         case .rollbackChange: return L("Откатить изменение под курсором")

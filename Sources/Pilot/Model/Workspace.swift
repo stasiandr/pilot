@@ -298,6 +298,8 @@ final class Workspace: ObservableObject {
     let gitHistory = GitHistoryModel()
     /// Открытые окна слияния: путь → сессия. Окно ищет свою здесь.
     var mergeSessions: [String: MergeSession] = [:]
+    /// Панель git под редактором.
+    @Published var showsGitPanel = false
     /// Авторы строк в колонке номеров, как «Annotate» в Rider.
     @Published var showsBlame = false
     /// Собранная колонка авторов и для какого blame.
@@ -4561,9 +4563,15 @@ final class Workspace: ObservableObject {
     /// Есть что остановить: ■ включена.
     var isRunningOrDebugging: Bool { run.isRunning || debug.isActive }
 
-    /// Окно git этого проекта на вкладке коммита; уже открыто — выходит вперёд.
+    /// ⌘K, как Commit в Rider: слева, во вкладке навигатора «Изменения».
+    /// Дифф по кускам и строкам — во вкладке «Коммит» панели git.
     func openCommitWindow() {
-        openGitWindow(tab: .commit)
+        guard git.repository != nil else {
+            showNotice(L("Проект не в git-репозитории"))
+            return
+        }
+        navigatorTab = .changes
+        if !showsSidebar { showsSidebar = true }
     }
 
     /// Окно NuGet этого проекта; уже открыто — выходит вперёд.
