@@ -16,6 +16,8 @@ struct GitCommitInfo: Identifiable, Hashable, Sendable {
     /// `refs/remotes/origin/main`, `tag: refs/tags/v1.2`.
     var refs: [String]
     var subject: String
+    /// Тело сообщения — только если просили (`formatWithBody`).
+    var body: String? = nil
 
     var id: String { hash }
     var shortHash: String { String(hash.prefix(8)) }
@@ -24,6 +26,8 @@ struct GitCommitInfo: Identifiable, Hashable, Sendable {
     /// Разделители полей и записей — управляющие символы: в теме коммита
     /// их не бывает, а табуляция и `|` бывают.
     static let format = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e"
+    /// С телом — для слияний MR: в нём заголовок и номер MR.
+    static let formatWithBody = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1f%b%x1e"
 
     static func parse(_ data: Data) -> [GitCommitInfo] {
         data.split(separator: 0x1E).compactMap { record in
@@ -39,8 +43,90 @@ struct GitCommitInfo: Identifiable, Hashable, Sendable {
                 email: fields[3],
                 date: Date(timeIntervalSince1970: TimeInterval(fields[4]) ?? 0),
                 refs: fields[5].isEmpty ? [] : fields[5].components(separatedBy: ", "),
-                subject: fields[6])
+                subject: fields[6],
+                body: fields.count > 7 ? fields[7].trimmingCharacters(in: .whitespacesAndNewlines) : nil)
         }
+    }
+}
+
+// MARK: - Слияния
+
+extension GitCommitInfo {
+    /// Обратное слияние — основная ветка влита в рабочую, чтобы её
+    /// догнать: `Merge branch 'master' into feature/x`, `… 'master' of
+    /// https://… into …`, `Merge remote-tracking branch 'origin/master' into …`.
+    /// Ничего не рассказывает — в истории его прячут. `main` — `master`
+    /// или `origin/master`.
+    func isBackMerge(main: String) -> Bool {
+        guard isMerge else { return false }
+        let name = main.split(separator: "/").last.map(String.init) ?? main
+        let merged = GitCommitInfo.mergedBranch(subject)
+        guard let merged else { return false }
+        let bare = merged.hasPrefix("origin/") ? String(merged.dropFirst("origin/".count)) : merged
+        return bare == name && !subject.hasSuffix("into '\(name)'") && !subject.hasSuffix("into \(name)")
+    }
+
+    /// Какую ветку влили: имя в первых кавычках темы слияния.
+    static func mergedBranch(_ subject: String) -> String? {
+        guard subject.hasPrefix("Merge "), let open = subject.firstIndex(of: "'") else { return nil }
+        let rest = subject[subject.index(after: open)...]
+        guard let close = rest.firstIndex(of: "'") else { return nil }
+        return String(rest[..<close])
+    }
+}
+
+/// Влитый MR — строка основной ветки в истории по первому родителю.
+/// Всё берётся из сообщения слияния, которое пишет GitLab: ветка — из
+/// темы, заголовок — первая содержательная строка тела, номер — из
+/// `See merge request группа/проект!16486`, задача — из имени ветки.
+struct MergeRequestInfo: Equatable, Sendable {
+    var branch: String
+    var title: String?
+    var iid: Int?
+    /// `OST-21643` или номер задачи из ветки (`#6828951`).
+    var task: String?
+
+    init?(_ commit: GitCommitInfo) {
+        guard commit.isMerge, let branch = GitCommitInfo.mergedBranch(commit.subject) else { return nil }
+        self.branch = branch
+        var title: String?
+        for raw in (commit.body ?? "").components(separatedBy: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("See merge request ") {
+                if let bang = line.lastIndex(of: "!") { iid = Int(line[line.index(after: bang)...]) }
+                continue
+            }
+            if title == nil, !line.isEmpty, !line.hasPrefix("Closes "), !line.hasPrefix("Co-authored-by") {
+                title = line
+            }
+        }
+        self.title = title
+        task = Self.task(in: branch) ?? title.flatMap(Self.task(in:))
+    }
+
+    /// `ABC-123` — ключ задачи; иначе число после `#`.
+    static func task(in text: String) -> String? {
+        let scalars = Array(text)
+        var i = 0
+        while i < scalars.count {
+            if scalars[i].isUppercase, scalars[i].isASCII {
+                var j = i
+                while j < scalars.count, scalars[j].isUppercase, scalars[j].isASCII { j += 1 }
+                if j - i >= 2, j < scalars.count, scalars[j] == "-" {
+                    var k = j + 1
+                    while k < scalars.count, scalars[k].isNumber { k += 1 }
+                    if k > j + 1, i == 0 || !scalars[i - 1].isLetter { return String(scalars[i..<k]) }
+                }
+                i = j
+            } else {
+                i += 1
+            }
+        }
+        if let hash = text.lastIndex(of: "#") {
+            let digits = text[text.index(after: hash)...].prefix { $0.isNumber }
+            if digits.count >= 3 { return "#" + digits }
+        }
+        return nil
     }
 }
 

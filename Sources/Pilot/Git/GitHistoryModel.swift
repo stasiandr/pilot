@@ -39,9 +39,86 @@ final class GitHistoryModel: ObservableObject {
         var target: String
     }
 
+    /// Как смотреть историю. Полный граф в репозитории, где история
+    /// строится через MR, почти нечитаем: на clm-client за месяц 976
+    /// коммитов, половина — слияния, 188 из них — обратные (master в
+    /// ветку). По первому родителю тот же месяц — 150 строк, 145 из них — MR.
+    enum Mode: String, CaseIterable, Hashable {
+        /// Моя ветка относительно основной, как smartlog в Sapling и `jj log`.
+        case mine
+        /// Основная ветка по первому родителю: влитые MR, раскрываются в коммиты.
+        case mainline
+        /// Все коммиты с графом.
+        case graph
+
+        var title: String {
+            switch self {
+            case .mine: return L("Моя ветка")
+            case .mainline: return L("По MR")
+            case .graph: return L("Граф")
+            }
+        }
+    }
+
+    @Published var mode: Mode = .mine {
+        didSet { if mode != oldValue { reload() } }
+    }
+
     @Published var filter = Filter() {
         didSet { if filter != oldValue { reload() } }
     }
+
+    // MARK: Моя ветка
+
+    struct BranchOverview: Equatable {
+        /// nil — HEAD отсоединён.
+        var branch: String?
+        /// `origin/master`.
+        var mainRef: String
+        /// Сама основная ветка: тогда «мои» — неотправленные.
+        var onMain: Bool
+        /// Коммиты ветки сверх основной, по первому родителю, новые сверху.
+        var commits: [GitCommitInfo]
+        /// Каких из них нет ни в одной ветке на сервере.
+        var unpushed: Set<String>
+        /// Где ветка отошла от основной.
+        var forkPoint: GitCommitInfo?
+        /// Насколько основная ушла вперёд с тех пор.
+        var behind: Int
+        var others: [OtherBranch]
+
+        var mainName: String { mainRef.split(separator: "/").dropFirst().joined(separator: "/").nilIfEmpty ?? mainRef }
+    }
+
+    struct OtherBranch: Equatable, Identifiable {
+        var name: String
+        var ahead: Int
+        var behind: Int
+        var date: Date
+        var subject: String
+        var id: String { name }
+    }
+
+    @Published private(set) var overview: BranchOverview?
+
+    // MARK: По MR
+
+    struct MainlineEntry: Identifiable, Equatable {
+        var commit: GitCommitInfo
+        var request: MergeRequestInfo?
+        var id: String { commit.hash }
+    }
+
+    @Published private(set) var mainline: [MainlineEntry] = []
+    /// Раскрытые MR — их коммиты подгружаются по требованию.
+    @Published var expanded: Set<String> = [] {
+        didSet { for hash in expanded.subtracting(oldValue) { loadChildren(of: hash) } }
+    }
+    /// Коммиты MR без обратных слияний; и сколько обратных спрятано.
+    @Published private(set) var children: [String: [GitCommitInfo]] = [:]
+    @Published private(set) var hiddenBackMerges: [String: Int] = [:]
+    /// Все коммиты, что сейчас на экране, — по ним ищется выбранный.
+    private var registry: [String: GitCommitInfo] = [:]
     @Published private(set) var commits: [GitCommitInfo] = []
     @Published private(set) var rows: [GitGraphRow] = []
     @Published private(set) var isLoading = false
@@ -58,6 +135,11 @@ final class GitHistoryModel: ObservableObject {
         didSet { if comparison != oldValue { loadComparison() } }
     }
     @Published private(set) var comparisonFiles: [GitChangedFile] = []
+    /// Что просили из меню коммита: новую ветку, revert, rebase — окна
+    /// открывает вид истории.
+    @Published var newBranchFrom: GitCommitInfo?
+    @Published var confirmRevert: GitCommitInfo?
+    @Published var rebaseBase: GitCommitInfo?
     @Published private(set) var error: String?
 
     struct Details: Equatable {
@@ -76,7 +158,7 @@ final class GitHistoryModel: ObservableObject {
     private let queue = DispatchQueue(label: "pilot.git.history", qos: .userInitiated)
     static let pageSize = 400
 
-    var selectedCommit: GitCommitInfo? { commits.first { $0.hash == selection } }
+    var selectedCommit: GitCommitInfo? { selection.flatMap { registry[$0] } }
 
     func open(repository: URL?) {
         guard repository != self.repository else { return }
@@ -94,16 +176,162 @@ final class GitHistoryModel: ObservableObject {
         commits = []
         known = []
         rows = []
+        mainline = []
+        children = [:]
+        hiddenBackMerges = [:]
+        expanded = []
+        registry = [:]
+        overview = nil
         hasMore = false
         error = nil
         selection = nil
-        loadPage()
+        // История файла или строк — всегда плоским списком: «моя ветка»
+        // к ней не относится.
+        switch filter.path == nil ? mode : .graph {
+        case .graph: loadPage()
+        case .mine: loadOverview()
+        case .mainline: loadMainline()
+        }
     }
 
     /// Следующая страница — когда долистали до конца.
     func loadMore() {
         guard hasMore, !isLoading else { return }
-        loadPage()
+        if mode == .mainline && filter.path == nil { loadMainline() } else { loadPage() }
+    }
+
+    private func register(_ commits: [GitCommitInfo]) {
+        for commit in commits { registry[commit.hash] = commit }
+    }
+
+    // MARK: - Основная ветка
+
+    /// Основная ветка: куда смотрит `origin/HEAD`, иначе первая из
+    /// привычных имён. `origin/…`, а не локальная, — она свежее.
+    nonisolated static func mainRef(in repository: URL) -> String? {
+        if let output = Git.run(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], in: repository),
+           output.status == 0 {
+            let ref = String(decoding: output.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ref.isEmpty { return ref }
+        }
+        for ref in ["origin/main", "origin/master", "origin/develop", "main", "master", "develop"] {
+            if Git.run(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], in: repository)?.status == 0 { return ref }
+        }
+        return nil
+    }
+
+    // MARK: - Моя ветка
+
+    private func loadOverview() {
+        guard let repository else { return }
+        isLoading = true
+        let current = generation
+        queue.async { [weak self] in
+            let overview = Self.overview(in: repository)
+            Task { @MainActor in
+                guard let self, self.generation == current else { return }
+                self.isLoading = false
+                self.overview = overview
+                if let overview {
+                    self.register(overview.commits + [overview.forkPoint].compactMap { $0 })
+                    self.selection = overview.commits.first?.hash ?? overview.forkPoint?.hash
+                } else {
+                    self.error = L("Не нашлась основная ветка (origin/HEAD, main или master)")
+                }
+            }
+        }
+    }
+
+    nonisolated private static func overview(in repository: URL) -> BranchOverview? {
+        guard let main = mainRef(in: repository) else { return nil }
+        func text(_ arguments: [String]) -> String {
+            guard let output = Git.run(arguments, in: repository), output.status == 0 else { return "" }
+            return String(decoding: output.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let branch = text(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        let mainName = main.hasPrefix("origin/") ? String(main.dropFirst("origin/".count)) : main
+        // По первому родителю: обратные слияния — одной строкой, без
+        // коммитов основной ветки, которые они принесли.
+        let commits = Git.run(["log", "--first-parent", GitCommitInfo.format, "--decorate=full", "-n", "300",
+                               "HEAD", "--not", main], in: repository).map { GitCommitInfo.parse($0.stdout) } ?? []
+        let unpushed = Set(text(["rev-list", "-n", "1000", "HEAD", "--not", "--remotes"]).split(separator: "\n").map(String.init))
+        let base = text(["merge-base", "HEAD", main])
+        let forkPoint = base.isEmpty ? nil
+            : Git.run(["log", "-n", "1", GitCommitInfo.format, "--decorate=full", base], in: repository)
+                .flatMap { GitCommitInfo.parse($0.stdout).first }
+        let behind = Int(text(["rev-list", "--count", "HEAD.." + main])) ?? 0
+
+        // Другие локальные ветки: насколько впереди и позади основной.
+        var others: [OtherBranch] = []
+        let refs = text(["for-each-ref", "--sort=-committerdate",
+                         "--format=%(refname:short)%1f%(ahead-behind:\(main))%1f%(committerdate:unix)%1f%(subject)",
+                         "refs/heads"])
+        for line in refs.split(separator: "\n") {
+            let f = line.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
+            guard f.count >= 4, f[0] != branch, f[0] != mainName else { continue }
+            let counts = f[1].split(separator: " ").compactMap { Int($0) }
+            others.append(OtherBranch(name: f[0], ahead: counts.first ?? 0, behind: counts.count > 1 ? counts[1] : 0,
+                                      date: Date(timeIntervalSince1970: TimeInterval(f[2]) ?? 0), subject: f[3]))
+        }
+        return BranchOverview(branch: branch.isEmpty ? nil : branch, mainRef: main, onMain: branch == mainName,
+                              commits: commits, unpushed: unpushed, forkPoint: forkPoint, behind: behind, others: others)
+    }
+
+    // MARK: - По MR
+
+    private func loadMainline() {
+        guard let repository else { return }
+        isLoading = true
+        let current = generation
+        let skip = mainline.count
+        let text = filter.text.trimmingCharacters(in: .whitespaces)
+        let author = filter.author.trimmingCharacters(in: .whitespaces)
+        let scopeRef: String? = {
+            if case .ref(let ref) = filter.scope { return ref }
+            return nil
+        }()
+        queue.async { [weak self] in
+            guard let main = scopeRef ?? Self.mainRef(in: repository) else {
+                Task { @MainActor in
+                    self?.isLoading = false
+                    self?.error = L("Не нашлась основная ветка (origin/HEAD, main или master)")
+                }
+                return
+            }
+            var arguments = ["log", "--first-parent", GitCommitInfo.formatWithBody, "--decorate=full",
+                             "-n", "\(Self.pageSize)", "--skip=\(skip)", main]
+            if !text.isEmpty { arguments += ["-i", "--fixed-strings", "--grep=\(text)"] }
+            if !author.isEmpty { arguments += ["-i", "--author=\(author)"] }
+            let page = Git.run(arguments, in: repository).map { GitCommitInfo.parse($0.stdout) } ?? []
+            let entries = page.map { MainlineEntry(commit: $0, request: MergeRequestInfo($0)) }
+            Task { @MainActor in
+                guard let self, self.generation == current else { return }
+                self.isLoading = false
+                self.mainline += entries
+                self.register(page)
+                self.hasMore = page.count >= Self.pageSize
+                if self.selection == nil, skip == 0 { self.selection = entries.first?.id }
+            }
+        }
+    }
+
+    /// Коммиты MR: что принесла вторая сторона слияния, без обратных слияний.
+    private func loadChildren(of hash: String) {
+        guard let repository, children[hash] == nil, let merge = registry[hash], merge.parents.count > 1 else { return }
+        let current = generation
+        queue.async { [weak self] in
+            let main = Self.mainRef(in: repository) ?? "master"
+            let all = Git.run(["log", "--first-parent", GitCommitInfo.format, "--decorate=full", "-n", "200",
+                               "\(merge.parents[0])..\(merge.parents[1])"], in: repository)
+                .map { GitCommitInfo.parse($0.stdout) } ?? []
+            let shown = all.filter { !$0.isBackMerge(main: main) }
+            Task { @MainActor in
+                guard let self, self.generation == current else { return }
+                self.children[hash] = shown
+                self.hiddenBackMerges[hash] = all.count - shown.count
+                self.register(shown)
+            }
+        }
     }
 
     private func arguments(skip: Int) -> [String] {
@@ -170,6 +398,7 @@ final class GitHistoryModel: ObservableObject {
                 let newRows = fresh.map { layout.add($0) }
                 self.layout = layout
                 self.commits += fresh
+                self.register(fresh)
                 self.rows += newRows
                 self.hasMore = page.count >= Self.pageSize && self.filter.lines == nil
                 if self.selection == nil, skip == 0 { self.selection = self.commits.first?.hash }
@@ -266,4 +495,8 @@ final class GitHistoryModel: ObservableObject {
             return String(data: output.stdout, encoding: .utf8)
         }.value
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

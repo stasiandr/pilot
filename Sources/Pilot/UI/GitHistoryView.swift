@@ -7,9 +7,6 @@ struct GitHistoryView: View {
     let workspace: Workspace
     @ObservedObject var history: GitHistoryModel
     @ObservedObject var client: GitClient
-    @State private var newBranchFrom: GitCommitInfo?
-    @State private var rebaseBase: GitCommitInfo?
-    @State private var confirmRevert: GitCommitInfo?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,7 +23,7 @@ struct GitHistoryView: View {
                 }
             } else {
                 HSplitView {
-                    log
+                    leftPane
                         .frame(minWidth: 460, idealWidth: 620, maxWidth: .infinity)
                     details
                         .frame(minWidth: 380, idealWidth: 520, maxWidth: .infinity)
@@ -34,17 +31,18 @@ struct GitHistoryView: View {
             }
         }
         .onAppear { history.open(repository: client.repository) }
-        .sheet(item: $newBranchFrom) { commit in
+        .sheet(item: $history.newBranchFrom) { commit in
             BranchNameSheet(title: L("Новая ветка от \(commit.shortHash)"), initial: "") { name in
                 client.createBranch(name, from: commit.hash)
             }
         }
-        .sheet(item: $rebaseBase) { base in
+        .sheet(item: $history.rebaseBase) { base in
             RebaseEditor(client: client, base: base)
         }
         .confirmationDialog(L("Отменить коммит новым коммитом?"),
-                            isPresented: Binding(get: { confirmRevert != nil }, set: { if !$0 { confirmRevert = nil } }),
-                            presenting: confirmRevert) { commit in
+                            isPresented: Binding(get: { history.confirmRevert != nil },
+                                                 set: { if !$0 { history.confirmRevert = nil } }),
+                            presenting: history.confirmRevert) { commit in
             Button("Revert") { client.revert(commit) }
         } message: { commit in
             Text(commit.subject)
@@ -53,8 +51,42 @@ struct GitHistoryView: View {
 
     // MARK: - Фильтры
 
+    /// Левая половина: история файла — всегда списком с графом, иначе по режиму.
+    @ViewBuilder
+    private var leftPane: some View {
+        switch history.filter.path == nil ? history.mode : .graph {
+        case .mine: MineHistoryList(workspace: workspace, history: history, client: client, commits: workspace.commits)
+        case .mainline: MainlineHistoryList(workspace: workspace, history: history, client: client)
+        case .graph: log
+        }
+    }
+
     private var filterBar: some View {
         HStack(spacing: 8) {
+            Picker("", selection: $history.mode) {
+                ForEach(GitHistoryModel.Mode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .disabled(history.filter.path != nil)
+            .help(L("Моя ветка — что в ней сверх основной; по MR — основная ветка списком влитых MR; граф — все коммиты"))
+            if history.mode != .mine || history.filter.path != nil {
+                filters
+            }
+            Spacer()
+            if history.isLoading { ProgressView().controlSize(.small) }
+            Button { history.reload() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless)
+                .help(L("Обновить"))
+        }
+        .font(.system(size: 12))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    @ViewBuilder
+    private var filters: some View {
             Menu {
                 Button(GitHistoryModel.Scope.current.title) { history.filter.scope = .current }
                 Button(GitHistoryModel.Scope.all.title) { history.filter.scope = .all }
@@ -77,15 +109,6 @@ struct GitHistoryView: View {
                     history.filter.lines = nil
                 }
             }
-            Spacer()
-            if history.isLoading { ProgressView().controlSize(.small) }
-            Button { history.reload() } label: { Image(systemName: "arrow.clockwise") }
-                .buttonStyle(.borderless)
-                .help(L("Обновить"))
-        }
-        .font(.system(size: 12))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
     }
 
     private func chip(_ text: String, clear: @escaping () -> Void) -> some View {
@@ -125,7 +148,7 @@ struct GitHistoryView: View {
                     .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
                     .listRowSeparator(.hidden)
                     .tag(commit.hash)
-                    .contextMenu { commitMenu(commit) }
+                    .contextMenu { CommitMenu(workspace: workspace, history: history, client: client, commit: commit) }
                     .onAppear {
                         if index == history.commits.count - 1 { history.loadMore() }
                     }
@@ -139,34 +162,6 @@ struct GitHistoryView: View {
             } else if !history.isLoading && history.commits.isEmpty {
                 Text(L("Коммитов не найдено")).foregroundStyle(.tertiary)
             }
-        }
-    }
-
-    @ViewBuilder
-    private func commitMenu(_ commit: GitCommitInfo) -> some View {
-        Button(L("Копировать хэш")) {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(commit.hash, forType: .string)
-        }
-        Divider()
-        Button(L("Новая ветка отсюда…")) { newBranchFrom = commit }
-        Button(L("Сравнить с текущим состоянием")) {
-            history.comparison = GitHistoryModel.Comparison(base: commit.hash, target: "HEAD")
-        }
-        Divider()
-        Button("Cherry-pick") { client.cherryPick(commit) }
-            .disabled(commit.isMerge)
-        // Revert слияния не предлагаем: во многих командах он запрещён, и
-        // после него ветку нельзя влить повторно.
-        if !commit.isMerge {
-            Button(L("Revert — отменить новым коммитом…")) { confirmRevert = commit }
-        }
-        Divider()
-        Button(L("Интерактивный rebase отсюда…")) { rebaseBase = commit }
-            .help(L("Переписать коммиты после этого — только неотправленные"))
-        Menu(L("Сдвинуть ветку сюда")) {
-            Button(L("Soft — правки подготовлены")) { client.reset(to: commit, mode: .soft) }
-            Button(L("Mixed — правки в рабочей копии")) { client.reset(to: commit, mode: .mixed) }
         }
     }
 

@@ -3,6 +3,7 @@
 #
 #   bin/pilot-git Репозиторий [--tab commit|history|branches|stash|journal|changes|popover|merge]
 #                 [--path файл] [--select хэш] [--width 1100] [--height 700] [--out git.png]
+#                 [--mode mine|mainline|graph] [--expand first|хэш]
 #                 [--lang en] [--wait 4] [--click x,y]… [--dump]
 #
 # Окно не показывается, приложение не активируется. git только читается,

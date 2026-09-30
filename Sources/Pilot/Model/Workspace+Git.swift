@@ -21,6 +21,7 @@ extension Workspace {
     /// история фрагмента.
     func showHistory(path: String, lines: ClosedRange<Int>? = nil) {
         gitHistory.open(repository: git.repository)
+        gitHistory.mode = .graph
         gitHistory.comparison = nil
         var filter = gitHistory.filter
         filter.path = path
@@ -74,6 +75,19 @@ extension Workspace {
         return max(0, line + shift)
     }
 
+    /// MR по номеру — в ревью Pilot, как ⌥⌘R с `!номер`.
+    func openMergeRequest(iid: Int) {
+        Task {
+            guard let mr = await review.mergeRequest(iid: iid) else {
+                showNotice(L("MR !\(iid) не найден — нет доступа к GitLab?"))
+                return
+            }
+            navigatorTab = .review
+            openReview(mr)
+            bringToFront()
+        }
+    }
+
     // MARK: - Авторы строк
 
     /// Колонка авторов для редактора: только когда включена и blame посчитан.
@@ -94,6 +108,7 @@ extension Workspace {
         guard let blame = git.blame, let commit = blame.commit(atLine: line), !commit.isUncommitted else { return }
         gitHistory.open(repository: git.repository)
         gitHistory.comparison = nil
+        gitHistory.mode = .graph
         var filter = GitHistoryModel.Filter()
         filter.text = commit.sha
         gitHistory.filter = filter

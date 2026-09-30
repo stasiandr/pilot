@@ -5381,6 +5381,35 @@ do {
     check(Merge3.split("a\r\nb\r\n") == ["a", "b"], "CRLF")
 }
 
+section("Git: слияния и MR")
+do {
+    func merge(_ subject: String, body: String? = nil) -> GitCommitInfo {
+        GitCommitInfo(hash: String(repeating: "a", count: 40), parents: ["p1", "p2"], author: "a", email: "e",
+                      date: Date(), refs: [], subject: subject, body: body)
+    }
+    check(merge("Merge branch 'master' into feature/x").isBackMerge(main: "origin/master"), "master влит в ветку")
+    check(merge("Merge branch 'master' of https://gitlab.x/clm-client into feature/y#123").isBackMerge(main: "master"),
+          "pull с сервера в ветку")
+    check(merge("Merge remote-tracking branch 'origin/master' into fix/z").isBackMerge(main: "origin/master"),
+          "remote-tracking")
+    check(!merge("Merge branch 'fix/a#OST-1' into 'master'").isBackMerge(main: "origin/master"), "MR в master — не обратное")
+    check(!merge("Merge branch 'feature/a' into feature/b").isBackMerge(main: "master"), "ветка в ветку — не обратное")
+    var plain = merge("Merge branch 'master' into x"); plain.parents = ["p1"]
+    check(!plain.isBackMerge(main: "master"), "не слияние — не обратное")
+
+    let mr = MergeRequestInfo(merge("Merge branch 'fix/faction-recruit-rank-costume#OST-21643' into 'master'",
+                                    body: "OST-21643 - Фракции. У главы фракции рекруты\n\nCloses OST-21643\n\nSee merge request clm-project/clm-client!16486"))
+    check(mr?.branch == "fix/faction-recruit-rank-costume#OST-21643" && mr?.iid == 16486 && mr?.task == "OST-21643"
+            && mr?.title == "OST-21643 - Фракции. У главы фракции рекруты", "MR из сообщения GitLab (\(String(describing: mr)))")
+    let numbered = MergeRequestInfo(merge("Merge branch 'feature/super-seasons#6828951' into 'master'", body: ""))
+    check(numbered?.task == "#6828951" && numbered?.title == nil && numbered?.iid == nil, "задача номером после #")
+    check(MergeRequestInfo.task(in: "r.vishnyakov/feature/agx-tonemapping#6805523") == "#6805523"
+            && MergeRequestInfo.task(in: "fix/ta/rename_vehicle#OST-52557") == "OST-52557"
+            && MergeRequestInfo.task(in: "feature/hhs-floor") == nil, "ключи задач")
+    var single = merge("Fix"); single.parents = ["p1"]
+    check(MergeRequestInfo(single) == nil, "не слияние — не MR")
+}
+
 section("Git: история и граф")
 do {
     func record(_ hash: Character, _ parents: [Character], refs: String = "", subject: String = "s") -> String {

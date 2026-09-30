@@ -5,6 +5,7 @@ import AppKit
 ///
 ///     Pilot --render-git Репозиторий [--tab commit|history|branches|stash|journal|changes|popover|merge]
 ///           [--path файл] [--select хэш] [--width 1100] [--height 700] [--out git.png]
+///           [--mode mine|mainline|graph] [--expand first|хэш]
 ///           [--lang en] [--wait 4] [--click x,y]… [--dump]
 ///
 /// `--path` — для merge: файл в конфликте; для commit — какой файл
@@ -66,7 +67,20 @@ enum HeadlessGit {
                 return 2
             }
             workspace.gitClient.windowTab = windowTab
+            if windowTab == .history, let mode = value("--mode").flatMap(GitHistoryModel.Mode.init(rawValue:)) {
+                workspace.gitHistory.mode = mode
+            }
             if windowTab == .history, let path { workspace.gitHistory.filter.path = path }
+            if windowTab == .history, let expand = value("--expand") {
+                // Раскрыть MR с этим началом хэша, когда список придёт.
+                let until = Date(timeIntervalSinceNow: 8)
+                while workspace.gitHistory.mainline.isEmpty && Date() < until {
+                    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+                }
+                let target = expand == "first" ? workspace.gitHistory.mainline.first(where: { $0.commit.isMerge })?.id
+                    : workspace.gitHistory.mainline.first(where: { $0.id.hasPrefix(expand) })?.id
+                if let target { workspace.gitHistory.expanded.insert(target) }
+            }
             content = AnyView(GitWindowView(workspace: workspace, client: workspace.gitClient))
         }
 
@@ -82,7 +96,7 @@ enum HeadlessGit {
         let deadline = Date(timeIntervalSinceNow: value("--wait").flatMap(Double.init) ?? 4)
         func loaded() -> Bool {
             switch tab {
-            case "history": return !workspace.gitHistory.commits.isEmpty && workspace.gitHistory.details != nil
+            case "history": return workspace.gitHistory.details != nil
             case "branches", "popover": return !workspace.gitClient.branches.isEmpty
             default: return workspace.commits.isLoaded
             }
