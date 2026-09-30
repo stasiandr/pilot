@@ -108,6 +108,9 @@ struct RootView: View {
             if workspace.review.active != nil {
                 ReviewBar(workspace: workspace)
             }
+            if workspace.root != nil {
+                GitOperationBar(workspace: workspace, client: workspace.gitClient)
+            }
             if workspace.showsConflictBar {
                 ConflictBar(workspace: workspace)
             }
@@ -166,6 +169,8 @@ struct RootView: View {
                          lineChanges: workspace.editorLineChanges,
                          removedLines: workspace.editorRemovedLines,
                          commentMarks: workspace.editorCommentMarks,
+                         blame: workspace.editorBlameColumn,
+                         onBlameClick: { workspace.blameClicked(line: $0) },
                          isReview: workspace.isReviewDocument,
                          popover: workspace.linePopover,
                          popoverContent: { request in
@@ -483,6 +488,7 @@ struct RootView: View {
                 unityChip
                 blameLabel
                 changesChip
+                BranchChip(workspace: workspace, client: workspace.gitClient)
                 if doc.media == nil, !workspace.showsRenderedMarkdown {
                     CaretPositionLabel(caret: workspace.caret, model: doc.model)
                 }
@@ -492,6 +498,7 @@ struct RootView: View {
                 noticeLabel
                 unityChip
                 changesChip
+                BranchChip(workspace: workspace, client: workspace.gitClient)
                 StatusIndicator(workspace: workspace)
             }
         }
@@ -839,6 +846,36 @@ private struct CaretPositionLabel: View {
 
 /// Кто и когда последним трогал строку под курсором. Появляется, когда
 /// blame досчитается; до тех пор места в строке не занимает.
+/// Ветка в статус-строке. Клик (и ⌃⇧B) — попап веток, как виджет
+/// ветки в Rider.
+private struct BranchChip: View {
+    let workspace: Workspace
+    @ObservedObject var client: GitClient
+    @State private var showsPopover = false
+
+    var body: some View {
+        if let status = workspace.git.status {
+            Button { showsPopover.toggle() } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: client.operation == nil ? "arrow.triangle.branch" : "arrow.triangle.merge")
+                        .font(.system(size: 9))
+                    Text(status.headLabel)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 180)
+                    if client.busy != nil { ProgressView().controlSize(.mini) }
+                }
+            }
+            .buttonStyle(.plain)
+            .help(KeymapStore.shared.help(L("Ветки"), .branches))
+            .popover(isPresented: $showsPopover, arrowEdge: .top) {
+                BranchPopover(workspace: workspace, client: client)
+            }
+            .onChange(of: workspace.branchPopoverRequest) { _, _ in showsPopover = true }
+        }
+    }
+}
+
 private struct BlameLabel: View {
     let caret: EditorCaret
     let blame: GitBlame

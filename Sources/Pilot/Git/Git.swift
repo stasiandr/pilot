@@ -57,13 +57,16 @@ enum Git {
 
     /// nil — git не установлен, не запустился или запуск отменили.
     static func run(_ arguments: [String], in directory: URL,
-                    cancellation: Cancellation? = nil) -> Output? {
+                    cancellation: Cancellation? = nil, optionalLocks: Bool = false) -> Output? {
         guard let executable else { return nil }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         // Без необязательных блокировок status не трогает index.lock и не
         // мешает git, запущенному пользователем в терминале в ту же секунду.
-        process.arguments = ["--no-optional-locks"] + arguments
+        // Изредка блокировку разрешаем: на большом репозитории status должен
+        // хоть иногда записать индекс, иначе fsmonitor и кэш неотслеживаемых
+        // не запоминают, что уже проверено (`Tuning`).
+        process.arguments = (optionalLocks ? [] : ["--no-optional-locks"]) + arguments
         process.currentDirectoryURL = directory
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_TERMINAL_PROMPT"] = "0"
@@ -104,18 +107,24 @@ enum Git {
     /// вход (сообщение коммита, патч) и отдаёт stderr — хуки и отказы
     /// удалённого репозитория надо показать. Пароль спросить некому: без
     /// терминала git и ssh сразу отказывают, а не ждут ввода.
-    static func execute(_ arguments: [String], in directory: URL, input: Data? = nil) -> Result? {
+    ///
+    /// Каждый запуск попадает в журнал (`Journal`): что Pilot сделал с
+    /// репозиторием, видно командой, а вывод хуков не теряется.
+    static func execute(_ arguments: [String], in directory: URL, input: Data? = nil,
+                        environment extra: [String: String] = [:], journal: Bool = true) -> Result? {
         guard let executable else { return nil }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
+        process.arguments = Tuning.flags(for: directory) + arguments
         process.currentDirectoryURL = directory
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_TERMINAL_PROMPT"] = "0"
         if environment["GIT_SSH_COMMAND"] == nil { environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes" }
         // Редактор для сообщения не откроется: оно всегда приходит через -F.
         environment["GIT_EDITOR"] = "true"
+        environment.merge(extra) { _, new in new }
         process.environment = environment
+        let started = Date()
 
         let stdout = Pipe(), stderr = Pipe(), stdin = Pipe()
         process.standardOutput = stdout
@@ -140,9 +149,27 @@ enum Git {
         let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
         group.wait()
         process.waitUntilExit()
-        return Result(status: process.terminationStatus,
-                      stdout: String(decoding: outputData, as: UTF8.self),
-                      stderr: String(decoding: errorData, as: UTF8.self))
+        let result = Result(status: process.terminationStatus,
+                            stdout: String(decoding: outputData, as: UTF8.self),
+                            stderr: String(decoding: errorData, as: UTF8.self))
+        if journal {
+            Journal.shared.record(arguments: arguments, directory: directory, result: result,
+                                  duration: Date().timeIntervalSince(started))
+        }
+        return result
+    }
+
+    /// Каталог git репозитория: у worktree и подмодуля `.git` — файл со
+    /// ссылкой, и настоящий каталог лежит в другом месте.
+    static func gitDirectory(for repository: URL) -> URL? {
+        let dotGit = repository.appendingPathComponent(".git")
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: dotGit.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return dotGit
+        }
+        guard let output = run(["rev-parse", "--absolute-git-dir"], in: repository), output.status == 0 else { return nil }
+        let path = String(decoding: output.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : URL(fileURLWithPath: path, isDirectory: true)
     }
 
     /// Отмена долгого запуска: blame на файле с богатой историей идёт секунды,
@@ -173,9 +200,9 @@ enum Git {
     // MARK: - Операции
 
     /// Ветка и изменённые файлы под `directory` (пути — от корня репозитория).
-    static func status(in directory: URL) -> GitStatus? {
-        guard let output = run(["status", "--porcelain=v2", "-z", "--branch",
-                                "--untracked-files=all", "--", "."], in: directory),
+    static func status(in directory: URL, optionalLocks: Bool = false) -> GitStatus? {
+        guard let output = run(Tuning.flags(for: directory) + ["status", "--porcelain=v2", "-z", "--branch",
+                                "--untracked-files=all", "--", "."], in: directory, optionalLocks: optionalLocks),
               output.status == 0 else { return nil }
         return GitStatus.parse(output.stdout)
     }

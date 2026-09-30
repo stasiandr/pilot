@@ -242,6 +242,16 @@ enum EditorCommand: String, CaseIterable {
     case markResolved = "git.markResolved"
     case localHistory = "git.localHistory"
     case commit = "git.commit"
+    case push = "git.push"
+    case pull = "git.pull"
+    case fetch = "git.fetch"
+    case branches = "git.branches"
+    case gitLog = "git.log"
+    case fileHistory = "git.fileHistory"
+    case annotate = "git.annotate"
+    case rollbackChange = "git.rollbackChange"
+    case stageChange = "git.stageChange"
+    case resolveConflicts = "git.resolveConflicts"
     // Unity
     case assetUsages = "unity.assetUsages"
     case toggleMeta = "unity.toggleMeta"
@@ -352,6 +362,16 @@ enum EditorCommand: String, CaseIterable {
         case .markResolved: return L("Отметить конфликт решённым")
         case .localHistory: return L("Локальная история")
         case .commit: return L("Коммит")
+        case .push: return L("Отправить (push)")
+        case .pull: return L("Обновить ветку (pull)")
+        case .fetch: return L("Получить с сервера (fetch)")
+        case .branches: return L("Ветки")
+        case .gitLog: return L("История git")
+        case .fileHistory: return L("История файла или выделения")
+        case .annotate: return L("Авторы строк (blame)")
+        case .rollbackChange: return L("Откатить изменение под курсором")
+        case .stageChange: return L("Подготовить изменение под курсором")
+        case .resolveConflicts: return L("Разрешить конфликты")
         case .assetUsages: return L("Где используется ассет")
         case .toggleMeta: return L("Ассет ↔ .meta")
         case .unityConsole: return L("Консоль Unity")
@@ -487,6 +507,16 @@ enum EditorCommand: String, CaseIterable {
         case .localHistory: return Shortcut("h", option: true, control: true)
         // Как в Rider.
         case .commit: return Shortcut("k", command: true)
+        case .push: return Shortcut("k", command: true, shift: true)
+        case .pull: return nil
+        case .fetch: return nil
+        case .branches: return Shortcut("b", control: true, shift: true)
+        case .gitLog: return Shortcut("9", command: true)
+        case .fileHistory: return nil
+        case .annotate: return nil
+        case .rollbackChange: return Shortcut("z", command: true, option: true)
+        case .stageChange: return nil
+        case .resolveConflicts: return nil
         case .assetUsages: return Shortcut("r", command: true, shift: true)
         case .toggleMeta: return Shortcut("m", command: true, control: true)
         case .unityConsole: return Shortcut("u", command: true, control: true)

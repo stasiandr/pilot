@@ -163,6 +163,72 @@ struct GitFilePatch: Equatable {
         (header + [hunk.header] + hunk.lines).joined(separator: "\n") + "\n"
     }
 
+    /// Патч из выбранных строк куска (индексы в `hunk.lines`), как `s` на
+    /// строках в Magit. Невыбранные правки не должны ни попасть в индекс,
+    /// ни пропасть из него, поэтому куску меняют форму:
+    ///
+    /// - вперёд (подготовить, `apply --cached`): невыбранная `+` выпадает —
+    ///   её нет ни до, ни после; невыбранная `-` становится контекстом —
+    ///   строка остаётся;
+    /// - назад (убрать из подготовленного, `apply --cached --reverse`):
+    ///   патч прикладывается к индексу как к «новой» стороне, поэтому
+    ///   наоборот: невыбранная `+` — контекст, невыбранная `-` выпадает.
+    ///
+    /// Счётчики в `@@` пересчитываются. nil — среди выбранных нет правок.
+    func patch(for hunk: Hunk, lines selected: Set<Int>, reverse: Bool) -> String? {
+        var body: [String] = []
+        var oldCount = 0, newCount = 0, changed = false
+        var dropped = false
+        for (i, line) in hunk.lines.enumerated() {
+            let marker = line.first
+            if marker == "\\" {
+                // «\ No newline» относится к строке перед ним: выпала она — выпадает и он.
+                if !dropped { body.append(line) }
+                continue
+            }
+            dropped = false
+            let isSelected = selected.contains(i)
+            switch marker {
+            case "+":
+                if isSelected {
+                    body.append(line); newCount += 1; changed = true
+                } else if reverse {
+                    body.append(" " + line.dropFirst()); oldCount += 1; newCount += 1
+                } else {
+                    dropped = true
+                }
+            case "-":
+                if isSelected {
+                    body.append(line); oldCount += 1; changed = true
+                } else if reverse {
+                    dropped = true
+                } else {
+                    body.append(" " + line.dropFirst()); oldCount += 1; newCount += 1
+                }
+            default:
+                body.append(line); oldCount += 1; newCount += 1
+            }
+        }
+        guard changed else { return nil }
+        // Прикладывается один этот кусок, поэтому обе стороны начинаются там,
+        // где он стоит в том, к чему прикладывается: вперёд — в индексе до
+        // правки (old), назад — в индексе с ней (new).
+        // У пустой стороны git пишет номер строки *перед* куском, поэтому
+        // считаем от первой строки куска и для пустой стороны отнимаем один.
+        let originalOld = hunk.lines.filter { $0.hasPrefix(" ") || $0.hasPrefix("-") }.count
+        let originalNew = hunk.lines.filter { $0.hasPrefix(" ") || $0.hasPrefix("+") }.count
+        let anchor = reverse ? hunk.newStart + (originalNew == 0 ? 1 : 0)
+                             : hunk.oldStart + (originalOld == 0 ? 1 : 0)
+        func start(_ count: Int) -> Int { count == 0 ? anchor - 1 : anchor }
+        let header = "@@ -\(start(oldCount)),\(oldCount) +\(start(newCount)),\(newCount) @@"
+        return (self.header + [header] + body).joined(separator: "\n") + "\n"
+    }
+
+    /// Номера строк куска, которые можно выбрать, — правки, а не контекст.
+    static func changeLines(_ hunk: Hunk) -> [Int] {
+        hunk.lines.indices.filter { hunk.lines[$0].hasPrefix("+") || hunk.lines[$0].hasPrefix("-") }
+    }
+
     /// `@@ -12,5 +12,6 @@` → (12, 12).
     static func hunkStarts(_ header: String) -> (Int, Int) {
         let parts = header.split(separator: " ")
@@ -189,5 +255,62 @@ enum CommitMessage {
             let t = line.trimmingCharacters(in: .whitespaces)
             return t.isEmpty || t.hasPrefix("#")
         }
+    }
+}
+
+// MARK: - Пары .meta
+
+/// В Unity у каждого ассета и папки есть `.meta` с его GUID. Закоммитить
+/// ассет без `.meta` — у коллег Unity сгенерирует новый GUID, и все ссылки
+/// на ассет в сценах и префабах порвутся. `.meta` без ассета — мусор,
+/// который Unity у них удалит. Поэтому подготовка, отмена и откат берут
+/// пару целиком, а окно коммита предупреждает о разорванных парах.
+enum MetaPairs {
+    static func partner(of path: String) -> String {
+        path.hasSuffix(".meta") ? String(path.dropLast(5)) : path + ".meta"
+    }
+
+    /// Пути вместе с изменёнными партнёрами из `candidates`.
+    static func expand(_ paths: [String], within candidates: Set<String>) -> [String] {
+        var result = paths
+        var seen = Set(paths)
+        for path in paths {
+            let other = partner(of: path)
+            if candidates.contains(other), seen.insert(other).inserted { result.append(other) }
+        }
+        return result
+    }
+
+    struct Problem: Equatable, Hashable {
+        enum Kind: Equatable, Hashable { case assetWithoutMeta, metaWithoutAsset }
+        var kind: Kind
+        var path: String
+    }
+
+    /// Подготовленные новые файлы без подготовленной пары. `exists` — есть
+    /// ли файл на диске (от корня репозитория); `tracked` — есть ли в HEAD.
+    /// Только для репозиториев, где `.meta` вообще бывают.
+    static func problems(in tree: GitWorkingTree, exists: (String) -> Bool, tracked: (String) -> Bool) -> [Problem] {
+        let staged = Dictionary(tree.staged.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        var problems: [Problem] = []
+        for change in tree.staged {
+            let path = change.path
+            let other = partner(of: path)
+            if change.staged == .added {
+                // Ассет добавлен, его .meta лежит рядом, но не подготовлен и не в HEAD.
+                if !path.hasSuffix(".meta"), staged[other] == nil, exists(other), !tracked(other) {
+                    problems.append(Problem(kind: .assetWithoutMeta, path: path))
+                }
+                // Новый .meta, а ассета нет ни в коммите, ни в HEAD.
+                if path.hasSuffix(".meta"), staged[other] == nil, !tracked(other) {
+                    problems.append(Problem(kind: .metaWithoutAsset, path: path))
+                }
+            }
+            if change.staged == .deleted, !path.hasSuffix(".meta"), staged[other] == nil, tracked(other), !exists(path) {
+                // Ассет удалён, а .meta остаётся в репозитории.
+                problems.append(Problem(kind: .metaWithoutAsset, path: other))
+            }
+        }
+        return problems
     }
 }

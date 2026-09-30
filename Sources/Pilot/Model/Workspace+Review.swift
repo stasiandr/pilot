@@ -62,7 +62,8 @@ extension Workspace {
     /// Клик по номеру строки. В файле MR окно есть всегда — хотя бы чтобы
     /// прокомментировать; в рабочей копии — только там, где что-то удалено.
     func lineClicked(_ line: Int) {
-        if isReviewDocument || removedLines(at: line) != nil || !threads(atLine: line).isEmpty {
+        if isReviewDocument || removedLines(at: line) != nil || !threads(atLine: line).isEmpty
+            || (document?.revision == nil && lineChange(at: line) != nil) {
             requestLinePopover(line: line, compose: false)
         }
     }

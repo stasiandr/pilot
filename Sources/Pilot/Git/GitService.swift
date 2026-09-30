@@ -19,7 +19,11 @@ final class GitService: ObservableObject {
     /// Отличия открытого файла от HEAD.
     @Published private(set) var lineChanges: [LineDiff.Change] = []
     /// Авторство строк открытого файла. Считается с задержкой и дольше всего.
-    @Published private(set) var blame: GitBlame?
+    @Published private(set) var blame: GitBlame? {
+        didSet { blameGeneration &+= 1 }
+    }
+    /// Растёт с каждым новым blame — по нему кэшируют то, что из него собрано.
+    private(set) var blameGeneration = 0
     /// Текст открытого файла в HEAD — чтобы показать, что было удалено.
     private var headText = ""
     private var headLines: [String]?
@@ -37,11 +41,22 @@ final class GitService: ObservableObject {
         return Array(lines[change.oldLines])
     }
 
+    /// Строки текста из HEAD — для отката блока в редакторе.
+    func headLines(_ range: Range<Int>) -> [String]? {
+        if headLines == nil {
+            headLines = headText.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.hasSuffix("\r") ? String($0.dropLast()) : String($0) }
+        }
+        guard let lines = headLines, range.upperBound <= lines.count else { return nil }
+        return Array(lines[range])
+    }
+
     /// Статус обновился — палитре пора перерисовать буквы.
     var onStatusChange: (() -> Void)?
 
     private var projectRoot: URL?
     private var document: LoadedDocument?
+    private var lastIndexWrite = Date.distantPast
 
     private let queue = DispatchQueue(label: "pilot.git", qos: .userInitiated)
     private let blameQueue = DispatchQueue(label: "pilot.git.blame", qos: .utility)
@@ -105,9 +120,15 @@ final class GitService: ObservableObject {
         guard let repository, let projectRoot else { return }
         let generation = statusGeneration.bump()
         let counter = statusGeneration
+        // Раз в минуту status может записать индекс: fsmonitor и кэш
+        // неотслеживаемых помнят проверенное только в нём. Занят индекс
+        // терминалом — git просто не пишет, ошибки нет.
+        let now = Date()
+        let optionalLocks = now.timeIntervalSince(lastIndexWrite) > 60 && !Git.Tuning.flags(for: repository).isEmpty
+        if optionalLocks { lastIndexWrite = now }
 
         queue.async { [weak self] in
-            guard let fresh = Git.status(in: projectRoot) else { return }
+            guard let fresh = Git.status(in: projectRoot, optionalLocks: optionalLocks) else { return }
             let files = Self.projectRelative(fresh.files, repository: repository, project: projectRoot)
             Task { @MainActor in
                 guard let self, counter.isCurrent(generation) else { return }

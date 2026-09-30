@@ -451,6 +451,9 @@ struct LineInspector: View {
                 if let removed = workspace.removedLines(at: line) {
                     RemovedLinesView(lines: removed, fontSize: workspace.fontSize)
                 }
+                if file == nil, workspace.document?.revision == nil, let change = workspace.lineChange(at: line) {
+                    ChangeActions(workspace: workspace, line: line, change: change)
+                }
                 ForEach(threads) { thread in
                     ThreadCard(discussion: thread, review: workspace.review,
                                outdated: workspace.review.active?.isOutdated(thread) ?? false)
@@ -469,6 +472,31 @@ struct LineInspector: View {
         }
         .frame(width: 480, height: min(max(contentHeight, 40), 560))
         .onPreferenceChange(ContentHeightKey.self) { contentHeight = $0 }
+    }
+}
+
+/// Кнопки блока изменений у строки: подготовить только его, откатить в
+/// тексте (⌘Z вернёт), история этих строк.
+private struct ChangeActions: View {
+    let workspace: Workspace
+    let line: Int
+    let change: LineDiff.Change
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(L("Подготовить блок")) { workspace.stageChange(at: line) }
+                .help(KeymapStore.shared.help(L("Только эти строки — в следующий коммит"), .stageChange))
+            Button(L("Откатить")) { workspace.revertChange(at: line) }
+                .help(KeymapStore.shared.help(L("Вернуть текст из HEAD; ⌘Z отменит"), .rollbackChange))
+            Spacer()
+            // У добавленных строк истории нет — их нет в HEAD.
+            if !change.oldLines.isEmpty {
+                Button(L("История строк")) {
+                    workspace.showLineHistory(headLines: change.oldLines)
+                }
+            }
+        }
+        .controlSize(.small)
     }
 }
 

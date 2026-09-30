@@ -79,6 +79,8 @@ struct ConflictBar: View {
                 if let error = workspace.conflictError {
                     Text(error).foregroundStyle(.orange).lineLimit(1)
                 }
+                Button(L("Слияние в три колонки…")) { workspace.openMergeForCurrentFile() }
+                    .help(L("Наша версия, их и результат рядом — как в Rider"))
                 Button(L("Все текущие")) { workspace.acceptAllConflicts(.current) }
                     .help(L("Во всех конфликтах файла оставить текущее"))
                 Button(L("Все входящие")) { workspace.acceptAllConflicts(.incoming) }

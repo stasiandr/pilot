@@ -5274,6 +5274,191 @@ do {
     }
 }
 
+// ───────────────────────────── Git-клиент ─────────────────────────────
+section("Git: строки куска")
+do {
+    let hunk = GitFilePatch.Hunk(header: "@@ -4,4 +4,5 @@", lines: [" a", "-b", "-c", "+B", "+C", "+D", " e"],
+                                 oldStart: 4, newStart: 4)
+    let patch = GitFilePatch(header: ["diff --git a/F b/F", "--- a/F", "+++ b/F"], hunks: [hunk])
+    check(GitFilePatch.changeLines(hunk) == [1, 2, 3, 4, 5], "выбираются только правки")
+    let forward = patch.patch(for: hunk, lines: [1, 3], reverse: false) ?? ""
+    check(forward.contains("@@ -4,4 +4,4 @@\n a\n-b\n c\n+B\n e\n"),
+          "вперёд: невыбранная - — контекст, невыбранная + — выпадает (\(forward))")
+    let backward = patch.patch(for: hunk, lines: [1, 3], reverse: true) ?? ""
+    check(backward.contains("@@ -4,5 +4,5 @@\n a\n-b\n+B\n C\n D\n e\n"),
+          "назад: невыбранная + — контекст, невыбранная - — выпадает (\(backward))")
+    check(patch.patch(for: hunk, lines: [0, 6], reverse: false) == nil, "только контекст — патча нет")
+    let insert = GitFilePatch.Hunk(header: "@@ -3,0 +4,2 @@", lines: ["+x", "+y"], oldStart: 3, newStart: 4)
+    let one = GitFilePatch(header: [], hunks: [insert]).patch(for: insert, lines: [0], reverse: false) ?? ""
+    check(one.hasPrefix("@@ -3,0 +4,1 @@\n+x\n"), "вставка: у пустой стороны — строка перед куском (\(one))")
+
+    let fm = FileManager.default
+    let repo = fm.temporaryDirectory.appendingPathComponent("pilot-lines-\(getpid())")
+    defer { try? fm.removeItem(at: repo) }
+    try? fm.createDirectory(at: repo, withIntermediateDirectories: true)
+    if Git.executable != nil {
+        let id = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+        try? "1\n2\n3\n4\n5\n".write(to: repo.appendingPathComponent("F.txt"), atomically: true, encoding: .utf8)
+        _ = Git.execute(["init", "-q"], in: repo)
+        _ = Git.execute(["add", "F.txt"], in: repo)
+        _ = Git.execute(id + ["commit", "-q", "-m", "init"], in: repo)
+        try? "1\nTWO\n3\nnew\n4\n5\n".write(to: repo.appendingPathComponent("F.txt"), atomically: true, encoding: .utf8)
+        let worktree = GitFilePatch.parse(String(decoding: Git.run(["diff", "-U3", "--", "F.txt"], in: repo)?.stdout ?? Data(), as: UTF8.self))
+        let h = worktree.hunks[0]
+        let addNew = h.lines.firstIndex(of: "+new")!
+        let staged = Git.execute(["apply", "--cached", "-"], in: repo,
+                                 input: Data((worktree.patch(for: h, lines: [addNew], reverse: false) ?? "").utf8))
+        let index = String(decoding: Git.run(["show", ":F.txt"], in: repo)?.stdout ?? Data(), as: UTF8.self)
+        check(staged?.succeeded == true && index == "1\n2\n3\nnew\n4\n5\n",
+              "в индексе — только выбранная строка (\(staged?.message ?? "") \(index))")
+        try? "1\nTWO\n3\nnew\n4\n5\n".write(to: repo.appendingPathComponent("F.txt"), atomically: true, encoding: .utf8)
+        _ = Git.execute(["add", "F.txt"], in: repo)
+        let cached = GitFilePatch.parse(String(decoding: Git.run(["diff", "--cached", "-U3", "--", "F.txt"], in: repo)?.stdout ?? Data(), as: UTF8.self))
+        let c = cached.hunks[0]
+        let two = c.lines.indices.filter { c.lines[$0] == "-2" || c.lines[$0] == "+TWO" }
+        let back = Git.execute(["apply", "--cached", "--reverse", "-"], in: repo,
+                               input: Data((cached.patch(for: c, lines: Set(two), reverse: true) ?? "").utf8))
+        let after = String(decoding: Git.run(["show", ":F.txt"], in: repo)?.stdout ?? Data(), as: UTF8.self)
+        check(back?.succeeded == true && after == "1\n2\n3\nnew\n4\n5\n",
+              "из индекса убрана только выбранная правка (\(back?.message ?? "") \(after))")
+    }
+}
+
+section("Git: пары .meta")
+do {
+    check(MetaPairs.partner(of: "Assets/A.cs") == "Assets/A.cs.meta" && MetaPairs.partner(of: "Assets/A.cs.meta") == "Assets/A.cs",
+          "партнёр ассета и .meta")
+    check(MetaPairs.expand(["Assets/A.cs", "B.cs.meta"], within: ["Assets/A.cs.meta", "B.cs", "C.cs"])
+            == ["Assets/A.cs", "B.cs.meta", "Assets/A.cs.meta", "B.cs"], "пара добавляется, если тоже изменена")
+    var tree = GitWorkingTree()
+    tree.changes = [
+        GitChange(path: "Assets/New.cs", staged: .added),
+        GitChange(path: "Assets/Paired.cs", staged: .added), GitChange(path: "Assets/Paired.cs.meta", staged: .added),
+        GitChange(path: "Assets/Orphan.png.meta", staged: .added),
+        GitChange(path: "Assets/Gone.cs", staged: .deleted),
+    ]
+    let onDisk: Set<String> = ["Assets/New.cs", "Assets/New.cs.meta", "Assets/Paired.cs", "Assets/Paired.cs.meta"]
+    let problems = MetaPairs.problems(in: tree, exists: { onDisk.contains($0) }, tracked: { $0 == "Assets/Gone.cs.meta" })
+    check(Set(problems) == [MetaPairs.Problem(kind: .assetWithoutMeta, path: "Assets/New.cs"),
+                            MetaPairs.Problem(kind: .metaWithoutAsset, path: "Assets/Orphan.png.meta"),
+                            MetaPairs.Problem(kind: .metaWithoutAsset, path: "Assets/Gone.cs.meta")],
+          "разорванные пары: \(problems)")
+}
+
+section("Git: слияние трёх версий")
+do {
+    let base = "a\nb\nc\nd\ne\n"
+    var chunks = Merge3.merge(base: base, ours: "a\nB\nc\nd\ne\n", theirs: "a\nb\nc\nD\ne\n")
+    check(chunks.map(\.kind) == [.stable, .changed(.ours), .stable, .changed(.theirs), .stable],
+          "правки в разных местах сливаются сами (\(chunks.map(\.kind)))")
+    check(Merge3.text(chunks.map(\.automatic), trailingNewline: true) == "a\nB\nc\nD\ne\n", "итог автослияния")
+
+    chunks = Merge3.merge(base: base, ours: "a\nX\nc\nd\ne\n", theirs: "a\nY\nc\nd\ne\n")
+    let conflict = chunks.first { $0.isConflict }
+    check(conflict?.base == ["b"] && conflict?.ours == ["X"] && conflict?.theirs == ["Y"], "одна строка по-разному — конфликт")
+
+    chunks = Merge3.merge(base: base, ours: "a\nX\nc\nd\ne\n", theirs: "a\nX\nc\nd\ne\n")
+    check(chunks.contains { $0.kind == .changed(.both) } && !chunks.contains { $0.isConflict }, "одинаковая правка — не конфликт")
+
+    chunks = Merge3.merge(base: "a\nb\n", ours: "a\nb\nours\n", theirs: "a\nb\ntheirs\n")
+    let tail = chunks.first { $0.isConflict }
+    check(tail?.base == [] && tail?.ours == ["ours"] && tail?.theirs == ["theirs"], "вставки в одно место — конфликт")
+    check(tail.flatMap(Merge3.autoResolve) == ["ours", "theirs"], "палочка: обе вставки подряд")
+
+    chunks = Merge3.merge(base: "a\nb\nc\n", ours: "a\nc\n", theirs: "a\nB\nc\n")
+    check(chunks.first { $0.isConflict }?.ours == [] && chunks.first { $0.isConflict }?.theirs == ["B"],
+          "удалили и изменили одну строку — конфликт")
+
+    chunks = Merge3.merge(base: "x\n", ours: "x\ny  =  1;\n", theirs: "x\ny = 1;\n")
+    check(chunks.first { $0.isConflict }.flatMap(Merge3.autoResolve) == ["y  =  1;"], "палочка: разница только в пробелах")
+
+    let using = Merge3.merge(base: "using A;\nclass C {}\n", ours: "using A;\nusing B;\nclass C {}\n",
+                             theirs: "using A;\nusing Z;\nclass C {}\n")
+    let resolved = using.map { $0.isConflict ? (Merge3.autoResolve($0) ?? $0.base) : $0.automatic }
+    check(Merge3.text(resolved, trailingNewline: true) == "using A;\nusing B;\nusing Z;\nclass C {}\n",
+          "два новых using с двух сторон")
+    check(Merge3.merge(base: "", ours: "", theirs: "").isEmpty, "пустые файлы")
+    check(Merge3.split("a\r\nb\r\n") == ["a", "b"], "CRLF")
+}
+
+section("Git: история и граф")
+do {
+    func record(_ hash: Character, _ parents: [Character], refs: String = "", subject: String = "s") -> String {
+        [String(repeating: hash, count: 40), parents.map { String(repeating: $0, count: 40) }.joined(separator: " "),
+         "Имя", "a@b", "1700000000", refs, subject].joined(separator: "\u{1f}") + "\u{1e}\n"
+    }
+    let log = record("d", ["b", "c"], refs: "HEAD -> main, origin/main, tag: v1") + record("c", ["a"]) + record("b", ["a"])
+        + record("a", [], subject: "тема с | и\tтабом")
+    let commits = GitCommitInfo.parse(Data(log.utf8))
+    check(commits.count == 4 && commits[0].isMerge && commits[0].refs == ["HEAD -> main", "origin/main", "tag: v1"],
+          "коммиты: слияние и ссылки")
+    check(commits[3].parents.isEmpty && commits[3].subject == "тема с | и\tтабом" && commits[0].author == "Имя",
+          "корневой коммит, тема с разделителями")
+
+    var layout = GitGraphLayout()
+    let rows = commits.map { layout.add($0) }
+    check(rows[0].column == 0 && rows[0].bottom.map(\.to).sorted() == [0, 1], "слияние: две линии вниз")
+    check(rows[1].column == 1 && rows[1].bottom == [.init(from: 1, to: 0, color: rows[1].color)]
+            || rows[1].column == 1 && rows[1].bottom.contains { $0.from == 1 },
+          "второй родитель — во второй колонке")
+    check(rows[2].column == 0, "первый родитель — в первой колонке (\(rows[2]))")
+    check(rows[3].column == 0 && rows[3].bottom.isEmpty && rows[3].top.contains { $0.from == 1 && $0.to == 0 },
+          "у корня линии сходятся, вниз ничего (\(rows[3]))")
+    check(rows.allSatisfy { $0.width <= 2 }, "граф в две колонки")
+
+    // Два независимых конца: вторая ветка встаёт рядом, а не вместо.
+    var tips = GitGraphLayout()
+    let t1 = tips.add(GitCommitInfo.parse(Data(record("e", ["a"]).utf8))[0])
+    let t2 = tips.add(GitCommitInfo.parse(Data(record("f", ["a"]).utf8))[0])
+    let t3 = tips.add(GitCommitInfo.parse(Data(record("a", []).utf8))[0])
+    check(t1.column == 0 && t2.column == 1 && t3.column == 0 && t3.top.count == 2, "две ветки от одного корня")
+    check(t1.color != t2.color, "разные ветки — разные цвета")
+
+    let refs = [
+        "refs/heads/main", "1111", "origin/main", "[ahead 2, behind 1]", "1700000000", "*", "Тема",
+    ].joined(separator: "\u{1f}") + "\u{1e}\n" + [
+        "refs/remotes/origin/HEAD", "1111", "", "", "1700000000", " ", "",
+    ].joined(separator: "\u{1f}") + "\u{1e}\n" + [
+        "refs/remotes/origin/feature/x", "2222", "", "", "1700000001", " ", "фича",
+    ].joined(separator: "\u{1f}") + "\u{1e}\n" + [
+        "refs/heads/old", "3333", "origin/old", "[gone]", "1600000000", " ", "",
+    ].joined(separator: "\u{1f}") + "\u{1e}\n"
+    let branches = GitBranch.parse(Data(refs.utf8))
+    check(branches.count == 3, "origin/HEAD — не ветка")
+    check(branches[0].isCurrent && branches[0].ahead == 2 && branches[0].behind == 1 && branches[0].upstream == "origin/main",
+          "текущая, впереди и позади")
+    check(branches[1].isRemote && branches[1].name == "origin/feature/x" && branches[1].localName == "feature/x",
+          "удалённая ветка и её локальное имя")
+    check(branches[2].upstreamGone, "ветку на сервере удалили")
+    check(GitBranch.isValidName("feature/JIRA-12_fix") && !GitBranch.isValidName("a b") && !GitBranch.isValidName("a..b")
+            && !GitBranch.isValidName("x.lock") && !GitBranch.isValidName("-x") && !GitBranch.isValidName("a/.b")
+            && !GitBranch.isValidName(""), "имена веток")
+
+    let stashes = GitStash.parse(Data(("stash@{0}\u{1f}abc\u{1f}1700000000\u{1f}On main: мой\u{1e}\n"
+                                       + "stash@{1}\u{1f}def\u{1f}1600000000\u{1f}WIP on main: 1 x\u{1e}\n").utf8))
+    check(stashes.map(\.ref) == ["stash@{0}", "stash@{1}"] && stashes[0].message == "On main: мой", "stash")
+
+    let files = GitChangedFile.parse(Data("M\0a.cs\0R087\0old.cs\0new.cs\0A\0dir/n.cs\0D\0gone.cs\0".utf8))
+    check(files.map(\.path) == ["a.cs", "new.cs", "dir/n.cs", "gone.cs"] && files[1].originalPath == "old.cs"
+            && files.map(\.kind) == [.modified, .renamed, .added, .deleted], "файлы коммита")
+
+    let sbs = SideBySideRow.rows(GitFilePatch(header: [], hunks: [
+        GitFilePatch.Hunk(header: "@@ -1,4 +1,4 @@", lines: [" a", "-b", "-c", "+B", " d", "+e"], oldStart: 1, newStart: 1),
+    ]))
+    check(sbs.map(\.kind) == [.context, .changed, .removed, .context, .added], "две колонки: пары и одиночки")
+    check(sbs[1].oldNumber == 2 && sbs[1].newNumber == 2 && sbs[2].oldNumber == 3 && sbs[2].new == nil
+            && sbs[4].newNumber == 4 && sbs[3].oldNumber == 4, "номера строк в двух колонках")
+
+    let steps = commits.prefix(3).reversed().enumerated().map { i, c in
+        RebaseStep(commit: c, action: [.pick, .reword, .fixup][i], message: i == 1 ? "новое" : nil)
+    }
+    let todo = RebaseStep.todo(steps) { "/tmp/msg \($0)" }
+    check(todo == "pick \(commits[2].hash)\npick \(commits[1].hash)\nexec git commit --amend --allow-empty --no-verify -q -F '/tmp/msg 1'\nfixup \(commits[0].hash)\n",
+          "список rebase: reword — через exec (\(todo))")
+    check(RebaseStep.problem([RebaseStep(commit: commits[0], action: .fixup)]) != nil
+            && RebaseStep.problem(steps) == nil, "первый — не fixup")
+}
+
 // ───────────────────────────── Локальная история ─────────────────────────────
 section("Локальная история")
 do {
