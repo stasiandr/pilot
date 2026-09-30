@@ -5405,6 +5405,67 @@ do {
                               "      objectReference: {fileID: 0}"]) == "Boss", "у переопределения показывается значение")
 }
 
+section("JSON: слияние по ключам")
+do {
+    let base = """
+    {
+    \t"shop": {
+    \t\t"sword": 100,
+    \t\t"shield": 50
+    \t},
+    \t"items": [
+    \t\t{ "id": 1, "count": 1 },
+    \t\t{ "id": 2, "count": 2 }
+    \t],
+    \t"old": true
+    }
+
+    """
+    // Мы: цена меча, второй предмет. Они: цена меча иначе, щит, новый ключ, первый предмет, удалили old.
+    let ours = base.replacingOccurrences(of: "\"sword\": 100", with: "\"sword\": 90")
+        .replacingOccurrences(of: "{ \"id\": 2, \"count\": 2 }", with: "{ \"id\": 2, \"count\": 5 }")
+    let theirs = base.replacingOccurrences(of: "\"sword\": 100", with: "\"sword\": 120")
+        .replacingOccurrences(of: "\"shield\": 50", with: "\"shield\": 60,\n\t\t\"bow\": 70")
+        .replacingOccurrences(of: "{ \"id\": 1, \"count\": 1 }", with: "{ \"id\": 1, \"count\": 9 }")
+        .replacingOccurrences(of: ",\n\t\"old\": true", with: "")
+    let result = JSONMerge.merge(base: base, ours: ours, theirs: theirs)
+    check(result?.conflicts.map(\.path) == ["shop.sword"], "спор — только цена меча (\(result?.conflicts.map(\.path) ?? []))")
+    let merged = result?.text([:]) ?? ""
+    check(merged.contains("\"sword\": 90") && merged.contains("\"shield\": 60") && merged.contains("\"bow\": 70")
+            && merged.contains("{ \"id\": 1, \"count\": 9 }") && merged.contains("{ \"id\": 2, \"count\": 5 }")
+            && !merged.contains("old"), "остальное слито само (\(merged))")
+    check(merged.contains("\n\t\t\"bow\": 70") || merged.contains("\t\t\"bow\""), "табуляции остались табуляциями")
+    check(JSONMerge.parse(Array(merged.utf16)) != nil, "итог — валидный JSON")
+    check(result?.text(["shop.sword": .theirs]).contains("\"sword\": 120") == true, "выбор их стороны")
+
+    // Добавили с двух сторон разные элементы массива по id — оба остаются.
+    let arrays = JSONMerge.merge(base: "[{\"id\":1}]", ours: "[{\"id\":1},{\"id\":2}]", theirs: "[{\"id\":1},{\"id\":3}]")
+    check(arrays?.conflicts.isEmpty == true
+            && (arrays?.text([:]) == "[{\"id\":1},{\"id\":3},{\"id\":2}]" || arrays?.text([:]) == "[{\"id\":1},{\"id\":2},{\"id\":3}]"),
+          "элементы по id с двух сторон (\(arrays?.text([:]) ?? ""))")
+    // Переформатирование — не правка.
+    let reformat = JSONMerge.merge(base: "{\"a\":1,\"b\":2}", ours: "{\n  \"a\": 1,\n  \"b\": 2\n}", theirs: "{\"a\":1,\"b\":3}")
+    check(reformat?.conflicts.isEmpty == true && reformat?.text([:]) == "{\n  \"a\": 1,\n  \"b\": 3\n}",
+          "наше форматирование + их значение")
+    // Удалили у нас, правили у них — спор.
+    let deleted = JSONMerge.merge(base: "{\"a\":1,\"b\":2}", ours: "{\"a\":1}", theirs: "{\"a\":1,\"b\":5}")
+    check(deleted?.conflicts.first?.path == "b" && deleted?.conflicts.first?.ours == nil
+            && deleted?.text([:]) == "{\"a\":1}" && deleted?.text(["b": .theirs]) == "{\"a\":1,\"b\":5}",
+          "удалили у нас, правили у них (\(deleted?.text(["b": .theirs]) ?? ""))")
+    check(JSONMerge.parse(Array("{\"a\": [1, 2,}".utf16)) == nil, "не JSON")
+    // Они удалили несколько последних ключей подряд — без висячей запятой.
+    let tail = JSONMerge.merge(base: "{\"a\":1,\"b\":2,\"c\":3,\"d\":4}", ours: "{\"a\":0,\"b\":2,\"c\":3,\"d\":4}",
+                               theirs: "{\"a\":1,\"b\":2}")
+    check(tail?.text([:]) == "{\"a\":0,\"b\":2}", "удаление хвоста подряд (\(tail?.text([:]) ?? ""))")
+    let replaced = JSONMerge.merge(base: "{\"g\":{\"x\":1,\"y\":2},\"z\":0}", ours: "{\"g\":{\"x\":1,\"y\":2},\"z\":1}",
+                                   theirs: "{\"g\":{\"p\":1,\"q\":2},\"z\":0}")
+    check(replaced?.text([:]) == "{\"g\":{\"p\":1,\"q\":2},\"z\":1}", "они заменили все ключи объекта (\(replaced?.text([:]) ?? ""))")
+    let middle = JSONMerge.merge(base: "{\"a\":1,\"c\":3}", ours: "{\"a\":0,\"c\":3}", theirs: "{\"a\":1,\"b\":2,\"c\":3}")
+    check(middle?.text([:]) == "{\"a\":0,\"b\":2,\"c\":3}", "новый ключ — на своё место (\(middle?.text([:]) ?? ""))")
+    let front = JSONMerge.merge(base: "[{\"id\":2}]", ours: "[{\"id\":2,\"x\":1}]", theirs: "[{\"id\":1},{\"id\":2}]")
+    check(front?.text([:]) == "[{\"id\":1},{\"id\":2,\"x\":1}]", "новый элемент — в начало (\(front?.text([:]) ?? ""))")
+}
+
 section("Git: слияние трёх версий")
 do {
     let base = "a\nb\nc\nd\ne\n"

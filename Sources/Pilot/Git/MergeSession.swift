@@ -17,6 +17,8 @@ final class MergeSession: ObservableObject {
     private var editorChanges: AnyCancellable?
     /// Unity YAML: слияние по объектам; nil — файл не Unity или не разобрался.
     @Published private(set) var objects: UnityMerge.Result?
+    /// JSON: слияние по ключам; nil — не JSON или не разобрался.
+    @Published private(set) var keys: JSONMerge.Result?
     /// Чьи версии: наша ветка и та, что вливается.
     @Published private(set) var oursName = ""
     /// Двоичный файл: сливать нечего, только взять одну сторону целиком.
@@ -71,6 +73,8 @@ final class MergeSession: ObservableObject {
             self.editor = editor
             if Self.isUnityYAML(path) || (ours ?? "").hasPrefix("%YAML") {
                 objects = UnityMerge.merge(base: base, ours: ours ?? "", theirs: theirs ?? "")
+            } else if (path as NSString).pathExtension.lowercased() == "json", let ours, let theirs {
+                keys = JSONMerge.merge(base: base, ours: ours, theirs: theirs)
             }
             let names = await Task.detached { Self.branchNames(repository) }.value
             oursName = names.ours

@@ -44,6 +44,7 @@ struct MergeView: View {
     @State private var mode: Mode = .text
     @State private var notice: String?
     @State private var picks: [String: UnityMerge.Pick] = [:]
+    @State private var keyPicks: [String: JSONMerge.Pick] = [:]
     @State private var confirmUnresolved = false
 
     enum Mode: Hashable { case objects, text }
@@ -59,6 +60,8 @@ struct MergeView: View {
                     if mode == .objects, let objects = session.objects {
                         UnityObjectMergeView(session: session, result: objects, picks: $picks,
                                              resolve: { workspace.unity.assets?.displayName(for: $0) })
+                    } else if mode == .objects, let keys = session.keys {
+                        JSONKeyMergeView(result: keys, picks: $keyPicks)
                     } else {
                         headers
                         Divider()
@@ -100,7 +103,7 @@ struct MergeView: View {
         }
         .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .onAppear { if !session.isLoaded { session.load() } }
-        .onChange(of: session.objects != nil) { _, hasObjects in if hasObjects { mode = .objects } }
+        .onChange(of: session.objects != nil || session.keys != nil) { _, structured in if structured { mode = .objects } }
         .background {
             Button("") { dismiss() }.keyboardShortcut("w", modifiers: .command).hidden()
         }
@@ -116,9 +119,9 @@ struct MergeView: View {
 
     private func toolbar(_ editor: MergeEditorModel) -> some View {
         HStack(spacing: 8) {
-            if session.objects != nil {
+            if session.objects != nil || session.keys != nil {
                 Picker("", selection: $mode) {
-                    Text(L("По объектам")).tag(Mode.objects)
+                    Text(session.keys != nil ? L("По ключам") : L("По объектам")).tag(Mode.objects)
                     Text(L("Текстом")).tag(Mode.text)
                 }
                 .pickerStyle(.segmented)
@@ -126,7 +129,7 @@ struct MergeView: View {
                 .fixedSize()
                 .help(L("По объектам — споры по свойствам GameObject'ов и компонентов; текстом — три колонки, как для кода"))
             }
-            if mode == .text || session.objects == nil {
+            if mode == .text || (session.objects == nil && session.keys == nil) {
                 Button { editor.moveToPreviousConflict() } label: { Image(systemName: "chevron.up") }
                     .help(L("Предыдущий конфликт"))
                     .keyboardShortcut(.upArrow, modifiers: [.command, .option])
@@ -156,6 +159,10 @@ struct MergeView: View {
     }
 
     private func summary(_ editor: MergeEditorModel) -> String {
+        if mode == .objects, let keys = session.keys {
+            let open = keys.conflicts.filter { keyPicks[$0.id] == nil }.count
+            return L("Слито само: \(keys.fromTheirs) их правок · споров: \(keys.conflicts.count), нерешено: \(open)")
+        }
         if mode == .objects, let objects = session.objects {
             let open = objects.conflicts.filter { picks[$0.id] == nil }.count
             return L("Слито само: \(objects.fromOurs + objects.fromTheirs) · споров: \(objects.conflicts.count), нерешено: \(open)")
@@ -191,6 +198,9 @@ struct MergeView: View {
             if mode == .objects, let objects = session.objects {
                 Button(L("Все — наши")) { for c in objects.conflicts { picks[c.id] = .ours } }
                 Button(L("Все — их")) { for c in objects.conflicts { picks[c.id] = .theirs } }
+            } else if mode == .objects, let keys = session.keys {
+                Button(L("Все — наши")) { for c in keys.conflicts { keyPicks[c.id] = .ours } }
+                Button(L("Все — их")) { for c in keys.conflicts { keyPicks[c.id] = .theirs } }
             } else {
                 Button(L("Принять левое")) { editor.acceptAll(.ours) }
                     .help(L("Весь файл — нашей версией"))
@@ -217,6 +227,7 @@ struct MergeView: View {
     }
 
     private func unresolved(_ editor: MergeEditorModel) -> Int {
+        if mode == .objects, let keys = session.keys { return keys.conflicts.filter { keyPicks[$0.id] == nil }.count }
         if mode == .objects, let objects = session.objects {
             return objects.conflicts.filter { picks[$0.id] == nil }.count
         }
@@ -224,7 +235,7 @@ struct MergeView: View {
     }
 
     private func save() {
-        let text = mode == .objects ? session.objects?.text(picks) : nil
+        let text = mode == .objects ? (session.keys?.text(keyPicks) ?? session.objects?.text(picks)) : nil
         finish { await session.save(text: text, markResolved: true) }
     }
 
@@ -235,6 +246,80 @@ struct MergeView: View {
                 dismiss()
             }
         }
+    }
+}
+
+/// JSON: споры списком, по путям (`shop.items[id=7].price`). Всё, что
+/// правила одна сторона, уже слито и сюда не попадает.
+struct JSONKeyMergeView: View {
+    let result: JSONMerge.Result
+    @Binding var picks: [String: JSONMerge.Pick]
+
+    var body: some View {
+        if result.conflicts.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "checkmark.circle").font(.system(size: 30, weight: .light))
+                    .foregroundStyle(Color(nsColor: Theme.gitAdded))
+                Text(L("Споров нет — всё слилось по ключам само")).foregroundStyle(.secondary)
+                Text(L("Взято их правок: \(result.fromTheirs), форматирование — наше"))
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(result.conflicts) { conflict in
+                        let pick = picks[conflict.id]
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(conflict.path).font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .textSelection(.enabled)
+                            HStack(alignment: .top, spacing: 10) {
+                                KeySide(label: L("Наше"), value: conflict.ours, chosen: pick == .ours) { picks[conflict.id] = .ours }
+                                KeySide(label: L("Их"), value: conflict.theirs, chosen: pick == .theirs) { picks[conflict.id] = .theirs }
+                            }
+                            if let base = conflict.base {
+                                Text(L("Было: \(base)")).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 6)
+                            .fill(pick == nil ? Color.red.opacity(0.08) : Color(nsColor: Theme.chromeBackground)))
+                        .overlay(RoundedRectangle(cornerRadius: 6)
+                            .stroke(pick == nil ? Color.red.opacity(0.35) : Color(nsColor: Theme.separator)))
+                    }
+                }
+                .padding(14)
+            }
+        }
+    }
+}
+
+private struct KeySide: View {
+    let label: String
+    let value: String?
+    let chosen: Bool
+    let pick: () -> Void
+
+    var body: some View {
+        Button(action: pick) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Image(systemName: chosen ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(chosen ? Color.accentColor : .secondary)
+                    Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                }
+                Text(value ?? L("— удалено —"))
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 5).fill(chosen ? Color.accentColor.opacity(0.18) : .clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

@@ -314,6 +314,13 @@ extension English {
         ("Взять нашу: %@", "Take Ours: %@"),
         ("Взять их: %@", "Take Theirs: %@"),
 
+        // JSON по ключам
+        ("Было: %@", "Base: %@"),
+        ("Взято их правок: %@, форматирование — наше", "Taken from theirs: %@, formatting is ours"),
+        ("По ключам", "By Keys"),
+        ("Слито само: %@ их правок · споров: %@, нерешено: %@", "Merged automatically: %@ of theirs · conflicts: %@, unresolved: %@"),
+        ("Споров нет — всё слилось по ключам само", "No conflicts — everything merged by keys on its own"),
+
         // Версии картинок и моделей
         ("До", "Before"),
         ("На диске", "On Disk"),
