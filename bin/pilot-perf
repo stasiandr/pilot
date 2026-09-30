@@ -7,14 +7,15 @@
 #   bin/pilot-perf --no-compare        только замерить и сохранить
 #   bin/pilot-perf --runs 3            повторов на сборку (по умолчанию 3)
 #   bin/pilot-perf --only open,palette,search
-#   bin/pilot-perf --quick             1 повтор, только окно (open, idle, palette, editor, files)
+#   bin/pilot-perf --quick             1 повтор, только окно (open, idle, palette, editor, files, stability)
 #   bin/pilot-perf --history           прошлые прогоны: главное по каждому
 #
 # Сценарии и места в проекте — в файле сценариев (по умолчанию первый
 # Extensions/*/perf.json, для OneState — clm-client):
 #
 #   окно:      open (проект с кэшами), idle, palette (набор в ⌘P),
-#              editor (набор в C#), files (переходы по файлам)
+#              editor (набор в C#), files (переходы по файлам),
+#              stability (что сдвинулось и перекрасилось после открытия файла)
 #   без окна:  index, search (индексы ⌘P и текст), rustlyn (компилятор), graph (граф значения)
 #
 # Главная мера — миллионы выполненных инструкций (`minstr`): от нагрузки на
@@ -46,13 +47,14 @@ STATE = os.path.join(HOME, "Library/Caches/Pilot-perf")
 RESULTS = os.path.join(HOME, "Library/Application Support/Pilot-perf")
 BUNDLE_ID = "dev.local.pilot.perf"
 
-UI = ["open", "idle", "palette", "editor", "files"]
+UI = ["open", "idle", "palette", "editor", "files", "stability"]
 ENGINE = ["index", "search", "rustlyn"]
 ALL = UI + ENGINE + ["graph"]
 
 # Допуск по единице метрики: доля от эталона и порог, меньше которого
 # разница — шум при любой доле.
-TOLERANCE = {"minstr": (0.03, 2.0), "ms": (0.25, 15.0), "mb": (0.10, 8.0), "n": (0.10, 1.0)}
+TOLERANCE = {"minstr": (0.03, 2.0), "ms": (0.25, 15.0), "mb": (0.10, 8.0), "n": (0.10, 1.0),
+             "score": (0.10, 0.01)}
 # Свой допуск там, где сборка против самой себя (A/A, 3+3 повтора,
 # 2026-09-28) разошлась сильнее общего: работа на букву и после перехода
 # зависит от того, когда успел прийти фоновый ответ компилятора. Инструкции

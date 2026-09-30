@@ -3058,10 +3058,15 @@ final class Workspace: ObservableObject {
             return
         }
         let unityContext = unity.context
+        let rustlyn = self.rustlyn
 
         work.async { [weak self] in
             guard let self else { return }
-            let result = Result { try LoadedDocument.load(url: url, unity: unityContext) }
+            let result = Result {
+                var document = try LoadedDocument.load(url: url, unity: unityContext)
+                document.insights = rustlyn.flatMap { Self.earlyInsights(document, around: reveal, rustlyn: $0) }
+                return document
+            }
             Task { @MainActor in
                 finish()
                 if counter.isCurrent(generation) {
@@ -3128,12 +3133,15 @@ final class Workspace: ObservableObject {
                          replacingReviewTab: Bool = false) {
         previewLoad = nil
         switch result {
-        case .success(let doc):
+        case .success(var doc):
             // Пока файл читался, его могли открыть другим путём.
             if let existing = tab(for: doc.url, revision: doc.revision) {
                 if !preview, reveal == nil { keepTabOpen(existing) }
                 activate(existing, reveal: reveal)
                 return
+            }
+            if let early = doc.insights, let memory = lensMemory[doc.url.path] {
+                doc.insights = early.remembering(memory, units: doc.model.units)
             }
             let buffer = TextBuffer(document: doc, fontSize: fontSize)
             if replacingReviewTab, let current = self.buffer, current.isReviewVersion,
@@ -3889,10 +3897,15 @@ final class Workspace: ObservableObject {
         }
         let generation = diagnosticsGeneration.bump()
         let counter = diagnosticsGeneration
+        // Числа прежней проверки — прежнего файла или прежнего текста — уже
+        // выброшены бы; пусть и не считаются, отнимая ядра у этой.
+        rustlyn.cancelCodeLens()
         let url = buffer.url
         let snapshot = buffer.model.snapshot()
         let id = ObjectIdentifier(buffer)
-        diagnosticsWork.asyncAfter(deadline: .now() + delay) { [weak self] in
+        let scheduled = DispatchTime.now() + delay
+        let queue = diagnosticsWork
+        queue.asyncAfter(deadline: scheduled) { [weak self] in
             guard counter.isCurrent(generation) else { return }
             let found = rustlyn.diagnostics(url, text: snapshot.text)
             Task { @MainActor in
@@ -3903,26 +3916,125 @@ final class Workspace: ObservableObject {
                 self.diagnosticsVersion += 1
             }
             // Подсказки и счётчики — следом, тем же снимком: ошибки не ждут
-            // поиска по проекту, который нужен счётчикам.
+            // поиска по проекту, который нужен счётчикам. И подсказки его не
+            // ждут: они со своими местами счётчиков уходят на экран сразу, с
+            // прежними числами, а свежие числа — последними, одной подписью,
+            // ничего не сдвигая.
             guard counter.isCurrent(generation) else { return }
             let hints = rustlyn.inlayHints(url, text: snapshot.text,
                                            range: NSRange(location: 0, length: snapshot.units.count))
             guard counter.isCurrent(generation) else { return }
-            let lenses = rustlyn.codeLens(url, text: snapshot.text)
-            Task { @MainActor in
-                guard let self, counter.isCurrent(generation), let buffer = self.buffer,
-                      ObjectIdentifier(buffer) == id, buffer.model.version == snapshot.version else { return }
-                // Проект ещё не скомпилирован — прежние остаются: они
-                // сдвигаются вместе с правками и лучше, чем ничего.
-                if hints == nil, lenses == nil, self.insightsBuffer == id { return }
-                let found = RustlynInsights(hints: hints ?? [], lenses: lenses ?? [])
-                self.currentInsights = found
-                self.insightsBuffer = id
-                buffer.insights = (snapshot.version, found)
-                self.insightsVersion += 1
+            let places = rustlyn.codeLensPlaces(url, text: snapshot.text)
+            let publish = { (hints: [RustlynInlayHint]?, lenses: [RustlynLens]?, counted: Bool) in
+                _ = Task { @MainActor in
+                    guard let self, counter.isCurrent(generation), let buffer = self.buffer,
+                          ObjectIdentifier(buffer) == id, buffer.model.version == snapshot.version else { return }
+                    // Проект ещё не скомпилирован — прежние остаются: они
+                    // сдвигаются вместе с правками и лучше, чем ничего.
+                    if hints == nil, lenses == nil, self.insightsBuffer == id { return }
+                    var found = RustlynInsights(hints: hints ?? [], lenses: lenses ?? [])
+                    // Подсказки с местами счётчиков — промежуточные: нужны, только
+                    // если на экране мест ещё нет. Есть (посчитаны при открытии) —
+                    // подсказки за краем экрана подождут чисел: каждая публикация
+                    // здесь перерисовывает всё окно.
+                    if !counted, let shown = buffer.insights, shown.version == snapshot.version,
+                       shown.found.lenses.map(\.range) == found.lenses.map(\.range) { return }
+                    if counted {
+                        self.rememberLensCounts(found.lenses, of: url, units: snapshot.units)
+                    } else if let memory = self.lensMemory[url.path] {
+                        found = found.remembering(memory, units: snapshot.units)
+                    }
+                    guard found != self.currentInsights || self.insightsBuffer != id else { return }
+                    // Те же, что на экране (вернулись на вкладку, числа не
+                    // изменились), — запомнить, а окно не будить.
+                    let unchanged = buffer.insights.map { $0.version == snapshot.version && $0.found == found } ?? false
+                    self.currentInsights = found
+                    self.insightsBuffer = id
+                    buffer.insights = (snapshot.version, found)
+                    if !unchanged { self.insightsVersion += 1 }
+                }
+            }
+            publish(hints, places, false)
+            // Числа — поиск по всему проекту на все ядра. Кто листает файлы,
+            // на каждом задерживается на миг, и считать для него — отнимать
+            // процессор у открытия следующего. Место под счётчики уже есть,
+            // так что подождать ничего не стоит: ушли — не считаем вовсе.
+            queue.asyncAfter(deadline: scheduled + Self.lensCountDelay) {
+                guard counter.isCurrent(generation) else { return }
+                let lenses = rustlyn.codeLens(url, text: snapshot.text)
+                publish(hints, lenses ?? places, lenses != nil)
             }
         }
     }
+
+    /// Сколько файл должен пробыть на экране, прежде чем считать числа его
+    /// счётчиков, — отсчёт от проверки, которую он заказал.
+    nonisolated static let lensCountDelay: Double = 0.4
+
+    /// Числа счётчиков, сосчитанные для файла, — по имени объявления (см.
+    /// `RustlynInsights.keys`): при следующем открытии и после правки
+    /// счётчик сразу с числом, а свежее число приходит на его место.
+    private var lensMemory: [String: [String: Int]] = [:]
+
+    private func rememberLensCounts(_ lenses: [RustlynLens], of url: URL, units: [UInt16]) {
+        var memory: [String: Int] = [:]
+        for (lens, key) in zip(lenses, RustlynInsights.keys(lenses, units: units)) {
+            if let count = lens.count { memory[key] = count }
+        }
+        lensMemory[url.path] = memory
+    }
+
+    /// Подсказки первого экрана и места счётчиков — при чтении файла, в фоне,
+    /// до показа: первый кадр уже с ними, и строки потом не едут ни вниз
+    /// (место под счётчик), ни вбок (подсказка). Первый экран — вокруг места
+    /// перехода или от начала файла; подсказки остального приходят после
+    /// проверки, за краем экрана. Rustlyn отвечает на это только про файл,
+    /// который он скомпилировал, — иначе nil, и всё приходит как прежде.
+    ///
+    /// Переход их не ждёт дольше `earlyBudget`: пока Rustlyn считает счётчики
+    /// прежнего файла по всему проекту, те же вопросы отвечаются сотнями
+    /// миллисекунд — тогда файл показывается без них, а они приходят, как
+    /// приходили до этого, после проверки.
+    nonisolated static func earlyInsights(_ document: LoadedDocument, around reveal: LSPRange?,
+                                          rustlyn: Rustlyn) -> RustlynInsights? {
+        final class Answer: @unchecked Sendable {
+            let lock = NSLock()
+            var value: RustlynInsights?
+            let done = DispatchSemaphore(value: 0)
+        }
+        let answer = Answer()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let found = computeEarlyInsights(document, around: reveal, rustlyn: rustlyn)
+            answer.lock.withLock { answer.value = found }
+            answer.done.signal()
+        }
+        guard answer.done.wait(timeout: .now() + earlyBudget) == .success else { return nil }
+        return answer.lock.withLock { answer.value }
+    }
+
+    /// Сколько переход ждёт подсказки первого экрана. Без чужой работы в
+    /// Rustlyn они отвечаются за миллисекунду-две.
+    nonisolated static let earlyBudget: DispatchTimeInterval = .milliseconds(40)
+
+    nonisolated private static func computeEarlyInsights(_ document: LoadedDocument, around reveal: LSPRange?,
+                                                         rustlyn: Rustlyn) -> RustlynInsights? {
+        let url = document.url
+        guard document.revision == nil, document.decompiled == nil, Rustlyn.understands(url) else { return nil }
+        let model = document.model
+        guard let places = rustlyn.codeLensPlaces(url, text: nil) else { return nil }
+        let center = reveal.map { $0.start.line } ?? 0
+        let first = max(0, center - earlyLines), last = min(model.lineCount - 1, center + earlyLines)
+        var hints: [RustlynInlayHint] = []
+        if first <= last {
+            let lower = model.lineRange(first).lowerBound, upper = model.lineRange(last).upperBound
+            hints = rustlyn.inlayHints(url, text: nil, range: NSRange(location: lower, length: upper - lower)) ?? []
+        }
+        return RustlynInsights(hints: hints, lenses: places)
+    }
+
+    /// Строк выше и ниже места перехода, что считаются первым экраном: с
+    /// запасом на высокое окно и на то, что переход ставит строку в середину.
+    nonisolated static let earlyLines = 120
 
     // MARK: - Подсказки в строках и счётчики использований
 

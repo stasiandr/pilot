@@ -16,7 +16,10 @@ import Combine
 ///   сколько раз будили всё окно (`Workspace.objectWillChange`) и сколько раз
 ///   писали в UserDefaults — и то и другое перерисовывает всё приложение;
 /// * `editor` — набор в C#-файле, то же на букву;
-/// * `files` — переходы по файлам: первое открытие и возврат на вкладку.
+/// * `files` — переходы по файлам: первое открытие и возврат на вкладку;
+/// * `stability` — как CLS в вебе: сколько после первого кадра файл
+///   сдвигался и перекрашивался, и не осталась ли подсветка неверной
+///   (см. EditorStability).
 ///
 /// Строка JSON на сценарий — в `PILOT_PERF_OUT` (см. PerfReport). Скрытое окно
 /// не рисуется, поэтому числа меньше того, что видит пользователь:
@@ -54,6 +57,9 @@ enum PerfUI {
         }
         if PerfConfig.wants("files"), let files = config.files, !files.isEmpty {
             guard await switchFiles(files, config: config, workspace: workspace) else { return 1 }
+        }
+        if PerfConfig.wants("stability"), let files = config.stability, !files.isEmpty {
+            guard await stability(files, config: config, workspace: workspace) else { return 1 }
         }
         return 0
     }
@@ -403,6 +409,53 @@ enum PerfUI {
             metrics["files.\(pass).longest.ms"] = longest.max() ?? 0
         }
         PerfReport.emit("files", metrics, info: ["files": "\(files.count)"])
+        return true
+    }
+
+    // MARK: - Стабильность открытия
+
+    private static func stability(_ files: [String], config: PerfConfig, workspace: Workspace) async -> Bool {
+        guard let probe = EditorStability.shared else { return false }
+        probe.isArmed = true
+        defer { probe.isArmed = false }
+        var metrics: [String: Double] = [:]
+        var info: [String: String] = [:]
+        // Первый проход открывает файлы, второй — возвращается на вкладки.
+        for pass in ["open", "tab"] {
+            var reports: [EditorStability.Report] = []
+            for entry in files {
+                var relative = entry
+                var range: LSPRange?
+                if let colon = entry.lastIndex(of: ":"), let line = Int(entry[entry.index(after: colon)...]) {
+                    relative = String(entry[..<colon])
+                    let place = LSPPosition(line: line - 1, character: 0)
+                    if pass == "open" { range = LSPRange(start: place, end: place) }
+                }
+                let url = config.url(relative)
+                workspace.navigate(to: NavTarget(url: url, range: range))
+                guard await wait("вкладка \(relative)", timeout: 20, pollMs: 5, {
+                    workspace.buffer?.url.path == url.path && probe.quietMs != nil
+                }) else { return false }
+                // Всё, что открытие запустило следом, — диагностика, подсказки,
+                // счётчики с поиском по проекту, — должно дойти до экрана.
+                _ = await wait("экран \(relative) успокоился", timeout: 30, pollMs: 50) { (probe.quietMs ?? 0) > 1500 }
+                await quiet(window: 500, share: 0.2, timeout: 30)
+                _ = await wait("экран \(relative) успокоился", timeout: 30, pollMs: 50) { (probe.quietMs ?? 0) > 1500 }
+                let report = probe.finish()
+                PerfReport.log("[\(pass)] " + report.summary)
+                reports.append(report)
+            }
+            func total(_ value: (EditorStability.Report) -> Double) -> Double { reports.reduce(0) { $0 + value($1) } }
+            metrics["stability.\(pass).shift.score"] = total(\.shiftScore)
+            metrics["stability.\(pass).shifts.n"] = total { Double($0.shifts) }
+            metrics["stability.\(pass).recolored.n"] = total { Double($0.recoloredChars) }
+            metrics["stability.\(pass).lens.n"] = total { Double($0.lensChanges) }
+            metrics["stability.\(pass).wrong.n"] = total { Double($0.wrongChars) }
+            metrics["stability.\(pass).first.ms"] = PerfReport.mean(reports.map(\.firstMs))
+            metrics["stability.\(pass).settled.ms"] = PerfReport.mean(reports.map(\.settledMs))
+            info["\(pass).chars"] = "\(Int(total { Double($0.chars) }))"
+        }
+        PerfReport.emit("stability", metrics, info: info.merging(["files": "\(files.count)"]) { a, _ in a })
         return true
     }
 

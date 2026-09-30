@@ -17,6 +17,14 @@
     "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",
     "Assets/dev/Scripts/ECS/Morpeh/Features/PedViewFeature/Character Controller Pro/Core/Scripts/Character/CharacterActor.cs"
   ],
+  "stability": [
+    "Assets/dev/Scripts/GlobalUtils/RarityLocalizationUtils.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/MusicFeature/Systems/MusicInitializeSystem.cs",
+    "Assets/dev/Scripts/GUI/MonoBehaviourComponents/Store/TuningStore/GuiTuningStoreCartComponent.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/PedViewFeature/PedViewFeature/StateMachine/DataContainers/PedViewStatesData.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/PaymentsFeature/Systems/Native/NativePurchaseStore.cs:250",
+    "Assets/dev/Scripts/GUI/MonoBehaviourComponents/GuiItemActionMenuPanel.cs"
+  ],
   "text_query": "vehicleInfosList",
   "completion": {
     "file": "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",

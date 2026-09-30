@@ -100,6 +100,8 @@ final class Rustlyn: @unchecked Sendable {
     func signatures(_ url: URL, offset: Int, text: String?) -> RustlynSignatures? { nil }
     func inlayHints(_ url: URL, text: String?, range: NSRange) -> [RustlynInlayHint]? { nil }
     func codeLens(_ url: URL, text: String?) -> [RustlynLens]? { nil }
+    func codeLensPlaces(_ url: URL, text: String?) -> [RustlynLens]? { nil }
+    func cancelCodeLens() {}
     func documentation(_ url: URL, offset: Int, text: String?) -> RustlynDocumentation? { nil }
     func selectionRanges(_ url: URL, selection: NSRange, text: String?) -> [NSRange]? { nil }
     func prepareRename(_ url: URL, offset: Int, text: String?) -> RustlynRenameInfo? { nil }
