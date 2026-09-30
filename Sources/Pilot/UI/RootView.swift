@@ -442,36 +442,15 @@ struct RootView: View {
         return workspace.run.isRunning ? L("Перезапустить «\(name)»") : L("Запустить «\(name)»")
     }
 
+    /// Имя проекта. Ветка — в строке под редактором (там же попап веток),
+    /// в заголовке она повторялась бы.
     private var titleView: some View {
-        let branch = workspace.git.status?.headLabel ?? workspace.branch
-        return HStack(spacing: compact ? 6 : 8) {
-            if branch != nil {
-                Image(systemName: "arrow.triangle.branch")
-                    .font(.system(size: compact ? 11 : 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-            // В компактном тулбаре на две строки нет высоты — ветка встаёт
-            // рядом с именем проекта.
-            let layout = compact
-                ? AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 6))
-                : AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
-            layout {
-                Text(workspace.root?.lastPathComponent ?? "Pilot")
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1)
-                    .layoutPriority(1)
-                if let branch {
-                    Text(branch)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
+        Text(workspace.root?.lastPathComponent ?? "Pilot")
+            .font(.system(size: 13, weight: .semibold))
+            .lineLimit(1)
             .frame(maxWidth: compact ? 280 : 170, alignment: .leading)
-        }
-        .padding(.horizontal, 4)
-        .help(workspace.git.status.map { branchHelp($0, changed: workspace.git.changedCount) } ?? "")
+            .padding(.horizontal, 4)
+            .help(workspace.git.status.map { branchHelp($0, changed: workspace.git.changedCount) } ?? "")
     }
 
     // MARK: - Статусная строка

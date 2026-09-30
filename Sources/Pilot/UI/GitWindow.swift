@@ -22,10 +22,6 @@ struct GitPanel: View {
             }
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if client.busy != nil || client.error != nil || client.notice != nil {
-                Divider()
-                GitClientStatus(client: client)
-            }
         }
         .frame(height: fixedHeight ?? height)
         .background(Color(nsColor: Theme.swiftUIEditorBackground))
@@ -82,7 +78,10 @@ struct GitPanel: View {
                 }
                 .buttonStyle(.plain)
             }
-            Spacer()
+            Spacer(minLength: 12)
+            // Что делается и чем кончилось — в шапке, одной строкой: строка
+            // снизу появлялась и пропадала и дёргала всю панель.
+            GitClientStatus(client: client, compact: true)
             Button { client.fetch() } label: { Image(systemName: "arrow.down.circle") }
                 .help(L("Получить с сервера") + " — git fetch --all --prune")
             Button { client.pull() } label: { Image(systemName: "arrow.down.to.line") }
@@ -98,19 +97,29 @@ struct GitPanel: View {
         .frame(height: 30)
     }
 
-    @ViewBuilder
+    /// Коммит и лог не пересоздаются при переключении вкладок — только
+    /// прячутся: иначе разделители колонок возвращались бы на место, а
+    /// списки мигали бы пустыми, пока git отвечает заново.
     private var content: some View {
-        switch client.windowTab {
-        case .commit: CommitView(workspace: workspace, commits: workspace.commits)
-        case .history:
+        ZStack {
+            CommitView(workspace: workspace, commits: workspace.commits)
+                .opacity(client.windowTab == .commit ? 1 : 0)
+                .allowsHitTesting(client.windowTab == .commit)
+                .accessibilityHidden(client.windowTab != .commit)
             HSplitView {
                 GitBranchTree(workspace: workspace, client: client, history: workspace.gitHistory)
                     .frame(minWidth: 160, idealWidth: 200, maxWidth: 320)
                 GitHistoryView(workspace: workspace, history: workspace.gitHistory, client: client)
                     .frame(minWidth: 600, maxWidth: .infinity)
             }
-        case .stash: GitStashView(client: client)
-        case .journal: GitJournalView(client: client)
+            .opacity(client.windowTab == .history ? 1 : 0)
+            .allowsHitTesting(client.windowTab == .history)
+            .accessibilityHidden(client.windowTab != .history)
+            switch client.windowTab {
+            case .stash: GitStashView(client: client)
+            case .journal: GitJournalView(client: client)
+            case .commit, .history: EmptyView()
+            }
         }
     }
 
@@ -207,31 +216,35 @@ private struct TuningBanner: View {
 
 struct GitClientStatus: View {
     @ObservedObject var client: GitClient
+    /// Одной строкой в шапке панели: длинная ошибка — в подсказке и в консоли.
+    var compact = false
 
     var body: some View {
         HStack(spacing: 6) {
             if let busy = client.busy {
                 ProgressView().controlSize(.mini)
-                Text(busy).foregroundStyle(.secondary)
+                Text(busy).foregroundStyle(.secondary).lineLimit(1)
             } else if let error = client.error {
                 Image(systemName: "xmark.octagon").foregroundStyle(Color(nsColor: Theme.diagnosticError))
-                Text(error)
-                    .font(.system(size: 11, design: .monospaced))
+                Text(compact ? error.replacingOccurrences(of: "\n", with: " ") : error)
+                    .font(.system(size: 11, design: compact ? .default : .monospaced))
                     .foregroundStyle(Color(nsColor: Theme.diagnosticError))
                     .textSelection(.enabled)
-                    .lineLimit(4)
-                Spacer()
-                Button(L("Журнал")) { client.windowTab = .journal }.controlSize(.small)
+                    .lineLimit(compact ? 1 : 4)
+                    .truncationMode(.tail)
+                    .help(error)
+                Button(L("Консоль")) { client.windowTab = .journal }.controlSize(.small)
                 Button { client.error = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
             } else if let notice = client.notice {
                 Image(systemName: "checkmark.circle").foregroundStyle(Color(nsColor: Theme.gitAdded))
-                Text(notice).foregroundStyle(.secondary)
+                Text(notice).foregroundStyle(.secondary).lineLimit(1)
             }
-            Spacer(minLength: 0)
+            if !compact { Spacer(minLength: 0) }
         }
         .font(.system(size: 11))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, compact ? 0 : 12)
+        .padding(.vertical, compact ? 0 : 6)
+        .frame(maxWidth: compact ? 520 : nil, alignment: .trailing)
     }
 }
 

@@ -127,10 +127,8 @@ final class GitHistoryModel: ObservableObject {
         didSet { if selection != oldValue { loadSelection() } }
     }
     @Published private(set) var details: Details?
-    @Published var selectedFile: String? {
-        didSet { if selectedFile != oldValue { loadFilePatch() } }
-    }
-    @Published private(set) var filePatch: GitFilePatch?
+    /// Выбранный файл коммита: двойной клик — изменения в редакторе.
+    @Published var selectedFile: String?
     @Published var comparison: Comparison? {
         didSet { if comparison != oldValue { loadComparison() } }
     }
@@ -170,21 +168,15 @@ final class GitHistoryModel: ObservableObject {
         reload()
     }
 
+    /// Перечитать. То, что на экране, остаётся, пока не придёт новое, и
+    /// заменяется разом: иначе после каждого коммита или переключения
+    /// режима список мигал бы пустым. Выбранный коммит остаётся выбранным,
+    /// если он есть и в новом списке.
     func reload() {
         generation += 1
-        layout = GitGraphLayout()
-        commits = []
-        known = []
-        rows = []
-        mainline = []
-        children = [:]
-        hiddenBackMerges = [:]
-        expanded = []
-        registry = [:]
-        overview = nil
+        replaceOnArrival = true
         hasMore = false
         error = nil
-        selection = nil
         // История файла или строк — всегда плоским списком: «моя ветка»
         // к ней не относится.
         switch filter.path == nil ? mode : .graph {
@@ -202,6 +194,34 @@ final class GitHistoryModel: ObservableObject {
 
     private func register(_ commits: [GitCommitInfo]) {
         for commit in commits { registry[commit.hash] = commit }
+    }
+
+    /// Следующий ответ заменяет показанное, а не дописывается к нему.
+    private var replaceOnArrival = false
+
+    /// Пришёл ответ после `reload`: старое — долой, разом.
+    private func replaceIfNeeded() {
+        guard replaceOnArrival else { return }
+        replaceOnArrival = false
+        layout = GitGraphLayout()
+        commits = []
+        known = []
+        rows = []
+        mainline = []
+        children = [:]
+        hiddenBackMerges = [:]
+        registry = [:]
+        overview = nil
+    }
+
+    /// После замены: прежний выбор, если он ещё есть, иначе первый.
+    private func keepSelection(first: String?) {
+        if let selection, registry[selection] != nil {
+            loadSelection()
+        } else {
+            selection = first
+        }
+        expanded = expanded.filter { registry[$0] != nil }
     }
 
     // MARK: - Основная ветка
@@ -231,10 +251,11 @@ final class GitHistoryModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.generation == current else { return }
                 self.isLoading = false
+                self.replaceIfNeeded()
                 self.overview = overview
                 if let overview {
                     self.register(overview.commits + [overview.forkPoint].compactMap { $0 })
-                    self.selection = overview.commits.first?.hash ?? overview.forkPoint?.hash
+                    self.keepSelection(first: overview.commits.first?.hash ?? overview.forkPoint?.hash)
                 } else {
                     self.error = L("Не нашлась основная ветка (origin/HEAD, main или master)")
                 }
@@ -283,7 +304,7 @@ final class GitHistoryModel: ObservableObject {
         guard let repository else { return }
         isLoading = true
         let current = generation
-        let skip = mainline.count
+        let skip = replaceOnArrival ? 0 : mainline.count
         let text = filter.text.trimmingCharacters(in: .whitespaces)
         let author = filter.author.trimmingCharacters(in: .whitespaces)
         let scopeRef: String? = {
@@ -307,10 +328,11 @@ final class GitHistoryModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.generation == current else { return }
                 self.isLoading = false
+                self.replaceIfNeeded()
                 self.mainline += entries
                 self.register(page)
                 self.hasMore = page.count >= Self.pageSize
-                if self.selection == nil, skip == 0 { self.selection = entries.first?.id }
+                if skip == 0 { self.keepSelection(first: entries.first?.id) }
             }
         }
     }
@@ -367,7 +389,7 @@ final class GitHistoryModel: ObservableObject {
         guard let repository else { return }
         isLoading = true
         let current = generation
-        let skip = commits.count
+        let skip = replaceOnArrival ? 0 : commits.count
         let arguments = arguments(skip: skip)
         // Хэш в поиске: сначала пробуем как ревизию.
         let text = filter.text.trimmingCharacters(in: .whitespaces)
@@ -391,6 +413,7 @@ final class GitHistoryModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.generation == current else { return }
                 self.isLoading = false
+                self.replaceIfNeeded()
                 self.error = failure
                 // Со -L git не умеет --skip — всё приходит первой страницей.
                 let fresh = page.filter { self.known.insert($0.hash).inserted }
@@ -401,18 +424,21 @@ final class GitHistoryModel: ObservableObject {
                 self.register(fresh)
                 self.rows += newRows
                 self.hasMore = page.count >= Self.pageSize && self.filter.lines == nil
-                if self.selection == nil, skip == 0 { self.selection = self.commits.first?.hash }
+                if skip == 0 { self.keepSelection(first: self.commits.first?.hash) }
             }
         }
     }
 
     // MARK: - Выбранный коммит
 
+    /// Прежние подробности висят, пока не придут новые: спиннер на каждый
+    /// клик по коммиту дёргал бы панель.
     private func loadSelection() {
-        details = nil
-        selectedFile = nil
-        filePatch = nil
-        guard let repository, let commit = selectedCommit else { return }
+        guard let repository, let commit = selectedCommit else {
+            details = nil
+            selectedFile = nil
+            return
+        }
         let current = generation
         queue.async { [weak self] in
             let body = Git.run(["show", "-s", "--format=%B", commit.hash], in: repository)
@@ -426,45 +452,14 @@ final class GitHistoryModel: ObservableObject {
             let files = Git.run(arguments, in: repository).map { GitChangedFile.parse($0.stdout) } ?? []
             Task { @MainActor in
                 guard let self, self.generation == current, self.selection == commit.hash else { return }
-                self.details = Details(commit: commit, body: body, files: files, parent: parent)
-                // История файла — сразу его дифф.
+                let fresh = Details(commit: commit, body: body, files: files, parent: parent)
+                if self.details != fresh { self.details = fresh }
+                // История файла — сразу он; прежний выбор, если файл есть и тут.
                 if let path = self.filter.path, files.contains(where: { $0.path == path }) {
                     self.selectedFile = path
-                } else {
+                } else if !files.contains(where: { $0.path == self.selectedFile }) {
                     self.selectedFile = files.first?.path
                 }
-            }
-        }
-    }
-
-    private func loadFilePatch() {
-        filePatch = nil
-        guard let repository, let path = selectedFile else { return }
-        let range: (String?, String)
-        if let comparison {
-            range = (comparison.base, comparison.target)
-        } else if let details {
-            range = (details.parent, details.commit.hash)
-        } else {
-            return
-        }
-        let original = (comparison == nil ? details?.files : comparisonFiles)?.first { $0.path == path }?.originalPath
-        let comparing = comparison != nil
-        queue.async { [weak self] in
-            var arguments: [String]
-            if let base = range.0 {
-                // Сравнение веток — от их общего предка (`...`), как в MR.
-                arguments = ["diff", "--no-color", "--no-ext-diff", "-U3", "-M"]
-                    + (comparing ? ["\(base)...\(range.1)"] : [base, range.1])
-            } else {
-                arguments = ["show", "--format=", "--no-color", "--no-ext-diff", "-U3", range.1]
-            }
-            arguments += ["--", path] + (original.map { [$0] } ?? [])
-            let patch = Git.run(arguments, in: repository)
-                .map { GitFilePatch.parse(String(decoding: $0.stdout, as: UTF8.self)) }
-            Task { @MainActor in
-                guard let self, self.selectedFile == path else { return }
-                self.filePatch = patch
             }
         }
     }
@@ -474,7 +469,6 @@ final class GitHistoryModel: ObservableObject {
     private func loadComparison() {
         comparisonFiles = []
         selectedFile = nil
-        filePatch = nil
         guard let repository, let comparison else { return }
         queue.async { [weak self] in
             let files = Git.run(["diff", "--name-status", "-z", "-M", "\(comparison.base)...\(comparison.target)"],
@@ -485,6 +479,16 @@ final class GitHistoryModel: ObservableObject {
                 self.selectedFile = files.first?.path
             }
         }
+    }
+
+    /// Общий предок двух ревизий — от него считается сравнение веток.
+    func mergeBase(_ a: String, _ b: String) async -> String? {
+        guard let repository else { return nil }
+        return await Task.detached {
+            guard let output = Git.run(["merge-base", a, b], in: repository), output.status == 0 else { return nil }
+            let hash = String(decoding: output.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            return hash.isEmpty ? nil : hash
+        }.value
     }
 
     /// Текст файла в коммите — открыть версию целиком.

@@ -2,7 +2,6 @@
 extension English {
     static let git: [(String, String)] = [
         // Окно git
-        ("Журнал", "Log"),
         ("Спрятать правки и переключить", "Stash Changes and Switch"),
         ("Правки уйдут в stash, ветка переключится, и они вернутся. Если не лягут — останутся в stash.",
          "Changes go to the stash, the branch switches, and they come back. If they don’t apply, they stay in the stash."),
@@ -193,6 +192,9 @@ extension English {
         ("История файла или выделения", "File or Selection History"),
         ("У этого файла нет истории в git", "This file has no git history"),
         ("История строк", "Line History"),
+
+        ("Двойной клик или Return — изменения файла в редакторе", "Double-click or Return — the file’s changes in the editor"),
+        ("Открыть изменения", "Open Changes"),
 
         // Панель git и строка под редактором
         ("Панель git", "Git Panel"),

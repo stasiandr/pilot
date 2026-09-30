@@ -94,6 +94,47 @@ extension Workspace {
         }
     }
 
+    // MARK: - Изменения файла в коммите
+
+    /// Изменения версии, открытой в редакторе, против её родителя.
+    var revisionDiff: RevisionDiff? {
+        guard let document, let revision = document.revision else { return nil }
+        return revisionDiffs[revision + "\n" + document.url.path]
+    }
+
+    /// Файл из истории — вкладкой редактора: его версия в `revision`,
+    /// изменения против `base` полосками и удалёнными строками в тексте,
+    /// курсор — на первом изменении. Удалённый файл — версия из `base`.
+    func openChanges(path: String, originalPath: String? = nil, revision: String, base: String?, deleted: Bool) {
+        guard let repository = git.repository else { return }
+        Task {
+            let texts = await Task.detached(priority: .userInitiated) { () -> (new: String?, old: String?) in
+                func show(_ ref: String?, _ path: String) -> String? {
+                    guard let ref, let output = Git.run(["show", "\(ref):\(path)"], in: repository),
+                          output.status == 0 else { return nil }
+                    return String(data: output.stdout, encoding: .utf8) ?? String(decoding: output.stdout, as: UTF8.self)
+                }
+                return (deleted ? nil : show(revision, path), show(base, originalPath ?? path))
+            }.value
+            if deleted {
+                guard let old = texts.old, let base else {
+                    showNotice(L("Не удалось прочитать \(path)"))
+                    return
+                }
+                openRevision(path: originalPath ?? path, revision: base, text: old)
+                return
+            }
+            guard let new = texts.new else {
+                showNotice(L("Не удалось прочитать \(path) в \(String(revision.prefix(8)))"))
+                return
+            }
+            let diff = RevisionDiff(old: texts.old ?? "", new: new)
+            let url = repository.appendingPathComponent(path)
+            revisionDiffs[revision + "\n" + url.path] = diff
+            openRevision(path: path, revision: revision, text: new, line: diff.changes.first?.lines.lowerBound)
+        }
+    }
+
     // MARK: - Авторы строк
 
     /// Колонка авторов для редактора: только когда включена и blame посчитан.
@@ -260,5 +301,29 @@ extension Workspace {
             commits.refresh()
             git.refresh()
         }
+    }
+}
+
+/// Изменения версии файла против другой: полоски у номеров и удалённые
+/// строки, как у файла MR. Для версий из истории git — во вкладке версии.
+struct RevisionDiff: Equatable {
+    var changes: [LineDiff.Change]
+    var oldLines: [String]
+
+    init(old: String, new: String) {
+        changes = LineDiff.changes(old: old, new: new)
+        oldLines = old.components(separatedBy: "\n").map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+    }
+
+    /// Удалённое — над строкой, с которой начинается изменение.
+    var removedLines: [RemovedLines] {
+        changes.filter { !$0.oldLines.isEmpty && $0.oldLines.upperBound <= oldLines.count }
+            .map { RemovedLines(line: $0.lines.lowerBound, lines: Array(oldLines[$0.oldLines])) }
+    }
+
+    func removed(at line: Int) -> [String]? {
+        guard let change = changes.first(where: { $0.lines.contains(line) || ($0.lines.isEmpty && $0.lines.lowerBound == line) }),
+              !change.oldLines.isEmpty, change.oldLines.upperBound <= oldLines.count else { return nil }
+        return Array(oldLines[change.oldLines])
     }
 }

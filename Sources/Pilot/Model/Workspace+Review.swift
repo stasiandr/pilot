@@ -20,6 +20,7 @@ extension Workspace {
     /// Полоски в колонке номеров: у файла MR — против базы MR, у рабочей
     /// копии — против HEAD. У удалённого файла полосок нет: он весь удалён.
     var editorLineChanges: [LineDiff.Change] {
+        if let diff = revisionDiff { return diff.changes }
         if let file = currentReviewFile { return file.raw.deletedFile ? [] : file.diff.changes }
         return document?.revision == nil ? git.lineChanges : []
     }
@@ -28,6 +29,7 @@ extension Workspace {
     /// которой начинается изменение. У удалённого файла их нет: он показан
     /// из базы MR целиком.
     var editorRemovedLines: [RemovedLines] {
+        if let diff = revisionDiff { return diff.removedLines }
         guard let file = currentReviewFile, !file.raw.deletedFile else { return [] }
         return file.diff.blocks.filter { !$0.removed.isEmpty }
             .map { RemovedLines(line: $0.newLines.lowerBound, lines: $0.removed) }
@@ -49,6 +51,7 @@ extension Workspace {
     /// Что было на месте строки до изменений: в MR — по диффу GitLab,
     /// в рабочей копии — по HEAD.
     func removedLines(at line: Int) -> [String]? {
+        if let diff = revisionDiff { return diff.removed(at: line) }
         if let file = currentReviewFile {
             guard !file.raw.deletedFile, let removed = file.diff.block(atNewLine: line)?.removed,
                   !removed.isEmpty else { return nil }

@@ -62,6 +62,8 @@ final class GitCommitService: ObservableObject {
     /// После коммита, push и прочего, что двигает HEAD, — пусть остальные
     /// (полоски, история) перечитают.
     var onRepositoryChanged: (() -> Void)?
+    /// После подготовки и отката: HEAD на месте, историю перечитывать незачем.
+    var onIndexChanged: (() -> Void)?
 
     private let queue = DispatchQueue(label: "pilot.git.commit", qos: .userInitiated)
     private var generation = 0
@@ -458,7 +460,7 @@ final class GitCommitService: ObservableObject {
                 if self.pending == 0 {
                     self.busy = nil
                     self.refresh()
-                    self.onRepositoryChanged?()
+                    self.onIndexChanged?()
                 }
             }
         }

@@ -300,6 +300,10 @@ final class Workspace: ObservableObject {
     var mergeSessions: [String: MergeSession] = [:]
     /// Панель git под редактором.
     @Published var showsGitPanel = false
+    /// Изменения версий файлов из истории против их родителя: полоски и
+    /// удалённые строки во вкладке версии, как у файла MR. Ключ —
+    /// `ревизия\nпуть`.
+    var revisionDiffs: [String: RevisionDiff] = [:]
     /// Авторы строк в колонке номеров, как «Annotate» в Rider.
     @Published var showsBlame = false
     /// Собранная колонка авторов и для какого blame.
@@ -368,6 +372,11 @@ final class Workspace: ObservableObject {
         })
         commits.beforeDiscard = { [weak self] url in self?.recordBeforeDiscard(url) }
         commits.onRepositoryChanged = { [weak self] in self?.gitRepositoryChanged() }
+        commits.onIndexChanged = { [weak self] in
+            guard let self else { return }
+            self.git.refresh()
+            if let document = self.document { self.git.documentEdited(document) }
+        }
         gitClient.onRepositoryChanged = { [weak self] in self?.gitRepositoryChanged() }
         gitClient.beforeCheckout = { [weak self] in self?.confirmUnsavedBeforeCheckout() ?? true }
         debug.onShowLocation = { [weak self] url, line in self?.showDebugLocation(url, line: line) }
@@ -3155,14 +3164,15 @@ final class Workspace: ObservableObject {
 
     /// Файл в версии из истории git — вкладкой только для чтения, как
     /// версия из MR.
-    func openRevision(path: String, revision: String, text: String) {
+    func openRevision(path: String, revision: String, text: String, line: Int? = nil) {
         guard let repository = git.repository else { return }
         let url = repository.appendingPathComponent(path)
         Task {
             let result = await Task.detached(priority: .userInitiated) {
                 Result { try LoadedDocument.make(url: url, data: Data(text.utf8), revision: revision) }
             }.value
-            self.present(result, reveal: nil)
+            let reveal = line.map { LSPRange(start: LSPPosition(line: $0, character: 0), end: LSPPosition(line: $0, character: 0)) }
+            self.present(result, reveal: reveal)
             self.bringToFront()
         }
     }

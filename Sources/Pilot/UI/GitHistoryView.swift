@@ -15,18 +15,13 @@ struct GitHistoryView: View {
             if let comparison = history.comparison {
                 comparisonBar(comparison)
                 Divider()
-                HSplitView {
-                    fileList(history.comparisonFiles, revision: comparison.target)
-                        .frame(minWidth: 260, idealWidth: 320, maxWidth: 480)
-                    PatchView(patch: history.selectedFile == nil ? GitFilePatch() : history.filePatch)
-                        .frame(minWidth: 420, maxWidth: .infinity)
-                }
+                fileList(history.comparisonFiles, revision: comparison.target, base: nil)
             } else {
                 HSplitView {
                     leftPane
                         .frame(minWidth: 360, idealWidth: 500, maxWidth: .infinity)
                     details
-                        .frame(minWidth: 520, idealWidth: 760, maxWidth: .infinity)
+                        .frame(minWidth: 280, idealWidth: 420, maxWidth: .infinity)
                 }
             }
         }
@@ -170,16 +165,12 @@ struct GitHistoryView: View {
     @ViewBuilder
     private var details: some View {
         if let details = history.details {
-            // Панель низкая и широкая: файлы и дифф — рядом, а не друг под другом.
-            HSplitView {
-                VStack(alignment: .leading, spacing: 0) {
-                    CommitHeader(details: details)
-                    Divider()
-                    fileList(details.files, revision: details.commit.hash)
-                }
-                .frame(minWidth: 200, idealWidth: 260, maxWidth: 420)
-                PatchView(patch: history.selectedFile == nil ? GitFilePatch() : history.filePatch)
-                    .frame(minWidth: 380, maxWidth: .infinity)
+            // Дифф в панели был бы крошечным — изменения файла открываются
+            // вкладкой редактора по двойному клику или Return.
+            VStack(alignment: .leading, spacing: 0) {
+                CommitHeader(details: details)
+                Divider()
+                fileList(details.files, revision: details.commit.hash, base: details.parent)
             }
         } else if history.selection != nil {
             ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -188,14 +179,18 @@ struct GitHistoryView: View {
         }
     }
 
-    private func fileList(_ files: [GitChangedFile], revision: String) -> some View {
+    /// Файлы коммита или сравнения. `base` — с чем сравнивать; nil при
+    /// сравнении веток — с их общим предком.
+    private func fileList(_ files: [GitChangedFile], revision: String, base: String?) -> some View {
         List(selection: $history.selectedFile) {
             ForEach(files) { file in
                 ChangedFileRow(letter: file.kind.letter, color: ChangeBadge.color(file.kind),
                                name: file.fileName, directory: file.directory,
                                detail: file.originalPath.map { "← " + ($0 as NSString).lastPathComponent })
                     .tag(file.path)
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { openChanges(file, revision: revision, base: base) })
                     .contextMenu {
+                        Button(L("Открыть изменения")) { openChanges(file, revision: revision, base: base) }
                         Button(L("Открыть эту версию")) { openVersion(file.path, revision: revision) }
                             .disabled(file.kind == .deleted)
                         Button(L("Открыть в редакторе")) {
@@ -209,6 +204,30 @@ struct GitHistoryView: View {
             }
         }
         .listStyle(.plain)
+        .onKeyPress(.return) {
+            guard let path = history.selectedFile, let file = files.first(where: { $0.path == path }) else { return .ignored }
+            openChanges(file, revision: revision, base: base)
+            return .handled
+        }
+        .overlay(alignment: .bottom) {
+            if !files.isEmpty {
+                Text(L("Двойной клик или Return — изменения файла в редакторе"))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .padding(6)
+            }
+        }
+    }
+
+    private func openChanges(_ file: GitChangedFile, revision: String, base: String?) {
+        Task {
+            var base = base
+            if base == nil, let comparison = history.comparison {
+                base = await history.mergeBase(comparison.base, comparison.target)
+            }
+            workspace.openChanges(path: file.path, originalPath: file.originalPath, revision: revision,
+                                  base: base, deleted: file.kind == .deleted)
+        }
     }
 
     private func openVersion(_ path: String, revision: String) {

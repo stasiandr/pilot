@@ -184,8 +184,9 @@ struct CommitView: View {
     // MARK: - Сообщение
 
     private var composer: some View {
-        CommitComposer(commits: commits, messageFocused: $messageFocused, height: 110)
-            .padding(12)
+        // Панель низкая: поле — на три строки, список файлов важнее.
+        CommitComposer(commits: commits, messageFocused: $messageFocused, height: 56, compact: true)
+            .padding(10)
     }
 }
 
@@ -314,8 +315,15 @@ struct CommitComposer: View {
         }
     }
 
-    @ViewBuilder
+    /// Высота строки состояния постоянная: «Подготовка…» после каждого
+    /// клика иначе сдвигала бы список файлов.
     private var status: some View {
+        statusContent.frame(maxWidth: .infinity, minHeight: 16, maxHeight: 90, alignment: .topLeading)
+            .fixedSize(horizontal: false, vertical: commits.error != nil)
+    }
+
+    @ViewBuilder
+    private var statusContent: some View {
         if let busy = commits.busy {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
