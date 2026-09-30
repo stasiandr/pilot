@@ -23,6 +23,8 @@ final class MergeSession: ObservableObject {
     /// ушёл к другому файлу и вернулся — выбранное на месте.
     @Published var picks: [String: UnityMerge.Pick] = [:]
     @Published var keyPicks: [String: JSONMerge.Pick] = [:]
+    /// Показать тремя колонками текста, хотя файл сливается по ключам или объектам.
+    @Published var showsText = false
     /// Чьи версии: наша ветка и та, что вливается.
     @Published private(set) var oursName = ""
     /// Двоичный файл: сливать нечего, только взять одну сторону целиком.

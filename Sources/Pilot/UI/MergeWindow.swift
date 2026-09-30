@@ -41,7 +41,14 @@ struct MergeView: View {
     let workspace: Workspace
     @ObservedObject var session: MergeSession
     @Environment(\.dismiss) private var dismiss
-    @State private var mode: Mode = .text
+    /// По ключам или объектам — если файл разобрался; «Текстом» — выбор
+    /// человека, он в сессии и держится при переходах между файлами.
+    private var mode: Mode {
+        (session.objects != nil || session.keys != nil) && !session.showsText ? .objects : .text
+    }
+    private var modeBinding: Binding<Mode> {
+        Binding(get: { mode }, set: { session.showsText = $0 == .text })
+    }
     @State private var notice: String?
     /// В окне конфликтов: файл решён — к следующему, а не закрыть окно.
     var onDone: (() -> Void)? = nil
@@ -88,7 +95,6 @@ struct MergeView: View {
         }
         .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .onAppear { if !session.isLoaded { session.load() } }
-        .onChange(of: session.objects != nil || session.keys != nil) { _, structured in if structured { mode = .objects } }
         .background {
             Button("") { dismiss() }.keyboardShortcut("w", modifiers: .command).hidden()
         }
@@ -105,7 +111,7 @@ struct MergeView: View {
     private func toolbar(_ editor: MergeEditorModel) -> some View {
         HStack(spacing: 8) {
             if session.objects != nil || session.keys != nil {
-                Picker("", selection: $mode) {
+                Picker("", selection: modeBinding) {
                     Text(session.keys != nil ? L("По ключам") : L("По объектам")).tag(Mode.objects)
                     Text(L("Текстом")).tag(Mode.text)
                 }

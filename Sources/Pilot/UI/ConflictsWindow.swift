@@ -14,6 +14,8 @@ final class ConflictsModel: ObservableObject {
     @Published var selection: String?
     @Published private(set) var loaded = false
     @Published var error: String?
+    /// Список файлов слева: полезен, но на длинном слиянии занимает место.
+    @Published var showsSidebar = true
     private(set) var repository: URL?
 
     var resolvedCount: Int { files.count - unresolved.count }
@@ -125,8 +127,20 @@ struct ConflictsView: View {
 
     var body: some View {
         HSplitView {
-            sidebar.frame(minWidth: 220, idealWidth: 280, maxWidth: 420)
+            if model.showsSidebar {
+                sidebar.frame(minWidth: 220, idealWidth: 280, maxWidth: 420)
+            }
             detail.frame(minWidth: 700, maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button { model.showsSidebar.toggle() } label: { Image(systemName: "sidebar.left") }
+                    .keyboardShortcut("s", modifiers: [.control, .command])
+                    .help(model.showsSidebar ? L("Скрыть список файлов") : L("Показать список файлов"))
+            }
+            if !model.showsSidebar {
+                ToolbarItem(placement: .navigation) { fileMenu }
+            }
         }
         .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .onAppear { model.open(repository: workspace.git.repository) }
@@ -137,6 +151,26 @@ struct ConflictsView: View {
     }
 
     // MARK: - Список
+
+    /// Список скрыт — файл и прогресс в заголовке, переход к любому файлу меню.
+    private var fileMenu: some View {
+        Menu {
+            ForEach(model.files, id: \.self) { path in
+                Button { model.selection = path } label: {
+                    Label((path as NSString).lastPathComponent,
+                          systemImage: model.unresolved.contains(path) ? "exclamationmark.triangle" : "checkmark.circle")
+                }
+            }
+            if model.isDone {
+                Divider()
+                Button(L("Завершить")) { model.selection = "__done__" }
+            }
+        } label: {
+            let name = model.selection.flatMap { $0 == "__done__" ? L("Завершить") : ($0 as NSString).lastPathComponent }
+            Text(verbatim: "\(name ?? "") · " + L("Решено \(model.resolvedCount) из \(model.files.count)"))
+        }
+        .fixedSize()
+    }
 
     private var sidebar: some View {
         VStack(spacing: 0) {

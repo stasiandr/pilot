@@ -378,6 +378,8 @@ extension English {
         ("Не удалось взять версию %@", "Couldn’t take a version of %@"),
         ("Решено %@ из %@", "Resolved %@ of %@"),
         ("Решить заново", "Resolve Again"),
+        ("Скрыть список файлов", "Hide File List"),
+        ("Показать список файлов", "Show File List"),
         ("Файлов: %@. Осталось закоммитить слияние.", "Files: %@. The merge only needs committing."),
         ("картинка или модель — выбрать сторону", "picture or model — pick a side"),
         ("сцена или префаб — по объектам", "scene or prefab — by objects"),
