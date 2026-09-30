@@ -298,6 +298,8 @@ final class Workspace: ObservableObject {
     let gitHistory = GitHistoryModel()
     /// Открытые окна слияния: путь → сессия. Окно ищет свою здесь.
     var mergeSessions: [String: MergeSession] = [:]
+    /// Окна сравнения версий картинок и моделей: ключ окна → что сравнивать.
+    var mediaComparisons: [String: MediaComparison] = [:]
     /// Панель git под редактором.
     @Published var showsGitPanel = false
     /// Изменения версий файлов из истории против их родителя: полоски и

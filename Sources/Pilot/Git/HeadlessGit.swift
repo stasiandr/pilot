@@ -57,6 +57,20 @@ enum HeadlessGit {
                                        yamlMerge: MergeSession.locateYAMLMerge(editorContents: nil))
             session.load()
             content = AnyView(MergeView(workspace: workspace, session: session))
+        case "media":
+            // Сравнение версий: --path файл, --before и --after — ревизии (`worktree`, `index`).
+            guard let path else { HeadlessInspector.log("для media нужен --path"); return 2 }
+            func revision(_ text: String?) -> GitBlobs.Revision {
+                switch text {
+                case nil, "worktree": return .workingTree
+                case "index": return .index
+                case "none": return .none
+                case let hash?: return .commit(hash)
+                }
+            }
+            content = AnyView(MediaCompareView(repository: repository, path: path,
+                                               before: .init(title: value("--before") ?? "HEAD", revision: revision(value("--before") ?? "HEAD")),
+                                               after: .init(title: value("--after") ?? "worktree", revision: revision(value("--after")))))
         case "changes":
             content = AnyView(ChangesNavigator(workspace: workspace, commits: workspace.commits))
         case "popover":
@@ -98,6 +112,7 @@ enum HeadlessGit {
             switch tab {
             case "history": return workspace.gitHistory.details != nil
             case "popover": return !workspace.gitClient.branches.isEmpty
+            case "media": return false
             default: return workspace.commits.isLoaded
             }
         }

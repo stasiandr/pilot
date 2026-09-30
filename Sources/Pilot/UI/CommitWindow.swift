@@ -387,7 +387,16 @@ struct CommitDiffPane: View {
 
     @ViewBuilder
     private func content(_ selection: GitCommitService.Selection) -> some View {
-        if commits.tree.changes.first(where: { $0.path == selection.path })?.isConflicted == true {
+        if MediaKind(filename: selection.path) != nil, let repository = commits.repository,
+           commits.tree.changes.first(where: { $0.path == selection.path })?.isConflicted != true {
+            // Картинка, модель, шрифт — сами версии, а не «двоичный файл».
+            MediaCompareView(repository: repository, path: selection.path,
+                             before: selection.staged ? .init(title: "HEAD", revision: .commit("HEAD"))
+                                                      : .init(title: L("Подготовлено"), revision: .index),
+                             after: selection.staged ? .init(title: L("Подготовлено"), revision: .index)
+                                                     : .init(title: L("На диске"), revision: .workingTree))
+                .id(selection)
+        } else if commits.tree.changes.first(where: { $0.path == selection.path })?.isConflicted == true {
             // Дифф конфликта — комбинированный (`@@@`): кусками его не
             // подготовить, решают его в окне слияния.
             VStack(spacing: 10) {

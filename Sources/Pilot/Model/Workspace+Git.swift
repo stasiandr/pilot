@@ -107,6 +107,17 @@ extension Workspace {
     /// курсор — на первом изменении. Удалённый файл — версия из `base`.
     func openChanges(path: String, originalPath: String? = nil, revision: String, base: String?, deleted: Bool) {
         guard let repository = git.repository else { return }
+        // Картинка, модель, шрифт, PDF — в окно сравнения версий: текстом их не показать.
+        if MediaKind(filename: path) != nil, let root {
+            let key = UUID().uuidString
+            mediaComparisons[key] = MediaComparison(
+                path: path, originalPath: originalPath,
+                before: .init(title: base.map { String($0.prefix(8)) } ?? L("Файла не было"),
+                              revision: base.map { .commit($0) } ?? .none),
+                after: .init(title: String(revision.prefix(8)), revision: deleted ? .none : .commit(revision)))
+            ProjectWindows.shared.openWindow?(id: MediaCompareWindow.sceneID, value: root.path + "\n" + key)
+            return
+        }
         Task {
             let texts = await Task.detached(priority: .userInitiated) { () -> (new: String?, old: String?) in
                 func show(_ ref: String?, _ path: String) -> String? {
@@ -326,4 +337,12 @@ struct RevisionDiff: Equatable {
               !change.oldLines.isEmpty, change.oldLines.upperBound <= oldLines.count else { return nil }
         return Array(oldLines[change.oldLines])
     }
+}
+
+/// Что сравнивать в окне версий картинки или модели.
+struct MediaComparison {
+    var path: String
+    var originalPath: String?
+    var before: MediaCompareView.Side
+    var after: MediaCompareView.Side
 }

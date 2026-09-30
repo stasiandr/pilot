@@ -50,6 +50,24 @@ enum Git {
 
     // MARK: - Запуск
 
+    /// Окружение для git. В PATH — папка самого git: Pilot, запущенный из
+    /// Finder, видит только /usr/bin:/bin, и `git lfs` (он в Homebrew рядом
+    /// с git) не находился — ни для превью, ни при переключении ветки с
+    /// файлами в LFS. Туда же — хуки, которые зовут инструменты из Homebrew.
+    static func environment(_ extra: [String: String] = [:]) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        if let executable {
+            let folder = (executable as NSString).deletingLastPathComponent
+            let path = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            if !path.split(separator: ":").contains(Substring(folder)) {
+                environment["PATH"] = folder + ":" + path
+            }
+        }
+        environment.merge(extra) { _, new in new }
+        return environment
+    }
+
     struct Output {
         var status: Int32
         var stdout: Data
@@ -68,9 +86,7 @@ enum Git {
         // не запоминают, что уже проверено (`Tuning`).
         process.arguments = (optionalLocks ? [] : ["--no-optional-locks"]) + arguments
         process.currentDirectoryURL = directory
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = environment
+        process.environment = environment()
 
         let stdout = Pipe()
         process.standardOutput = stdout
@@ -117,8 +133,7 @@ enum Git {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = Tuning.flags(for: directory) + arguments
         process.currentDirectoryURL = directory
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        var environment = environment()
         if environment["GIT_SSH_COMMAND"] == nil { environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes" }
         // Редактор для сообщения не откроется: оно всегда приходит через -F.
         environment["GIT_EDITOR"] = "true"

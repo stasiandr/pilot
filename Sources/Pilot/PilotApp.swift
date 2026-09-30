@@ -639,6 +639,11 @@ struct PilotApp: App {
             MergeWindow(target: target)
         }
         .defaultSize(width: 1300, height: 760)
+        // Версии картинки или модели из истории — рядом.
+        WindowGroup(id: MediaCompareWindow.sceneID, for: String.self) { $target in
+            MediaCompareWindow(target: target)
+        }
+        .defaultSize(width: 1100, height: 640)
         // Форк: окна MariaDB в Docker и обозревателя базы (Fork/Database) —
         // открываются из меню «Окно» и кнопкой базы в тулбаре.
         DatabaseScenes()

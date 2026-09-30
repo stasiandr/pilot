@@ -326,8 +326,16 @@ struct GitStashView: View {
                 }
                 .listStyle(.sidebar)
                 .frame(minWidth: 220, idealWidth: 260, maxWidth: 400)
-                PatchView(patch: selectedFile == nil ? GitFilePatch() : patch)
-                    .frame(minWidth: 360, maxWidth: .infinity)
+                Group {
+                    if let path = selectedFile, MediaKind(filename: path) != nil, let repository, let stash = selected {
+                        MediaCompareView(repository: repository, path: path,
+                                         before: .init(title: L("До"), revision: .commit(stash.ref + "^1")),
+                                         after: .init(title: stash.ref, revision: .commit(stash.ref)))
+                    } else {
+                        PatchView(patch: selectedFile == nil ? GitFilePatch() : patch)
+                    }
+                }
+                .frame(minWidth: 360, maxWidth: .infinity)
             }
         }
         .onChange(of: selection) { _, _ in loadFiles() }
