@@ -41,263 +41,181 @@ struct MergeView: View {
     let workspace: Workspace
     @ObservedObject var session: MergeSession
     @Environment(\.dismiss) private var dismiss
-    @State private var current = 0
-    @State private var editing: Int?
-    @State private var draft = ""
+    @State private var mode: Mode = .text
     @State private var notice: String?
+    @State private var picks: [String: UnityMerge.Pick] = [:]
+    @State private var confirmUnresolved = false
+
+    enum Mode: Hashable { case objects, text }
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            Divider()
-            if !session.isLoaded {
-                ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let editor = session.editor {
+                // Счётчики и кнопки смотрят на сам редактор: его решения
+                // сессию не меняют, и без этого «нерешено: 5» не убывало.
+                EditorObserver(editor: editor) {
+                    toolbar(editor)
+                    Divider()
+                    if mode == .objects, let objects = session.objects {
+                        UnityObjectMergeView(session: session, result: objects, picks: $picks,
+                                             resolve: { workspace.unity.assets?.displayName(for: $0) })
+                    } else {
+                        headers
+                        Divider()
+                        MergeEditor(model: editor)
+                    }
+                    Divider()
+                    footer(editor)
+                }
+            } else if session.isBinary {
+                VStack(spacing: 12) {
+                    Image(systemName: "doc.questionmark").font(.system(size: 30, weight: .light)).foregroundStyle(.tertiary)
+                    Text(L("Двоичный файл — слить его нельзя, только взять одну версию целиком"))
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button(L("Взять нашу: \(session.oursName)")) { finish { await session.takeWhole(true) } }
+                        Button(L("Взять их: \(session.theirsName)")) { finish { await session.takeWhole(false) } }
+                    }
+                    .disabled(session.busy)
+                    if let error = session.error {
+                        Text(error).foregroundStyle(Color(nsColor: Theme.diagnosticError)).textSelection(.enabled)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let error = session.error {
+                Text(error).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                chunkList
+                ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            Divider()
-            footer
         }
         .background(Color(nsColor: Theme.swiftUIEditorBackground))
-        .onAppear {
-            if !session.isLoaded { session.load() }
-        }
+        .onAppear { if !session.isLoaded { session.load() } }
+        .onChange(of: session.objects != nil) { _, hasObjects in if hasObjects { mode = .objects } }
         .background {
             Button("") { dismiss() }.keyboardShortcut("w", modifiers: .command).hidden()
         }
-    }
-
-    private var header: some View {
-        HStack(spacing: 0) {
-            column(L("Наша версия (текущая ветка)"), missing: session.missing.ours)
-            column(L("Результат"), missing: false)
-            column(L("Их версия (вливаемая)"), missing: session.missing.theirs)
-        }
-        .font(.system(size: 12, weight: .medium))
-        .frame(height: 30)
-    }
-
-    private func column(_ title: String, missing: Bool) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-            if missing { Text(L("— файл удалён")).foregroundStyle(Color(nsColor: Theme.gitDeleted)) }
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    // MARK: - Куски
-
-    private var chunkList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(session.chunks.enumerated()), id: \.offset) { index, chunk in
-                        chunkRow(index, chunk)
-                            .id(index)
-                    }
-                }
-            }
-            .onChange(of: current) { _, value in
-                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(value, anchor: .center) }
-            }
-            .onAppear {
-                if let first = session.conflictIndices.first {
-                    current = first
-                    DispatchQueue.main.async { proxy.scrollTo(first, anchor: .center) }
-                }
-            }
+        .confirmationDialog(L("Не все конфликты решены"), isPresented: $confirmUnresolved) {
+            Button(L("Сохранить как есть")) { save() }
+        } message: {
+            Text(mode == .objects ? L("В нерешённых спорах останется наша сторона.")
+                                  : L("В нерешённых кусках останется текст общего предка."))
         }
     }
 
-    @ViewBuilder
-    private func chunkRow(_ index: Int, _ chunk: Merge3.Chunk) -> some View {
-        switch chunk.kind {
-        case .stable:
-            StableChunk(lines: chunk.base)
-        case .changed(let side):
-            HStack(alignment: .top, spacing: 0) {
-                lines(chunk.ours, tint: side == .theirs ? nil : Theme.gitAdded)
-                divider
-                lines(chunk.automatic, tint: Theme.gitAdded)
-                divider
-                lines(chunk.theirs, tint: side == .ours ? nil : Theme.gitAdded)
-            }
-            .fixedSize(horizontal: false, vertical: true)
-        case .conflict:
-            conflictRow(index, chunk)
-        }
-    }
+    // MARK: - Верх
 
-    private func conflictRow(_ index: Int, _ chunk: Merge3.Chunk) -> some View {
-        let resolved = session.resolutions[index]
-        let isCurrent = current == index
-        return VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 0) {
-                VStack(alignment: .trailing, spacing: 0) {
-                    lines(chunk.ours, tint: Theme.gitConflicted)
-                    Button { session.resolve(index, .ours); advance(from: index) } label: {
-                        Label(L("Взять"), systemImage: "arrow.right")
-                    }
-                    .controlSize(.small)
-                    .padding(4)
-                }
-                divider
-                VStack(spacing: 0) {
-                    if editing == index {
-                        TextEditor(text: $draft)
-                            .font(.system(size: 11.5, design: .monospaced))
-                            .frame(minHeight: 80)
-                        HStack {
-                            Button(L("Отмена")) { editing = nil }
-                            Button(L("Готово")) {
-                                session.setText(index, draft)
-                                editing = nil
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
-                        .controlSize(.small)
-                        .padding(4)
-                    } else if let resolved {
-                        lines(resolved, tint: Theme.gitAdded)
-                        HStack {
-                            Button(L("Править")) { startEditing(index) }
-                            Button(L("Сбросить")) { session.unresolve(index) }
-                        }
-                        .controlSize(.small)
-                        .padding(4)
-                    } else {
-                        lines(chunk.base, tint: nil, dimmed: true)
-                        HStack(spacing: 4) {
-                            Button(L("Обе")) { session.resolve(index, .oursThenTheirs); advance(from: index) }
-                                .help(L("Сначала наша, потом их"))
-                            Button(L("Их, потом наша")) { session.resolve(index, .theirsThenOurs); advance(from: index) }
-                            Button(L("Править")) { startEditing(index) }
-                            if Merge3.autoResolve(chunk) != nil {
-                                Button { session.resolutions[index] = Merge3.autoResolve(chunk); advance(from: index) } label: {
-                                    Image(systemName: "wand.and.stars")
-                                }
-                                .help(L("Решить автоматически"))
-                            }
-                        }
-                        .controlSize(.small)
-                        .padding(4)
-                    }
-                }
-                divider
-                VStack(alignment: .leading, spacing: 0) {
-                    lines(chunk.theirs, tint: Theme.gitConflicted)
-                    Button { session.resolve(index, .theirs); advance(from: index) } label: {
-                        Label(L("Взять"), systemImage: "arrow.left")
-                    }
-                    .controlSize(.small)
-                    .padding(4)
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-        }
-        .overlay(Rectangle().stroke(isCurrent ? Color.accentColor : Color(nsColor: Theme.gitConflicted).opacity(0.5),
-                                    lineWidth: isCurrent ? 2 : 1))
-        .contentShape(Rectangle())
-        .onTapGesture { current = index }
-    }
-
-    private var divider: some View {
-        Rectangle().fill(Color(nsColor: Theme.separator)).frame(width: 1)
-    }
-
-    private func lines(_ lines: [String], tint: NSColor?, dimmed: Bool = false) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if lines.isEmpty {
-                Text(" ").font(.system(size: 11.5, design: .monospaced))
-            }
-            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                Text(line.isEmpty ? " " : line)
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(dimmed ? .tertiary : .primary)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 1)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(tint.map { Color(nsColor: $0).opacity(0.12) } ?? .clear)
-        .textSelection(.enabled)
-    }
-
-    private func startEditing(_ index: Int) {
-        draft = session.lines(of: index).joined(separator: "\n")
-        editing = index
-        current = index
-    }
-
-    /// К следующему нерешённому.
-    private func advance(from index: Int) {
-        let conflicts = session.conflictIndices
-        if let next = conflicts.first(where: { $0 > index && session.resolutions[$0] == nil })
-            ?? conflicts.first(where: { session.resolutions[$0] == nil }) {
-            current = next
-        }
-    }
-
-    // MARK: - Низ
-
-    private var footer: some View {
+    private func toolbar(_ editor: MergeEditorModel) -> some View {
         HStack(spacing: 8) {
-            let total = session.conflictIndices.count
-            Text(session.unresolvedCount == 0 ? L("Все конфликты решены") : L("Нерешено: \(session.unresolvedCount) из \(total)"))
-                .foregroundStyle(session.unresolvedCount == 0 ? Color(nsColor: Theme.gitAdded) : .secondary)
-            Button { move(-1) } label: { Image(systemName: "chevron.up") }
-                .help(L("Предыдущий конфликт"))
-                .keyboardShortcut(.upArrow, modifiers: [.command, .option])
-            Button { move(1) } label: { Image(systemName: "chevron.down") }
-                .help(L("Следующий конфликт"))
-                .keyboardShortcut(.downArrow, modifiers: [.command, .option])
-            Button {
-                let count = session.autoResolve()
-                notice = count == 0 ? L("Само не решается ничего") : L("Решено само: \(count)")
-            } label: {
-                Label(L("Решить простые"), systemImage: "wand.and.stars")
+            if session.objects != nil {
+                Picker("", selection: $mode) {
+                    Text(L("По объектам")).tag(Mode.objects)
+                    Text(L("Текстом")).tag(Mode.text)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help(L("По объектам — споры по свойствам GameObject'ов и компонентов; текстом — три колонки, как для кода"))
             }
-            .help(L("Разница только в пробелах, вставки в одно место с обеих сторон"))
-            Menu(L("Все оставшиеся…")) {
-                Button(L("Нашей версией")) { session.resolveAll(.ours) }
-                Button(L("Их версией")) { session.resolveAll(.theirs) }
-                Divider()
-                Button(L("Взять наш файл целиком")) { finish { await session.takeWhole(true) } }
-                Button(L("Взять их файл целиком")) { finish { await session.takeWhole(false) } }
+            if mode == .text || session.objects == nil {
+                Button { editor.moveToPreviousConflict() } label: { Image(systemName: "chevron.up") }
+                    .help(L("Предыдущий конфликт"))
+                    .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                Button { editor.moveToNextConflict() } label: { Image(systemName: "chevron.down") }
+                    .help(L("Следующий конфликт"))
+                    .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+                Button {
+                    let count = editor.resolveSimple()
+                    notice = count == 0 ? L("Само не решается ничего") : L("Решено само: \(count)")
+                } label: {
+                    Label(L("Решить простые"), systemImage: "wand.and.stars")
+                }
+                .help(L("Разница только в пробелах, вставки в одно место с обеих сторон"))
             }
-            .fixedSize()
             if session.yamlMerge != nil {
                 Button("UnityYAMLMerge") { finish { await session.runYAMLMerge() } }
                     .help(L("Слить сцену или префаб по объектам — инструментом Unity"))
             }
             if let notice { Text(notice).foregroundStyle(.secondary) }
+            Spacer()
+            Text(summary(editor)).foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .font(.system(size: 12))
+        .padding(.horizontal, 12)
+        .frame(height: 34)
+    }
+
+    private func summary(_ editor: MergeEditorModel) -> String {
+        if mode == .objects, let objects = session.objects {
+            let open = objects.conflicts.filter { picks[$0.id] == nil }.count
+            return L("Слито само: \(objects.fromOurs + objects.fromTheirs) · споров: \(objects.conflicts.count), нерешено: \(open)")
+        }
+        return L("Изменений: \(editor.changeCount) · конфликтов: \(editor.conflictCount), нерешено: \(editor.unresolvedCount)")
+    }
+
+    private var headers: some View {
+        HStack(spacing: 0) {
+            column(L("Наша: \(session.oursName)"), missing: session.missing.ours)
+            Color.clear.frame(width: MergeEditorView.stripWidth)
+            column(L("Результат"), missing: false)
+            Color.clear.frame(width: MergeEditorView.stripWidth)
+            column(session.theirsName.isEmpty ? L("Их версия") : L("Их: \(session.theirsName)"),
+                   missing: session.missing.theirs)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .frame(height: 26)
+    }
+
+    private func column(_ title: String, missing: Bool) -> some View {
+        HStack(spacing: 6) {
+            Text(title).lineLimit(1).truncationMode(.middle)
+            if missing { Text(L("— файл удалён")).foregroundStyle(Color(nsColor: Theme.gitDeleted)) }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Низ
+
+    private func footer(_ editor: MergeEditorModel) -> some View {
+        HStack(spacing: 8) {
+            if mode == .objects, let objects = session.objects {
+                Button(L("Все — наши")) { for c in objects.conflicts { picks[c.id] = .ours } }
+                Button(L("Все — их")) { for c in objects.conflicts { picks[c.id] = .theirs } }
+            } else {
+                Button(L("Принять левое")) { editor.acceptAll(.ours) }
+                    .help(L("Весь файл — нашей версией"))
+                Button(L("Принять правое")) { editor.acceptAll(.theirs) }
+                    .help(L("Весь файл — их версией"))
+            }
             if let error = session.error {
-                Text(error).foregroundStyle(Color(nsColor: Theme.diagnosticError)).lineLimit(3).textSelection(.enabled)
+                Text(error).foregroundStyle(Color(nsColor: Theme.diagnosticError)).lineLimit(2).textSelection(.enabled)
             }
             Spacer()
             if session.busy { ProgressView().controlSize(.small) }
             Button(L("Отмена")) { dismiss() }
-            Button(L("Сохранить и отметить решённым")) {
-                finish { await session.save(markResolved: true) }
+                .keyboardShortcut(.cancelAction)
+            Button(L("Применить")) {
+                if unresolved(editor) > 0 { confirmUnresolved = true } else { save() }
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(session.unresolvedCount > 0 || session.busy)
+            .disabled(session.busy)
+            .help(L("Записать результат и отметить файл решённым"))
         }
         .font(.system(size: 12))
         .padding(10)
     }
 
-    private func move(_ delta: Int) {
-        let conflicts = session.conflictIndices
-        guard !conflicts.isEmpty else { return }
-        if delta > 0 {
-            current = conflicts.first { $0 > current } ?? conflicts[0]
-        } else {
-            current = conflicts.last { $0 < current } ?? conflicts[conflicts.count - 1]
+    private func unresolved(_ editor: MergeEditorModel) -> Int {
+        if mode == .objects, let objects = session.objects {
+            return objects.conflicts.filter { picks[$0.id] == nil }.count
         }
+        return editor.unresolvedCount
+    }
+
+    private func save() {
+        let text = mode == .objects ? session.objects?.text(picks) : nil
+        finish { await session.save(text: text, markResolved: true) }
     }
 
     private func finish(_ action: @escaping () async -> Bool) {
@@ -310,44 +228,136 @@ struct MergeView: View {
     }
 }
 
-/// Общий кусок: длинный свёрнут до пары строк по краям.
-private struct StableChunk: View {
-    let lines: [String]
-    @State private var expanded = false
+/// Перерисовывает содержимое на каждое изменение редактора.
+private struct EditorObserver<Content: View>: View {
+    @ObservedObject var editor: MergeEditorModel
+    @ViewBuilder let content: () -> Content
 
     var body: some View {
-        let collapsed = lines.count > 8 && !expanded
-        let shown = collapsed ? Array(lines.prefix(3)) : lines
-        VStack(spacing: 0) {
-            row(shown)
-            if collapsed {
-                Button(L("… ещё \(lines.count - 6) общих строк")) { expanded = true }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .padding(.vertical, 2)
-                row(Array(lines.suffix(3)))
+        VStack(spacing: 0) { content() }
+    }
+}
+
+// MARK: - По объектам
+
+/// Сцена или префаб: споры списком, по объектам иерархии. У каждого —
+/// значение с нашей стороны и с их, выбор — кнопкой. Всё, что правила
+/// одна сторона, уже слито и сюда не попадает.
+struct UnityObjectMergeView: View {
+    @ObservedObject var session: MergeSession
+    let result: UnityMerge.Result
+    @Binding var picks: [String: UnityMerge.Pick]
+    let resolve: UnityYAMLFile.Resolver
+    @State private var names: [Int64: String] = [:]
+
+    var body: some View {
+        if result.conflicts.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "checkmark.circle").font(.system(size: 30, weight: .light))
+                    .foregroundStyle(Color(nsColor: Theme.gitAdded))
+                Text(L("Споров нет — всё слилось по объектам само")).foregroundStyle(.secondary)
+                Text(L("Слито само: \(result.fromOurs) наших правок и \(result.fromTheirs) их"))
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(groups, id: \.fileID) { group in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "cube").foregroundStyle(.secondary)
+                                Text(verbatim: names[group.fileID] ?? "&\(group.fileID)").font(.system(size: 13, weight: .semibold))
+                                Text(verbatim: "&\(group.fileID)").font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                            }
+                            ForEach(group.conflicts) { conflict in
+                                row(conflict)
+                            }
+                        }
+                    }
+                }
+                .padding(14)
+            }
+            .task(id: result.conflicts.count) { names = await objectNames() }
         }
     }
 
-    private func row(_ lines: [String]) -> some View {
-        HStack(alignment: .top, spacing: 0) {
-            ForEach(0..<3, id: \.self) { column in
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                        Text(line.isEmpty ? " " : line)
-                            .font(.system(size: 11.5, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+    private struct Group { var fileID: Int64; var conflicts: [UnityMerge.Conflict] }
+
+    private var groups: [Group] {
+        var order: [Int64] = []
+        var byID: [Int64: [UnityMerge.Conflict]] = [:]
+        for conflict in result.conflicts {
+            if byID[conflict.fileID] == nil { order.append(conflict.fileID) }
+            byID[conflict.fileID, default: []].append(conflict)
+        }
+        return order.map { Group(fileID: $0, conflicts: byID[$0] ?? []) }
+    }
+
+    private func row(_ conflict: UnityMerge.Conflict) -> some View {
+        let pick = picks[conflict.id]
+        return HStack(alignment: .top, spacing: 10) {
+            Text(title(conflict))
+                .font(.system(size: 12, design: .monospaced))
+                .frame(width: 220, alignment: .leading)
+                .lineLimit(2)
+            side(L("Наше"), value: conflict.ours, chosen: pick == .ours) { picks[conflict.id] = .ours }
+            side(L("Их"), value: conflict.theirs, chosen: pick == .theirs) { picks[conflict.id] = .theirs }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6)
+            .fill(pick == nil ? Color.red.opacity(0.08) : Color(nsColor: Theme.chromeBackground)))
+        .overlay(RoundedRectangle(cornerRadius: 6)
+            .stroke(pick == nil ? Color.red.opacity(0.35) : Color(nsColor: Theme.separator)))
+    }
+
+    private func title(_ conflict: UnityMerge.Conflict) -> String {
+        switch conflict.kind {
+        case .property: return conflict.property
+        case .deletedByOurs: return L("объект удалён у нас, у них изменён")
+        case .deletedByTheirs: return L("объект удалён у них, у нас изменён")
+        }
+    }
+
+    private func side(_ label: String, value: [String]?, chosen: Bool, pick: @escaping () -> Void) -> some View {
+        Button(action: pick) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Image(systemName: chosen ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(chosen ? Color.accentColor : .secondary)
+                    Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 6)
-                .frame(maxWidth: .infinity)
-                if column < 2 { Rectangle().fill(Color(nsColor: Theme.separator)).frame(width: 1) }
+                Text(value == nil ? L("— удалено —") : UnityMerge.display(value))
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 5)
+                .fill(chosen ? Color.accentColor.opacity(0.18) : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Имена объектов: `Player / Body › PlayerController` — по нашей версии,
+    /// а удалённых у нас — по их.
+    private func objectNames() async -> [Int64: String] {
+        let repository = session.repository, path = session.path
+        let ids = Set(result.conflicts.map(\.fileID))
+        let texts = await Task.detached { () -> [String] in
+            [2, 3].compactMap { stage in
+                Git.run(["show", ":\(stage):\(path)"], in: repository).map { String(decoding: $0.stdout, as: UTF8.self) }
+            }
+        }.value
+        var names: [Int64: String] = [:]
+        for text in texts {
+            guard let file = UnityYAMLFile.parse(Array(text.utf16)) else { continue }
+            for id in ids where names[id] == nil {
+                if let index = file.index(ofFileID: id) { names[id] = file.describe(objectAt: index, resolve: resolve) }
             }
         }
-        .fixedSize(horizontal: false, vertical: true)
+        return names
     }
 }

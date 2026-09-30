@@ -22,7 +22,7 @@ cp Sources/Pilot/Git/{LineDiff,GitParsing,Git,MergeConflicts,GitCommit,GitHistor
 cp Sources/Pilot/Nav/{SymbolIndex,LocalNavigator}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Decompile/{AssemblyMetadata,AssemblySignatures,AssemblySource,AssemblyIndex}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/GitLab/{GitLabRemote,GitLabModels,UnifiedDiff,MergeRequestSearch}.swift "$TMP/Sources/coretests/"
-cp Sources/Pilot/Unity/{UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector,UnityHierarchy,UnityLog,UnityGenerators}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Unity/{UnityMerge,UnityProject,UnityAssetIndex,UnityYAML,UnityUsages,UnityCSharp,UnityProperties,UnityInspector,UnityHierarchy,UnityLog,UnityGenerators}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Archive/ArchiveLayout.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Run/{RunTargets,ServerLog,LogSites}.swift Sources/Pilot/NuGet/{NuGetProjects,NuGetSources,NuGetClient,NuGetRestore}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Configs/ConfigCatalog.swift Sources/Pilot/Update/Release.swift Sources/Pilot/Extensions/ProjectRules.swift "$TMP/Sources/coretests/"

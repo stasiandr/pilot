@@ -5345,6 +5345,64 @@ do {
           "разорванные пары: \(problems)")
 }
 
+section("Unity: слияние по объектам")
+do {
+    let head = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+    let go = "--- !u!1 &100\nGameObject:\n  m_Name: Player\n  m_Component:\n  - component: {fileID: 101}\n  m_IsActive: 1\n"
+    let tr = "--- !u!4 &101\nTransform:\n  m_GameObject: {fileID: 100}\n  m_LocalPosition: {x: 0, y: 0, z: 0}\n  m_Children: []\n"
+    let mb = "--- !u!114 &102\nMonoBehaviour:\n  m_GameObject: {fileID: 100}\n  speed: 5\n  health: 100\n"
+    let base = head + go + tr + mb
+    // Мы: позиция и скорость. Они: здоровье, новый компонент (объект + ссылка), скорость иначе.
+    let ours = base.replacingOccurrences(of: "{x: 0, y: 0, z: 0}", with: "{x: 1, y: 0, z: 0}")
+        .replacingOccurrences(of: "speed: 5", with: "speed: 6.5")
+    let collider = "--- !u!65 &103\nBoxCollider:\n  m_GameObject: {fileID: 100}\n"
+    let theirs = (base.replacingOccurrences(of: "health: 100", with: "health: 150")
+        .replacingOccurrences(of: "speed: 5", with: "speed: 7")
+        .replacingOccurrences(of: "  - component: {fileID: 101}\n", with: "  - component: {fileID: 101}\n  - component: {fileID: 103}\n"))
+        + collider
+    let result = UnityMerge.merge(base: base, ours: ours, theirs: theirs)
+    check(result?.conflicts.map(\.property) == ["speed"], "спорит только скорость (\(result?.conflicts.map(\.property) ?? []))")
+    let merged = result?.text(["102#speed": .theirs]) ?? ""
+    check(merged.contains("{x: 1, y: 0, z: 0}") && merged.contains("health: 150") && merged.contains("speed: 7")
+            && merged.contains("  - component: {fileID: 103}") && merged.contains("--- !u!65 &103"),
+          "остальное слито само: позиция наша, здоровье и коллайдер их (\(merged))")
+    check(result?.text([:]).contains("speed: 6.5") == true, "нерешённый спор — наша сторона")
+    check(merged.hasPrefix("%YAML 1.1\n") && merged.hasSuffix("\n"), "шапка и перевод строки в конце")
+
+    // Оба добавили по ребёнку — оба остаются.
+    let kidsOurs = base.replacingOccurrences(of: "m_Children: []", with: "m_Children:\n  - {fileID: 200}")
+    let kidsTheirs = base.replacingOccurrences(of: "m_Children: []", with: "m_Children:\n  - {fileID: 300}")
+    let kids = UnityMerge.merge(base: base, ours: kidsOurs, theirs: kidsTheirs)
+    check(kids?.conflicts.isEmpty == true && kids?.text([:]).contains("  - {fileID: 200}\n  - {fileID: 300}") == true,
+          "дети с двух сторон — объединение")
+
+    // Удалили объект, а они его правили — спор про объект целиком.
+    let removed = head + go + tr
+    let edited = base.replacingOccurrences(of: "health: 100", with: "health: 1")
+    let deletion = UnityMerge.merge(base: base, ours: removed, theirs: edited)
+    check(deletion?.conflicts.first?.kind == .deletedByOurs && deletion?.text([:]).contains("&102") == false
+            && deletion?.text(["102#object": .theirs]).contains("health: 1") == true, "удалили у нас, правили у них")
+
+    // Переопределения вложенного префаба — по одному.
+    func instance(_ mods: String) -> String {
+        head + "--- !u!1001 &500\nPrefabInstance:\n  m_Modification:\n    serializedVersion: 3\n    m_Modifications:\n" + mods
+            + "    m_RemovedComponents: []\n"
+    }
+    func mod(_ id: Int, _ path: String, _ value: String) -> String {
+        "    - target: {fileID: \(id), guid: abc, type: 3}\n      propertyPath: \(path)\n      value: \(value)\n      objectReference: {fileID: 0}\n"
+    }
+    let pb = instance(mod(1, "m_Name", "Enemy"))
+    let po = instance(mod(1, "m_Name", "Boss") + mod(2, "speed", "3"))
+    let pt = instance(mod(1, "m_Name", "Enemy") + mod(4, "health", "9"))
+    let prefab = UnityMerge.merge(base: pb, ours: po, theirs: pt)
+    let prefabText = prefab?.text([:]) ?? ""
+    check(prefab?.conflicts.isEmpty == true && prefabText.contains("value: Boss") && prefabText.contains("propertyPath: speed")
+            && prefabText.contains("propertyPath: health"), "переопределения префаба сливаются по одному (\(prefabText))")
+    let clash = UnityMerge.merge(base: pb, ours: instance(mod(1, "m_Name", "Boss")), theirs: instance(mod(1, "m_Name", "King")))
+    check(clash?.conflicts.map(\.property) == ["m_Modifications › m_Name (&1)"], "спор — только за одно переопределение")
+    check(UnityMerge.display(["  speed: 7"]) == "7" && UnityMerge.parse("class A {}") == nil, "значение для показа; не YAML")
+}
+
 section("Git: слияние трёх версий")
 do {
     let base = "a\nb\nc\nd\ne\n"

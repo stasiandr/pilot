@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 /// Слияние одного файла в конфликте: три версии из индекса (предок —
 /// `:1:`, наша — `:2:`, их — `:3:`), куски diff3 и решение по каждому
@@ -11,8 +12,16 @@ final class MergeSession: ObservableObject {
     let yamlMerge: URL?
 
     @Published private(set) var chunks: [Merge3.Chunk] = []
-    /// Решения спорных кусков: индекс куска → строки результата.
-    @Published var resolutions: [Int: [String]] = [:]
+    /// Три редактора окна слияния — создаются, когда версии прочитаны.
+    @Published private(set) var editor: MergeEditorModel?
+    private var editorChanges: AnyCancellable?
+    /// Unity YAML: слияние по объектам; nil — файл не Unity или не разобрался.
+    @Published private(set) var objects: UnityMerge.Result?
+    /// Чьи версии: наша ветка и та, что вливается.
+    @Published private(set) var oursName = ""
+    /// Двоичный файл: сливать нечего, только взять одну сторону целиком.
+    @Published private(set) var isBinary = false
+    @Published private(set) var theirsName = ""
     @Published private(set) var isLoaded = false
     @Published var error: String?
     @Published private(set) var busy = false
@@ -33,23 +42,39 @@ final class MergeSession: ObservableObject {
         unityExtensions.contains((path as NSString).pathExtension)
     }
 
-    var conflictIndices: [Int] { chunks.indices.filter { chunks[$0].isConflict } }
-    var unresolvedCount: Int { conflictIndices.filter { resolutions[$0] == nil }.count }
-
     func load() {
         let repository = repository, path = path
         Task {
-            let versions = await Task.detached(priority: .userInitiated) { () -> [String?] in
+            let raw = await Task.detached(priority: .userInitiated) { () -> [Data?] in
                 (1...3).map { stage in
                     guard let output = Git.run(["show", ":\(stage):\(path)"], in: repository), output.status == 0 else { return nil }
-                    return String(data: output.stdout, encoding: .utf8) ?? String(decoding: output.stdout, as: UTF8.self)
+                    return output.stdout
                 }
             }.value
+            if raw.contains(where: { $0?.prefix(8192).contains(0) == true }) {
+                isBinary = true
+                let names = await Task.detached { Self.branchNames(repository) }.value
+                oursName = names.ours
+                theirsName = names.theirs
+                isLoaded = true
+                return
+            }
+            let versions = raw.map { data in data.map { String(data: $0, encoding: .utf8) ?? String(decoding: $0, as: UTF8.self) } }
             let base = versions[0] ?? "", ours = versions[1], theirs = versions[2]
             missing = (ours == nil, theirs == nil)
             trailingNewline = (ours ?? theirs ?? base).hasSuffix("\n")
             chunks = Merge3.merge(base: base, ours: ours ?? "", theirs: theirs ?? "")
-            resolutions = [:]
+            let editor = MergeEditorModel(chunks: chunks, trailingNewline: trailingNewline,
+                                          fileName: (path as NSString).lastPathComponent)
+            // Решения в редакторе — это и счётчики окна: пусть оно их видит.
+            editorChanges = editor.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+            self.editor = editor
+            if Self.isUnityYAML(path) || (ours ?? "").hasPrefix("%YAML") {
+                objects = UnityMerge.merge(base: base, ours: ours ?? "", theirs: theirs ?? "")
+            }
+            let names = await Task.detached { Self.branchNames(repository) }.value
+            oursName = names.ours
+            theirsName = names.theirs
             isLoaded = true
             if versions.allSatisfy({ $0 == nil }) {
                 error = L("В индексе нет версий этого файла — конфликт уже решён или файл не в слиянии")
@@ -57,61 +82,36 @@ final class MergeSession: ObservableObject {
         }
     }
 
-    // MARK: - Решения
-
-    enum Choice { case ours, theirs, oursThenTheirs, theirsThenOurs, base }
-
-    func resolve(_ index: Int, _ choice: Choice) {
-        guard chunks.indices.contains(index) else { return }
-        let chunk = chunks[index]
-        switch choice {
-        case .ours: resolutions[index] = chunk.ours
-        case .theirs: resolutions[index] = chunk.theirs
-        case .oursThenTheirs: resolutions[index] = chunk.ours + chunk.theirs
-        case .theirsThenOurs: resolutions[index] = chunk.theirs + chunk.ours
-        case .base: resolutions[index] = chunk.base
+    /// Наша ветка — текущая; их — из `MERGE_HEAD` (или rebase, cherry-pick),
+    /// именем из сообщения слияния, иначе коротким хэшем.
+    nonisolated static func branchNames(_ repository: URL) -> (ours: String, theirs: String) {
+        func text(_ arguments: [String]) -> String {
+            guard let output = Git.run(arguments, in: repository), output.status == 0 else { return "" }
+            return String(decoding: output.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         }
-    }
-
-    func setText(_ index: Int, _ text: String) {
-        resolutions[index] = Merge3.split(text.hasSuffix("\n") ? text : text + "\n")
-    }
-
-    func unresolve(_ index: Int) { resolutions[index] = nil }
-
-    /// Палочка: всё, что решается без человека. Сколько решено.
-    @discardableResult
-    func autoResolve() -> Int {
-        var count = 0
-        for index in conflictIndices where resolutions[index] == nil {
-            if let lines = Merge3.autoResolve(chunks[index]) {
-                resolutions[index] = lines
-                count += 1
+        let ours = text(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        var theirs = ""
+        if let directory = Git.gitDirectory(for: repository),
+           let message = try? String(contentsOf: directory.appendingPathComponent("MERGE_MSG"), encoding: .utf8),
+           let first = message.split(separator: "\n").first, let branch = GitCommitInfo.mergedBranch(String(first)) {
+            theirs = branch
+        }
+        if theirs.isEmpty {
+            for head in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REVERT_HEAD"] {
+                let hash = text(["rev-parse", "--short", "--verify", "--quiet", head])
+                if !hash.isEmpty { theirs = hash; break }
             }
         }
-        return count
+        return (ours.isEmpty ? "HEAD" : ours, theirs)
     }
-
-    /// Всё спорное — одной стороной.
-    func resolveAll(_ choice: Choice) {
-        for index in conflictIndices where resolutions[index] == nil { resolve(index, choice) }
-    }
-
-    func lines(of index: Int) -> [String] {
-        resolutions[index] ?? chunks[index].automatic
-    }
-
-    var resultText: String {
-        Merge3.text(chunks.indices.map(lines(of:)), trailingNewline: trailingNewline)
-    }
-
-    // MARK: - Запись
 
     /// Записать результат и отметить файл решённым. true — получилось.
-    func save(markResolved: Bool) async -> Bool {
+    /// `text` — готовый текст (из редактора или слияния по объектам).
+    func save(text: String? = nil, markResolved: Bool) async -> Bool {
         let url = repository.appendingPathComponent(path)
         do {
-            try resultText.write(to: url, atomically: true, encoding: .utf8)
+            guard let text = text ?? editor?.resultText else { return false }
+            try text.write(to: url, atomically: true, encoding: .utf8)
         } catch {
             self.error = error.localizedDescription
             return false
