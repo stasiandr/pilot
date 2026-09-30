@@ -54,6 +54,10 @@ struct PilotApp: App {
         if HeadlessInspector.isRequested {
             exit(MainActor.assumeIsolated { HeadlessInspector.run() })
         }
+        // `--render-git Репозиторий` — окно git в PNG (HeadlessGit).
+        if HeadlessGit.isRequested {
+            exit(MainActor.assumeIsolated { HeadlessGit.run() })
+        }
     }
 
     /// Команда редактора — первому ответчику, тексту, если фокус в нём.
@@ -335,17 +339,53 @@ struct PilotApp: App {
 
     private var gitMenu: some View {
         Menu("Git") {
+            let noRepository = workspace.git.repository == nil
+            Button(L("Коммит…")) { workspace.openCommitWindow() }
+                .keyboardShortcut(keys.keyboardShortcut(.commit))
+                .disabled(noRepository)
+            Button(L("Отправить (push)")) { workspace.gitClient.push() }
+                .keyboardShortcut(keys.keyboardShortcut(.push))
+                .disabled(noRepository)
+            Button(L("Обновить ветку (pull)")) { workspace.gitClient.pull() }
+                .keyboardShortcut(keys.keyboardShortcut(.pull))
+                .disabled(noRepository)
+            Button(L("Получить с сервера (fetch)")) { workspace.gitClient.fetch() }
+                .keyboardShortcut(keys.keyboardShortcut(.fetch))
+                .disabled(noRepository)
+            Divider()
+            Button(L("Ветки…")) { workspace.branchPopoverRequest += 1 }
+                .keyboardShortcut(keys.keyboardShortcut(.branches))
+                .disabled(noRepository)
+            Button(workspace.showsGitPanel ? L("Скрыть панель git") : L("Панель git")) { workspace.toggleGitPanel() }
+                .keyboardShortcut(keys.keyboardShortcut(.gitLog))
+                .disabled(noRepository)
+            Button(L("История файла или выделения")) { workspace.showCurrentFileHistory() }
+                .keyboardShortcut(keys.keyboardShortcut(.fileHistory))
+                .disabled(noRepository || workspace.document == nil)
+            Button("Stash…") { workspace.openGitPanel(tab: .stash) }
+                .disabled(noRepository)
+            Divider()
             Button(L("Изменённые файлы…")) { workspace.openPalette(mode: .changes) }
                 .keyboardShortcut(keys.keyboardShortcut(.changedFiles))
-                .disabled(workspace.git.repository == nil)
+                .disabled(noRepository)
             Button(L("Следующее изменение")) { workspace.jumpToChange(1) }
                 .keyboardShortcut(keys.keyboardShortcut(.nextChange))
             Button(L("Предыдущее изменение")) { workspace.jumpToChange(-1) }
                 .keyboardShortcut(keys.keyboardShortcut(.previousChange))
+            Button(L("Подготовить изменение под курсором")) { workspace.stageChangeAtCaret() }
+                .keyboardShortcut(keys.keyboardShortcut(.stageChange))
+                .disabled(workspace.editorLineChanges.isEmpty)
+            Button(L("Откатить изменение под курсором")) { workspace.revertChangeAtCaret() }
+                .keyboardShortcut(keys.keyboardShortcut(.rollbackChange))
+                .disabled(workspace.editorLineChanges.isEmpty)
+            Toggle(L("Авторы строк (blame)"), isOn: Binding(get: { workspace.showsBlame },
+                                                            set: { workspace.showsBlame = $0 }))
+                .keyboardShortcut(keys.keyboardShortcut(.annotate))
+                .disabled(noRepository || workspace.document == nil)
             Divider()
-            Button(L("Коммит…")) { workspace.openCommitWindow() }
-                .keyboardShortcut(keys.keyboardShortcut(.commit))
-                .disabled(workspace.git.repository == nil)
+            Button(L("Разрешить конфликты…")) { workspace.openNextConflict() }
+                .keyboardShortcut(keys.keyboardShortcut(.resolveConflicts))
+                .disabled(workspace.git.conflictedCount == 0)
             Button(L("Локальная история…")) { workspace.showLocalHistory() }
                 .keyboardShortcut(keys.keyboardShortcut(.localHistory))
                 .disabled(workspace.document == nil)
@@ -594,11 +634,11 @@ struct PilotApp: App {
             NuGetWindow(rootPath: rootPath)
         }
         .defaultSize(width: 1000, height: 640)
-        // Окно коммита — так же, своё у каждого проекта.
-        WindowGroup(id: CommitWindow.sceneID, for: String.self) { $rootPath in
-            CommitWindow(rootPath: rootPath)
+        // Окно слияния — своё у каждого файла в конфликте.
+        WindowGroup(id: MergeWindow.sceneID, for: String.self) { $target in
+            MergeWindow(target: target)
         }
-        .defaultSize(width: 1100, height: 700)
+        .defaultSize(width: 1300, height: 760)
         // Форк: окна MariaDB в Docker и обозревателя базы (Fork/Database) —
         // открываются из меню «Окно» и кнопкой базы в тулбаре.
         DatabaseScenes()

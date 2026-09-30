@@ -31,7 +31,7 @@ struct NavigatorView: View {
         switch workspace.navigatorTab {
         case .project, .outline: return true
         case .review:            return workspace.isReviewSearchVisible
-        case .recent, .hierarchy: return false
+        case .recent, .hierarchy, .changes: return false
         }
     }
 
@@ -45,6 +45,7 @@ struct NavigatorView: View {
                 .accessibilityHidden(workspace.navigatorTab != .project)
             switch workspace.navigatorTab {
             case .project: EmptyView()
+            case .changes: ChangesNavigator(workspace: workspace, commits: workspace.commits)
             case .outline: OutlineList(workspace: workspace)
             case .review:  ReviewNavigator(workspace: workspace)
             case .recent:  RecentList(workspace: workspace)

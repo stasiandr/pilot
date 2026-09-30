@@ -41,7 +41,7 @@ enum LaunchForwarding {
     }
 
     /// Флаги запусков без окна.
-    private static let headlessFlags: Set<String> = ["--value-graph", "--render-inspector"]
+    private static let headlessFlags: Set<String> = ["--value-graph", "--render-inspector", "--render-git"]
 
     /// Только этот же бандл: сборки из соседних worktree с тем же
     /// идентификатором — чужие окна, в них не пересылаем.

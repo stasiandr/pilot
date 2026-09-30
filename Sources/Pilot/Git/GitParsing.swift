@@ -196,6 +196,39 @@ struct GitBlame {
     }
 }
 
+/// Колонка авторов у номеров строк, как Annotate в Rider: у первой
+/// строки каждого куска одного коммита — автор и дата, фон тем ярче,
+/// чем свежее правка.
+struct BlameColumn: Equatable {
+    /// По коммиту: подпись, SHA и свежесть 0…1 (1 — самый новый в файле).
+    var labels: [String]
+    var shas: [String]
+    var freshness: [Double]
+    /// Для каждой строки — индекс коммита, -1 — не закоммичено или неизвестно.
+    var lineCommits: [Int32]
+
+    init(_ blame: GitBlame, dateFormat: (Date) -> String) {
+        let times = blame.commits.map { $0.time?.timeIntervalSince1970 ?? 0 }
+        let committed = zip(blame.commits, times).filter { !$0.0.isUncommitted }.map(\.1)
+        let oldest = committed.min() ?? 0, newest = committed.max() ?? 0
+        labels = blame.commits.map { commit in
+            guard !commit.isUncommitted else { return "" }
+            let author = commit.author.count > 14 ? String(commit.author.prefix(13)) + "…" : commit.author
+            return author + "  " + (commit.time.map(dateFormat) ?? "")
+        }
+        shas = blame.commits.map(\.sha)
+        freshness = times.map { newest > oldest ? ($0 - oldest) / (newest - oldest) : 1 }
+        lineCommits = blame.lineCommits.map { index in
+            index >= 0 && blame.commits[Int(index)].isUncommitted ? -1 : index
+        }
+    }
+
+    func commit(atLine line: Int) -> Int? {
+        guard line >= 0, line < lineCommits.count, lineCommits[line] >= 0 else { return nil }
+        return Int(lineCommits[line])
+    }
+}
+
 private extension String {
     func value(after prefix: String) -> String? {
         hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil

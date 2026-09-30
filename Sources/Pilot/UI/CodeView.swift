@@ -1332,6 +1332,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// Обработчики приходят из SwiftUI и до создания вьюх, и после.
     private func applyLineHandlers() {
         ruler?.onLineClick = onLineClick
+        ruler?.onBlameClick = onBlameClick
         ruler?.onBreakpointClick = onBreakpointClick
         ruler?.onBreakpointContext = onBreakpointCondition == nil ? nil : { [weak self] line in
             self?.editBreakpointCondition(line)
@@ -1805,6 +1806,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         ruler?.eventLines = []
         ruler?.setChanges([])
         ruler?.setCommentMarks([:], column: false)
+        ruler?.blame = nil
     }
 
     /// Точки останова в гаттере.
@@ -1828,6 +1830,16 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     /// и тогда, когда тредов ещё нет: иначе гаттер дёргался бы от первого.
     func setCommentMarks(_ marks: [Int: CommentMark], column: Bool) {
         ruler?.setCommentMarks(marks, column: column)
+    }
+
+    /// Авторы строк слева от номеров; nil — колонки нет.
+    func setBlame(_ blame: BlameColumn?) {
+        ruler?.blame = blame
+    }
+
+    /// Клик по автору строки.
+    var onBlameClick: ((Int) -> Void)? {
+        didSet { if isViewLoaded { ruler?.onBlameClick = onBlameClick } }
     }
 
     // MARK: - Всплывающее окно у строки
@@ -3902,7 +3914,7 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
     func invalidateWidth() {
         digits = String(model?.lineCount ?? 0).count
         ruleThickness = CGFloat(max(3, digits)) * 8.0 + 20 + Self.foldColumn
-            + (hasCommentColumn ? Self.commentColumn : 0)
+            + (hasCommentColumn ? Self.commentColumn : 0) + blameWidth
         needsDisplay = true
     }
 
@@ -3954,6 +3966,38 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
     private var commentMarks: [Int: CommentMark] = [:]
     var onLineClick: ((Int) -> Void)?
 
+    // MARK: Авторы строк
+
+    /// Колонка авторов слева; nil — выключена.
+    var blame: BlameColumn? {
+        didSet {
+            guard blame != oldValue else { return }
+            if (blame == nil) != (oldValue == nil) { invalidateWidth() } else { needsDisplay = true }
+        }
+    }
+    /// Клик по автору строки — её коммит.
+    var onBlameClick: ((Int) -> Void)?
+    private var blameWidth: CGFloat { blame == nil ? 0 : Self.blameColumn }
+    private static let blameColumn: CGFloat = 150
+    /// Всё, что левее номеров: авторы и значки тредов ревью.
+    private var leftColumns: CGFloat { blameWidth + (hasCommentColumn ? Self.commentColumn : 0) }
+
+    private func drawBlame(line: Int, top: CGFloat, height: CGFloat, showsLabel: Bool) {
+        guard let blame, let commit = blame.commit(atLine: line) else { return }
+        let freshness = blame.freshness[commit]
+        Theme.gitModified.withAlphaComponent(0.05 + 0.20 * freshness).setFill()
+        NSRect(x: 0, y: top, width: blameWidth - 4, height: height).fill()
+        guard showsLabel else { return }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: max(9, font.pointSize - 2)),
+            .foregroundColor: Theme.gutterText,
+        ]
+        let label = blame.labels[commit] as NSString
+        let size = label.size(withAttributes: attributes)
+        label.draw(in: NSRect(x: 4, y: top + (height - size.height) / 2, width: blameWidth - 10, height: size.height),
+                   withAttributes: attributes)
+    }
+
     func setCommentMarks(_ marks: [Int: CommentMark], column: Bool) {
         guard marks != commentMarks || column != hasCommentColumn else { return }
         commentMarks = marks
@@ -3977,7 +4021,7 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
             return true
         }
         let size = tinted.size
-        tinted.draw(in: NSRect(origin: NSPoint(x: 3, y: top + (height - size.height) / 2), size: size))
+        tinted.draw(in: NSRect(origin: NSPoint(x: blameWidth + 3, y: top + (height - size.height) / 2), size: size))
     }
 
     /// Где на линейке строка — для клика и для стрелки всплывающего окна.
@@ -4007,6 +4051,10 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if point.x < blameWidth, let onBlameClick, let line = line(at: point) {
+            onBlameClick(line)
+            return
+        }
         // Стрелка сворачивания — справа, у самого текста.
         if point.x >= ruleThickness - Self.foldColumn - 8, let onFoldClick,
            let line = line(at: point), foldRegions[line] != nil {
@@ -4057,7 +4105,7 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
     /// Ярлык точки: прямоугольник со стрелкой вправо под номером строки.
     /// Не вставшая у отладчика — бледная, с контуром.
     private func drawBreakpoint(_ mark: BreakpointMark, top: CGFloat, height: CGFloat) {
-        let left: CGFloat = (hasCommentColumn ? Self.commentColumn : 0) + 2
+        let left: CGFloat = leftColumns + 2
         let right = ruleThickness - Self.foldColumn - 3
         let rect = NSRect(x: left, y: top + 1, width: right - left, height: max(height - 2, 8))
         let path = Self.tabPath(rect)
@@ -4183,6 +4231,12 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
                 Theme.currentLine.setFill()
                 NSRect(x: 0, y: y, width: ruleThickness, height: lineRect.height).fill()
             }
+            if blame != nil {
+                // Подпись — у первой строки куска одного коммита и у первой видимой.
+                let previous = line > firstLine ? blame?.commit(atLine: line - 1) : nil
+                drawBlame(line: line, top: y, height: lineRect.height,
+                          showsLabel: line == firstLine || previous != blame?.commit(atLine: line))
+            }
             let mark = breakpoints[line]
             if let mark { drawBreakpoint(mark, top: y, height: lineRect.height) }
             let executing = executionLine == line
@@ -4202,7 +4256,7 @@ final class LineNumberRuler: NSRulerView, NSViewToolTipOwner {
             if eventLines.contains(line), let image = markerImage {
                 let side = image.size
                 // Правее колонки комментариев ревью, если она есть.
-                let x: CGFloat = (hasCommentColumn ? Self.commentColumn : 0) + 4
+                let x: CGFloat = leftColumns + 4
                 image.draw(in: NSRect(x: x, y: y + (lineRect.height - side.height) / 2,
                                       width: side.width, height: side.height))
             }
@@ -4290,6 +4344,9 @@ struct CodeView: NSViewControllerRepresentable {
     /// Удалённые строки ревью MR — прямо в тексте; пусто вне ревью.
     var removedLines: [RemovedLines] = []
     var commentMarks: [Int: CommentMark] = [:]
+    /// Авторы строк у номеров; nil — выключено.
+    var blame: BlameColumn? = nil
+    var onBlameClick: ((Int) -> Void)? = nil
     /// Документ из ревью: под значки тредов в гаттере всегда есть место.
     var isReview = false
     var popover: Workspace.LinePopoverRequest? = nil
@@ -4347,6 +4404,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.onCommentLine = onCommentLine
         controller.onBreakpointClick = onBreakpointClick
         controller.onBreakpointCondition = onBreakpointCondition
+        controller.onBlameClick = onBlameClick
         return controller
     }
 
@@ -4358,6 +4416,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.onCommentLine = onCommentLine
         controller.onBreakpointClick = onBreakpointClick
         controller.onBreakpointCondition = onBreakpointCondition
+        controller.onBlameClick = onBlameClick
         controller.contextActions = contextActions
         controller.codeActions = codeActions
         controller.textMenuActions = textMenuActions
@@ -4440,6 +4499,11 @@ struct CodeView: NSViewControllerRepresentable {
             context.coordinator.commentMarks = commentMarks
             context.coordinator.isReview = isReview
             controller.setCommentMarks(commentMarks, column: isReview)
+        }
+
+        if documentChanged || context.coordinator.blame != blame {
+            context.coordinator.blame = blame
+            controller.setBlame(blame)
         }
 
         if documentChanged || context.coordinator.breakpoints != breakpoints {
@@ -4569,6 +4633,7 @@ struct CodeView: NSViewControllerRepresentable {
         var lineChanges: [LineDiff.Change] = []
         var removedLines: [RemovedLines] = []
         var commentMarks: [Int: CommentMark] = [:]
+        var blame: BlameColumn?
         var isReview = false
         var appliedPopover = 0
         var conflicts: [MergeConflict] = []

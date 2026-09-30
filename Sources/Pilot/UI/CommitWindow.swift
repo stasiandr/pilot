@@ -1,37 +1,12 @@
 import SwiftUI
 import AppKit
 
-/// Окно коммита проекта, как Commit в Rider: слева подготовленное и нет,
-/// под ними — сообщение; справа — дифф выбранного файла, куски которого
+/// Вкладка «Коммит» панели git: слева подготовленное и нет, под ними —
+/// сообщение; справа — дифф выбранного файла, куски и строки которого
 /// подготавливаются по одному.
-struct CommitWindow: View {
-    static let sceneID = "commit"
-
-    let rootPath: String?
-    @ObservedObject private var language = LanguageStore.shared
-
-    var body: some View {
-        Group {
-            if let workspace = ProjectWindows.shared.workspaces.first(where: { $0.root?.path == rootPath }) {
-                CommitView(workspace: workspace, commits: workspace.commits)
-                    .navigationTitle(L("Коммит — \(workspace.root?.lastPathComponent ?? "")"))
-            } else {
-                Text(L("Проект этого окна закрыт"))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .navigationTitle(L("Коммит"))
-            }
-        }
-        .id(language.current)
-        .frame(minWidth: 900, minHeight: 540)
-        .preferredColorScheme(Theme.current.isDark ? .dark : .light)
-    }
-}
-
 struct CommitView: View {
     let workspace: Workspace
     @ObservedObject var commits: GitCommitService
-    @Environment(\.dismiss) private var dismiss
     @FocusState private var messageFocused: Bool
     @State private var confirmDiscard: GitChange?
 
@@ -45,10 +20,9 @@ struct CommitView: View {
                 composer
             }
             .frame(minWidth: 320, idealWidth: 380, maxWidth: 560)
-            DiffPane(commits: commits)
+            CommitDiffPane(commits: commits, resolve: { workspace.openMerge(path: $0) })
                 .frame(minWidth: 480, maxWidth: .infinity)
         }
-        .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .onAppear {
             commits.refresh()
             messageFocused = true
@@ -56,11 +30,6 @@ struct CommitView: View {
         // Вернулись из терминала — там могли закоммитить или переключить ветку.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             commits.refresh()
-        }
-        .background {
-            Button("") { dismiss() }
-                .keyboardShortcut("w", modifiers: .command)
-                .hidden()
         }
         .confirmationDialog(L("Откатить правки в «\(confirmDiscard?.fileName ?? "")»?"),
                             isPresented: Binding(get: { confirmDiscard != nil }, set: { if !$0 { confirmDiscard = nil } }),
@@ -92,7 +61,7 @@ struct CommitView: View {
             Spacer()
             if commits.tree.ahead > 0 || (commits.tree.upstream == nil && commits.tree.branch != nil && commits.tree.head != nil) {
                 Button(L("Отправить коммиты")) { commits.push() }
-                    .disabled(commits.busy != nil)
+                    .disabled(commits.isCommitting)
                     .help(commits.tree.upstream == nil ? L("Создать ветку на сервере и отправить") : "git push")
             }
             Button { commits.refresh() } label: { Image(systemName: "arrow.clockwise") }
@@ -126,6 +95,12 @@ struct CommitView: View {
             }
         }
         .listStyle(.sidebar)
+        // Пробел — подготовить или убрать выбранный файл, как в Rider.
+        .onKeyPress(.space) {
+            guard let selection = commits.selection else { return .ignored }
+            selection.staged ? commits.unstage([selection.path]) : commits.stage([selection.path])
+            return .handled
+        }
         .overlay {
             if commits.isLoaded && commits.tree.changes.isEmpty {
                 VStack(spacing: 6) {
@@ -146,7 +121,7 @@ struct CommitView: View {
             Button(action, action: perform)
                 .buttonStyle(.borderless)
                 .font(.system(size: 11))
-                .disabled(!enabled || commits.busy != nil)
+                .disabled(!enabled)
         }
     }
 
@@ -161,31 +136,25 @@ struct CommitView: View {
             }
             .buttonStyle(.borderless)
             .help(staged ? L("Убрать из коммита") : L("Подготовить к коммиту"))
-            .disabled(commits.busy != nil)
-            Text(letter(change, staged: staged))
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(nsColor: color(change, staged: staged)))
-                .frame(width: 12)
-            Text(change.fileName).lineLimit(1)
-            Text(change.directory)
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.head)
+            .disabled(change.isConflicted)
+            ChangedFileRow(letter: letter(change, staged: staged), color: color(change, staged: staged),
+                           name: change.fileName, directory: change.directory)
         }
         .tag(selection)
         .contextMenu {
             if staged {
                 Button(L("Убрать из коммита")) { commits.unstage([change.path]) }
+            } else if change.isConflicted {
+                Button(L("Разрешить конфликт…")) { workspace.openMerge(path: change.path) }
             } else {
                 Button(L("Подготовить к коммиту")) { commits.stage([change.path]) }
-                if !change.isConflicted {
-                    Button(L("Откатить правки…")) { confirmDiscard = change }
-                }
+                Button(L("Откатить правки…")) { confirmDiscard = change }
             }
             Divider()
             Button(L("Открыть в редакторе")) { open(change) }
                 .disabled(change.staged == .deleted || change.unstaged == .deleted)
+            Button(L("История файла")) { workspace.showHistory(path: change.path) }
+                .disabled(change.isUntracked)
             Button(L("Показать в Finder")) {
                 if let repository = commits.repository {
                     NSWorkspace.shared.activateFileViewerSelecting([repository.appendingPathComponent(change.path)])
@@ -203,12 +172,7 @@ struct CommitView: View {
     private func color(_ change: GitChange, staged: Bool) -> NSColor {
         if change.isConflicted { return Theme.gitConflicted }
         if change.isUntracked { return Theme.gitAdded }
-        switch staged ? change.staged : change.unstaged {
-        case .added: return Theme.gitAdded
-        case .deleted: return Theme.gitDeleted
-        case .renamed: return Theme.gitRenamed
-        default: return Theme.gitModified
-        }
+        return ChangeBadge.color(staged ? change.staged : change.unstaged)
     }
 
     private func open(_ change: GitChange) {
@@ -220,11 +184,24 @@ struct CommitView: View {
     // MARK: - Сообщение
 
     private var composer: some View {
+        CommitComposer(commits: commits, messageFocused: $messageFocused, height: 110)
+            .padding(12)
+    }
+}
+
+/// Сообщение и кнопки коммита. Общее у окна и вкладки навигатора.
+struct CommitComposer: View {
+    @ObservedObject var commits: GitCommitService
+    var messageFocused: FocusState<Bool>.Binding
+    var height: CGFloat
+    var compact = false
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $commits.message)
                     .font(.system(size: 12))
-                    .focused($messageFocused)
+                    .focused(messageFocused)
                     .scrollContentBackground(.hidden)
                     .padding(4)
                 if commits.message.isEmpty {
@@ -236,14 +213,15 @@ struct CommitView: View {
                         .allowsHitTesting(false)
                 }
             }
-            .frame(height: 110)
+            .frame(height: height)
             .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: Theme.chromeBackground)))
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(nsColor: Theme.separator)))
 
             HStack {
-                Toggle(L("Изменить последний коммит"), isOn: $commits.amend)
+                Toggle(compact ? L("Amend") : L("Изменить последний коммит"), isOn: $commits.amend)
                     .toggleStyle(.checkbox)
-                    .disabled(commits.tree.head == nil || commits.busy != nil)
+                    .disabled(commits.tree.head == nil || commits.isCommitting)
+                    .help(L("Изменить последний коммит"))
                 Spacer()
                 let length = CommitMessage.summary(commits.message).count
                 if length > CommitMessage.summaryLimit {
@@ -254,20 +232,86 @@ struct CommitView: View {
                 }
             }
 
+            metaWarnings
+
             HStack {
-                Button(L("Закоммитить и отправить")) { commits.commit(andPush: true) }
-                    .keyboardShortcut(.return, modifiers: [.command, .option])
-                    .disabled(!commits.canCommit)
+                Menu {
+                    Button(L("Закоммитить и отправить")) { commits.commit(andPush: true) }
+                        .keyboardShortcut(.return, modifiers: [.command, .option])
+                        .disabled(!commits.canCommit)
+                    Divider()
+                    fixupMenu
+                } label: {
+                    Text(compact ? "…" : L("Ещё"))
+                }
+                .fixedSize()
+                .onAppear { commits.loadRecentCommits() }
                 Spacer()
-                Button(commits.amend ? L("Изменить коммит") : L("Закоммитить")) { commits.commit(andPush: false) }
+                Button(commitTitle) { commits.commit(andPush: false) }
                     .keyboardShortcut(.return, modifiers: .command)
                     .buttonStyle(.borderedProminent)
                     .disabled(!commits.canCommit)
+                    .help(commits.commitsEverything
+                          ? L("Ничего не подготовлено — в коммит пойдут все изменения")
+                          : L("В коммит пойдёт подготовленное"))
             }
 
             status
         }
-        .padding(12)
+    }
+
+    private var commitTitle: String {
+        if commits.amend { return L("Изменить коммит") }
+        if commits.commitsEverything, !commits.tree.unstaged.isEmpty {
+            return L("Закоммитить всё (\(commits.tree.unstaged.count))")
+        }
+        return L("Закоммитить")
+    }
+
+    /// Fixup — в коммит, которого ещё нет на сервере. Со вливанием —
+    /// сразу переписать ветку (`rebase --autosquash`).
+    @ViewBuilder
+    private var fixupMenu: some View {
+        if commits.tree.staged.isEmpty {
+            Text(L("Fixup: сначала подготовьте правки"))
+        } else if commits.recentCommits.isEmpty {
+            Text(L("Fixup: нет неотправленных коммитов"))
+        } else {
+            Menu(L("Fixup в коммит")) {
+                ForEach(commits.recentCommits.prefix(15)) { commit in
+                    Button("\(commit.shortHash)  \(commit.subject)") { commits.commit(andPush: false, fixup: commit) }
+                }
+            }
+            Menu(L("Влить в коммит (fixup + autosquash)")) {
+                ForEach(commits.recentCommits.prefix(15)) { commit in
+                    Button("\(commit.shortHash)  \(commit.subject)") {
+                        commits.commit(andPush: false, fixup: commit, autosquash: true)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var metaWarnings: some View {
+        if !commits.metaProblems.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(commits.metaProblems.prefix(4), id: \.self) { problem in
+                    Label(problem.kind == .assetWithoutMeta
+                          ? L("\((problem.path as NSString).lastPathComponent) — без своего .meta")
+                          : L("\((problem.path as NSString).lastPathComponent) — .meta без ассета"),
+                          systemImage: "exclamationmark.triangle")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if commits.metaProblems.count > 4 {
+                    Text(L("… и ещё \(commits.metaProblems.count - 4)"))
+                }
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(Color(nsColor: Theme.diagnosticWarning))
+            .help(L("Ассет без .meta у коллег получит новый GUID, и ссылки на него порвутся; .meta без ассета Unity удалит"))
+        }
     }
 
     @ViewBuilder
@@ -298,8 +342,17 @@ struct CommitView: View {
 
 // MARK: - Дифф
 
-private struct DiffPane: View {
+/// Дифф выбранного файла в окне коммита. Клавиши, как в Magit:
+/// ↑↓ или j/k — между кусками, s — подготовить кусок или выбранные
+/// строки, u — убрать, x — откатить, Esc — снять выбор строк.
+struct CommitDiffPane: View {
     @ObservedObject var commits: GitCommitService
+    /// Файл в конфликте — в окно слияния.
+    var resolve: ((String) -> Void)? = nil
+    @AppStorage(DiffLayout.key) private var layout = DiffLayout.unified
+    @State private var focusedHunk = 0
+    @FocusState private var focused: Bool
+    @State private var confirmDiscard: GitFilePatch.Hunk?
 
     var body: some View {
         if let selection = commits.selection {
@@ -314,11 +367,29 @@ private struct DiffPane: View {
                     Text(selection.staged ? L("подготовлено") : L("не подготовлено"))
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                    DiffLayoutPicker(layout: $layout)
                 }
                 .padding(.horizontal, 12)
                 .frame(height: 34)
                 Divider()
                 content(selection)
+                if layout == .unified, commits.patch?.hunks.isEmpty == false,
+                   commits.tree.changes.first(where: { $0.path == selection.path })?.isConflicted != true {
+                    Divider()
+                    Text(selection.staged
+                         ? L("j/k — куски  ·  клик, ⇧клик — строки  ·  u — убрать из коммита")
+                         : L("j/k — куски  ·  клик, ⇧клик — строки  ·  s — подготовить  ·  x — откатить"))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .frame(height: 22)
+                }
+            }
+            .confirmationDialog(L("Откатить этот кусок?"),
+                                isPresented: Binding(get: { confirmDiscard != nil }, set: { if !$0 { confirmDiscard = nil } }),
+                                presenting: confirmDiscard) { hunk in
+                Button(L("Откатить"), role: .destructive) { commits.discard(hunk) }
+            } message: { _ in
+                Text(L("Правки пропадут из файла; прежний текст останется в локальной истории (⌃⌥H)."))
             }
         } else {
             Text(L("Выберите файл"))
@@ -329,7 +400,19 @@ private struct DiffPane: View {
 
     @ViewBuilder
     private func content(_ selection: GitCommitService.Selection) -> some View {
-        if let text = commits.untrackedText {
+        if commits.tree.changes.first(where: { $0.path == selection.path })?.isConflicted == true {
+            // Дифф конфликта — комбинированный (`@@@`): кусками его не
+            // подготовить, решают его в окне слияния.
+            VStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.merge").font(.system(size: 28, weight: .light)).foregroundStyle(.tertiary)
+                Text(L("Файл в конфликте")).foregroundStyle(.secondary)
+                if let resolve {
+                    Button(L("Слияние в три колонки…")) { resolve(selection.path) }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let text = commits.untrackedText {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(text.components(separatedBy: "\n").prefix(3000).enumerated()), id: \.offset) { i, line in
@@ -343,17 +426,10 @@ private struct DiffPane: View {
                 placeholder(L("Двоичный файл — показать нечего"))
             } else if patch.hunks.isEmpty {
                 placeholder(L("Отличий нет"))
+            } else if layout == .sideBySide {
+                SideBySideView(rows: SideBySideRow.rows(patch))
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(patch.hunks) { hunk in
-                            HunkCard(hunk: hunk, staged: selection.staged, busy: commits.busy != nil) {
-                                commits.toggle(hunk)
-                            }
-                        }
-                    }
-                    .padding(12)
-                }
+                hunks(patch, staged: selection.staged)
             }
         } else {
             ProgressView().controlSize(.small)
@@ -361,79 +437,76 @@ private struct DiffPane: View {
         }
     }
 
+    private func hunks(_ patch: GitFilePatch, staged: Bool) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(Array(patch.hunks.enumerated()), id: \.element.id) { index, hunk in
+                        HunkCard(hunk: hunk, selectedLines: commits.selectedLines[hunk.id] ?? [],
+                                 focused: focused && index == focusedHunk,
+                                 onLineClick: { line, extend in
+                                     focusedHunk = index
+                                     focused = true
+                                     commits.toggleLine(line, in: hunk, extend: extend)
+                                 }) {
+                            let lines = commits.selectedLines[hunk.id]?.isEmpty == false
+                            if !staged {
+                                Button(lines ? L("Откатить строки") : L("Откатить")) { confirmDiscard = hunk }
+                                    .controlSize(.small)
+                            }
+                            Button(staged ? (lines ? L("Убрать строки") : L("Убрать кусок"))
+                                          : (lines ? L("Подготовить строки") : L("Подготовить кусок"))) {
+                                commits.toggle(hunk)
+                            }
+                            .controlSize(.small)
+                        }
+                        .id(hunk.id)
+                    }
+                }
+                .padding(12)
+            }
+            .focusable()
+            .focusEffectDisabled()
+            .focused($focused)
+            .onKeyPress(characters: .init(charactersIn: "jksuxJK")) { press in
+                handle(press.characters, patch: patch, staged: staged, proxy: proxy)
+            }
+            .onKeyPress(.downArrow) { handle("j", patch: patch, staged: staged, proxy: proxy) }
+            .onKeyPress(.upArrow) { handle("k", patch: patch, staged: staged, proxy: proxy) }
+            .onKeyPress(.escape) {
+                commits.selectedLines = [:]
+                return .handled
+            }
+            .onChange(of: patch.hunks.count) { _, count in focusedHunk = min(focusedHunk, max(0, count - 1)) }
+        }
+    }
+
+    private func handle(_ key: String, patch: GitFilePatch, staged: Bool, proxy: ScrollViewProxy) -> KeyPress.Result {
+        guard !patch.hunks.isEmpty else { return .ignored }
+        let hunk = patch.hunks[min(focusedHunk, patch.hunks.count - 1)]
+        switch key.lowercased() {
+        case "j":
+            focusedHunk = min(focusedHunk + 1, patch.hunks.count - 1)
+            withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(patch.hunks[focusedHunk].id, anchor: .top) }
+        case "k":
+            focusedHunk = max(focusedHunk - 1, 0)
+            withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(patch.hunks[focusedHunk].id, anchor: .top) }
+        case "s":
+            guard !staged else { return .ignored }
+            commits.toggle(hunk)
+        case "u":
+            guard staged else { return .ignored }
+            commits.toggle(hunk)
+        case "x":
+            guard !staged else { return .ignored }
+            confirmDiscard = hunk
+        default:
+            return .ignored
+        }
+        return .handled
+    }
+
     private func placeholder(_ text: String) -> some View {
         Text(text).foregroundStyle(.tertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-private struct HunkCard: View {
-    let hunk: GitFilePatch.Hunk
-    let staged: Bool
-    let busy: Bool
-    let toggle: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(hunk.header)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer()
-                Text("+\(hunk.additions) −\(hunk.deletions)")
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                Button(staged ? L("Убрать кусок") : L("Подготовить кусок"), action: toggle)
-                    .controlSize(.small)
-                    .disabled(busy)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color(nsColor: Theme.chromeBackground))
-            ForEach(Array(numbered.enumerated()), id: \.offset) { _, item in
-                DiffLine(text: item.text, number: item.number)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(nsColor: Theme.separator)))
-    }
-
-    /// Номера строк нового текста — у удалённых строк номера нет.
-    private var numbered: [(text: String, number: Int?)] {
-        var line = hunk.newStart
-        return hunk.lines.map { text in
-            if text.hasPrefix("-") || text.hasPrefix("\\") { return (text, nil) }
-            defer { line += 1 }
-            return (text, line)
-        }
-    }
-}
-
-private struct DiffLine: View {
-    let text: String
-    let number: Int?
-
-    var body: some View {
-        let marker = text.first
-        HStack(alignment: .top, spacing: 6) {
-            Text(number.map(String.init) ?? "")
-                .frame(width: 40, alignment: .trailing)
-                .foregroundStyle(.tertiary)
-            Text(text.isEmpty ? " " : text)
-                .foregroundStyle(marker == "\\" ? .tertiary : .primary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .font(.system(size: 11.5, design: .monospaced))
-        .padding(.horizontal, 6)
-        .padding(.vertical, 1)
-        .background(background(marker))
-    }
-
-    private func background(_ marker: Character?) -> Color {
-        switch marker {
-        case "+": return Color(nsColor: Theme.gitAdded).opacity(0.14)
-        case "-": return Color(nsColor: Theme.gitDeleted).opacity(0.14)
-        default: return .clear
-        }
     }
 }

@@ -82,6 +82,7 @@ struct WindowSettingsView: View {
     @AppStorage(EditorChrome.key) private var chrome = EditorChrome.regular
     @AppStorage(EditorChrome.jumpBarKey) private var showsJumpBar = true
     @AppStorage(EditorChrome.projectTabsKey) private var showsProjectTabs = false
+    @State private var showsStatusBar = false
 
     var body: some View {
         Form {
@@ -92,6 +93,10 @@ struct WindowSettingsView: View {
             LabeledContent(L("Кнопки на панели")) {
                 Button(L("Настроить…")) { Self.customizeToolbar() }
             }
+            LabeledContent(L("Строка под редактором")) {
+                Button(L("Настроить…")) { showsStatusBar = true }
+                    .popover(isPresented: $showsStatusBar) { StatusBarCustomizer() }
+            }
             Toggle(L("Путь к файлу над редактором"), isOn: $showsJumpBar)
             Toggle(L("Вкладки проектов"), isOn: $showsProjectTabs)
             Text(L("Проекты открываются вкладками одного окна; полоса с названиями — когда их больше одного. Выключено — каждый проект в своём окне, а вторая половина пары — вкладкой по своей кнопке."))
@@ -99,7 +104,7 @@ struct WindowSettingsView: View {
                 .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
-        .frame(width: 640, height: 280)
+        .frame(width: 640, height: 310)
     }
 
     /// Окно настройки тулбара — у окна проекта: у настроек своего тулбара нет.

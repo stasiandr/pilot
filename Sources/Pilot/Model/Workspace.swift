@@ -179,11 +179,12 @@ final class Workspace: ObservableObject {
     // MARK: Навигатор
 
     enum NavigatorTab: Hashable, CaseIterable {
-        case project, outline, review, recent, hierarchy
+        case project, changes, outline, review, recent, hierarchy
 
         var icon: String {
             switch self {
             case .project: return "folder"
+            case .changes: return "plusminus.circle"
             case .outline: return "list.bullet.indent"
             case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock"
@@ -194,6 +195,7 @@ final class Workspace: ObservableObject {
         var selectedIcon: String {
             switch self {
             case .project: return "folder.fill"
+            case .changes: return "plusminus.circle.fill"
             case .outline: return "list.bullet.indent"
             case .review:  return "arrow.triangle.pull"
             case .recent:  return "clock.fill"
@@ -204,6 +206,7 @@ final class Workspace: ObservableObject {
         var title: String {
             switch self {
             case .project: return L("Проект")
+            case .changes: return L("Изменения и коммит")
             case .outline: return L("Структура файла")
             case .review:  return L("Ревью мерж-реквестов")
             case .recent:  return L("Недавние проекты")
@@ -289,6 +292,20 @@ final class Workspace: ObservableObject {
     /// Окно коммита: подготовка, дифф, коммит и push. Подписано само —
     /// в objectWillChange воркспейса не пробрасывается.
     let commits = GitCommitService()
+    /// Ветки, stash, слияние, rebase — репозиторий целиком.
+    let gitClient = GitClient()
+    /// Окно истории этого проекта.
+    let gitHistory = GitHistoryModel()
+    /// Открытые окна слияния: путь → сессия. Окно ищет свою здесь.
+    var mergeSessions: [String: MergeSession] = [:]
+    /// Панель git под редактором.
+    @Published var showsGitPanel = false
+    /// Авторы строк в колонке номеров, как «Annotate» в Rider.
+    @Published var showsBlame = false
+    /// Собранная колонка авторов и для какого blame.
+    var blameColumnCache: (generation: Int, column: BlameColumn)?
+    /// Попап веток из статус-строки: каждый запрос — новый номер.
+    @Published var branchPopoverRequest = 0
     private var observations: [AnyCancellable] = []
 
     // MARK: Расширения (см. Workspace+Extensions)
@@ -350,6 +367,9 @@ final class Workspace: ObservableObject {
             DispatchQueue.main.async { self.commits.refresh() }
         })
         commits.beforeDiscard = { [weak self] url in self?.recordBeforeDiscard(url) }
+        commits.onRepositoryChanged = { [weak self] in self?.gitRepositoryChanged() }
+        gitClient.onRepositoryChanged = { [weak self] in self?.gitRepositoryChanged() }
+        gitClient.beforeCheckout = { [weak self] in self?.confirmUnsavedBeforeCheckout() ?? true }
         debug.onShowLocation = { [weak self] url, line in self?.showDebugLocation(url, line: line) }
         // То же с языковым сервером (Swift и то, что описано в servers.json):
         // без этого фишка в статус-строке и ⌘T узнавали бы о его готовности
@@ -616,6 +636,9 @@ final class Workspace: ObservableObject {
         nuget.workspaceChanged(to: archived ? nil : url)
         unityConsole.workspaceChanged(to: archived ? nil : unity.project?.root)
         commits.workspaceChanged(to: git.repository)
+        gitClient.workspaceChanged(to: git.repository)
+        gitClient.refresh()
+        gitHistory.open(repository: nil)
         localHistory = archived ? nil : LocalHistory(directory: LocalHistory.directory(forProject: url))
         localHistoryFile = nil
         if let history = localHistory {
@@ -1383,6 +1406,8 @@ final class Workspace: ObservableObject {
         nugetOffer = nil
         unityConsole.workspaceChanged(to: nil)
         commits.workspaceChanged(to: nil)
+        gitClient.workspaceChanged(to: nil)
+        gitHistory.open(repository: nil)
         localHistory = nil
         localHistoryFile = nil
         configCatalogs.warm(root: nil, rules: nil)
@@ -3128,6 +3153,20 @@ final class Workspace: ObservableObject {
                 reveal: nil)
     }
 
+    /// Файл в версии из истории git — вкладкой только для чтения, как
+    /// версия из MR.
+    func openRevision(path: String, revision: String, text: String) {
+        guard let repository = git.repository else { return }
+        let url = repository.appendingPathComponent(path)
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try LoadedDocument.make(url: url, data: Data(text.utf8), revision: revision) }
+            }.value
+            self.present(result, reveal: nil)
+            self.bringToFront()
+        }
+    }
+
     private func present(_ result: Result<LoadedDocument, Error>, reveal: LSPRange?,
                          preview: Bool = false, replacingPreview: Bool = false,
                          replacingReviewTab: Bool = false) {
@@ -4637,13 +4676,15 @@ final class Workspace: ObservableObject {
     /// Есть что остановить: ■ включена.
     var isRunningOrDebugging: Bool { run.isRunning || debug.isActive }
 
-    /// Окно коммита этого проекта; уже открыто — выходит вперёд.
+    /// ⌘K, как Commit в Rider: слева, во вкладке навигатора «Изменения».
+    /// Дифф по кускам и строкам — во вкладке «Коммит» панели git.
     func openCommitWindow() {
-        guard let root, git.repository != nil else {
+        guard git.repository != nil else {
             showNotice(L("Проект не в git-репозитории"))
             return
         }
-        ProjectWindows.shared.openWindow?(id: CommitWindow.sceneID, value: root.path)
+        navigatorTab = .changes
+        if !showsSidebar { showsSidebar = true }
     }
 
     /// Окно NuGet этого проекта; уже открыто — выходит вперёд.

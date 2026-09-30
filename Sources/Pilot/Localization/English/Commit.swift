@@ -7,7 +7,6 @@ extension English {
         ("Проект не в git-репозитории", "The project isn’t in a git repository"),
 
         // CommitWindow.swift
-        ("Коммит — %@", "Commit — %@"),
         ("Откатить правки в «%@»?", "Discard changes in “%@”?"),
         ("В Корзину", "Move to Trash"),
         ("Откатить", "Discard"),

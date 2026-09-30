@@ -23,6 +23,9 @@ struct RootView: View {
     @AppStorage(EditorChrome.jumpBarKey) private var showsJumpBar = true
     @ObservedObject private var copilot = CopilotService.shared
     @AppStorage(EditorChrome.projectTabsKey) private var showsProjectTabs = false
+    /// Что стоит в строке под редактором и в каком порядке.
+    @AppStorage(StatusBarLayout.key) private var statusBarLayout = StatusBarLayout.defaultText
+    @State private var showsStatusBarCustomizer = false
     private var compact: Bool { chrome.isCompact }
 
     var body: some View {
@@ -108,6 +111,9 @@ struct RootView: View {
             if workspace.review.active != nil {
                 ReviewBar(workspace: workspace)
             }
+            if workspace.root != nil {
+                GitOperationBar(workspace: workspace, client: workspace.gitClient)
+            }
             if workspace.showsConflictBar {
                 ConflictBar(workspace: workspace)
             }
@@ -123,6 +129,11 @@ struct RootView: View {
                 }
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 .clipped()
+            }
+            if workspace.root != nil, workspace.showsGitPanel {
+                GitPanel(workspace: workspace, client: workspace.gitClient)
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                    .clipped()
             }
             if workspace.root != nil, workspace.debug.isPanelVisible {
                 DebugPanel(debug: workspace.debug, root: workspace.root) { url, line in
@@ -166,6 +177,8 @@ struct RootView: View {
                          lineChanges: workspace.editorLineChanges,
                          removedLines: workspace.editorRemovedLines,
                          commentMarks: workspace.editorCommentMarks,
+                         blame: workspace.editorBlameColumn,
+                         onBlameClick: { workspace.blameClicked(line: $0) },
                          isReview: workspace.isReviewDocument,
                          popover: workspace.linePopover,
                          popoverContent: { request in
@@ -465,34 +478,15 @@ struct RootView: View {
 
     /// Как нижняя полоса редактора Xcode: язык слева, позиция курсора справа.
     private var statusBar: some View {
-        HStack(spacing: 10) {
-            if let doc = workspace.document {
-                let icon = Theme.fileIcon(forName: doc.url.lastPathComponent)
-                Image(systemName: icon.symbol)
-                    .font(.system(size: 10))
-                    .foregroundStyle(Color(nsColor: icon.color))
-                Text(doc.languageName)
-                if doc.media == nil {
-                    Text(Theme.count(doc.model.lineCount, "строка", "строки", "строк"))
-                        .foregroundStyle(.tertiary)
-                }
-
-                Spacer()
-
-                noticeLabel
-                unityChip
-                blameLabel
-                changesChip
-                if doc.media == nil, !workspace.showsRenderedMarkdown {
-                    CaretPositionLabel(caret: workspace.caret, model: doc.model)
-                }
-                StatusIndicator(workspace: workspace)
-            } else {
+        let items = StatusBarLayout.decode(statusBarLayout)
+        return HStack(spacing: 10) {
+            ForEach(items, id: \.self) { item in
+                statusItem(item)
+            }
+            // Без растяжки всё прижато влево, а сообщения — в конце.
+            if !items.contains(.space) {
                 Spacer()
                 noticeLabel
-                unityChip
-                changesChip
-                StatusIndicator(workspace: workspace)
             }
         }
         .font(.system(size: 11))
@@ -502,6 +496,48 @@ struct RootView: View {
         .background(Color(nsColor: Theme.swiftUIEditorBackground))
         .overlay(alignment: .top) {
             Rectangle().fill(Color(nsColor: Theme.separator)).frame(height: 1)
+        }
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button(L("Настроить строку…")) { showsStatusBarCustomizer = true }
+        }
+        .popover(isPresented: $showsStatusBarCustomizer, arrowEdge: .top) {
+            StatusBarCustomizer()
+        }
+    }
+
+    @ViewBuilder
+    private func statusItem(_ item: StatusBarItem) -> some View {
+        let doc = workspace.document
+        switch item {
+        case .language:
+            if let doc {
+                let icon = Theme.fileIcon(forName: doc.url.lastPathComponent)
+                HStack(spacing: 5) {
+                    Image(systemName: icon.symbol)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color(nsColor: icon.color))
+                    Text(doc.languageName)
+                }
+            }
+        case .lines:
+            if let doc, doc.media == nil {
+                Text(Theme.count(doc.model.lineCount, "строка", "строки", "строк"))
+                    .foregroundStyle(.tertiary)
+            }
+        case .space:
+            Spacer()
+            // Короткие сообщения — сразу справа от растяжки: их видно всегда.
+            noticeLabel
+        case .unity: unityChip
+        case .blame: blameLabel
+        case .changes: changesChip
+        case .branch: BranchChip(workspace: workspace, client: workspace.gitClient)
+        case .caret:
+            if let doc, doc.media == nil, !workspace.showsRenderedMarkdown {
+                CaretPositionLabel(caret: workspace.caret, model: doc.model)
+            }
+        case .activity: StatusIndicator(workspace: workspace)
         }
     }
 
@@ -839,6 +875,41 @@ private struct CaretPositionLabel: View {
 
 /// Кто и когда последним трогал строку под курсором. Появляется, когда
 /// blame досчитается; до тех пор места в строке не занимает.
+/// Ветка в статус-строке. Клик (и ⌃⇧B) — попап веток, как виджет
+/// ветки в Rider.
+private struct BranchChip: View {
+    let workspace: Workspace
+    @ObservedObject var client: GitClient
+    @State private var showsPopover = false
+
+    var body: some View {
+        if let status = workspace.git.status {
+            Button { showsPopover.toggle() } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: client.operation == nil ? "arrow.triangle.branch" : "arrow.triangle.merge")
+                        .font(.system(size: 9))
+                    // Своя ширина, без растяжения: длинное имя — с многоточием в середине.
+                    Text(Self.short(status.headLabel))
+                        .lineLimit(1)
+                        .fixedSize()
+                    if client.busy != nil { ProgressView().controlSize(.mini) }
+                }
+            }
+            .buttonStyle(.plain)
+            .help(KeymapStore.shared.help(L("Ветки"), .branches))
+            .popover(isPresented: $showsPopover, arrowEdge: .top) {
+                BranchPopover(workspace: workspace, client: client)
+            }
+            .onChange(of: workspace.branchPopoverRequest) { _, _ in showsPopover = true }
+        }
+    }
+
+    static func short(_ name: String) -> String {
+        guard name.count > 28 else { return name }
+        return String(name.prefix(14)) + "…" + String(name.suffix(12))
+    }
+}
+
 private struct BlameLabel: View {
     let caret: EditorCaret
     let blame: GitBlame
