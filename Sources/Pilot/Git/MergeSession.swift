@@ -53,7 +53,9 @@ final class MergeSession: ObservableObject {
                     return output.stdout
                 }
             }.value
-            if raw.contains(where: { $0?.prefix(8192).contains(0) == true }) {
+            // Картинка, модель, шрифт, PDF — показываем как их, даже если
+            // формат текстовый (OBJ, SVG): вершины текстом не сравнить.
+            if raw.contains(where: { $0?.prefix(8192).contains(0) == true }) || MediaKind(filename: path) != nil {
                 isBinary = true
                 let names = await Task.detached { Self.branchNames(repository) }.value
                 oursName = names.ours
@@ -145,6 +147,25 @@ final class MergeSession: ObservableObject {
         }.value
         guard result?.succeeded == true else {
             error = result?.message ?? L("Не удалось запустить git")
+            return false
+        }
+        return await add()
+    }
+
+    /// Ни одной из правок — версия общего предка (`:1:`), и файл решён.
+    func takeBase() async -> Bool {
+        busy = true
+        defer { busy = false }
+        let repository = repository, path = path
+        let written = await Task.detached { () -> Bool in
+            guard let output = Git.run(["cat-file", "blob", ":1:\(path)"], in: repository), output.status == 0 else { return false }
+            var data = output.stdout
+            if GitBlobs.isLFSPointer(data), let url = GitBlobs.file(path, at: .stage(1), in: repository),
+               let real = try? Data(contentsOf: url) { data = real }
+            return (try? data.write(to: repository.appendingPathComponent(path))) != nil
+        }.value
+        guard written else {
+            error = L("Не удалось записать версию общего предка")
             return false
         }
         return await add()

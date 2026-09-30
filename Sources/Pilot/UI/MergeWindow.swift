@@ -71,30 +71,7 @@ struct MergeView: View {
                     footer(editor)
                 }
             } else if session.isBinary {
-                VStack(spacing: 10) {
-                    if MediaKind(filename: session.path) != nil {
-                        // Наша и их версии — самим файлом: что берёшь, то и видно.
-                        MediaCompareView(repository: session.repository, path: session.path,
-                                         before: .init(title: L("Наша: \(session.oursName)"), revision: .stage(2)),
-                                         after: .init(title: session.theirsName.isEmpty ? L("Их версия") : L("Их: \(session.theirsName)"),
-                                                      revision: .stage(3)))
-                    } else {
-                        Image(systemName: "doc.questionmark").font(.system(size: 30, weight: .light)).foregroundStyle(.tertiary)
-                            .padding(.top, 40)
-                    }
-                    Text(L("Двоичный файл — слить его нельзя, только взять одну версию целиком"))
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        Button(L("Взять нашу: \(session.oursName)")) { finish { await session.takeWhole(true) } }
-                        Button(L("Взять их: \(session.theirsName)")) { finish { await session.takeWhole(false) } }
-                    }
-                    .disabled(session.busy)
-                    if let error = session.error {
-                        Text(error).foregroundStyle(Color(nsColor: Theme.diagnosticError)).textSelection(.enabled)
-                    }
-                }
-                .padding(.bottom, 14)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                BinaryMergeView(session: session, finish: finish)
             } else if let error = session.error {
                 Text(error).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {

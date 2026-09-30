@@ -428,6 +428,10 @@ struct FontViewer: View {
 
 struct ModelViewer: View {
     let url: URL
+    /// Общая камера нескольких просмотрщиков: крутишь один — поворачиваются все.
+    var sync: CameraSync? = nil
+    /// Модель загрузилась — для таблицы сравнения версий.
+    var onLoad: ((ModelScene) -> Void)? = nil
 
     @State private var loaded: ModelScene?
     @State private var error: String?
@@ -436,7 +440,7 @@ struct ModelViewer: View {
     var body: some View {
         Group {
             if let loaded {
-                SceneView3D(model: loaded, wireframe: wireframe)
+                SceneView3D(model: loaded, wireframe: wireframe, sync: sync)
                     .overlay(alignment: .bottom) {
                         InfoCapsule(items: loaded.info) {
                             MediaButton(symbol: "square.grid.3x3", help: L("Каркас"), active: wireframe) {
@@ -456,11 +460,26 @@ struct ModelViewer: View {
                 Result { try ModelScene.load(url) }
             }.value
             switch result {
-            case .success(let scene): loaded = scene
+            case .success(let scene):
+                loaded = scene
+                onLoad?(scene)
             case .failure(let failure): error = failure.localizedDescription
             }
         }
     }
+}
+
+/// Что в модели — для сравнения версий: числа и имена сеток и материалов.
+struct ModelFacts: Equatable, Sendable {
+    var meshes = 0
+    var triangles = 0
+    var vertices: Int?
+    var size: String?
+    var materials = 0
+    var bones = 0
+    var animations = 0
+    var meshNames: [String] = []
+    var materialNames: [String] = []
 }
 
 final class ModelScene: @unchecked Sendable {
@@ -468,6 +487,7 @@ final class ModelScene: @unchecked Sendable {
     let center: SCNVector3
     let radius: CGFloat
     let info: [String]
+    var facts = ModelFacts()
 
     init(scene: SCNScene, center: SCNVector3, radius: CGFloat, info: [String]) {
         self.scene = scene
@@ -539,10 +559,14 @@ final class ModelScene: @unchecked Sendable {
         } else {
             throw LoadError.unsupported
         }
-        var triangles = 0, meshes = 0
+        var triangles = 0, meshes = 0, vertices = 0
+        var meshNames: [String] = [], materialNames = Set<String>()
         scene.rootNode.enumerateHierarchy { node, _ in
             guard let geometry = node.geometry else { return }
             meshes += 1
+            vertices += geometry.sources(for: .vertex).first?.vectorCount ?? 0
+            meshNames.append(node.name ?? geometry.name ?? "mesh \(meshes)")
+            for material in geometry.materials { if let name = material.name { materialNames.insert(name) } }
             for element in geometry.elements where element.primitiveType == .triangles {
                 triangles += element.primitiveCount
             }
@@ -550,10 +574,15 @@ final class ModelScene: @unchecked Sendable {
         }
         guard meshes > 0 else { throw LoadError.empty }
         let (lo, hi) = scene.rootNode.boundingBox
-        return make(scene: scene, lo: lo, hi: hi, info: [
+        let model = make(scene: scene, lo: lo, hi: hi, info: [
             ext.uppercased(), count(meshes, "сетка", "сетки", "сеток"),
             count(triangles, "треугольник", "треугольника", "треугольников"),
         ] + [fileSize(url)].compactMap { $0 })
+        model.facts = ModelFacts(meshes: meshes, triangles: triangles, vertices: vertices,
+                                 size: String(format: "%.2f × %.2f × %.2f", hi.x - lo.x, hi.y - lo.y, hi.z - lo.z),
+                                 materials: materialNames.count, meshNames: meshNames.sorted(),
+                                 materialNames: materialNames.sorted())
+        return model
     }
 
     private static func loadFBX(_ url: URL) throws -> ModelScene {
@@ -631,7 +660,11 @@ final class ModelScene: @unchecked Sendable {
         if !fbx.materials.isEmpty { info.append(count(fbx.materials.count, "материал", "материала", "материалов")) }
         if fbx.bones > 0 { info.append(count(fbx.bones, "кость", "кости", "костей")) }
         if fbx.animations > 0 { info.append(count(fbx.animations, "анимация", "анимации", "анимаций")) }
-        return make(scene: scene, lo: lo, hi: hi, info: info)
+        let model = make(scene: scene, lo: lo, hi: hi, info: info)
+        model.facts = ModelFacts(meshes: fbx.meshes.count, triangles: fbx.triangles, vertices: fbx.controlPoints,
+                                 size: size, materials: fbx.materials.count, bones: fbx.bones, animations: fbx.animations,
+                                 meshNames: fbx.meshes.map(\.name).sorted(), materialNames: fbx.materials.map(\.name).sorted())
+        return model
     }
 
     private static func make(scene: SCNScene, lo: SCNVector3, hi: SCNVector3, info: [String]) -> ModelScene {
@@ -649,9 +682,14 @@ final class ModelScene: @unchecked Sendable {
 struct SceneView3D: NSViewRepresentable {
     let model: ModelScene
     let wireframe: Bool
+    var sync: CameraSync? = nil
 
     func makeNSView(context: Context) -> SCNView {
-        let view = SCNView()
+        let view = SyncedSCNView()
+        view.sync = sync
+        view.model = model
+        sync?.register(view)
+        view.delegate = view
         view.scene = model.scene
         view.backgroundColor = Theme.editorBackground
         view.antialiasingMode = .multisampling4X
@@ -668,3 +706,54 @@ struct SceneView3D: NSViewRepresentable {
         view.debugOptions = wireframe ? [.renderAsWireframe] : []
     }
 }
+
+/// Общая камера для нескольких моделей рядом: какой крутят мышью, тот и
+/// ведёт, остальные повторяют поворот и приближение — у каждой
+/// относительно своего центра и в своём масштабе.
+@MainActor
+final class CameraSync {
+    private var views: [WeakView] = []
+    fileprivate weak var leader: SyncedSCNView?
+
+    private struct WeakView { weak var view: SyncedSCNView? }
+
+    fileprivate func register(_ view: SyncedSCNView) {
+        views.removeAll { $0.view == nil }
+        views.append(WeakView(view: view))
+    }
+
+    /// Ведущий повернул камеру — остальные туда же.
+    fileprivate func follow(_ source: SyncedSCNView) {
+        guard leader === source, let from = source.model, let camera = source.pointOfView else { return }
+        let offset = camera.position - from.center
+        for entry in views {
+            guard let view = entry.view, view !== source, let to = view.model, let target = view.pointOfView else { continue }
+            let scale = to.radius / max(from.radius, 0.0001)
+            target.position = to.center + offset * scale
+            target.orientation = camera.orientation
+        }
+    }
+}
+
+final class SyncedSCNView: SCNView, SCNSceneRendererDelegate {
+    weak var sync: CameraSync?
+    var model: ModelScene?
+
+    private func lead() { MainActor.assumeIsolated { sync?.leader = self } }
+
+    override func mouseDown(with event: NSEvent) { lead(); super.mouseDown(with: event) }
+    override func rightMouseDown(with event: NSEvent) { lead(); super.rightMouseDown(with: event) }
+    override func scrollWheel(with event: NSEvent) { lead(); super.scrollWheel(with: event) }
+    override func magnify(with event: NSEvent) { lead(); super.magnify(with: event) }
+
+    nonisolated func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.sync?.follow(self) }
+        }
+    }
+}
+
+private func - (a: SCNVector3, b: SCNVector3) -> SCNVector3 { SCNVector3(a.x - b.x, a.y - b.y, a.z - b.z) }
+private func + (a: SCNVector3, b: SCNVector3) -> SCNVector3 { SCNVector3(a.x + b.x, a.y + b.y, a.z + b.z) }
+private func * (a: SCNVector3, k: CGFloat) -> SCNVector3 { SCNVector3(a.x * k, a.y * k, a.z * k) }

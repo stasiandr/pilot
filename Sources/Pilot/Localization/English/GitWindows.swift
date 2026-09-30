@@ -310,9 +310,6 @@ extension English {
         ("объект удалён у нас, у них изменён", "object deleted in ours, changed in theirs"),
         ("объект удалён у них, у нас изменён", "object deleted in theirs, changed in ours"),
         ("— удалено —", "— deleted —"),
-        ("Двоичный файл — слить его нельзя, только взять одну версию целиком", "A binary file can’t be merged — take one version whole"),
-        ("Взять нашу: %@", "Take Ours: %@"),
-        ("Взять их: %@", "Take Theirs: %@"),
 
         // JSON по ключам
         ("Было: %@", "Base: %@"),
@@ -338,6 +335,31 @@ extension English {
         ("Подготовлено", "Staged"),
         ("Рядом", "Side by Side"),
         ("Файла не было", "No file yet"),
+
+        // Конфликт картинок и моделей
+        ("%@×%@ → %@×%@: размер изменился", "%@×%@ → %@×%@: size changed"),
+        ("Анимации", "Animations"),
+        ("Было — общий предок", "Base — common ancestor"),
+        ("Было", "Base"),
+        ("Вершины", "Vertices"),
+        ("Взять их", "Take Theirs"),
+        ("Взять нашу", "Take Ours"),
+        ("Изменено %@%% пикселей · область %@×%@", "Changed %@%% of pixels · area %@×%@"),
+        ("Кости", "Bones"),
+        ("Материалы", "Materials"),
+        ("Наша", "Ours"),
+        ("Не удалось записать версию общего предка", "Couldn’t write the common ancestor’s version"),
+        ("Ни одной из правок — версия общего предка", "Neither change — the common ancestor’s version"),
+        ("Оставить как было", "Keep the Base"),
+        ("Пиксели те же", "Pixels unchanged"),
+        ("Подсвечивать, что изменила каждая сторона", "Highlight what each side changed"),
+        ("Размер", "Size"),
+        ("Разница", "Difference"),
+        ("Сетки", "Meshes"),
+        ("Треугольники", "Triangles"),
+        ("Файла не было — обе стороны его добавили", "No file in the base — both sides added it"),
+        ("материалы", "materials"),
+        ("сетки", "meshes"),
 
         // Меню и редактор
         ("Получить с сервера (fetch)", "Fetch"),

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 var failures = 0
 var checks = 0
@@ -5465,6 +5468,26 @@ do {
     let front = JSONMerge.merge(base: "[{\"id\":2}]", ours: "[{\"id\":2,\"x\":1}]", theirs: "[{\"id\":1},{\"id\":2}]")
     check(front?.text([:]) == "[{\"id\":1},{\"id\":2,\"x\":1}]", "новый элемент — в начало (\(front?.text([:]) ?? ""))")
 }
+
+#if canImport(CoreGraphics)
+section("Картинки: что изменилось")
+do {
+    func image(_ fill: (Int, Int) -> UInt8) -> CGImage {
+        var pixels = [UInt8](repeating: 255, count: 20 * 10 * 4)
+        for y in 0..<10 { for x in 0..<20 { let i = (y * 20 + x) * 4; pixels[i] = fill(x, y); pixels[i + 1] = 0; pixels[i + 2] = 0 } }
+        let provider = CGDataProvider(data: Data(pixels) as CFData)!
+        return CGImage(width: 20, height: 10, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 80,
+                       space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+    }
+    let base = image { _, _ in 100 }
+    let edited = image { x, y in x >= 15 && y < 4 ? 200 : 100 }
+    let diff = ImageDiff.compare(base, edited)
+    check(diff?.bounds == CGRect(x: 15, y: 0, width: 5, height: 4) && abs((diff?.changed ?? 0) - 0.1) < 0.001 && diff?.mask != nil,
+          "область изменения — правый верхний угол, 10% (\(String(describing: diff?.bounds)))")
+    check(ImageDiff.compare(base, image { _, _ in 104 })?.bounds == nil, "мелкая разница — не изменение")
+}
+#endif
 
 section("Git: слияние трёх версий")
 do {
