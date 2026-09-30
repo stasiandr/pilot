@@ -1,0 +1,286 @@
+#!/bin/bash
+# Репозиторий-песочница со всеми видами конфликтов слияния — посмотреть,
+# как с ними обходится Pilot:
+#
+#   bin/pilot-merge-demo [папка]          # по умолчанию ~/personal/pilot-merge-demo-all
+#
+# master (Анна) и feature/balance (Борис) правили одно и то же, и слияние
+# остановлено на конфликтах:
+#
+#   Assets/Scripts/Player.cs, Shop.cs    — код: споры, «простые» (палочка), правки одной стороны
+#   Assets/Scenes/Level.unity            — сцена: по объектам (8 правок сливаются сами, 3 спора)
+#   Assets/Prefabs/Player.prefab         — префаб: один спор
+#   Configs/store/shop.json              — JSON по ключам: 2 спора, остальное само
+#   Configs/events/govermentEvents.json  — настоящий конфиг clm-server, если он рядом:
+#                                          47 маркеров у git, ни одного спора по ключам
+#   Assets/Textures/courier.png          — картинка: у нас значок, у них низ
+#   Assets/Textures/logo.png             — картинка: у них другой размер
+#   Assets/Models/crate.obj              — модель: у нас ручка, у них крышка и шире
+#
+# Папка пересоздаётся с нуля. Открыть: open -a Pilot.app <папка>
+set -euo pipefail
+R="${1:-$HOME/personal/pilot-merge-demo-all}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+rm -rf "$R"
+mkdir -p "$R"/Assets/{Scripts,Scenes,Prefabs,Textures,Models} "$R"/Configs/{store,events} "$R/ProjectSettings"
+cd "$R"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_EMAIL=anna@example.com GIT_COMMITTER_EMAIL=anna@example.com
+anna() { GIT_AUTHOR_NAME="Анна" GIT_COMMITTER_NAME="Анна" "$@"; }
+boris() { GIT_AUTHOR_NAME="Борис" GIT_COMMITTER_NAME="Борис" GIT_AUTHOR_EMAIL=boris@example.com "$@"; }
+
+git init -q -b master
+# OBJ — текст, но сливать вершины построчно бессмысленно: пусть git считает его двоичным.
+printf '*.obj binary\n' > .gitattributes
+echo "m_EditorVersion: 6000.3.14f1" > ProjectSettings/ProjectVersion.txt
+
+# ── Картинки: рисует маленький Swift-скрипт (CoreGraphics), без зависимостей.
+cat > "$TMP/image.swift" <<'SWIFT'
+import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
+// image.swift out w h — градиент с «иконкой»; image.swift in out x y w h r g b a [scale] — закрасить прямоугольник.
+let a = CommandLine.arguments
+func save(_ image: CGImage, _ path: String) {
+    let d = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(d, image, nil); CGImageDestinationFinalize(d)
+}
+func context(_ w: Int, _ h: Int) -> CGContext {
+    CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+}
+if a.count == 4 {
+    let w = Int(a[2])!, h = Int(a[3])!
+    let c = context(w, h)
+    let g = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                       colors: [CGColor(red: 0.2, green: 0.5, blue: 0.9, alpha: 1), CGColor(red: 0.95, green: 0.7, blue: 0.3, alpha: 1)] as CFArray,
+                       locations: [0, 1])!
+    c.drawLinearGradient(g, start: .zero, end: CGPoint(x: w, y: h), options: [])
+    c.setFillColor(CGColor(red: 0.55, green: 0.3, blue: 0.85, alpha: 1))
+    c.fillEllipse(in: CGRect(x: 80, y: Double(h) - 190, width: 110, height: 110))
+    c.setFillColor(CGColor(red: 0.95, green: 0.2, blue: 0.2, alpha: 1))
+    c.fill(CGRect(x: Double(w) * 0.6, y: 60, width: 180, height: 260))
+    save(c.makeImage()!, a[1])
+} else {
+    let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: a[1]) as CFURL, nil)!
+    let image = CGImageSourceCreateImageAtIndex(src, 0, nil)!
+    let scale = a.count > 11 ? Double(a[11])! : 1
+    let w = Int(Double(image.width) * scale), h = Int(Double(image.height) * scale)
+    let c = context(w, h)
+    c.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+    let n = a[3...10].map { Double($0)! }
+    if n[2] > 0 {
+        c.setFillColor(CGColor(red: n[4], green: n[5], blue: n[6], alpha: n[7]))
+        c.fill(CGRect(x: n[0], y: Double(h) - n[1] - n[3], width: n[2], height: n[3]))
+    }
+    save(c.makeImage()!, a[2])
+}
+SWIFT
+swiftc -O -o "$TMP/image" "$TMP/image.swift" 2>/dev/null
+IMG="$TMP/image"
+
+# Настоящая иконка из clm-client, если он рядом, иначе нарисованная.
+P=Assets/Sprites/infoBase/ib_job_Courier.png
+if [[ -d "$HOME/work/clm-client/.git" ]] && command -v git-lfs >/dev/null &&
+   (cd "$HOME/work/clm-client" && git cat-file -e "HEAD:$P" 2>/dev/null); then
+    (cd "$HOME/work/clm-client" && git show "HEAD:$P" | git lfs smudge -- "$P") > Assets/Textures/courier.png
+else
+    "$IMG" Assets/Textures/courier.png 1024 512
+fi
+"$IMG" Assets/Textures/courier.png Assets/Textures/logo.png 0 0 0 0 0 0 0 0 0.25
+
+# ── Модель: ящик из кубов. obj.py <файл> — строки «имя x0 y0 z0 x1 y1 z1 материал» на входе.
+cat > "$TMP/obj.py" <<'PY'
+import sys
+lines = ["mtllib crate.mtl"]; v = 0
+for spec in sys.stdin.read().split("\n"):
+    if not spec.strip(): continue
+    name, *c, mat = spec.split(); x0, y0, z0, x1, y1, z1 = map(float, c)
+    vs = [(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0),(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)]
+    faces = [(1,2,3,4),(5,8,7,6),(1,5,6,2),(2,6,7,3),(3,7,8,4),(5,1,4,8)]
+    lines += [f"o {name}", f"usemtl {mat}"] + [f"v {a} {b} {c}" for a, b, c in vs]
+    lines += ["f " + " ".join(str(v + i) for i in f) for f in faces]
+    v += 8
+open(sys.argv[1], "w").write("\n".join(lines) + "\n")
+PY
+echo "Crate 0 0 0 1 1 1 Wood" | python3 "$TMP/obj.py" Assets/Models/crate.obj
+printf 'newmtl Wood\nKd 0.6 0.4 0.2\nnewmtl Metal\nKd 0.7 0.7 0.75\n' > Assets/Models/crate.mtl
+
+# ── Код.
+cat > Assets/Scripts/Player.cs <<'CS'
+using UnityEngine;
+
+public class Player : MonoBehaviour
+{
+    public float speed = 5f;
+    public int health = 100;
+
+    void Update()
+    {
+        Move();
+    }
+
+    void Move()
+    {
+        var x = Input.GetAxis("Horizontal");
+        transform.position += Vector3.right * x * speed * Time.deltaTime;
+    }
+
+    public void Damage(int amount)
+    {
+        health -= amount;
+        if (health <= 0) Die();
+    }
+
+    void Die()
+    {
+        Destroy(gameObject);
+    }
+}
+CS
+cat > Assets/Scripts/Shop.cs <<'CS'
+public class Shop
+{
+    public int Price(string item)
+    {
+        return item == "sword" ? 100 : 50;
+    }
+}
+CS
+
+# ── Сцена и префаб.
+python3 - <<'PY'
+def go(fid, name, comps):
+    return f"--- !u!1 &{fid}\nGameObject:\n  m_ObjectHideFlags: 0\n  m_Component:\n" + "".join(f"  - component: {{fileID: {c}}}\n" for c in comps) + f"  m_Layer: 0\n  m_Name: {name}\n  m_IsActive: 1\n"
+def tr(fid, go_, pos, father, children):
+    ch = "  m_Children: []\n" if not children else "  m_Children:\n" + "".join(f"  - {{fileID: {c}}}\n" for c in children)
+    return f"--- !u!4 &{fid}\nTransform:\n  m_GameObject: {{fileID: {go_}}}\n  m_LocalPosition: {pos}\n  m_LocalScale: {{x: 1, y: 1, z: 1}}\n{ch}  m_Father: {{fileID: {father}}}\n"
+def mb(fid, go_, cls, fields):
+    return f"--- !u!114 &{fid}\nMonoBehaviour:\n  m_GameObject: {{fileID: {go_}}}\n  m_Enabled: 1\n  m_EditorClassIdentifier: Assembly-CSharp::{cls}\n" + "".join(f"  {k}: {v}\n" for k, v in fields)
+head = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+scene = head + go(100, "Level", [101]) + tr(101, 100, "{x: 0, y: 0, z: 0}", 0, [201, 301])
+scene += go(200, "Player", [201, 202]) + tr(201, 200, "{x: 0, y: 1, z: 0}", 101, [])
+scene += mb(202, 200, "Player", [("speed", 5), ("health", 100), ("jumpHeight", 2)])
+scene += go(300, "Enemy", [301, 302]) + tr(301, 300, "{x: 10, y: 0, z: 0}", 101, [])
+scene += mb(302, 300, "EnemyAI", [("aggroRadius", 8), ("damage", 10)])
+scene += ("--- !u!1001 &900\nPrefabInstance:\n  m_ObjectHideFlags: 0\n  m_Modification:\n    serializedVersion: 3\n"
+          "    m_TransformParent: {fileID: 101}\n    m_Modifications:\n"
+          "    - target: {fileID: 4000, guid: 0123456789abcdef0123456789abcdef, type: 3}\n      propertyPath: m_Name\n"
+          "      value: Chest\n      objectReference: {fileID: 0}\n    m_RemovedComponents: []\n"
+          "  m_SourcePrefab: {fileID: 100100000, guid: 0123456789abcdef0123456789abcdef, type: 3}\n")
+open("Assets/Scenes/Level.unity", "w").write(scene)
+prefab = head + go(1001, "Player", [1002]) + mb(1002, 1001, "Player", [("speed", 5), ("health", 100)])
+open("Assets/Prefabs/Player.prefab", "w").write(prefab)
+PY
+
+# ── JSON.
+cat > Configs/store/shop.json <<'JSON'
+{
+	"currency": "coins",
+	"items": [
+		{ "id": "sword", "price": 100, "limit": 1 },
+		{ "id": "shield", "price": 50, "limit": 1 },
+		{ "id": "potion", "price": 5, "limit": 10 }
+	],
+	"sale": {
+		"enabled": false,
+		"discount": 0.1
+	}
+}
+JSON
+# Настоящий конфиг clm-server: слияние, где git оставляет 47 маркеров.
+SERVER="$HOME/work/clm-server"
+REAL=Configs/events/govermentEvents.json
+MERGE=cb95304edcd4aef0e2a083d35f7f2c44dca82686
+HAS_SERVER=0
+if [[ -d "$SERVER/.git" ]] && (cd "$SERVER" && git cat-file -e "$MERGE^2:$REAL" 2>/dev/null); then
+    HAS_SERVER=1
+    read -r P1 P2 < <(cd "$SERVER" && git log -1 --format=%P "$MERGE")
+    BASE=$(cd "$SERVER" && git merge-base "$P1" "$P2")
+    (cd "$SERVER" && git show "$BASE:$REAL") > "$REAL"
+fi
+
+for f in Assets/Scripts/*.cs Assets/Scenes/*.unity Assets/Prefabs/*.prefab Assets/Textures/*.png Assets/Models/*.obj; do
+    echo "guid: $(echo "$f" | md5 | cut -c1-32)" > "$f.meta"
+done
+anna git add -A
+anna git commit -qm "Проект: код, сцена, конфиги, текстуры, модель"
+
+# ── Их ветка.
+git checkout -qb feature/balance
+python3 - <<'PY'
+def edit(path, *pairs):
+    s = open(path).read()
+    for a, b in pairs:
+        assert a in s, (path, a)
+        s = s.replace(a, b)
+    open(path, "w").write(s)
+edit("Assets/Scripts/Player.cs",
+     ("using UnityEngine;", "using UnityEngine;\nusing System.Collections;"),
+     ("public float speed = 5f;", "public float speed = 7f;"),
+     ("        health -= amount;", "        health -= Mathf.Max(0, amount - armor);"),
+     ("    public int health = 100;", "    public int health = 100;\n    public int armor = 2;"),
+     ("        Destroy(gameObject);", "        Destroy(gameObject, 0.5f);"))
+edit("Assets/Scripts/Shop.cs", ("100 : 50", "120 : 60"))
+edit("Assets/Scenes/Level.unity",
+     ("  speed: 5\n", "  speed: 7\n"), ("{x: 0, y: 1, z: 0}", "{x: 0, y: 3, z: 0}"),
+     ("  health: 100\n", "  health: 150\n"), ("  damage: 10\n", "  damage: 15\n"),
+     ("      value: Chest\n", "      value: Loot Box\n"),
+     ("    m_RemovedComponents: []\n", "    - target: {fileID: 4001, guid: 0123456789abcdef0123456789abcdef, type: 3}\n      propertyPath: m_LocalScale.x\n      value: 2\n      objectReference: {fileID: 0}\n    m_RemovedComponents: []\n"),
+     ("  m_Children:\n  - {fileID: 201}\n  - {fileID: 301}\n", "  m_Children:\n  - {fileID: 201}\n  - {fileID: 301}\n  - {fileID: 401}\n"))
+s = open("Assets/Scenes/Level.unity").read()
+s += "--- !u!1 &400\nGameObject:\n  m_Component:\n  - component: {fileID: 401}\n  m_Name: Coin\n  m_IsActive: 1\n--- !u!4 &401\nTransform:\n  m_GameObject: {fileID: 400}\n  m_LocalPosition: {x: 5, y: 1, z: 0}\n  m_Children: []\n  m_Father: {fileID: 101}\n"
+open("Assets/Scenes/Level.unity", "w").write(s)
+edit("Assets/Prefabs/Player.prefab", ("  speed: 5\n", "  speed: 7\n"))
+edit("Configs/store/shop.json",
+     ('"price": 100', '"price": 120'), ('"discount": 0.1', '"discount": 0.25'),
+     ('{ "id": "potion", "price": 5, "limit": 10 }', '{ "id": "potion", "price": 5, "limit": 20 },\n\t\t{ "id": "bow", "price": 70, "limit": 1 }'))
+PY
+"$IMG" Assets/Textures/courier.png "$TMP/t.png" 0 380 1024 132 0 0 0 0.45 && mv "$TMP/t.png" Assets/Textures/courier.png
+"$IMG" Assets/Textures/courier.png Assets/Textures/logo.png 0 0 0 0 0 0 0 0 0.3
+printf 'Crate 0 0 0 1.5 1 1 Wood\nLid -0.05 1 -0.05 1.55 1.12 1.05 Wood\n' | python3 "$TMP/obj.py" Assets/Models/crate.obj
+[[ $HAS_SERVER == 1 ]] && (cd "$SERVER" && git show "$P2:$REAL") > "$REAL"
+boris git commit -qam "Баланс: скорость 7, броня, магазин, уровень, арт"
+
+# ── Наша ветка.
+git checkout -q master
+python3 - <<'PY'
+def edit(path, *pairs):
+    s = open(path).read()
+    for a, b in pairs:
+        assert a in s, (path, a)
+        s = s.replace(a, b)
+    open(path, "w").write(s)
+edit("Assets/Scripts/Player.cs",
+     ("using UnityEngine;", "using UnityEngine;\nusing System.Linq;"),
+     ("public float speed = 5f;", "public float speed = 6.5f;"),
+     ("        health -= amount;", "        health -= amount;\n        OnDamaged?.Invoke(amount);"),
+     ("    public int health = 100;\n", "    public int health = 100;\n    public System.Action<int> OnDamaged;\n"),
+     ("        Destroy(gameObject);", "        Destroy(gameObject, 0.5f); "),
+     ('        var x = Input.GetAxis("Horizontal");', '        var x = Input.GetAxisRaw("Horizontal");'))
+edit("Assets/Scripts/Shop.cs", ("100 : 50", "90 : 40"))
+edit("Assets/Scenes/Level.unity",
+     ("  speed: 5\n", "  speed: 6.5\n"), ("{x: 0, y: 1, z: 0}", "{x: 2, y: 1, z: 0}"),
+     ("  aggroRadius: 8\n", "  aggroRadius: 12\n"), ("      value: Chest\n", "      value: Treasure Chest\n"),
+     ("  - component: {fileID: 302}\n", "  - component: {fileID: 302}\n  - component: {fileID: 303}\n"))
+s = open("Assets/Scenes/Level.unity").read()
+s += "--- !u!65 &303\nBoxCollider:\n  m_GameObject: {fileID: 300}\n  m_Size: {x: 1, y: 2, z: 1}\n"
+open("Assets/Scenes/Level.unity", "w").write(s)
+edit("Assets/Prefabs/Player.prefab", ("  speed: 5\n", "  speed: 6.5\n"))
+edit("Configs/store/shop.json",
+     ('"price": 100', '"price": 90'), ('"discount": 0.1', '"discount": 0.15'),
+     ('"enabled": false', '"enabled": true'),
+     ('{ "id": "shield", "price": 50, "limit": 1 }', '{ "id": "shield", "price": 45, "limit": 1 }'))
+PY
+"$IMG" Assets/Textures/courier.png "$TMP/o.png" 90 70 150 110 1 0.2 0.2 0.55 && mv "$TMP/o.png" Assets/Textures/courier.png
+"$IMG" Assets/Textures/logo.png "$TMP/l.png" 20 20 60 40 0.2 0.5 1 0.8 && mv "$TMP/l.png" Assets/Textures/logo.png
+printf 'Crate 0 0 0 1 1 1 Wood\nHandle 1 0.4 0.3 1.15 0.6 0.7 Metal\n' | python3 "$TMP/obj.py" Assets/Models/crate.obj
+[[ $HAS_SERVER == 1 ]] && (cd "$SERVER" && git show "$P1:$REAL") > "$REAL"
+anna git commit -qam "Скорость 6.5, событие урона, распродажа, уровень, арт"
+
+anna git merge feature/balance >/dev/null 2>&1 || true
+echo "Готово: $R — слияние feature/balance в master остановлено на конфликтах:"
+git status --short | sed 's/^/  /'
