@@ -73,6 +73,11 @@ enum HeadlessGit {
                                                after: .init(title: value("--after") ?? "worktree", revision: revision(value("--after")))))
         case "changes":
             content = AnyView(ChangesNavigator(workspace: workspace, commits: workspace.commits))
+        case "conflicts":
+            workspace.git.workspaceChanged(to: repository)
+            workspace.conflictsModel.open(repository: repository)
+            if let path { workspace.conflictsModel.selection = path }
+            content = AnyView(ConflictsView(workspace: workspace, model: workspace.conflictsModel, client: workspace.gitClient))
         case "popover":
             content = AnyView(BranchPopover(workspace: workspace, client: workspace.gitClient))
         default:
@@ -113,6 +118,7 @@ enum HeadlessGit {
             case "history": return workspace.gitHistory.details != nil
             case "popover": return !workspace.gitClient.branches.isEmpty
             case "media": return false
+            case "conflicts": return workspace.conflictsModel.loaded
             default: return workspace.commits.isLoaded
             }
         }

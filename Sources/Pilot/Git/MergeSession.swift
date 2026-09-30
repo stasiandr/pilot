@@ -19,6 +19,10 @@ final class MergeSession: ObservableObject {
     @Published private(set) var objects: UnityMerge.Result?
     /// JSON: слияние по ключам; nil — не JSON или не разобрался.
     @Published private(set) var keys: JSONMerge.Result?
+    /// Выбор в спорах по объектам и по ключам — в сессии, а не в виде:
+    /// ушёл к другому файлу и вернулся — выбранное на месте.
+    @Published var picks: [String: UnityMerge.Pick] = [:]
+    @Published var keyPicks: [String: JSONMerge.Pick] = [:]
     /// Чьи версии: наша ветка и та, что вливается.
     @Published private(set) var oursName = ""
     /// Двоичный файл: сливать нечего, только взять одну сторону целиком.

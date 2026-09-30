@@ -209,11 +209,20 @@ extension Workspace {
         return session
     }
 
-    /// Окно слияния для файла в конфликте.
+    /// Файл в конфликте — в окне «Конфликты», где все файлы слияния по
+    /// очереди: решил этот — окно перейдёт к следующему.
     func openMerge(path: String) {
         guard let root else { return }
-        mergeSessions[path] = nil
-        ProjectWindows.shared.openWindow?(id: MergeWindow.sceneID, value: root.path + "\n" + path)
+        conflictsModel.open(repository: git.repository)
+        conflictsModel.selection = path
+        ProjectWindows.shared.openWindow?(id: ConflictsWindow.sceneID, value: root.path)
+    }
+
+    /// Все конфликты по очереди, с первого нерешённого.
+    func openConflicts() {
+        guard let root, git.repository != nil else { return }
+        conflictsModel.open(repository: git.repository)
+        ProjectWindows.shared.openWindow?(id: ConflictsWindow.sceneID, value: root.path)
     }
 
     /// Окно слияния для файла, открытого в редакторе.
@@ -222,15 +231,13 @@ extension Workspace {
         openMerge(path: path)
     }
 
-    /// Первый файл в конфликте — в окно слияния.
+    /// Окно «Конфликты» — все файлы слияния по очереди.
     func openNextConflict() {
-        guard let repository = git.repository, let root else { return }
-        let prefix = root.path == repository.path ? "" : String(root.path.dropFirst(repository.path.count + 1)) + "/"
-        guard let path = git.changedFiles.filter({ $0.value == .conflicted }).keys.sorted().first else {
+        guard git.conflictedCount > 0 || gitClient.operation != nil else {
             showNotice(L("Конфликтов нет"))
             return
         }
-        openMerge(path: prefix + path)
+        openConflicts()
     }
 
     func mergeFinished(path: String) {

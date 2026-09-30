@@ -43,8 +43,16 @@ struct MergeView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var mode: Mode = .text
     @State private var notice: String?
-    @State private var picks: [String: UnityMerge.Pick] = [:]
-    @State private var keyPicks: [String: JSONMerge.Pick] = [:]
+    /// В окне конфликтов: файл решён — к следующему, а не закрыть окно.
+    var onDone: (() -> Void)? = nil
+    private var picks: [String: UnityMerge.Pick] {
+        get { session.picks }
+        nonmutating set { session.picks = newValue }
+    }
+    private var keyPicks: [String: JSONMerge.Pick] {
+        get { session.keyPicks }
+        nonmutating set { session.keyPicks = newValue }
+    }
     @State private var confirmUnresolved = false
 
     enum Mode: Hashable { case objects, text }
@@ -58,10 +66,10 @@ struct MergeView: View {
                     toolbar(editor)
                     Divider()
                     if mode == .objects, let objects = session.objects {
-                        UnityObjectMergeView(session: session, result: objects, picks: $picks,
+                        UnityObjectMergeView(session: session, result: objects, picks: $session.picks,
                                              resolve: { workspace.unity.assets?.displayName(for: $0) })
                     } else if mode == .objects, let keys = session.keys {
-                        JSONKeyMergeView(result: keys, picks: $keyPicks)
+                        JSONKeyMergeView(result: keys, picks: $session.keyPicks)
                     } else {
                         headers
                         Divider()
@@ -189,8 +197,10 @@ struct MergeView: View {
             }
             Spacer()
             if session.busy { ProgressView().controlSize(.small) }
-            Button(L("Отмена")) { dismiss() }
-                .keyboardShortcut(.cancelAction)
+            if onDone == nil {
+                Button(L("Отмена")) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
             Button(L("Применить")) {
                 if unresolved(editor) > 0 { confirmUnresolved = true } else { save() }
             }
@@ -220,7 +230,7 @@ struct MergeView: View {
         Task {
             if await action() {
                 workspace.mergeFinished(path: session.path)
-                dismiss()
+                if let onDone { onDone() } else { dismiss() }
             }
         }
     }

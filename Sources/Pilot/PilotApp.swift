@@ -639,6 +639,11 @@ struct PilotApp: App {
             MergeWindow(target: target)
         }
         .defaultSize(width: 1300, height: 760)
+        // Все конфликты слияния по очереди — одно окно на проект.
+        WindowGroup(id: ConflictsWindow.sceneID, for: String.self) { $rootPath in
+            ConflictsWindow(rootPath: rootPath)
+        }
+        .defaultSize(width: 1500, height: 820)
         // Версии картинки или модели из истории — рядом.
         WindowGroup(id: MediaCompareWindow.sceneID, for: String.self) { $target in
             MediaCompareWindow(target: target)

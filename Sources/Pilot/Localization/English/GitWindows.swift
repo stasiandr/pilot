@@ -365,6 +365,23 @@ extension English {
         ("материалы ", "materials "),
         ("сетки ", "meshes "),
 
+        // Окно «Конфликты»
+        ("%@ — решён", "%@ — resolved"),
+        ("JSON — по ключам", "JSON — by keys"),
+        ("Взять их целиком", "Take Theirs Whole"),
+        ("Взять наше целиком", "Take Ours Whole"),
+        ("Все конфликты решены", "All conflicts resolved"),
+        ("Завершить слияние", "Finish Merge"),
+        ("Завершить", "Finish"),
+        ("К завершению", "To Finish"),
+        ("Конфликты — %@", "Conflicts — %@"),
+        ("Не удалось взять версию %@", "Couldn’t take a version of %@"),
+        ("Решено %@ из %@", "Resolved %@ of %@"),
+        ("Решить заново", "Resolve Again"),
+        ("Файлов: %@. Осталось закоммитить слияние.", "Files: %@. The merge only needs committing."),
+        ("картинка или модель — выбрать сторону", "picture or model — pick a side"),
+        ("сцена или префаб — по объектам", "scene or prefab — by objects"),
+
         // Меню и редактор
         ("Получить с сервера (fetch)", "Fetch"),
         ("Подготовить изменение под курсором", "Stage Change at Caret"),
