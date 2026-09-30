@@ -316,10 +316,20 @@ extension English {
 
         // JSON по ключам
         ("Было: %@", "Base: %@"),
-        ("Взято их правок: %@, форматирование — наше", "Taken from theirs: %@, formatting is ours"),
         ("По ключам", "By Keys"),
-        ("Слито само: %@ их правок · споров: %@, нерешено: %@", "Merged automatically: %@ of theirs · conflicts: %@, unresolved: %@"),
-        ("Споров нет — всё слилось по ключам само", "No conflicts — everything merged by keys on its own"),
+
+        ("Взято их: %@", "Theirs: %@"),
+        ("Все: %@", "All: %@"),
+        ("Наше: %@", "Ours: %@"),
+        ("Путь", "Path"),
+        ("Споров: %@, нерешено: %@ · взято их: %@, оставлено наших: %@",
+         "Conflicts: %@, unresolved: %@ · taken from theirs: %@, kept ours: %@"),
+        ("Споры: %@", "Conflicts: %@"),
+        ("Стороны не отличаются", "The sides don’t differ"),
+        ("их", "theirs"),
+        ("наше", "ours"),
+        ("спор", "conflict"),
+        ("— нет —", "— absent —"),
 
         // Версии картинок и моделей
         ("До", "Before"),

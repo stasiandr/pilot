@@ -161,7 +161,7 @@ struct MergeView: View {
     private func summary(_ editor: MergeEditorModel) -> String {
         if mode == .objects, let keys = session.keys {
             let open = keys.conflicts.filter { keyPicks[$0.id] == nil }.count
-            return L("Слито само: \(keys.fromTheirs) их правок · споров: \(keys.conflicts.count), нерешено: \(open)")
+            return L("Споров: \(keys.conflicts.count), нерешено: \(open) · взято их: \(keys.fromTheirs), оставлено наших: \(keys.fromOurs)")
         }
         if mode == .objects, let objects = session.objects {
             let open = objects.conflicts.filter { picks[$0.id] == nil }.count
@@ -249,49 +249,106 @@ struct MergeView: View {
     }
 }
 
-/// JSON: споры списком, по путям (`shop.items[id=7].price`). Всё, что
-/// правила одна сторона, уже слито и сюда не попадает.
+/// JSON: все изменённые поля по путям (`shop.items[id=7].price`) — споры
+/// сверху, ниже то, что слилось само, с пометкой, чья сторона взята. Любое
+/// поле переключается на другую сторону кликом: так видно и проверяемо,
+/// что именно слилось, а не только «споров нет».
 struct JSONKeyMergeView: View {
     let result: JSONMerge.Result
     @Binding var picks: [String: JSONMerge.Pick]
+    @State private var filter: Filter = .all
+    @State private var query = ""
+
+    enum Filter: Hashable { case all, conflicts, theirs, ours }
+
+    private var shown: [JSONMerge.Change] {
+        let words = query.lowercased().split(separator: " ").map(String.init)
+        return result.changes.filter { change in
+            switch filter {
+            case .all: break
+            case .conflicts: guard change.kind == .conflict else { return false }
+            case .theirs: guard change.kind == .theirs else { return false }
+            case .ours: guard change.kind == .ours else { return false }
+            }
+            let path = change.path.lowercased()
+            return words.allSatisfy { path.contains($0) }
+        }
+        // Споры — первыми, дальше как в файле.
+        .sorted { ($0.kind == .conflict ? 0 : 1) < ($1.kind == .conflict ? 0 : 1) }
+    }
 
     var body: some View {
-        if result.conflicts.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "checkmark.circle").font(.system(size: 30, weight: .light))
-                    .foregroundStyle(Color(nsColor: Theme.gitAdded))
-                Text(L("Споров нет — всё слилось по ключам само")).foregroundStyle(.secondary)
-                Text(L("Взято их правок: \(result.fromTheirs), форматирование — наше"))
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(result.conflicts) { conflict in
-                        let pick = picks[conflict.id]
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(conflict.path).font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                .textSelection(.enabled)
-                            HStack(alignment: .top, spacing: 10) {
-                                KeySide(label: L("Наше"), value: conflict.ours, chosen: pick == .ours) { picks[conflict.id] = .ours }
-                                KeySide(label: L("Их"), value: conflict.theirs, chosen: pick == .theirs) { picks[conflict.id] = .theirs }
-                            }
-                            if let base = conflict.base {
-                                Text(L("Было: \(base)")).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
-                                    .lineLimit(2)
-                            }
-                        }
-                        .padding(8)
-                        .background(RoundedRectangle(cornerRadius: 6)
-                            .fill(pick == nil ? Color.red.opacity(0.08) : Color(nsColor: Theme.chromeBackground)))
-                        .overlay(RoundedRectangle(cornerRadius: 6)
-                            .stroke(pick == nil ? Color.red.opacity(0.35) : Color(nsColor: Theme.separator)))
-                    }
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Picker("", selection: $filter) {
+                    Text(L("Все: \(result.changes.count)")).tag(Filter.all)
+                    Text(L("Споры: \(result.conflicts.count)")).tag(Filter.conflicts)
+                    Text(L("Взято их: \(result.fromTheirs)")).tag(Filter.theirs)
+                    Text(L("Наше: \(result.fromOurs)")).tag(Filter.ours)
                 }
-                .padding(14)
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                SearchField(text: $query, prompt: L("Путь"))
+                    .frame(maxWidth: 260)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            Divider()
+            if result.changes.isEmpty {
+                Text(L("Стороны не отличаются")).foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(shown) { change in row(change) }
+                    }
+                    .padding(12)
+                }
             }
         }
+    }
+
+    private func row(_ change: JSONMerge.Change) -> some View {
+        let chosen = picks[change.id] ?? change.defaultPick
+        let open = change.kind == .conflict && picks[change.id] == nil
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                badge(change.kind)
+                Text(change.path).font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                Spacer()
+                if let base = change.base, change.kind == .conflict {
+                    Text(L("Было: \(base)")).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.tail).frame(maxWidth: 260, alignment: .trailing)
+                }
+            }
+            HStack(alignment: .top, spacing: 8) {
+                KeySide(label: L("Наше"), value: change.ours, chosen: !open && chosen == .ours) { picks[change.id] = .ours }
+                KeySide(label: L("Их"), value: change.theirs, chosen: !open && chosen == .theirs) { picks[change.id] = .theirs }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6)
+            .fill(open ? Color.red.opacity(0.08) : Color(nsColor: Theme.chromeBackground)))
+        .overlay(RoundedRectangle(cornerRadius: 6)
+            .stroke(open ? Color.red.opacity(0.35) : Color(nsColor: Theme.separator)))
+    }
+
+    private func badge(_ kind: JSONMerge.Change.Kind) -> some View {
+        let (text, color): (String, Color) = {
+            switch kind {
+            case .conflict: return (L("спор"), .red)
+            case .theirs: return (L("их"), .blue)
+            case .ours: return (L("наше"), .green)
+            }
+        }()
+        return Text(text)
+            .font(.system(size: 10, weight: .semibold))
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(Capsule().fill(color.opacity(0.2)))
+            .foregroundStyle(color)
     }
 }
 
@@ -309,9 +366,9 @@ private struct KeySide: View {
                         .foregroundStyle(chosen ? Color.accentColor : .secondary)
                     Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                 }
-                Text(value ?? L("— удалено —"))
+                Text(value ?? L("— нет —"))
                     .font(.system(size: 12, design: .monospaced))
-                    .lineLimit(8)
+                    .lineLimit(6)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(6)

@@ -136,15 +136,34 @@ enum JSONMerge {
 
     // MARK: - Результат
 
-    struct Conflict: Identifiable, Equatable {
-        var id: String { path }
+    /// Изменённое поле: спор, взятое у них или оставленное наше. Любое
+    /// можно переключить на другую сторону — видно всё, что слилось, а не
+    /// только споры: иначе «споров нет» не проверить глазами.
+    struct Change: Identifiable, Equatable {
+        enum Kind: Equatable {
+            /// Обе стороны по-разному.
+            case conflict
+            /// Правили только они — взято их.
+            case theirs
+            /// Правили только мы — оставлено наше.
+            case ours
+        }
+
+        var kind: Kind
         /// `a.b[3].c`, у элемента массива по ключу — `a.b[id=7].c`.
         var path: String
         /// Текст значения с каждой стороны; nil — ключа там нет.
         var base: String?
         var ours: String?
         var theirs: String?
+        /// Уникален, даже если путь повторился.
+        var id: String
+
+        /// Чья сторона, пока человек не выбрал: спор и наше — наша, остальное — их.
+        var defaultPick: Pick { kind == .theirs ? .theirs : .ours }
     }
+
+    typealias Conflict = Change
 
     enum Pick: Equatable { case ours, theirs }
 
@@ -152,24 +171,29 @@ enum JSONMerge {
         /// Наш текст, в который вносятся правки.
         var ours: [UInt16]
         var edits: [Edit]
-        var conflicts: [Conflict]
-        var fromTheirs = 0
+        var changes: [Change]
 
+        var conflicts: [Change] { changes.filter { $0.kind == .conflict } }
+        var fromTheirs: Int { changes.filter { $0.kind == .theirs }.count }
+        var fromOurs: Int { changes.filter { $0.kind == .ours }.count }
+
+        /// Правка нашего текста; применяется, когда у её изменения выбрана
+        /// их сторона.
         struct Edit: Equatable {
             var range: Range<Int>
             var text: String
-            /// Спор: текст зависит от выбора. `text` — на случай «их».
-            var conflict: String?
+            var change: String
         }
 
-        /// Итоговый текст. Нерешённый спор — наша сторона.
+        /// Итоговый текст. Не выбрано — как по умолчанию: спор — наше.
         func text(_ picks: [String: Pick]) -> String {
+            let defaults = Dictionary(changes.map { ($0.id, $0.defaultPick) }, uniquingKeysWith: { a, _ in a })
             var out = ours
             // С конца, чтобы начала ещё не применённых правок не сдвигались.
             // В одной точке — сперва вырезать, потом вставить: иначе
             // вставленное попало бы под вырезание.
             for edit in edits.sorted(by: { ($0.range.lowerBound, $0.range.count) > ($1.range.lowerBound, $1.range.count) }) {
-                if let id = edit.conflict, picks[id] != .theirs { continue }
+                guard (picks[edit.change] ?? defaults[edit.change] ?? .theirs) == .theirs else { continue }
                 out.replaceSubrange(edit.range, with: Array(edit.text.utf16))
             }
             return String(decoding: out, as: UTF16.self)
@@ -182,7 +206,7 @@ enum JSONMerge {
         let b = Array(base.utf16), o = Array(ours.utf16), t = Array(theirs.utf16)
         guard let ov = parse(o), let tv = parse(t) else { return nil }
         let bv = parse(b)
-        var result = Result(ours: o, edits: [], conflicts: [])
+        var result = Result(ours: o, edits: [], changes: [])
         var context = Context(b: b, o: o, t: t)
         context.merge(base: bv, ours: ov, theirs: tv, path: "", into: &result)
         return result
@@ -195,20 +219,35 @@ enum JSONMerge {
             String(decoding: source[range], as: UTF16.self)
         }
 
+        /// Изменение и правки, которые его «их» сторона вносит в наш текст.
+        mutating func record(_ kind: Change.Kind, _ path: String, base: String?, ours: String?, theirs: String?,
+                             edits: [(Range<Int>, String)], into result: inout Result) {
+            var id = path.isEmpty ? "$" : path
+            if result.changes.contains(where: { $0.id == id }) { id += "#\(result.changes.count)" }
+            result.changes.append(Change(kind: kind, path: path.isEmpty ? "$" : path, base: base, ours: ours, theirs: theirs, id: id))
+            for (range, text) in edits { result.edits.append(.init(range: range, text: text, change: id)) }
+        }
+
         mutating func merge(base: Value?, ours: Value, theirs: Value, path: String, into result: inout Result) {
             let oc = canonical(ours), tc = canonical(theirs), bc = base.map(canonical)
-            if oc == tc || tc == bc { return }                       // одинаково или они не трогали
-            // Правили только они. Скаляр — их текстом; объект и массив — вглубь,
-            // чтобы наше форматирование осталось, а поменялось только нужное.
+            if oc == tc { return }
             let sameShape: Bool = {
                 switch (ours, theirs) {
                 case (.object, .object), (.array, .array): return true
                 default: return false
                 }
             }()
+            let baseText = base.map { text(b, $0.range) }
+            // Правила одна сторона. Скаляр — одной записью; объект и массив —
+            // вглубь, до изменённых полей, а наше форматирование остаётся.
+            if tc == bc, !sameShape {
+                record(.ours, path, base: baseText, ours: text(o, ours.range), theirs: text(t, theirs.range),
+                       edits: [(ours.range, text(t, theirs.range))], into: &result)
+                return
+            }
             if oc == bc, !sameShape {
-                result.edits.append(.init(range: ours.range, text: text(t, theirs.range), conflict: nil))
-                result.fromTheirs += 1
+                record(.theirs, path, base: baseText, ours: text(o, ours.range), theirs: text(t, theirs.range),
+                       edits: [(ours.range, text(t, theirs.range))], into: &result)
                 return
             }
             switch (ours, theirs) {
@@ -225,32 +264,27 @@ enum JSONMerge {
                     }
                     mergeMembers(base: asMembers(bi), ours: asMembers(oi), theirs: asMembers(ti), oursRange: ours.range,
                                  path: path, keyed: key, into: &result)
-                } else if canonical(ours) == base.map(canonical) {
-                    // Мы массив только переформатировали — берём их, целиком.
-                    result.edits.append(.init(range: ours.range, text: text(t, theirs.range), conflict: nil))
-                    result.fromTheirs += 1
                 } else if oi.count == ti.count, bi.count == oi.count {
                     for index in oi.indices {
                         merge(base: bi[index], ours: oi[index], theirs: ti[index], path: path + "[\(index)]", into: &result)
                     }
+                } else if oc == bc || tc == bc {
+                    // Массив без ключей, длина разная: правила одна сторона — она целиком.
+                    record(oc == bc ? .theirs : .ours, path, base: baseText, ours: text(o, ours.range),
+                           theirs: text(t, theirs.range), edits: [(ours.range, text(t, theirs.range))], into: &result)
                 } else {
-                    conflict(path, base: base, ours: ours, theirs: theirs, into: &result)
+                    record(.conflict, path, base: baseText, ours: text(o, ours.range), theirs: text(t, theirs.range),
+                           edits: [(ours.range, text(t, theirs.range))], into: &result)
                 }
             default:
-                conflict(path, base: base, ours: ours, theirs: theirs, into: &result)
+                record(.conflict, path, base: baseText, ours: text(o, ours.range), theirs: text(t, theirs.range),
+                       edits: [(ours.range, text(t, theirs.range))], into: &result)
             }
         }
 
-        mutating func conflict(_ path: String, base: Value?, ours: Value, theirs: Value, into result: inout Result) {
-            let id = path.isEmpty ? "$" : path
-            result.conflicts.append(Conflict(path: id, base: base.map { text(b, $0.range) },
-                                             ours: text(o, ours.range), theirs: text(t, theirs.range)))
-            result.edits.append(.init(range: ours.range, text: text(t, theirs.range), conflict: id))
-        }
-
-        /// Ключи объекта (или элементы массива по ключу): общие — вглубь,
-        /// удалённые ими — вырезаются из нашего текста, добавленные ими —
-        /// вставляются в конец.
+        /// Ключи объекта (или элементы массива по ключу): общие — вглубь;
+        /// удалённое и добавленное одной стороной — записью, которую можно
+        /// переключить.
         mutating func mergeMembers(base: [Member], ours: [Member], theirs: [Member], oursRange: Range<Int>,
                                    path: String, keyed: String? = nil, into result: inout Result) {
             let bm = Dictionary(base.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
@@ -269,18 +303,21 @@ enum JSONMerge {
                     // Они удалили. Мы не трогали — удаляем; правили — спор.
                     if canonical(old.value) == canonical(member.value) {
                         removed.insert(index)
-                        result.fromTheirs += 1
                     } else {
-                        let id = childPath(member.key)
-                        result.conflicts.append(Conflict(path: id, base: text(b, old.value.range),
-                                                         ours: text(o, member.range), theirs: nil))
-                        result.edits.append(.init(range: removal(of: index, in: ours, container: oursRange), text: "",
-                                                  conflict: id))
+                        record(.conflict, childPath(member.key), base: text(b, old.value.range), ours: text(o, member.range),
+                               theirs: nil, edits: [(removal(of: index, in: ours, container: oursRange), "")], into: &result)
                     }
+                } else {
+                    // Добавили мы: переключить на их сторону — убрать.
+                    record(.ours, childPath(member.key), base: nil, ours: text(o, member.range), theirs: nil,
+                           edits: [(removal(of: index, in: ours, container: oursRange), "")], into: &result)
                 }
             }
-            for range in removals(removed, in: ours) {
-                result.edits.append(.init(range: range, text: "", conflict: nil))
+            // Удалённое ими подряд — одной записью и одним вырезанием.
+            for (range, indices) in removals(removed, in: ours) {
+                record(.theirs, indices.map { childPath(ours[$0].key) }.joined(separator: ", "),
+                       base: indices.map { text(o, ours[$0].range) }.joined(separator: "\n"), ours: indices.map { text(o, ours[$0].range) }.joined(separator: "\n"),
+                       theirs: nil, edits: [(range, "")], into: &result)
             }
             // Добавленное ими: ключа нет ни у нас, ни в базе. Встаёт после
             // того же соседа, что и у них (как при текстовом слиянии), —
@@ -302,28 +339,31 @@ enum JSONMerge {
             }
             for group in groups {
                 let body = group.members.map { text(t, $0.range) }.joined(separator: glue)
-                result.fromTheirs += group.members.count
+                let edit: (Range<Int>, String)
                 if let after = group.after {
                     let at = ours[after].range.upperBound
-                    result.edits.append(.init(range: at..<at, text: glue + body, conflict: nil))
+                    edit = (at..<at, glue + body)
                 } else if let first = ours.indices.first(where: { !removed.contains($0) }) {
                     // Раньше всех наших — перед первым оставшимся.
                     let at = ours[first].range.lowerBound
-                    result.edits.append(.init(range: at..<at, text: body + glue, conflict: nil))
+                    edit = (at..<at, body + glue)
                 } else {
                     // Наших не осталось: на место последнего (или в пустой объект).
                     let at = insertionPoint(ours: ours, container: oursRange)
-                    result.edits.append(.init(range: at..<at, text: body, conflict: nil))
+                    edit = (at..<at, body)
                 }
+                record(.theirs, group.members.map { childPath($0.key) }.joined(separator: ", "), base: nil, ours: nil,
+                       theirs: group.members.map { text(t, $0.range) }.joined(separator: "\n"), edits: [edit], into: &result)
             }
-            // Удалённое нами, но правленное ими, — спор (иначе их правка пропала бы молча).
+            // Удалённое нами: они не трогали — оставляем удалённым (можно
+            // вернуть); они правили — спор, иначе их правка пропала бы молча.
             for their in theirs where !ourKeys.contains(their.key) {
-                guard let old = bm[their.key], canonical(old.value) != canonical(their.value) else { continue }
-                let id = childPath(their.key)
+                guard let old = bm[their.key] else { continue }
                 let insertion = insertionPoint(ours: ours, container: oursRange)
-                result.conflicts.append(Conflict(path: id, base: text(b, old.value.range), ours: nil, theirs: text(t, their.range)))
-                result.edits.append(.init(range: insertion..<insertion,
-                                          text: (ours.isEmpty ? "" : separator(ours)) + text(t, their.range), conflict: id))
+                let edit = (insertion..<insertion, (ours.isEmpty ? "" : separator(ours)) + text(t, their.range))
+                let changed = canonical(old.value) != canonical(their.value)
+                record(changed ? .conflict : .ours, childPath(their.key), base: text(b, old.value.range), ours: nil,
+                       theirs: text(t, their.range), edits: [edit], into: &result)
             }
         }
 
@@ -331,20 +371,21 @@ enum JSONMerge {
         /// куском, вместе с запятыми. Серия в конце забирает запятую перед
         /// собой, остальные — после; иначе куски соседних удалений
         /// перекрывались, и запятая оставалась висеть.
-        func removals(_ indices: Set<Int>, in members: [Member]) -> [Range<Int>] {
-            var ranges: [Range<Int>] = []
+        func removals(_ indices: Set<Int>, in members: [Member]) -> [(Range<Int>, [Int])] {
+            var ranges: [(Range<Int>, [Int])] = []
             var index = 0
             while index < members.count {
                 guard indices.contains(index) else { index += 1; continue }
                 let first = index
                 while index + 1 < members.count, indices.contains(index + 1) { index += 1 }
                 let last = index
+                let run = Array(first...last)
                 if last + 1 < members.count {
-                    ranges.append(members[first].range.lowerBound..<members[last + 1].range.lowerBound)
+                    ranges.append((members[first].range.lowerBound..<members[last + 1].range.lowerBound, run))
                 } else if first > 0 {
-                    ranges.append(members[first - 1].range.upperBound..<members[last].range.upperBound)
+                    ranges.append((members[first - 1].range.upperBound..<members[last].range.upperBound, run))
                 } else {
-                    ranges.append(members[first].range.lowerBound..<members[last].range.upperBound)
+                    ranges.append((members[first].range.lowerBound..<members[last].range.upperBound, run))
                 }
                 index += 1
             }
