@@ -107,7 +107,7 @@ final class GitHistoryModel: ObservableObject {
     }
 
     private func arguments(skip: Int) -> [String] {
-        var arguments = ["log", GitCommitInfo.format, "-n", "\(Self.pageSize)", "--skip=\(skip)"]
+        var arguments = ["log", GitCommitInfo.format, "--decorate=full", "-n", "\(Self.pageSize)", "--skip=\(skip)"]
         if let lines = filter.lines, let path = filter.path {
             // История фрагмента: git сам следит, куда строки уехали.
             arguments += ["-L", "\(lines.lowerBound),\(lines.upperBound):\(path)", "-s"]
@@ -147,7 +147,7 @@ final class GitHistoryModel: ObservableObject {
         queue.async { [weak self] in
             var page: [GitCommitInfo] = []
             var failure: String?
-            if hashLike, let output = Git.run(["log", GitCommitInfo.format, "-n", "1", text, "--"], in: repository),
+            if hashLike, let output = Git.run(["log", GitCommitInfo.format, "--decorate=full", "-n", "1", text, "--"], in: repository),
                output.status == 0 {
                 page = GitCommitInfo.parse(output.stdout)
             }

@@ -50,6 +50,10 @@ struct PilotApp: App {
         if HeadlessInspector.isRequested {
             exit(MainActor.assumeIsolated { HeadlessInspector.run() })
         }
+        // `--render-git Репозиторий` — окно git в PNG (HeadlessGit).
+        if HeadlessGit.isRequested {
+            exit(MainActor.assumeIsolated { HeadlessGit.run() })
+        }
     }
 
     /// Команда редактора — первому ответчику, тексту, если фокус в нём.

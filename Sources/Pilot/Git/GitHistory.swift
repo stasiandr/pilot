@@ -12,7 +12,8 @@ struct GitCommitInfo: Identifiable, Hashable, Sendable {
     var author: String
     var email: String
     var date: Date
-    /// `HEAD -> main`, `origin/main`, `tag: v1.2`.
+    /// Как в `%D`: с `--decorate=full` — `HEAD -> refs/heads/main`,
+    /// `refs/remotes/origin/main`, `tag: refs/tags/v1.2`.
     var refs: [String]
     var subject: String
 
@@ -40,6 +41,42 @@ struct GitCommitInfo: Identifiable, Hashable, Sendable {
                 refs: fields[5].isEmpty ? [] : fields[5].components(separatedBy: ", "),
                 subject: fields[6])
         }
+    }
+}
+
+/// Ссылка у коммита в логе: ветка, удалённая ветка, тег или HEAD.
+struct GitRefLabel: Equatable, Sendable {
+    enum Kind: Equatable, Sendable { case head, local, remote, tag }
+    var kind: Kind
+    var name: String
+    /// HEAD указывает на эту ветку (`HEAD -> main`).
+    var isCurrent = false
+
+    /// Из записи `%D`. Короткие имена (без `--decorate=full`) понимаются
+    /// тоже, но тогда локальную ветку со слешем от удалённой не отличить.
+    init(_ decoration: String) {
+        var text = decoration
+        if text.hasPrefix("HEAD -> ") {
+            isCurrent = true
+            text = String(text.dropFirst("HEAD -> ".count))
+        }
+        if text == "HEAD" {
+            kind = .head
+        } else if text.hasPrefix("tag: ") {
+            kind = .tag
+            text = String(text.dropFirst("tag: ".count))
+        } else if text.hasPrefix("refs/remotes/") {
+            kind = .remote
+        } else if text.hasPrefix("refs/heads/") {
+            kind = .local
+        } else {
+            kind = text.contains("/") ? .remote : .local
+        }
+        for prefix in ["refs/heads/", "refs/remotes/", "refs/tags/"] where text.hasPrefix(prefix) {
+            text = String(text.dropFirst(prefix.count))
+        }
+        name = text
+        if isCurrent { kind = .local }
     }
 }
 

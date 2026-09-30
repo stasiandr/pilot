@@ -42,6 +42,7 @@ extension English {
 
         // Коммит
         ("Разрешить конфликт…", "Resolve Conflict…"),
+        ("Файл в конфликте", "The file has conflicts"),
         ("Amend", "Amend"),
         ("Ещё", "More"),
         ("Ничего не подготовлено — в коммит пойдут все изменения", "Nothing is staged — the commit takes all changes"),

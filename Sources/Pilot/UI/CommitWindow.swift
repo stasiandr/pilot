@@ -43,7 +43,7 @@ struct CommitView: View {
                 composer
             }
             .frame(minWidth: 320, idealWidth: 380, maxWidth: 560)
-            CommitDiffPane(commits: commits)
+            CommitDiffPane(commits: commits, resolve: { workspace.openMerge(path: $0) })
                 .frame(minWidth: 480, maxWidth: .infinity)
         }
         .onAppear {
@@ -370,6 +370,8 @@ struct CommitComposer: View {
 /// строки, u — убрать, x — откатить, Esc — снять выбор строк.
 struct CommitDiffPane: View {
     @ObservedObject var commits: GitCommitService
+    /// Файл в конфликте — в окно слияния.
+    var resolve: ((String) -> Void)? = nil
     @AppStorage(DiffLayout.key) private var layout = DiffLayout.unified
     @State private var focusedHunk = 0
     @FocusState private var focused: Bool
@@ -394,7 +396,8 @@ struct CommitDiffPane: View {
                 .frame(height: 34)
                 Divider()
                 content(selection)
-                if layout == .unified, commits.patch?.hunks.isEmpty == false {
+                if layout == .unified, commits.patch?.hunks.isEmpty == false,
+                   commits.tree.changes.first(where: { $0.path == selection.path })?.isConflicted != true {
                     Divider()
                     Text(selection.staged
                          ? L("j/k — куски  ·  клик, ⇧клик — строки  ·  u — убрать из коммита")
@@ -420,7 +423,19 @@ struct CommitDiffPane: View {
 
     @ViewBuilder
     private func content(_ selection: GitCommitService.Selection) -> some View {
-        if let text = commits.untrackedText {
+        if commits.tree.changes.first(where: { $0.path == selection.path })?.isConflicted == true {
+            // Дифф конфликта — комбинированный (`@@@`): кусками его не
+            // подготовить, решают его в окне слияния.
+            VStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.merge").font(.system(size: 28, weight: .light)).foregroundStyle(.tertiary)
+                Text(L("Файл в конфликте")).foregroundStyle(.secondary)
+                if let resolve {
+                    Button(L("Слияние в три колонки…")) { resolve(selection.path) }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let text = commits.untrackedText {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(text.components(separatedBy: "\n").prefix(3000).enumerated()), id: \.offset) { i, line in

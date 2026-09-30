@@ -121,6 +121,9 @@ struct GitHistoryView: View {
         List(selection: $history.selection) {
             ForEach(Array(history.commits.enumerated()), id: \.element.hash) { index, commit in
                 CommitRow(commit: commit, row: index < history.rows.count ? history.rows[index] : nil)
+                    // Без отступов: линии графа соседних строк должны сходиться.
+                    .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
+                    .listRowSeparator(.hidden)
                     .tag(commit.hash)
                     .contextMenu { commitMenu(commit) }
                     .onAppear {
@@ -227,6 +230,21 @@ struct GitHistoryView: View {
 
 private struct CommitRow: View {
     static let height: CGFloat = 24
+
+    /// Текущая и локальные ветки, потом удалённые, потом теги.
+    static func ordered(_ refs: [String]) -> [String] {
+        func rank(_ ref: String) -> Int {
+            let label = GitRefLabel(ref)
+            if label.isCurrent { return 0 }
+            switch label.kind {
+            case .head: return 0
+            case .local: return 1
+            case .remote: return 2
+            case .tag: return 3
+            }
+        }
+        return refs.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
+    }
     let commit: GitCommitInfo
     let row: GitGraphRow?
 
@@ -235,8 +253,17 @@ private struct CommitRow: View {
             if let row {
                 GraphCell(row: row).frame(width: GraphCell.width(for: row), height: Self.height)
             }
-            ForEach(commit.refs.prefix(4), id: \.self) { ref in
+            // В clm-client у коммита бывает десяток тегов сборок — тема важнее:
+            // две метки (ветки вперёд), остальные — числом.
+            let refs = Self.ordered(commit.refs)
+            ForEach(refs.prefix(2), id: \.self) { ref in
                 RefBadge(ref: ref)
+            }
+            if refs.count > 2 {
+                Text("+\(refs.count - 2)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .help(refs.dropFirst(2).map { GitRefLabel($0).name }.joined(separator: "\n"))
             }
             Text(commit.subject)
                 .lineLimit(1)
@@ -245,7 +272,7 @@ private struct CommitRow: View {
             Text(commit.author)
                 .lineLimit(1)
                 .foregroundStyle(.secondary)
-                .frame(maxWidth: 140, alignment: .trailing)
+                .frame(width: 120, alignment: .trailing)
             Text(commit.date.formatted(date: .abbreviated, time: .shortened))
                 .font(.system(size: 11).monospacedDigit())
                 .foregroundStyle(.tertiary)
@@ -253,6 +280,7 @@ private struct CommitRow: View {
             Text(commit.shortHash)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
+                .fixedSize()
         }
         .font(.system(size: 12))
         .frame(height: Self.height)
@@ -264,20 +292,32 @@ private struct RefBadge: View {
     let ref: String
 
     var body: some View {
-        let isHead = ref.hasPrefix("HEAD")
-        let isTag = ref.hasPrefix("tag: ")
-        let isRemote = ref.contains("/") && !isHead
-        let text = ref.replacingOccurrences(of: "HEAD -> ", with: "").replacingOccurrences(of: "tag: ", with: "")
-        HStack(spacing: 3) {
-            Image(systemName: isTag ? "tag" : isRemote ? "cloud" : "arrow.triangle.branch")
-                .font(.system(size: 8))
-            Text(text).lineLimit(1)
+        let label = GitRefLabel(ref)
+        let icon: String
+        let tint: Color
+        switch label.kind {
+        case .tag: icon = "tag"; tint = .orange
+        case .remote: icon = "cloud"; tint = .secondary
+        case .head: icon = "scope"; tint = .accentColor
+        case .local: icon = "arrow.triangle.branch"; tint = label.isCurrent ? .accentColor : .green
         }
-        .font(.system(size: 10, weight: isHead ? .semibold : .regular))
+        return HStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 8))
+            Text(Self.short(label.name)).lineLimit(1)
+        }
+        .font(.system(size: 10, weight: label.isCurrent ? .semibold : .regular))
         .padding(.horizontal, 5)
         .padding(.vertical, 1)
-        .background(Capsule().fill((isHead ? Color.accentColor : isTag ? Color.orange : Color.secondary).opacity(0.2)))
+        .background(Capsule().fill(tint.opacity(0.2)))
         .fixedSize()
+        .help(label.name)
+    }
+
+    /// Длинные имена веток (`origin/fix/…#OST-21643`) — с многоточием в
+    /// середине: начало и номер задачи в конце важнее.
+    static func short(_ name: String) -> String {
+        guard name.count > 26 else { return name }
+        return String(name.prefix(12)) + "…" + String(name.suffix(12))
     }
 }
 

@@ -5405,6 +5405,11 @@ do {
     check(rows[3].column == 0 && rows[3].bottom.isEmpty && rows[3].top.contains { $0.from == 1 && $0.to == 0 },
           "у корня линии сходятся, вниз ничего (\(rows[3]))")
     check(rows.allSatisfy { $0.width <= 2 }, "граф в две колонки")
+    let refLabels = ["HEAD -> refs/heads/main", "refs/remotes/origin/feature/x", "refs/heads/feature/jump",
+                     "tag: refs/tags/v1", "HEAD"].map(GitRefLabel.init)
+    check(refLabels.map(\.kind) == [.local, .remote, .local, .tag, .head] && refLabels[0].isCurrent
+            && refLabels.map(\.name) == ["main", "origin/feature/x", "feature/jump", "v1", "HEAD"],
+          "метки коммита: локальная ветка со слешем — не удалённая")
 
     // Два независимых конца: вторая ветка встаёт рядом, а не вместо.
     var tips = GitGraphLayout()
