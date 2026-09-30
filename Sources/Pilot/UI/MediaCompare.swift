@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import SceneKit
 
 /// Две версии картинки, модели, шрифта или PDF — рядом, тем же
 /// просмотрщиком, что открывает файл в редакторе. Картинки — ещё и
@@ -223,59 +224,66 @@ struct ImageDiffPane: View {
 
 // MARK: - Конфликт двоичного файла
 
-/// Конфликт картинки, модели, шрифта: сливать нечего, выбирают одну
-/// версию. Чтобы выбрать с толком — три колонки: наша, общий предок, их,
-/// и у сторон видно, что каждая изменила. Картинки — маской изменённых
-/// пикселей, модели — общей камерой и таблицей «было / наше / их».
+/// Конфликт картинки, модели, шрифта — как слияние текста: слева наша
+/// версия, справа их, посередине — чем они отличаются. Выбор — одна из
+/// двух: слить картинку или модель по кускам нельзя.
+///
+/// Разница — у картинки маской отличающихся пикселей или наложением с
+/// ползунком; у модели — обе в одной сцене, наша оранжевым, их синим, и у
+/// всех трёх просмотрщиков общая камера.
 struct BinaryMergeView: View {
     @ObservedObject var session: MergeSession
     let finish: (@escaping () async -> Bool) -> Void
 
-    @State private var urls: [GitBlobs.Revision: URL?] = [:]
-    @State private var showsMask = true
+    @State private var ours: URL??
+    @State private var theirs: URL??
     @State private var facts: [Int: ModelFacts] = [:]
     @State private var sync = CameraSync()
+    @State private var blend = false
+    @State private var mix = 0.5
 
     private var kind: MediaKind? { MediaKind(filename: session.path) }
 
     var body: some View {
         VStack(spacing: 0) {
-            if kind == .image {
-                HStack {
-                    Toggle(L("Подсвечивать, что изменила каждая сторона"), isOn: $showsMask).toggleStyle(.checkbox)
-                    Spacer()
-                }
-                .font(.system(size: 12))
-                .padding(.horizontal, 12)
-                .frame(height: 30)
-                Divider()
-            }
             HStack(spacing: 0) {
-                column(stage: 2, title: L("Наша: \(session.oursName)"))
+                column(title: L("Наша: \(session.oursName)"), url: ours, stage: 2)
                 Divider()
-                column(stage: 1, title: L("Было — общий предок"))
+                VStack(spacing: 0) {
+                    HStack {
+                        Text(L("Чем отличаются")).font(.system(size: 12, weight: .medium))
+                        if kind == .image {
+                            Picker("", selection: $blend) {
+                                Text(L("Маска")).tag(false)
+                                Text(L("Наложение")).tag(true)
+                            }
+                            .pickerStyle(.segmented).labelsHidden().fixedSize().controlSize(.small)
+                        }
+                    }
+                    .frame(maxWidth: .infinity).frame(height: 26)
+                    difference
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 Divider()
-                column(stage: 3, title: session.theirsName.isEmpty ? L("Их версия") : L("Их: \(session.theirsName)"))
+                column(title: session.theirsName.isEmpty ? L("Их версия") : L("Их: \(session.theirsName)"), url: theirs, stage: 3)
             }
-            if kind == .model, facts.count > 1 {
+            if kind == .model, facts[2] != nil || facts[3] != nil {
                 Divider()
-                ModelFactsTable(base: facts[1], ours: facts[2], theirs: facts[3])
+                ModelFactsTable(left: facts[2], right: facts[3])
             }
             Divider()
             HStack(spacing: 8) {
+                Button(L("← Взять левое")) { finish { await session.takeWhole(true) } }
+                    .disabled(ours == .some(nil))
                 if let error = session.error {
                     Text(error).foregroundStyle(Color(nsColor: Theme.diagnosticError)).lineLimit(2).textSelection(.enabled)
                 }
                 Spacer()
                 if session.busy { ProgressView().controlSize(.small) }
-                Button(L("Взять нашу")) { finish { await session.takeWhole(true) } }
-                if url(1) != nil {
-                    Button(L("Оставить как было")) { finish { await session.takeBase() } }
-                        .help(L("Ни одной из правок — версия общего предка"))
-                }
-                Button(L("Взять их")) { finish { await session.takeWhole(false) } }
-                    .buttonStyle(.borderedProminent)
+                Button(L("Взять правое →")) { finish { await session.takeWhole(false) } }
+                    .disabled(theirs == .some(nil))
             }
+            .buttonStyle(.borderedProminent)
             .disabled(session.busy)
             .font(.system(size: 12))
             .padding(10)
@@ -283,60 +291,169 @@ struct BinaryMergeView: View {
         .task(id: session.path) { await load() }
     }
 
-    private func url(_ stage: Int) -> URL? { urls[.stage(stage)] ?? nil }
-
     @ViewBuilder
-    private func column(stage: Int, title: String) -> some View {
+    private func column(title: String, url: URL??, stage: Int) -> some View {
         VStack(spacing: 0) {
             Text(title).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
                 .frame(maxWidth: .infinity).frame(height: 26)
-            if urls[.stage(stage)] == nil {
+            switch url {
+            case .none:
                 ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let file = url(stage), let kind {
+            case .some(.none):
+                Text(L("Файл удалён")).foregroundStyle(.tertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .some(.some(let file)):
                 switch kind {
-                case .image:
-                    // У сторон — что изменилось относительно предка; у предка — он сам.
-                    ImageDiffPane(url: file, base: stage == 1 ? nil : url(1), showsMask: showsMask)
-                case .model:
-                    ModelViewer(url: file, sync: sync, onLoad: { scene in facts[stage] = scene.facts })
-                default:
-                    MediaView(url: file, kind: kind)
+                case .image?: ImageDiffPane(url: file)
+                case .model?: ModelViewer(url: file, sync: sync, onLoad: { scene in facts[stage] = scene.facts })
+                case let other?: MediaView(url: file, kind: other)
+                case nil: Text(file.lastPathComponent).foregroundStyle(.tertiary)
                 }
-            } else {
-                Text(stage == 1 ? L("Файла не было — обе стороны его добавили") : L("Файл удалён"))
-                    .foregroundStyle(.tertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    @ViewBuilder
+    private var difference: some View {
+        if case .some(.some(let left)) = ours, case .some(.some(let right)) = theirs {
+            switch kind {
+            case .image?:
+                if blend {
+                    VStack(spacing: 6) {
+                        ZStack {
+                            OverlayImage(url: left)
+                            OverlayImage(url: right).opacity(mix)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        HStack {
+                            Text(L("левое")).font(.system(size: 11)).foregroundStyle(.secondary)
+                            Slider(value: $mix, in: 0...1)
+                            Text(L("правое")).font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: 320)
+                    }
+                    .padding(8)
+                } else {
+                    // Поверх левой — красным, где правая другая.
+                    ImageDiffPane(url: left, base: right)
+                }
+            case .model?:
+                ModelOverlayViewer(left: left, right: right, sync: sync)
+            default:
+                Text(L("Сравнить можно только глазами — слева и справа"))
+                    .foregroundStyle(.tertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else if ours == nil || theirs == nil {
+            ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            Text(L("Одна сторона файл удалила")).foregroundStyle(.tertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
     private func load() async {
         let repository = session.repository, path = session.path
-        let loaded = await Task.detached(priority: .userInitiated) { () -> [GitBlobs.Revision: URL?] in
-            var result: [GitBlobs.Revision: URL?] = [:]
-            for stage in 1...3 { result[.stage(stage)] = .some(GitBlobs.file(path, at: .stage(stage), in: repository)) }
-            return result
+        let (left, right) = await Task.detached(priority: .userInitiated) {
+            (GitBlobs.file(path, at: .stage(2), in: repository), GitBlobs.file(path, at: .stage(3), in: repository))
         }.value
-        urls = loaded
+        ours = .some(left)
+        theirs = .some(right)
     }
 }
 
-/// Модели в конфликте — числами: что у предка, у нас и у них. Изменённое
-/// стороной относительно предка подсвечено; ниже — какие сетки и
-/// материалы каждая добавила или убрала.
+/// Две модели в одной сцене: левая оранжевым, правая синим, обе
+/// полупрозрачные. Где совпадают — смешанный цвет, где разошлись — видно,
+/// чья деталь.
+struct ModelOverlayViewer: View {
+    let left: URL
+    let right: URL
+    var sync: CameraSync? = nil
+
+    @State private var model: ModelScene?
+    @State private var error: String?
+
+    var body: some View {
+        Group {
+            if let model {
+                SceneView3D(model: model, wireframe: false, sync: sync)
+                    .overlay(alignment: .bottom) {
+                        HStack(spacing: 14) {
+                            legend(.orange, L("левое"))
+                            legend(.blue, L("правое"))
+                        }
+                        .font(.system(size: 11))
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(Capsule().fill(.ultraThinMaterial))
+                        .padding(8)
+                    }
+            } else if let error {
+                Text(error).foregroundStyle(.tertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: left.path + right.path) {
+            let left = left, right = right
+            let result = await Task.detached(priority: .userInitiated) { () -> Result<ModelScene, Error> in
+                Result { try ModelScene.overlay(try ModelScene.load(left), try ModelScene.load(right)) }
+            }.value
+            switch result {
+            case .success(let scene): model = scene
+            case .failure(let failure): error = failure.localizedDescription
+            }
+        }
+    }
+
+    private func legend(_ color: Color, _ text: String) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(text)
+        }
+    }
+}
+
+extension ModelScene {
+    /// Сцена из двух моделей: у каждой свой полупрозрачный цвет.
+    static func overlay(_ left: ModelScene, _ right: ModelScene) -> ModelScene {
+        let scene = SCNScene()
+        func add(_ source: ModelScene, _ color: NSColor) {
+            let material = SCNMaterial()
+            material.diffuse.contents = color
+            material.transparency = 0.55
+            material.isDoubleSided = true
+            material.lightingModel = .blinn
+            material.writesToDepthBuffer = false
+            let root = source.scene.rootNode.clone()
+            root.enumerateHierarchy { node, _ in
+                if node.camera != nil || node.light != nil { node.removeFromParentNode(); return }
+                if let geometry = node.geometry?.copy() as? SCNGeometry {
+                    geometry.materials = [material]
+                    node.geometry = geometry
+                }
+            }
+            scene.rootNode.addChildNode(root)
+        }
+        add(left, NSColor.systemOrange)
+        add(right, NSColor.systemBlue)
+        let radius = max(left.radius, right.radius)
+        let center = SCNVector3((left.center.x + right.center.x) / 2, (left.center.y + right.center.y) / 2,
+                                (left.center.z + right.center.z) / 2)
+        return ModelScene(scene: scene, center: center, radius: radius, info: [])
+    }
+}
+
+/// Модели в конфликте — числами: левая и правая, различия подсвечены;
+/// ниже — какие сетки и материалы есть только у одной из них.
 struct ModelFactsTable: View {
-    let base: ModelFacts?
-    let ours: ModelFacts?
-    let theirs: ModelFacts?
+    let left: ModelFacts?
+    let right: ModelFacts?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 3) {
                 GridRow {
                     Text("")
-                    Text(L("Наша")).fontWeight(.medium)
-                    Text(L("Было")).fontWeight(.medium)
-                    Text(L("Их")).fontWeight(.medium)
+                    Text(L("Левое")).fontWeight(.medium)
+                    Text(L("Правое")).fontWeight(.medium)
                 }
                 row(L("Сетки")) { "\($0.meshes)" }
                 row(L("Треугольники")) { "\($0.triangles)" }
@@ -347,49 +464,39 @@ struct ModelFactsTable: View {
                 row(L("Анимации")) { "\($0.animations)" }
             }
             .font(.system(size: 11, design: .monospaced))
-            changes(L("Наша"), ours)
-            changes(L("Их"), theirs)
+            if let left, let right {
+                only(L("Только слева"), left, right)
+                only(L("Только справа"), right, left)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func row(_ title: String, _ value: @escaping (ModelFacts) -> String) -> some View {
-        let b = base.map(value)
+        let l = left.map(value), r = right.map(value)
         return GridRow {
             Text(title).foregroundStyle(.secondary)
-            cell(ours.map(value), changed: ours.map(value) != b)
-            Text(b ?? "—")
-            cell(theirs.map(value), changed: theirs.map(value) != b)
+            cell(l, differs: l != r)
+            cell(r, differs: l != r)
         }
     }
 
-    private func cell(_ text: String?, changed: Bool) -> some View {
+    private func cell(_ text: String?, differs: Bool) -> some View {
         Text(text ?? "—")
-            .foregroundStyle(changed ? Color.orange : .primary)
-            .fontWeight(changed ? .semibold : .regular)
+            .foregroundStyle(differs ? Color.orange : .primary)
+            .fontWeight(differs ? .semibold : .regular)
     }
 
     @ViewBuilder
-    private func changes(_ side: String, _ facts: ModelFacts?) -> some View {
-        if let facts, let base {
-            let meshes = diff(base.meshNames, facts.meshNames), materials = diff(base.materialNames, facts.materialNames)
-            let parts = [describe(L("сетки"), meshes), describe(L("материалы"), materials)].compactMap { $0 }
-            if !parts.isEmpty {
-                Text("\(side): " + parts.joined(separator: "; "))
-                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
-            }
+    private func only(_ title: String, _ a: ModelFacts, _ b: ModelFacts) -> some View {
+        let meshes = a.meshNames.filter { !b.meshNames.contains($0) }
+        let materials = a.materialNames.filter { !b.materialNames.contains($0) }
+        if !meshes.isEmpty || !materials.isEmpty {
+            let parts = [meshes.isEmpty ? nil : L("сетки ") + meshes.prefix(8).joined(separator: ", "),
+                         materials.isEmpty ? nil : L("материалы ") + materials.prefix(8).joined(separator: ", ")].compactMap { $0 }
+            Text("\(title): " + parts.joined(separator: "; "))
+                .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
         }
-    }
-
-    private func diff(_ old: [String], _ new: [String]) -> (added: [String], removed: [String]) {
-        (new.filter { !old.contains($0) }, old.filter { !new.contains($0) })
-    }
-
-    private func describe(_ what: String, _ change: (added: [String], removed: [String])) -> String? {
-        var parts: [String] = []
-        if !change.added.isEmpty { parts.append("+" + change.added.prefix(6).joined(separator: ", ")) }
-        if !change.removed.isEmpty { parts.append("−" + change.removed.prefix(6).joined(separator: ", ")) }
-        return parts.isEmpty ? nil : "\(what) " + parts.joined(separator: " ")
     }
 }

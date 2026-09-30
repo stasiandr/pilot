@@ -152,25 +152,6 @@ final class MergeSession: ObservableObject {
         return await add()
     }
 
-    /// Ни одной из правок — версия общего предка (`:1:`), и файл решён.
-    func takeBase() async -> Bool {
-        busy = true
-        defer { busy = false }
-        let repository = repository, path = path
-        let written = await Task.detached { () -> Bool in
-            guard let output = Git.run(["cat-file", "blob", ":1:\(path)"], in: repository), output.status == 0 else { return false }
-            var data = output.stdout
-            if GitBlobs.isLFSPointer(data), let url = GitBlobs.file(path, at: .stage(1), in: repository),
-               let real = try? Data(contentsOf: url) { data = real }
-            return (try? data.write(to: repository.appendingPathComponent(path))) != nil
-        }.value
-        guard written else {
-            error = L("Не удалось записать версию общего предка")
-            return false
-        }
-        return await add()
-    }
-
     /// UnityYAMLMerge: сливает сцену по объектам. Код 0 — слил сам, файл
     /// записан; иначе — остались конфликты, и файл не трогаем.
     func runYAMLMerge() async -> Bool {
