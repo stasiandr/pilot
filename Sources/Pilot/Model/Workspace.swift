@@ -3401,16 +3401,6 @@ final class Workspace: ObservableObject {
         }
     }
 
-    /// Двойной клик по блоку просмотра — исходник на его строке.
-    func showMarkdownSource(line: Int) {
-        guard isMarkdownDocument, let buffer else { return }
-        buffer.showsMarkdownSource = true
-        objectWillChange.send()
-        let position = LSPPosition(line: line, character: 0)
-        requestReveal(LSPRange(start: position, end: position))
-        focusEditor()
-    }
-
     private func setBuffer(_ new: TextBuffer?) {
         // Своё выделение новая вкладка пришлёт сама, когда редактор её покажет.
         if new !== buffer { editorSelection = NSRange(location: 0, length: 0) }

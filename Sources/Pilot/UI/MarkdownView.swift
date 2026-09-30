@@ -15,9 +15,16 @@ struct MarkdownView: NSViewRepresentable {
     let reveal: Workspace.RevealRequest?
     let fontSize: CGFloat
     var onOpenFile: (URL) -> Void
-    var onShowSource: (Int) -> Void
 
     static let scheme = "pilot-md"
+
+    /// Ширина колонки текста в точках, 0 — во всё окно. Тянется за края
+    /// колонки прямо на странице и одна на все документы.
+    static var readingWidth: Double {
+        get { UserDefaults.standard.object(forKey: widthKey) as? Double ?? 860 }
+        set { UserDefaults.standard.set(newValue, forKey: widthKey) }
+    }
+    private static let widthKey = "pilot.markdownReadingWidth"
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, WKURLSchemeHandler {
         var parent: MarkdownView
@@ -104,8 +111,9 @@ struct MarkdownView: NSViewRepresentable {
 
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let body = message.body as? [String: Any] else { return }
-            if let line = body["source"] as? Int {
-                parent.onShowSource(line)
+            if let width = body["width"] as? Double {
+                // Пишется раз — когда отпустили край, а не на каждый сдвиг.
+                MarkdownView.readingWidth = width
             } else if let y = body["scroll"] as? Double {
                 parent.buffer.markdownScroll = y
             }
@@ -147,7 +155,8 @@ struct MarkdownView: NSViewRepresentable {
             let html = """
             <!doctype html><html><head><meta charset="utf-8">
             <base href="\(Markdown.escape(base))">
-            <style>\(Theme.markdownCSS) body{font-size:\(Int(view.fontSize + 2))px}</style>
+            <style>\(Theme.markdownCSS) body{font-size:\(Int(view.fontSize + 2))px}
+            main{max-width:\(MarkdownView.readingWidth > 0 ? "\(Int(MarkdownView.readingWidth))px" : "none")}</style>
             </head><body><main>\(body)</main>
             <script>\(MarkdownView.script(scroll: view.buffer.markdownScroll))</script>
             </body></html>
@@ -188,8 +197,9 @@ struct MarkdownView: NSViewRepresentable {
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "pilot")
     }
 
-    /// Прокрутка к строке исходника, двойной клик → исходник, якоря
-    /// `#заголовок` внутри страницы и запоминание прокрутки.
+    /// Прокрутка к строке исходника, якоря `#заголовок` внутри страницы,
+    /// ширина колонки за её края, широкие таблицы шире колонки
+    /// и запоминание прокрутки.
     static func script(scroll: Double) -> String {
         """
         (function(){
@@ -204,10 +214,61 @@ struct MarkdownView: NSViewRepresentable {
             best.scrollIntoView({block: 'start'});
             best.classList.remove('flash'); void best.offsetWidth; best.classList.add('flash');
           };
-          document.addEventListener('dblclick', e => {
-            if (e.target.closest('a')) return;
-            const el = e.target.closest('[data-line]');
-            if (el) post({source: +el.dataset.line});
+          // Таблица шире колонки выходит за неё в обе стороны, насколько
+          // позволяет окно, и только шире окна прокручивается.
+          const main = document.querySelector('main');
+          const edges = ['l', 'r'].map(side => {
+            const el = document.createElement('div');
+            el.className = 'measure';
+            el.dataset.side = side;
+            document.body.appendChild(el);
+            return el;
+          });
+          const pad = 16, gap = 24, minWidth = 360;
+          const layout = () => {
+            const r = main.getBoundingClientRect();
+            edges[0].style.left = Math.max(r.left - gap, 6) + 'px';
+            edges[1].style.left = Math.min(r.right + gap, document.documentElement.clientWidth - 6) + 'px';
+            const vw = document.documentElement.clientWidth;
+            for (const t of main.querySelectorAll('table')) {
+              t.style.maxWidth = ''; t.style.marginLeft = '';
+              const box = t.parentElement.getBoundingClientRect();
+              const w = t.scrollWidth + t.offsetWidth - t.clientWidth;
+              if (w <= box.width) continue;
+              const width = Math.min(w, vw - 2 * pad);
+              const x = Math.max(pad, Math.min(box.left - (width - box.width) / 2, vw - pad - width));
+              t.style.maxWidth = width + 'px';
+              t.style.marginLeft = (x - box.left) + 'px';
+            }
+          };
+          layout();
+          window.addEventListener('resize', layout);
+          document.fonts.ready.then(layout);
+          for (const edge of edges) edge.addEventListener('mousedown', e => {
+            e.preventDefault();
+            const sign = edge.dataset.side === 'r' ? 1 : -1;
+            const startX = e.clientX, startWidth = main.getBoundingClientRect().width;
+            const maxWidth = main.parentElement.clientWidth
+              - parseFloat(getComputedStyle(document.body).paddingLeft)
+              - parseFloat(getComputedStyle(document.body).paddingRight);
+            let width = startWidth;
+            edge.classList.add('drag');
+            document.body.classList.add('measuring');
+            const move = e => {
+              // Колонка по центру: край уходит на столько же, сколько мышь.
+              width = Math.max(minWidth, Math.min(maxWidth, startWidth + 2 * sign * (e.clientX - startX)));
+              main.style.maxWidth = width >= maxWidth ? 'none' : width + 'px';
+              layout();
+            };
+            const up = () => {
+              window.removeEventListener('mousemove', move);
+              window.removeEventListener('mouseup', up);
+              edge.classList.remove('drag');
+              document.body.classList.remove('measuring');
+              post({width: width >= maxWidth ? 0 : Math.round(width)});
+            };
+            window.addEventListener('mousemove', move);
+            window.addEventListener('mouseup', up);
           });
           document.addEventListener('click', e => {
             const a = e.target.closest('a[href]');

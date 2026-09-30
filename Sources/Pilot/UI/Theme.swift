@@ -349,6 +349,10 @@ enum Theme {
         body{color:\(hex(M.text));font:15px/1.65 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
           -webkit-font-smoothing:antialiased;padding:28px 40px 80px}
         main{max-width:860px;margin:0 auto}
+        .measure{position:fixed;top:0;bottom:0;width:11px;margin-left:-5px;cursor:col-resize;z-index:5}
+        .measure::after{content:"";position:absolute;top:0;bottom:0;left:5px;width:1px;background:\(hex(M.surface1));opacity:0;transition:opacity .15s}
+        .measure:hover::after,.measure.drag::after{opacity:1}
+        body.measuring{cursor:col-resize;user-select:none}
         h1,h2,h3,h4,h5,h6{color:\(hex(M.text));font-weight:650;line-height:1.25;margin:1.6em 0 .6em;scroll-margin-top:16px}
         h1{font-size:2em;padding-bottom:.3em;border-bottom:1px solid \(hex(M.surface0))}
         h2{font-size:1.5em;padding-bottom:.25em;border-bottom:1px solid \(hex(M.surface0))}
@@ -371,7 +375,7 @@ enum Theme {
         li.task{list-style:none}
         li.task input{margin:0 .45em 0 -1.35em;vertical-align:-1px;accent-color:\(hex(M.green))}
         hr{border:none;border-top:1px solid \(hex(M.surface1));margin:2em 0}
-        table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}
+        table{border-collapse:collapse;display:block;overflow-x:auto;width:max-content;max-width:100%}
         th,td{border:1px solid \(hex(M.surface0));padding:6px 12px;vertical-align:top}
         th{background:\(hex(M.mantle));font-weight:600}
         tr:nth-child(even) td{background:\(rgba(M.surface0, 0.35))}

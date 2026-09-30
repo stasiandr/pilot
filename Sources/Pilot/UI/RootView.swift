@@ -155,8 +155,7 @@ struct RootView: View {
         } else if let buffer = workspace.buffer, workspace.showsRenderedMarkdown {
             MarkdownView(buffer: buffer, version: buffer.model.version, reveal: workspace.reveal,
                          fontSize: workspace.fontSize,
-                         onOpenFile: { workspace.open(file: $0) },
-                         onShowSource: { workspace.showMarkdownSource(line: $0) })
+                         onOpenFile: { workspace.open(file: $0) })
                 .id(ObjectIdentifier(buffer))
         } else if let buffer = workspace.buffer {
             OccurrencesReader(caret: workspace.caret) { occurrences in
