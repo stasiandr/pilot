@@ -45,8 +45,7 @@ final class LocalHistory: @unchecked Sendable {
 
     /// Папка истории проекта: по хэшу пути корня, имя — для человека.
     static func directory(forProject root: URL, base: URL? = nil) -> URL {
-        let base = base ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Pilot/History")
+        let base = base ?? CacheStore.Locations.standard.history
         let path = root.standardizedFileURL.path
         return base.appendingPathComponent("\(root.lastPathComponent)-\(hash(path))")
     }

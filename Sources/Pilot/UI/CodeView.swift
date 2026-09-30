@@ -29,6 +29,11 @@ struct LoadedDocument: Sendable {
     var semanticsVersion: Int = 0
     /// Картинка, модель, шрифт или PDF: текста нет, вместо редактора — просмотр.
     var media: MediaKind? = nil
+    /// Подсказки первого экрана и места счётчиков использований, посчитанные
+    /// при чтении файла, — чтобы первый же кадр был с ними и строки потом не
+    /// ехали (см. `Workspace.earlyInsights`). nil — не C# или проект ещё не
+    /// скомпилирован.
+    var insights: RustlynInsights? = nil
 
     /// Разбор соответствует тексту — по нему можно править и переходить.
     var isSemanticsFresh: Bool { semanticsVersion == model.version }
@@ -1347,6 +1352,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     private var isApplying = false
     /// Идёт `highlightVisible` — второй раз, изнутри раскладки, в неё не входим.
     private var isHighlighting = false
+    /// Идёт подмена хранилища: покрашенное сейчас она же и сотрёт.
+    private var isReplacingStorage = false
     /// Перекраска после правки уже назначена на следующий виток.
     private var repaintScheduled = false
     /// Покрашенный участок текста. В символах, а не строках: временные
@@ -1649,6 +1656,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
                                                                max(0, buffer.model.units.count - 1)))
         highlightVisible()
         textView.updateCurrentLineHighlight()
+        EditorStability.shared?.shown(self)
         return target
     }
 
@@ -1660,8 +1668,22 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
 
     /// Подсветка живёт во временных атрибутах раскладки, а не в тексте:
     /// они привязаны к позициям, и чужой файл не должен их унаследовать.
+    ///
+    /// Подмена меняет высоту текста, клип об этом сообщает — и
+    /// `highlightVisible` звался прямо изнутри неё: красил новый текст,
+    /// запоминал покрашенное, а следующая строка здесь цвета стирала. Экран
+    /// оставался без подсветки, а редактор считал его покрашенным — до
+    /// прокрутки или правки. Бывало это не всегда: только если высота текста
+    /// у файлов разная. Поэтому пока идёт подмена, не красим, а покрашенным
+    /// после неё не считается ничего.
     private func replaceStorage(with storage: NSTextStorage) {
         guard let layout = textView.layoutManager else { return }
+        isReplacingStorage = true
+        defer {
+            isReplacingStorage = false
+            painted = nil
+            unpainted = nil
+        }
         clearTemporaryAttributes(layout)
         layout.replaceTextStorage(storage)
         clearTemporaryAttributes(layout)
@@ -2782,7 +2804,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         // Раскладка видимого ниже уточняет высоту текста, клип от этого
         // сдвигается и зовёт сюда снова — изнутри раскладки. Вложенный вызов
         // пропускаем: этот и так спросит видимое заново, когда она закончится.
-        guard !isApplying, !isHighlighting,
+        guard !isApplying, !isHighlighting, !isReplacingStorage,
               let model, model.spec != nil,
               let storage = textView.textStorage,
               storage.length > 0 else { return }
@@ -2962,6 +2984,110 @@ private enum InfoPart: Sendable {
     case fix(String?)
 }
 
+// MARK: - Кадр для замера стабильности (EditorStability)
+
+extension CodeViewController {
+    /// Что сейчас на экране — для `EditorStability`: где стоит каждая видимая
+    /// строка (в координатах прокрутки, как её видит глаз), где кончается,
+    /// какого цвета её символы и какой над ней счётчик. Видимое
+    /// раскладывается, как его разложит отрисовка.
+    func stabilityFrame(colors palette: inout [NSColor]) -> EditorFrame? {
+        guard let buffer, let model = self.model, let layout = textView.layoutManager,
+              let storage = textView.textStorage, storage.length > 0,
+              let visible = textView.charactersOnScreen() else { return nil }
+        let clip = scrollView.contentView.bounds
+        let origin = textView.textContainerOrigin
+        let left = textView.convert(NSPoint(x: origin.x, y: 0), to: scrollView).x
+        let units = model.units
+        let length = min(storage.length, units.count)
+        let lenses = Dictionary(textView.codeLenses.compactMap { lens in
+            textView.lensRect(for: lens) == nil ? nil : (lens.anchor, lens.title)
+        }, uniquingKeysWith: { a, _ in a })
+
+        func colorIndex(_ color: NSColor?) -> UInt8 {
+            guard let color else { return 0 }
+            if let i = palette.firstIndex(where: { $0 == color }) { return UInt8(min(i + 1, 254)) }
+            palette.append(color)
+            return UInt8(min(palette.count, 254))
+        }
+
+        var frame = EditorFrame(buffer: ObjectIdentifier(buffer), height: clip.height, width: clip.width)
+        let firstLine = model.line(containing: visible.location)
+        let lastLine = model.line(containing: min(max(visible.location, NSMaxRange(visible) - 1), max(0, units.count - 1)))
+        guard firstLine <= lastLine else { return frame }
+        for line in firstLine...lastLine {
+            let range = model.lineRange(line)
+            let start = range.lowerBound
+            guard start < length, textView.foldedRanges.allSatisfy({ !NSLocationInRange(start, $0) }) else { continue }
+            var end = min(range.upperBound, length)
+            while end > start, units[end - 1] == 0x0A || units[end - 1] == 0x0D { end -= 1 }
+            let glyph = layout.glyphIndexForCharacter(at: start)
+            let text = layout.textLineRect(forGlyphAt: glyph)
+            let y = text.minY + origin.y - clip.minY
+            guard y + text.height > 0, y < clip.height else { continue }
+            var endX = left
+            if end > start {
+                let lastGlyph = layout.glyphIndexForCharacter(at: end - 1)
+                endX = left + layout.lineFragmentUsedRect(forGlyphAt: lastGlyph, effectiveRange: nil).maxX - clip.minX
+            }
+            var colors = [UInt8](repeating: 255, count: end - start)
+            var i = start
+            while i < end {
+                var run = NSRange()
+                let color = layout.temporaryAttribute(.foregroundColor, atCharacterIndex: i,
+                                                      longestEffectiveRange: &run,
+                                                      in: NSRange(location: i, length: end - i)) as? NSColor
+                let index = colorIndex(color)
+                let upper = min(end, max(i + 1, NSMaxRange(run)))
+                for j in i..<upper where units[j] != 0x20 && units[j] != 0x09 { colors[j - start] = index }
+                i = upper
+            }
+            var hash = Hasher()
+            hash.combine(units[start..<end].count)
+            for u in units[start..<end] { hash.combine(u) }
+            frame.lines[line] = .init(y: y, left: left, endX: endX, text: hash.finalize(), colors: colors,
+                                      lens: lenses[start])
+        }
+        return frame
+    }
+
+    /// Цвета, которые `paint` положил бы на строки сейчас: токены и
+    /// украшения — для проверки, что на экране именно они.
+    func expectedColors(line: Int, colors palette: [NSColor]) -> [UInt8]? {
+        guard let model, let storage = textView.textStorage, line < model.lineCount else { return nil }
+        let range = model.lineRange(line)
+        let length = min(storage.length, model.units.count)
+        var end = min(range.upperBound, length)
+        let start = range.lowerBound
+        guard start < end else { return [] }
+        while end > start, model.units[end - 1] == 0x0A || model.units[end - 1] == 0x0D { end -= 1 }
+        var colors: [NSColor?] = Array(repeating: nil, count: end - start)
+        func put(_ r: NSRange, _ color: NSColor) {
+            let lower = max(r.location, start), upper = min(NSMaxRange(r), end)
+            guard lower < upper else { return }
+            for j in lower..<upper { colors[j - start] = color }
+        }
+        for t in model.colorTokens(fromLine: line, toLine: line) where t.kind != .plain {
+            put(NSRange(location: Int(t.start), length: Int(t.length)), Theme.color(t.kind))
+        }
+        if let decorator, let document = buffer?.document {
+            for d in decorator(document, NSRange(location: start, length: end - start)) {
+                if let color = d.color { put(d.range, color) }
+            }
+        }
+        return (start..<end).map { j in
+            let unit = model.units[j]
+            guard unit != 0x20, unit != 0x09 else { return 255 }
+            guard let color = colors[j - start] else { return 0 }
+            guard let i = palette.firstIndex(where: { $0 == color }) else { return 254 }
+            return UInt8(min(i + 1, 254))
+        }
+    }
+
+    /// Показанный буфер — чей кадр снимает замер.
+    var shownBuffer: TextBuffer? { buffer }
+}
+
 extension CodeViewController: NSLayoutManagerDelegate {
 
     // MARK: Ошибки
@@ -3086,9 +3212,14 @@ extension CodeViewController: NSLayoutManagerDelegate {
             : oldAnchors.symmetricDifference(newAnchors)
 
         // Места над строками выше экрана сдвинут текст — держим на месте
-        // строку, что сверху.
+        // строку, что сверху. А пока встаёт переход — строку перехода: места
+        // над строками между верхом экрана и ею увели бы её вниз, за край, и
+        // проверка перехода догоняла бы её прокруткой уже на глазах.
         let keepTop = !changedAnchors.isEmpty
-        if keepTop { saveViewState() }
+        let held = keepTop ? landing.flatMap { landing in
+            lineTop(landing.range.location).map { (landing.range.location, $0 - scrollView.contentView.bounds.minY) }
+        } : nil
+        if keepTop, held == nil { saveViewState() }
 
         textView.hintFont = hintFont
         textView.lensFont = lensFont
@@ -3115,11 +3246,29 @@ extension CodeViewController: NSLayoutManagerDelegate {
         invalidate(Array(changedHints), glyphs: true)
         invalidate(Array(changedAnchors), glyphs: false)
         guard !changedHints.isEmpty || !changedAnchors.isEmpty else { return }
-        if keepTop, let state = buffer?.viewState {
+        if let (location, offset) = held, let top = lineTop(location) {
+            let clip = scrollView.contentView
+            let target = NSPoint(x: clip.bounds.minX, y: max(0, top - offset))
+            if abs(clip.bounds.minY - target.y) >= 1 {
+                clip.scroll(to: target)
+                scrollView.reflectScrolledClipView(clip)
+            }
+            highlightVisible()
+        } else if keepTop, let state = buffer?.viewState {
             scroll(toLine: state.topLine, offset: state.topOffset, x: state.scrollX)
         }
         textView.needsDisplay = true
         ruler?.needsDisplay = true
+    }
+
+    /// Верх текста строки с символом `location` в координатах текст-вида —
+    /// после раскладки этой строки.
+    private func lineTop(_ location: Int) -> CGFloat? {
+        guard let layout = textView.layoutManager, let storage = textView.textStorage,
+              storage.length > 0 else { return nil }
+        let glyph = layout.glyphIndexForCharacter(at: min(location, storage.length - 1))
+        layout.ensureLayout(forGlyphRange: NSRange(location: glyph, length: 1))
+        return layout.textLineRect(forGlyphAt: glyph).minY + textView.textContainerOrigin.y
     }
 
     /// Первый символ строки — не пробел и не таб; пустая — её конец.
@@ -3131,8 +3280,12 @@ extension CodeViewController: NSLayoutManagerDelegate {
         return i
     }
 
-    /// «3 использования», «нет использований».
-    static func usagesTitle(_ count: Int) -> String {
+    /// «3 использования», «нет использований»; не сосчитано — «… использований»:
+    /// место под счётчик уже отведено, число придёт после поиска по проекту.
+    static func usagesTitle(_ count: Int?) -> String {
+        guard let count else {
+            return "… " + Localization.word(for: 5, "использование", "использования", "использований")
+        }
         guard count > 0 else { return L("нет использований") }
         return Localization.count(count, "использование", "использования", "использований", grouped: false)
     }

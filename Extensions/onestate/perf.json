@@ -1,0 +1,49 @@
+{
+  "project": "/Users/stas/work/clm-client",
+  "cache_roots": ["/Users/stas/work/clm-server"],
+  "idle_seconds": 24,
+  "palette": { "text": "ParkingVehicle", "rounds": 3, "interval_ms": 150 },
+  "editor": {
+    "file": "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",
+    "line": 696, "column": 13,
+    "text": "var halfBase = frontAxlePos.x * 0.5f;",
+    "rounds": 2, "interval_ms": 120
+  },
+  "files": [
+    "Assets/dev/Scripts/ECS/Morpeh/Features/ParkingFeature/Components/Parking.cs",
+    "Assets/dev/Scripts/Keyboard/SoftKeyboardInputField.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/PedViewFeature/PedViewFeature/Systems/PedViewStorage.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/FriendsFeature/UnityComponents/UI/ChatChannelsTabUI.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/PedViewFeature/Character Controller Pro/Core/Scripts/Character/CharacterActor.cs"
+  ],
+  "stability": [
+    "Assets/dev/Scripts/GlobalUtils/RarityLocalizationUtils.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/MusicFeature/Systems/MusicInitializeSystem.cs",
+    "Assets/dev/Scripts/GUI/MonoBehaviourComponents/Store/TuningStore/GuiTuningStoreCartComponent.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/PedViewFeature/PedViewFeature/StateMachine/DataContainers/PedViewStatesData.cs",
+    "Assets/dev/Scripts/ECS/Morpeh/Features/PaymentsFeature/Systems/Native/NativePurchaseStore.cs:250",
+    "Assets/dev/Scripts/GUI/MonoBehaviourComponents/GuiItemActionMenuPanel.cs"
+  ],
+  "text_query": "vehicleInfosList",
+  "completion": {
+    "file": "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",
+    "line": 677, "column": 50
+  },
+  "definition": {
+    "file": "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",
+    "line": 696, "column": 47
+  },
+  "references": {
+    "file": "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",
+    "line": 648, "column": 13
+  },
+  "edit": {
+    "file": "Assets/dev/Scripts/ECS/Morpeh/Features/VehicleViewFeature/Providers/VehicleAllOneProvider.cs",
+    "line": 696, "column": 13
+  },
+  "edit_text": "var halfBase = frontAxlePos.x * 0.5f;",
+  "graphs": [
+    "Assets/dev/Scripts/ECS/Morpeh/Features/ParkingFeature/Components/Parking.cs:13:53"
+  ]
+}

@@ -592,17 +592,44 @@ struct RustlynInlayHint: Equatable {
 }
 
 /// Сколько раз по проекту использовано объявленное в файле: `range` — имя
-/// в объявлении.
+/// в объявлении. `count` — nil, пока не сосчитано: место под счётчик уже
+/// есть, числа ещё нет.
 struct RustlynLens: Equatable {
     var range: NSRange
-    var count: Int
+    var count: Int?
 }
 
-/// Подсказки в строках и счётчики использований файла — одним пакетом:
-/// считаются вместе, после проверки файла.
+/// Подсказки в строках и счётчики использований файла. Приходят по частям:
+/// при открытии — подсказки первого экрана и места счётчиков, после
+/// проверки — подсказки всего файла, последними — числа счётчиков.
 struct RustlynInsights: Equatable {
     var hints: [RustlynInlayHint] = []
     var lenses: [RustlynLens] = []
+
+    /// Счётчики без чисел берут числа, сосчитанные прежде: `memory` — по
+    /// имени объявления и его номеру среди одноимённых в файле (см. `keys`).
+    func remembering(_ memory: [String: Int], units: [UInt16]) -> RustlynInsights {
+        guard !memory.isEmpty, lenses.contains(where: { $0.count == nil }) else { return self }
+        var copy = self
+        for (i, key) in Self.keys(lenses, units: units).enumerated() where copy.lenses[i].count == nil {
+            copy.lenses[i].count = memory[key]
+        }
+        return copy
+    }
+
+    /// Ключи счётчиков для памяти чисел: имя и его номер среди одноимённых
+    /// — позиции после правки другие, а имена те же.
+    static func keys(_ lenses: [RustlynLens], units: [UInt16]) -> [String] {
+        var seen: [String: Int] = [:]
+        return lenses.map { lens in
+            let lower = max(0, min(lens.range.location, units.count))
+            let upper = max(lower, min(NSMaxRange(lens.range), units.count))
+            let name = String(decoding: units[lower..<upper], as: UTF16.self)
+            let ordinal = seen[name, default: 0]
+            seen[name] = ordinal + 1
+            return "\(name)#\(ordinal)"
+        }
+    }
 }
 
 /// Перегрузка вызова: `void Add(T item)` и где в ней каждый параметр.

@@ -561,6 +561,30 @@ final class Rustlyn: @unchecked Sendable {
         }
     }
 
+    /// Бросить подсчёт `codeLens`, который идёт сейчас: его числа уже никому
+    /// не нужны, а поиск по проекту занимает все ядра. Начатый после — не
+    /// задевает. С любого потока.
+    func cancelCodeLens() {
+        rln_cancel_code_lens(handle)
+    }
+
+    /// Где будут счётчики `codeLens` — имена объявлений, в том же порядке, —
+    /// без самих чисел (`count` — nil). Смотрит только этот файл, поэтому
+    /// годится при открытии: место под счётчики отводится сразу, а числа,
+    /// которым нужен поиск по проекту, приходят потом и строк не двигают.
+    func codeLensPlaces(_ url: URL, text: String?) -> [RustlynLens]? {
+        var raw = RlnLenses()
+        let status = DeepStack.run { url.path.withCString { path in
+            Self.withOptionalCString(text) { body in rln_code_lens_places(handle, path, body, &raw) }
+        } }
+        guard status == RLN_OK else { return nil }
+        defer { rln_lenses_free(raw) }
+        guard let items = raw.items else { return [] }
+        return UnsafeBufferPointer(start: items, count: raw.count).map {
+            RustlynLens(range: NSRange(location: Int($0.start), length: Int($0.length)), count: nil)
+        }
+    }
+
     /// Перегрузки вызова, в скобках которого `offset`. `nil` — не в скобках
     /// вызова или проект ещё не скомпилирован.
     func signatures(_ url: URL, offset: Int, text: String?) -> RustlynSignatures? {

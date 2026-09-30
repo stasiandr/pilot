@@ -104,6 +104,7 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
             .font: Theme.editorFont(size: fontSize),
             .foregroundColor: Theme.color(.plain),
         ])
+        insights = document.insights.map { (document.model.version, $0) }
         super.init()
         storage.delegate = self
         fixAttributesAhead()

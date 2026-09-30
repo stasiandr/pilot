@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+# Замер скорости Pilot по ключевым сценариям и сравнение с эталоном.
+#
+#   bin/pilot-perf                     это дерево против main (или HEAD, если на main есть правки)
+#   bin/pilot-perf --against REV       против коммита или ветки REV
+#   bin/pilot-perf --baseline last     против прошлого сохранённого прогона (или файла)
+#   bin/pilot-perf --no-compare        только замерить и сохранить
+#   bin/pilot-perf --runs 3            повторов на сборку (по умолчанию 3)
+#   bin/pilot-perf --only open,palette,search
+#   bin/pilot-perf --quick             1 повтор, только окно (open, idle, palette, editor, files, stability)
+#   bin/pilot-perf --history           прошлые прогоны: главное по каждому
+#
+# Сценарии и места в проекте — в файле сценариев (по умолчанию первый
+# Extensions/*/perf.json, для OneState — clm-client):
+#
+#   окно:      open (проект с кэшами), idle, palette (набор в ⌘P),
+#              editor (набор в C#), files (переходы по файлам),
+#              stability (что сдвинулось и перекрасилось после открытия файла)
+#   без окна:  index, search (индексы ⌘P и текст), rustlyn (компилятор), graph (граф значения)
+#
+# Главная мера — миллионы выполненных инструкций (`minstr`): от нагрузки на
+# машину она почти не зависит, в отличие от времени. Сборки гоняются
+# вперемешку (эталон, эта, эта, эталон…), каждая — с одних и тех же кэшей
+# проекта (копия ~/Library/Caches/Pilot, снятая в начале прогона), под своим
+# идентификатором бандла и скрытой: окна и фокус пользователя, его кэши,
+# настройки и история правок не трогаются. Проект на диске — тоже.
+#
+# Код выхода 1 — есть регрессия (✗). Прогоны лежат в
+# ~/Library/Application Support/Pilot-perf, сборки эталонов — в
+# ~/Library/Caches/Pilot-perf.
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import os
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, "Library/Caches/Pilot-perf")
+RESULTS = os.path.join(HOME, "Library/Application Support/Pilot-perf")
+BUNDLE_ID = "dev.local.pilot.perf"
+
+UI = ["open", "idle", "palette", "editor", "files", "stability"]
+ENGINE = ["index", "search", "rustlyn"]
+ALL = UI + ENGINE + ["graph"]
+
+# Допуск по единице метрики: доля от эталона и порог, меньше которого
+# разница — шум при любой доле.
+TOLERANCE = {"minstr": (0.03, 2.0), "ms": (0.25, 15.0), "mb": (0.10, 8.0), "n": (0.10, 1.0),
+             "score": (0.10, 0.01)}
+# Свой допуск там, где сборка против самой себя (A/A, 3+3 повтора,
+# 2026-09-28) разошлась сильнее общего: работа на букву и после перехода
+# зависит от того, когда успел прийти фоновый ответ компилятора. Инструкции
+# индексов, поиска, компилятора и открытия расходятся меньше чем на 1%.
+# Префикс имени → (доля, порог; None — порог единицы).
+TOLERANCE_BY_NAME = [
+    ("editor.key.main.minstr", 0.20, None),
+    ("editor.round.minstr", 0.08, None),
+    ("editor.wakes.n", 0.25, 2.0),
+    ("palette.round.minstr", 0.15, None),
+    ("files.", 0.15, None),
+    ("open.main.minstr", 0.05, None),
+    ("rustlyn.references.", 0.06, None),
+    # Простой мерится кусками по 3 с, и числа маленькие: общий порог в 2 млн
+    # инструкций спрятал бы как раз то, что просыпается раз в секунду-другую.
+    ("idle.main.wakeups.n", 0.15, 2.0),
+    ("idle.main.minstr", 0.15, 0.3),
+    ("idle.minstr", 0.15, 0.5),
+]
+
+
+def tolerance(metric):
+    share, floor = TOLERANCE.get(unit(metric), (0.10, 1.0))
+    for prefix, own_share, own_floor in TOLERANCE_BY_NAME:
+        if metric.startswith(prefix):
+            return own_share, own_floor if own_floor is not None else floor
+    return share, floor
+# Время на загруженной машине врёт — оно показывается, но в код выхода
+# идёт, только если выросло больше чем вдвое. Застревания главного потока —
+# тоже время.
+def soft(metric):
+    return unit(metric) == "ms" or metric.endswith(".stalls.n")
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def fail(message):
+    print("pilot-perf: " + message, file=sys.stderr, flush=True)
+    sys.exit(2)
+
+
+def run(cmd, cwd=None, env=None, check=True, quiet=False, timeout=None):
+    out = subprocess.DEVNULL if quiet else None
+    result = subprocess.run(cmd, cwd=cwd, env=env, stdout=out, stderr=out, timeout=timeout)
+    if check and result.returncode != 0:
+        fail("не вышло: " + " ".join(cmd))
+    return result.returncode
+
+
+def output(cmd, cwd=None):
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True).stdout.strip()
+
+
+def fnv(path):
+    """Хэш корня проекта — тот же, что у CacheStore.projectHash."""
+    h = 0xCBF29CE484222325
+    for byte in path.encode("utf-8"):
+        h = ((h ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+# ─────────────────────────────── Сборки ───────────────────────────────
+
+def rustlyn_path():
+    candidates = [os.environ.get("RUSTLYN_PATH"), os.path.join(ROOT, "../rustlyn")]
+    # Из worktree Rustlyn ищется рядом с основной копией репозитория.
+    common = output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT)
+    if common:
+        candidates.append(os.path.join(os.path.dirname(common), "../rustlyn"))
+    for path in candidates:
+        if path and os.path.isfile(os.path.join(path, "Cargo.toml")):
+            return os.path.realpath(path)
+    fail("не нашёл Rustlyn: задайте RUSTLYN_PATH")
+
+
+def build_here():
+    """Это дерево — как есть на диске, с несохранёнными в git правками."""
+    log("==> сборка этого дерева (release)")
+    env = dict(os.environ, RUSTLYN_PATH=rustlyn_path())
+    run(["./build-rust.sh"], cwd=ROOT, env=env, quiet=True)
+    if run(["swift", "build", "-c", "release"], cwd=ROOT, check=False, quiet=True) != 0:
+        run(["swift", "build", "-c", "release"], cwd=ROOT, check=False)
+        fail("это дерево не собралось")
+    return os.path.join(output(["swift", "build", "-c", "release", "--show-bin-path"], cwd=ROOT), "Pilot")
+
+
+def library_stamp():
+    digest = hashlib.sha256()
+    for path in [".build/rustlyn/librustlyn_ffi.a", "Sources/CRustlyn/include/rustlyn.h"]:
+        with open(os.path.join(ROOT, path), "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def build_revision(sha):
+    """Эталон: коммит `sha`, собранный с той же библиотекой Rustlyn, что и
+    это дерево, — чтобы разница была только в Pilot. Собранное хранится."""
+    stamp = library_stamp()
+    home = os.path.join(STATE, "builds", sha[:12] + "-" + stamp)
+    binary = os.path.join(home, "Pilot")
+    if os.path.isfile(binary):
+        return binary, home
+    listed = output(["git", "ls-tree", "-r", "--name-only", sha, "Sources/Pilot/Perf"], cwd=ROOT)
+    if "PerfUI.swift" not in listed:
+        fail("в %s нет замеров (Sources/Pilot/Perf) — сравнить не с чем; "
+             "возьмите --baseline или --no-compare" % sha[:10])
+    log("==> сборка эталона %s (release, один раз)" % sha[:10])
+    src = os.path.join(STATE, "src", sha[:12])
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src)
+    archive = subprocess.Popen(["git", "archive", sha], cwd=ROOT, stdout=subprocess.PIPE)
+    subprocess.run(["tar", "-x", "-C", src], stdin=archive.stdout, check=True)
+    archive.wait()
+    os.makedirs(os.path.join(src, ".build/rustlyn"), exist_ok=True)
+    os.makedirs(os.path.join(src, "Sources/CRustlyn/include"), exist_ok=True)
+    shutil.copy2(os.path.join(ROOT, ".build/rustlyn/librustlyn_ffi.a"), os.path.join(src, ".build/rustlyn/"))
+    shutil.copy2(os.path.join(ROOT, "Sources/CRustlyn/include/rustlyn.h"),
+                 os.path.join(src, "Sources/CRustlyn/include/"))
+    if run(["swift", "build", "-c", "release"], cwd=src, check=False, quiet=True) != 0:
+        run(["swift", "build", "-c", "release"], cwd=src, check=False)
+        fail("эталон %s не собрался с этой библиотекой Rustlyn" % sha[:10])
+    os.makedirs(home, exist_ok=True)
+    built = os.path.join(output(["swift", "build", "-c", "release", "--show-bin-path"], cwd=src), "Pilot")
+    shutil.copy2(built, binary)
+    # Рядом с бинарником — то, что кладёт в бандл build.sh: Info.plist и расширения.
+    os.makedirs(os.path.join(home, "Resources"), exist_ok=True)
+    shutil.copy2(os.path.join(src, "Resources/Info.plist"), os.path.join(home, "Resources/Info.plist"))
+    if os.path.isdir(os.path.join(src, "Extensions")):
+        shutil.copytree(os.path.join(src, "Extensions"), os.path.join(home, "Extensions"), dirs_exist_ok=True)
+    shutil.rmtree(src, ignore_errors=True)
+    return binary, home
+
+
+def bundle(binary, resources, label):
+    """Pilot.app под своим идентификатором: свои настройки, своя пересылка
+    файлов — окна и настройки пользователя его не касаются. `resources` —
+    папка с Resources/Info.plist и Extensions/ (корень дерева или эталона)."""
+    app = os.path.join(STATE, "apps", label, "Pilot.app")
+    shutil.rmtree(app, ignore_errors=True)
+    os.makedirs(os.path.join(app, "Contents/MacOS"))
+    os.makedirs(os.path.join(app, "Contents/Resources"))
+    shutil.copy2(binary, os.path.join(app, "Contents/MacOS/Pilot"))
+    # plutil, а не plistlib: в комментариях Info.plist есть `--`, строгий
+    # XML-разбор такого не принимает, а macOS — принимает.
+    plist = os.path.join(app, "Contents/Info.plist")
+    shutil.copy2(os.path.join(resources, "Resources/Info.plist"), plist)
+    for key, value in [("CFBundleIdentifier", BUNDLE_ID), ("CFBundleName", "Pilot perf"),
+                       ("CFBundleDisplayName", "Pilot perf")]:
+        run(["plutil", "-replace", key, "-string", value, plist], quiet=True)
+    extensions = os.path.join(resources, "Extensions")
+    for manifest in glob.glob(os.path.join(extensions, "*/extension.json")):
+        name = os.path.basename(os.path.dirname(manifest))
+        target = os.path.join(app, "Contents/Resources/Extensions", name)
+        os.makedirs(target, exist_ok=True)
+        shutil.copy2(manifest, target)
+    run(["codesign", "--force", "--deep", "--sign", "-", app], quiet=True)
+    return app
+
+
+# ─────────────────────────────── Кэши ────────────────────────────────
+
+def snapshot(config, dest):
+    """Кэши проекта и его пары — копией (клоны APFS: секунды и ноль места)."""
+    source = os.path.join(HOME, "Library/Caches/Pilot")
+    target = os.path.join(dest, "Caches/Pilot")
+    os.makedirs(os.path.join(target, "rustlyn"), exist_ok=True)
+    roots = [config["project"]] + config.get("cache_roots", [])
+    copied = 0
+    for root in roots:
+        h = fnv(root)
+        for path in glob.glob(os.path.join(source, "%016x.*" % h)):
+            run(["cp", "-c", path, target], quiet=True)
+            copied += 1
+        folder = os.path.join(source, "rustlyn", "%s-%x" % (os.path.basename(root)[:32], h))
+        if os.path.isdir(folder):
+            run(["cp", "-c", "-R", folder, os.path.join(target, "rustlyn")], quiet=True)
+            copied += 1
+    shared = os.path.join(source, "rustlyn/assemblies")
+    if os.path.isdir(shared):
+        run(["cp", "-c", "-R", shared, os.path.join(target, "rustlyn")], quiet=True)
+    if copied == 0:
+        fail("у %s нет кэшей в ~/Library/Caches/Pilot — откройте проект в Pilot хоть раз" % config["project"])
+
+
+def fresh_copy(snap, dest):
+    shutil.rmtree(dest, ignore_errors=True)
+    run(["cp", "-c", "-R", snap, dest], quiet=True)
+    return dest
+
+
+# ─────────────────────────────── Запуски ──────────────────────────────
+
+def leftovers(app):
+    binary = os.path.join(app, "Contents/MacOS/Pilot")
+    found = output(["pgrep", "-f", binary])
+    return [int(pid) for pid in found.split()] if found else []
+
+
+def kill(app):
+    for pid in leftovers(app):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def launch_ui(app, env, log_path, timeout):
+    """Окно — через `open`: скрытым (-j), не вперёд (-g), новым процессом."""
+    subprocess.run(["defaults", "delete", BUNDLE_ID], capture_output=True)
+    shutil.rmtree(os.path.join(HOME, "Library/Saved Application State", BUNDLE_ID + ".savedState"),
+                  ignore_errors=True)
+    cmd = ["open", "-W", "-n", "-g", "-j", "--stdout", log_path, "--stderr", log_path]
+    for key, value in env.items():
+        cmd += ["--env", "%s=%s" % (key, value)]
+    cmd += [app, "--args", "-ApplePersistenceIgnoreState", "YES"]
+    process = subprocess.Popen(cmd)
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill(app)
+        process.kill()
+        return False
+    finally:
+        # Главный поток встал — SIGTERM не поможет (см. persistOnTermination).
+        time.sleep(0.5)
+        kill(app)
+    return True
+
+
+def launch(app, args, env, log_path, timeout):
+    binary = os.path.join(app, "Contents/MacOS/Pilot")
+    with open(log_path, "a") as log_file:
+        try:
+            subprocess.run([binary] + args, env=dict(os.environ, **env), stdout=subprocess.DEVNULL,
+                           stderr=log_file, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill(app)
+            return False
+    return True
+
+
+def read_records(path):
+    records = []
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except ValueError:
+                        pass
+    return records
+
+
+# ─────────────────────────────── Сравнение ────────────────────────────
+
+def unit(metric):
+    return metric.rsplit(".", 1)[-1]
+
+
+def verdict(before, after, metric):
+    """✗ регрессия, ↓ лучше, ? похоже на регрессию, но разброс велик, · как было."""
+    if not before or not after:
+        return " ", 0.0
+    a, b = statistics.median(before), statistics.median(after)
+    share, floor = tolerance(metric)
+    delta = b - a
+    relative = delta / a if a else (1.0 if delta else 0.0)
+    limit = max(floor, share * abs(a))
+    if abs(delta) <= limit:
+        return "·", relative
+    # Разброс: повторы одной сборки не должны перекрываться с другой.
+    separated = (min(after) > max(before)) if delta > 0 else (max(after) < min(before))
+    if len(before) < 2 or len(after) < 2:
+        separated = True
+    if soft(metric) and abs(relative) < 1.0:
+        # Время: вдвое — уже не шум, меньше — только пометка.
+        return ("⚠" if separated and delta > 0 else "·"), relative
+    if delta < 0:
+        return ("↓" if separated else "·"), relative
+    return ("✗" if separated else "?"), relative
+
+
+def number(value, metric):
+    u = unit(metric)
+    if u == "n":
+        return "%.0f" % value if value == int(value) else "%.1f" % value
+    if abs(value) >= 1000:
+        return "%.0f" % value
+    if abs(value) >= 100:
+        return "%.1f" % value
+    return "%.2f" % value
+
+
+def ordered(metrics):
+    def key(metric):
+        scenario = metric.split(".", 1)[0]
+        group = ALL.index(scenario) if scenario in ALL else len(ALL)
+        return (group, metric)
+    return sorted(metrics, key=key)
+
+
+def report(reference, current, labels, only_changes=False):
+    names = ordered(set(reference) | set(current))
+    width = max([len(n) for n in names] + [10])
+    header = "%-*s %14s %14s %9s" % (width, "", labels[0][:14], labels[1][:14], "")
+    log("\n" + header)
+    marks = {}
+    last_group = None
+    for name in names:
+        mark, relative = verdict(reference.get(name), current.get(name), name)
+        marks[name] = mark
+        if only_changes and mark in "· ":
+            continue
+        # Процессорное время рядом с инструкциями и временем ничего не
+        # добавляет — только если оно само выросло.
+        if name.endswith(".cpu.ms") and mark in "· ":
+            continue
+        group = name.split(".", 1)[0]
+        if group != last_group:
+            log("")
+            last_group = group
+        a = number(statistics.median(reference[name]), name) if reference.get(name) else "—"
+        b = number(statistics.median(current[name]), name) if current.get(name) else "—"
+        change = "%+.1f%%" % (relative * 100) if reference.get(name) and current.get(name) else ""
+        log("%-*s %14s %14s %9s %s" % (width, name, a, b, change, mark))
+    bad = [n for n, m in marks.items() if m == "✗"]
+    doubtful = [n for n, m in marks.items() if m in "?⚠"]
+    better = [n for n, m in marks.items() if m == "↓"]
+    log("")
+    if bad:
+        log("✗ регрессия: " + ", ".join(bad))
+    if doubtful:
+        log("? под подозрением (разброс или время): " + ", ".join(doubtful))
+    if better:
+        log("↓ лучше: " + ", ".join(better))
+    if not bad and not doubtful:
+        log("✓ регрессий нет")
+    return bad
+
+
+# ─────────────────────────────── Прогон ───────────────────────────────
+
+def plan(only, config):
+    """Запуски одного повтора: окно (одним процессом), группы без окна, граф."""
+    wanted = [s for s in ALL if not only or s in only]
+    launches = []
+    ui = [s for s in UI if s in wanted]
+    if ui:
+        launches.append(("ui", ui))
+    for group in ENGINE:
+        if group in wanted:
+            launches.append(("engine:" + group, [group]))
+    if "graph" in wanted:
+        for target in config.get("graphs", []):
+            launches.append(("graph", [target]))
+    return launches
+
+
+def measure(builds, config, config_path, runs, only, run_dir):
+    snap = os.path.join(run_dir, "snapshot")
+    log("==> кэши проекта: копия ~/Library/Caches/Pilot")
+    snapshot(config, snap)
+    launches = plan(only, config)
+    total = runs * len(builds) * len(launches)
+    step = 0
+    values = {label: {} for label, _ in builds}
+    info = {label: {} for label, _ in builds}
+    failures = []
+    for r in range(runs):
+        # Эталон, эта, эта, эталон… — медленный дрейф машины делится поровну.
+        order = builds if r % 2 == 0 else list(reversed(builds))
+        for label, app in order:
+            shared = None
+            for kind, what in launches:
+                step += 1
+                log("[%d/%d] %s · %s · повтор %d" % (step, total, label, kind if kind != "graph" else "graph", r + 1))
+                out = os.path.join(run_dir, "%s-%d-%d.jsonl" % (label, r, step))
+                log_path = os.path.join(run_dir, "%s-%d-%d.log" % (label, r, step))
+                env = {
+                    "PILOT_PERF_CONFIG": config_path,
+                    "PILOT_PERF_OUT": out,
+                    # Без чужого: обновлений не спрашивать (и не лезть за
+                    # токеном в связку ключей), лог настоящего Unity не читать.
+                    "PILOT_UPDATE_FEED": "file:///nonexistent/feed.json",
+                    "PILOT_UNITY_LOG": os.path.join(run_dir, "Editor.log"),
+                }
+                if kind == "ui":
+                    # Окно пишет кэши — каждому запуску свежая копия.
+                    env["PILOT_CACHES"] = fresh_copy(snap, os.path.join(run_dir, "caches-ui"))
+                    env["PILOT_PERF"] = "ui"
+                    env["PILOT_PERF_ONLY"] = ",".join(what)
+                    ok = launch_ui(app, env, log_path, timeout=900)
+                else:
+                    if shared is None:
+                        shared = fresh_copy(snap, os.path.join(run_dir, "caches-engine"))
+                    env["PILOT_CACHES"] = shared
+                    if kind == "graph":
+                        target = what[0]
+                        if not os.path.isabs(target.split(":")[0]):
+                            target = os.path.join(config["project"], target)
+                        ok = launch(app, ["--value-graph", target, "--limit", "40"], env, log_path, timeout=600)
+                    else:
+                        env["PILOT_PERF"] = kind
+                        ok = launch(app, [], env, log_path, timeout=900)
+                records = read_records(out)
+                if not ok or not records:
+                    failures.append("%s %s повтор %d (лог: %s)" % (label, kind, r + 1, log_path))
+                    log("    ✗ не отработал, лог: " + log_path)
+                    continue
+                for record in records:
+                    for name, value in record.get("metrics", {}).items():
+                        values[label].setdefault(name, []).append(value)
+                    for name, value in record.get("info", {}).items():
+                        info[label][record["scenario"] + "." + name] = value
+    return values, info, failures
+
+
+def workload(config):
+    project = config["project"]
+    return {
+        "project": project,
+        "commit": output(["git", "rev-parse", "HEAD"], cwd=project)[:12],
+        "dirty": bool(output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=project)),
+    }
+
+
+def describe_tree():
+    sha = output(["git", "rev-parse", "HEAD"], cwd=ROOT)
+    dirty = bool(output(["git", "status", "--porcelain", "--untracked-files=no", "--", "Sources", "Package.swift"],
+                        cwd=ROOT))
+    return sha, dirty
+
+
+def default_reference():
+    """На ветке — её начало от main; на main — HEAD, если есть правки, иначе HEAD~1."""
+    branch = output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=ROOT)
+    sha, dirty = describe_tree()
+    if branch != "main":
+        base = output(["git", "merge-base", "HEAD", "main"], cwd=ROOT)
+        if base and base != sha:
+            return base
+    return sha if dirty else output(["git", "rev-parse", "HEAD~1"], cwd=ROOT)
+
+
+def find_config(path):
+    if path:
+        return os.path.realpath(path)
+    found = sorted(glob.glob(os.path.join(ROOT, "Extensions/*/perf.json")))
+    if not found:
+        fail("нет файла сценариев: Extensions/<имя>/perf.json или --config")
+    return found[0]
+
+
+def saved_runs():
+    return sorted(glob.glob(os.path.join(RESULTS, "*.json")))
+
+
+def history(limit):
+    headline = ["open.main.minstr", "open.main.longest.ms", "open.compiled.ms", "open.minstr", "idle.main.wakeups.n",
+                "palette.key.main.minstr", "palette.wakes.n", "editor.key.main.minstr", "files.open.main.minstr",
+                "search.files.minstr", "rustlyn.load.minstr", "rustlyn.edit.minstr", "graph.build.minstr"]
+    runs = saved_runs()[-limit:]
+    if not runs:
+        log("прогонов ещё нет")
+        return
+    loaded = []
+    for path in runs:
+        with open(path) as f:
+            loaded.append(json.load(f))
+    log("%-26s" % "" + "".join("%12s" % r["builds"]["new"]["label"][:11] for r in loaded))
+    log("%-26s" % "" + "".join("%12s" % r["date"][5:16].replace("T", " ") for r in loaded))
+    for name in headline:
+        row = []
+        for r in loaded:
+            v = r["values"]["new"].get(name)
+            row.append("%12s" % (number(statistics.median(v), name) if v else "—"))
+        log("%-26s" % name + "".join(row))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Замер скорости Pilot и сравнение с эталоном")
+    parser.add_argument("--against", help="эталон: коммит или ветка")
+    parser.add_argument("--baseline", help="эталон: сохранённый прогон (файл или last)")
+    parser.add_argument("--no-compare", action="store_true", help="только замерить")
+    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--only", help="сценарии через запятую: " + ",".join(ALL))
+    parser.add_argument("--quick", action="store_true", help="1 повтор, только окно")
+    parser.add_argument("--config", help="файл сценариев")
+    parser.add_argument("--app", help="готовый бинарник Pilot вместо сборки этого дерева")
+    parser.add_argument("--history", nargs="?", const=10, type=int, help="прошлые прогоны")
+    parser.add_argument("--keep", action="store_true", help="не удалять копии кэшей и логи прогона")
+    args = parser.parse_args()
+
+    if args.history:
+        history(args.history)
+        return 0
+    only = set(args.only.split(",")) if args.only else set()
+    unknown = only - set(ALL)
+    if unknown:
+        fail("нет таких сценариев: " + ", ".join(sorted(unknown)))
+    runs = args.runs
+    if args.quick:
+        runs = 1
+        only = only or set(UI)
+
+    config_path = find_config(args.config)
+    with open(config_path) as f:
+        config = json.load(f)
+    if not os.path.isdir(config["project"]):
+        fail("нет проекта %s (%s)" % (config["project"], config_path))
+
+    sha, dirty = describe_tree()
+    new_label = sha[:8] + ("+" if dirty else "")
+    binary = os.path.realpath(args.app) if args.app else build_here()
+    builds = [("new", bundle(binary, ROOT, "new"))]
+    reference = None
+    labels = {"new": new_label}
+    if args.baseline:
+        path = saved_runs()[-1] if args.baseline == "last" and saved_runs() else args.baseline
+        if not os.path.isfile(path):
+            fail("нет сохранённого прогона: " + args.baseline)
+        with open(path) as f:
+            reference = json.load(f)
+        labels["ref"] = reference["builds"]["new"]["label"]
+    elif not args.no_compare:
+        against = output(["git", "rev-parse", args.against], cwd=ROOT) if args.against else default_reference()
+        if not against:
+            fail("не понял, что такое " + args.against)
+        ref_binary, ref_home = build_revision(against)
+        builds.insert(0, ("ref", bundle(ref_binary, ref_home, "ref")))
+        labels["ref"] = against[:8]
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(STATE, "runs", stamp)
+    os.makedirs(run_dir, exist_ok=True)
+    load = os.getloadavg()
+    log("==> %d повтор(а) · сценарии: %s · нагрузка %.0f" % (runs, ",".join(sorted(only)) or "все", load[0]))
+
+    def interrupted(*_):
+        for _, app in builds:
+            kill(app)
+        fail("прервано")
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+
+    started = time.time()
+    values, info, failures = measure(builds, config, config_path, runs, only, run_dir)
+    for _, app in builds:
+        kill(app)
+
+    result = {
+        "date": datetime.datetime.now().isoformat(timespec="seconds"),
+        "machine": {"load": list(load), "load_after": list(os.getloadavg()),
+                    "cpu": output(["sysctl", "-n", "machdep.cpu.brand_string"])},
+        "workload": workload(config),
+        "config": config_path,
+        "rustlyn": output(["git", "rev-parse", "--short=10", "HEAD"], cwd=rustlyn_path()),
+        "runs": runs,
+        "only": sorted(only),
+        "builds": {"new": {"label": new_label, "sha": sha, "dirty": dirty}},
+        "values": {"new": values["new"]},
+        "info": {"new": info["new"]},
+        "failures": failures,
+        "minutes": round((time.time() - started) / 60, 1),
+    }
+    if "ref" in values:
+        result["builds"]["ref"] = {"label": labels["ref"]}
+        result["values"]["ref"] = values["ref"]
+        result["info"]["ref"] = info["ref"]
+    os.makedirs(RESULTS, exist_ok=True)
+    saved = os.path.join(RESULTS, "%s-%s.json" % (stamp, new_label))
+    with open(saved, "w") as f:
+        json.dump(result, f, indent=1, ensure_ascii=False)
+    if not args.keep:
+        for name in ["snapshot", "caches-ui", "caches-engine"]:
+            shutil.rmtree(os.path.join(run_dir, name), ignore_errors=True)
+    # Логи прошлых прогонов нужны, пока в них смотрят: хранятся последние 20.
+    for old in sorted(glob.glob(os.path.join(STATE, "runs", "*")))[:-20]:
+        shutil.rmtree(old, ignore_errors=True)
+
+    log("\n==> %.1f мин, прогон: %s" % (result["minutes"], saved))
+    for failure in failures:
+        log("✗ не отработал: " + failure)
+    bad = []
+    if reference is not None:
+        if reference.get("workload", {}).get("commit") != result["workload"]["commit"]:
+            log("⚠ проект с тех пор изменился (%s → %s): разница может быть не от Pilot"
+                % (reference.get("workload", {}).get("commit"), result["workload"]["commit"]))
+        bad = report(reference["values"]["new"], values["new"], [labels["ref"], labels["new"]])
+    elif "ref" in values:
+        bad = report(values["ref"], values["new"], [labels["ref"], labels["new"]])
+    else:
+        report({}, values["new"], ["", labels["new"]])
+    return 1 if bad or failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
