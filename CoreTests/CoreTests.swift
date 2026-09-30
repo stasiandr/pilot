@@ -5401,6 +5401,8 @@ do {
     let clash = UnityMerge.merge(base: pb, ours: instance(mod(1, "m_Name", "Boss")), theirs: instance(mod(1, "m_Name", "King")))
     check(clash?.conflicts.map(\.property) == ["m_Modifications › m_Name (&1)"], "спор — только за одно переопределение")
     check(UnityMerge.display(["  speed: 7"]) == "7" && UnityMerge.parse("class A {}") == nil, "значение для показа; не YAML")
+    check(UnityMerge.display(["    - target: {fileID: 1, guid: a, type: 3}", "      propertyPath: m_Name", "      value: Boss",
+                              "      objectReference: {fileID: 0}"]) == "Boss", "у переопределения показывается значение")
 }
 
 section("Git: слияние трёх версий")

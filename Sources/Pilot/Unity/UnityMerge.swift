@@ -312,6 +312,14 @@ enum UnityMerge {
     /// Значение для показа: `  speed: 5` → `5`, многострочное — без отступа.
     static func display(_ lines: [String]?) -> String {
         guard let lines, !lines.isEmpty else { return "—" }
+        // Переопределение префаба: важно значение (или ссылка), остальное — в заголовке спора.
+        if lines.first?.trimmingCharacters(in: .whitespaces).hasPrefix("- target:") == true {
+            let value = lines.first { $0.trimmingCharacters(in: .whitespaces).hasPrefix("value:") }
+                .map { $0.trimmingCharacters(in: .whitespaces).dropFirst("value:".count).trimmingCharacters(in: .whitespaces) } ?? ""
+            let reference = lines.first { $0.contains("objectReference:") && !$0.contains("{fileID: 0}") }
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            return reference ?? (value.isEmpty ? "—" : value)
+        }
         if lines.count == 1, let colon = lines[0].firstIndex(of: ":") {
             let value = lines[0][lines[0].index(after: colon)...].trimmingCharacters(in: .whitespaces)
             return value.isEmpty ? "—" : value
