@@ -39,14 +39,9 @@ extension English {
         ("Разрешить конфликт…", "Resolve Conflict…"),
         ("Файл в конфликте", "The file has conflicts"),
         ("Amend", "Amend"),
-        ("Ещё", "More"),
         ("Ничего не подготовлено — в коммит пойдут все изменения", "Nothing is staged — the commit takes all changes"),
         ("В коммит пойдёт подготовленное", "The commit takes what’s staged"),
         ("Закоммитить всё (%@)", "Commit All (%@)"),
-        ("Fixup: сначала подготовьте правки", "Fixup: stage changes first"),
-        ("Fixup: нет неотправленных коммитов", "Fixup: no unpushed commits"),
-        ("Fixup в коммит", "Fixup into Commit"),
-        ("Влить в коммит (fixup + autosquash)", "Squash into Commit (fixup + autosquash)"),
         ("%@ — без своего .meta", "%@ — without its .meta"),
         ("%@ — .meta без ассета", "%@ — .meta without its asset"),
         ("Ассет без .meta у коллег получит новый GUID, и ссылки на него порвутся; .meta без ассета Unity удалит",
@@ -195,6 +190,8 @@ extension English {
 
         ("Двойной клик или Return — изменения файла в редакторе", "Double-click or Return — the file’s changes in the editor"),
         ("Открыть изменения", "Open Changes"),
+
+        ("⌥⌘↩ — закоммитить и отправить", "⌥⌘↩ — commit and push"),
 
         // Панель git и строка под редактором
         ("Панель git", "Git Panel"),

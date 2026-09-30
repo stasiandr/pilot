@@ -61,17 +61,14 @@ struct GitBranchTree: View {
     @ViewBuilder
     private var tree: some View {
         special(L("HEAD (текущая ветка)"), icon: "scope", selected: isMine) {
-            history.filter.scope = .current
-            history.mode = .mine
+            history.show(scope: .current, mode: .mine)
         }
         special(L("Основная — по MR"), icon: "list.bullet.rectangle", selected: isMainline) {
-            history.filter.scope = .current
-            history.mode = .mainline
+            history.show(scope: .current, mode: .mainline)
         }
         special(L("Все ветки — граф"), icon: "point.3.connected.trianglepath.dotted",
                 selected: history.mode == .graph && history.filter.scope == .all) {
-            history.filter.scope = .all
-            history.mode = .graph
+            history.show(scope: .all, mode: .graph)
         }
         group(L("Локальные"), id: "local", branches: client.localBranches)
         group(L("Удалённые"), id: "remote", branches: client.remoteBranches)
@@ -176,11 +173,10 @@ struct GitBranchTree: View {
         .background(selected ? Color.accentColor.opacity(0.25) : .clear)
         .contentShape(Rectangle())
         .help(branch.name + "\n" + branch.subject)
-        .onTapGesture(count: 2) { client.checkout(branch) }
-        .onTapGesture {
-            history.filter.scope = .ref(branch.name)
-            history.mode = .graph
-        }
+        // Одиночный клик — сразу: пара onTapGesture(count: 2) + onTapGesture
+        // ждёт, не будет ли второго, и лог ветки открывался с задержкой.
+        .onTapGesture { history.show(scope: .ref(branch.name), mode: .graph) }
+        .simultaneousGesture(TapGesture(count: 2).onEnded { client.checkout(branch) })
         .contextMenu { menu(branch) }
     }
 

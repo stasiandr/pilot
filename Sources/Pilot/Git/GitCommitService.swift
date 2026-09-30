@@ -54,8 +54,6 @@ final class GitCommitService: ObservableObject {
     @Published private(set) var notice: String?
     /// Разорванные пары ассет — `.meta` среди подготовленного.
     @Published private(set) var metaProblems: [MetaPairs.Problem] = []
-    /// Последние коммиты ветки — для fixup.
-    @Published private(set) var recentCommits: [GitCommitInfo] = []
 
     /// Перед тем как откатить правки файла — снимок в локальную историю.
     var beforeDiscard: ((URL) -> Void)?
@@ -100,7 +98,6 @@ final class GitCommitService: ObservableObject {
         notice = nil
         amend = false
         messageBeforeAmend = nil
-        recentCommits = []
         metaProblems = []
         message = loadDraft()
     }
@@ -120,10 +117,11 @@ final class GitCommitService: ObservableObject {
             let problems = tree.map { Self.metaProblems(in: $0, repository: repository) } ?? []
             Task { @MainActor in
                 guard let self, self.generation == current, self.pending == 0, let tree else { return }
-                if self.tree != tree { self.tree = tree }
+                let previous = self.tree
+                if self.tree != tree { Self.quietly { self.tree = tree } }
                 if self.metaProblems != problems { self.metaProblems = problems }
                 self.isLoaded = true
-                self.fixSelection()
+                self.fixSelection(previous: previous)
                 self.loadPatch()
             }
         }
@@ -139,14 +137,26 @@ final class GitCommitService: ObservableObject {
             tracked: { path in Git.run(["cat-file", "-e", "HEAD:\(path)"], in: repository)?.status == 0 })
     }
 
-    /// Выбранный файл ушёл из своей группы (подготовили целиком) — выбираем
-    /// его же в другой, а если его нет совсем — первый.
-    private func fixSelection() {
+    /// Выбранный файл ушёл из своей группы (подготовили целиком) — выбор
+    /// остаётся в той же группе, на соседнем файле, как в Rider: кто
+    /// подготавливает файлы по одному, идёт по списку дальше. Группа
+    /// опустела — тот же файл в другой; файла нет совсем — первый.
+    private func fixSelection(previous: GitWorkingTree? = nil) {
         if let selection {
-            let change = tree.changes.first { $0.path == selection.path }
-            if let change {
-                if selection.staged && !change.hasStaged { self.selection = Selection(path: change.path, staged: false) }
-                if !selection.staged && !change.hasUnstaged { self.selection = Selection(path: change.path, staged: true) }
+            let group = selection.staged ? tree.staged : tree.unstaged
+            if group.contains(where: { $0.path == selection.path }) { return }
+            let before = (selection.staged ? previous?.staged : previous?.unstaged) ?? []
+            if let index = before.firstIndex(where: { $0.path == selection.path }) {
+                let paths = Set(group.map(\.path))
+                let neighbour = before[(index + 1)...].first { paths.contains($0.path) }
+                    ?? before[..<index].last { paths.contains($0.path) }
+                if let neighbour {
+                    self.selection = Selection(path: neighbour.path, staged: selection.staged)
+                    return
+                }
+            }
+            if let change = tree.changes.first(where: { $0.path == selection.path }) {
+                self.selection = Selection(path: change.path, staged: !selection.staged)
                 return
             }
         }
@@ -159,13 +169,15 @@ final class GitCommitService: ObservableObject {
         }
     }
 
+    /// Прежний дифф висит, пока не придёт новый: пустое место или спиннер
+    /// между ними мигали бы на каждый клик.
     private func loadPatch() {
-        guard let repository, let selection,
-              let change = tree.changes.first(where: { $0.path == selection.path }) else {
+        guard let repository, let selection else {
             patch = nil
             untrackedText = nil
             return
         }
+        guard let change = tree.changes.first(where: { $0.path == selection.path }) else { return }
         let current = generation
         queue.async { [weak self] in
             var patch: GitFilePatch?
@@ -223,6 +235,7 @@ final class GitCommitService: ObservableObject {
     /// до ответа не угадать.
     private func moveOptimistically(_ paths: [String], toStaged: Bool) {
         let set = Set(paths)
+        let previous = tree
         var changed = false
         for i in tree.changes.indices where set.contains(tree.changes[i].path) {
             var change = tree.changes[i]
@@ -237,10 +250,18 @@ final class GitCommitService: ObservableObject {
             } else {
                 continue
             }
-            tree.changes[i] = change
+            Self.quietly { tree.changes[i] = change }
             changed = true
         }
-        if changed { fixSelection() }
+        if changed { fixSelection(previous: previous) }
+    }
+
+    /// Без анимации: строки, которые уезжают и приезжают с затуханием на
+    /// каждый клик, и есть то мигание.
+    private static func quietly(_ body: () -> Void) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction, body)
     }
 
     /// Подготовить кусок — или, в подготовленном, убрать его обратно.
@@ -410,17 +431,6 @@ final class GitCommitService: ObservableObject {
                 if let result, result.succeeded { self.notice = L("Отправлено") }
                 self.finishCommit(error: result?.succeeded == true ? nil : (result?.message ?? L("Не удалось запустить git")))
             }
-        }
-    }
-
-    /// Последние коммиты ветки, которых нет ни в одной ветке на сервере, —
-    /// в них можно влить fixup, не переписывая опубликованную историю.
-    func loadRecentCommits() {
-        guard let repository else { return }
-        queue.async { [weak self] in
-            let arguments = ["log", "-n", "30", GitCommitInfo.format, "HEAD", "--not", "--remotes"]
-            let commits = Git.run(arguments, in: repository).map { GitCommitInfo.parse($0.stdout) } ?? []
-            Task { @MainActor in self?.recentCommits = commits.filter { !$0.isMerge } }
         }
     }
 

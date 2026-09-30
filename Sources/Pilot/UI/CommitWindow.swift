@@ -15,6 +15,7 @@ struct CommitView: View {
             VStack(spacing: 0) {
                 branchBar
                 Divider()
+                StageAllBar(commits: commits)
                 fileList
                 Divider()
                 composer
@@ -82,16 +83,14 @@ struct CommitView: View {
                     row(change, staged: true)
                 }
             } header: {
-                sectionHeader(L("Подготовлено"), count: commits.tree.staged.count,
-                              action: L("Убрать все"), enabled: !commits.tree.staged.isEmpty) { commits.unstageAll() }
+                Text(L("Подготовлено \(commits.tree.staged.count)"))
             }
             Section {
                 ForEach(commits.tree.unstaged) { change in
                     row(change, staged: false)
                 }
             } header: {
-                sectionHeader(L("Изменения"), count: commits.tree.unstaged.count,
-                              action: L("Подготовить все"), enabled: !commits.tree.unstaged.isEmpty) { commits.stageAll() }
+                Text(L("Изменения \(commits.tree.unstaged.count)"))
             }
         }
         .listStyle(.sidebar)
@@ -110,18 +109,6 @@ struct CommitView: View {
             } else if !commits.isLoaded {
                 ProgressView().controlSize(.small)
             }
-        }
-    }
-
-    private func sectionHeader(_ title: String, count: Int, action: String, enabled: Bool,
-                               perform: @escaping () -> Void) -> some View {
-        HStack {
-            Text("\(title) \(count)")
-            Spacer()
-            Button(action, action: perform)
-                .buttonStyle(.borderless)
-                .font(.system(size: 11))
-                .disabled(!enabled)
         }
     }
 
@@ -190,6 +177,27 @@ struct CommitView: View {
     }
 }
 
+/// «Подготовить все» и «Убрать все» — полосой над списком, а не в
+/// заголовках секций: заголовки едут вслед за строками, и кнопки вместе
+/// с ними. Здесь они стоят на месте.
+struct StageAllBar: View {
+    @ObservedObject var commits: GitCommitService
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(L("Подготовить все")) { commits.stageAll() }
+                .disabled(commits.tree.unstaged.filter { !$0.isConflicted }.isEmpty)
+            Button(L("Убрать все")) { commits.unstageAll() }
+                .disabled(commits.tree.staged.isEmpty)
+            Spacer()
+        }
+        .buttonStyle(.borderless)
+        .font(.system(size: 11))
+        .padding(.horizontal, 12)
+        .frame(height: 24)
+    }
+}
+
 /// Сообщение и кнопки коммита. Общее у окна и вкладки навигатора.
 struct CommitComposer: View {
     @ObservedObject var commits: GitCommitService
@@ -236,25 +244,20 @@ struct CommitComposer: View {
             metaWarnings
 
             HStack {
-                Menu {
-                    Button(L("Закоммитить и отправить")) { commits.commit(andPush: true) }
-                        .keyboardShortcut(.return, modifiers: [.command, .option])
-                        .disabled(!commits.canCommit)
-                    Divider()
-                    fixupMenu
-                } label: {
-                    Text(compact ? "…" : L("Ещё"))
-                }
-                .fixedSize()
-                .onAppear { commits.loadRecentCommits() }
+                // ⌥⌘↩ — закоммитить и сразу отправить, без лишнего меню.
+                Button("") { commits.commit(andPush: true) }
+                    .keyboardShortcut(.return, modifiers: [.command, .option])
+                    .disabled(!commits.canCommit)
+                    .hidden()
+                    .frame(width: 0)
                 Spacer()
                 Button(commitTitle) { commits.commit(andPush: false) }
                     .keyboardShortcut(.return, modifiers: .command)
                     .buttonStyle(.borderedProminent)
                     .disabled(!commits.canCommit)
-                    .help(commits.commitsEverything
+                    .help((commits.commitsEverything
                           ? L("Ничего не подготовлено — в коммит пойдут все изменения")
-                          : L("В коммит пойдёт подготовленное"))
+                          : L("В коммит пойдёт подготовленное")) + "\n" + L("⌥⌘↩ — закоммитить и отправить"))
             }
 
             status
@@ -267,30 +270,6 @@ struct CommitComposer: View {
             return L("Закоммитить всё (\(commits.tree.unstaged.count))")
         }
         return L("Закоммитить")
-    }
-
-    /// Fixup — в коммит, которого ещё нет на сервере. Со вливанием —
-    /// сразу переписать ветку (`rebase --autosquash`).
-    @ViewBuilder
-    private var fixupMenu: some View {
-        if commits.tree.staged.isEmpty {
-            Text(L("Fixup: сначала подготовьте правки"))
-        } else if commits.recentCommits.isEmpty {
-            Text(L("Fixup: нет неотправленных коммитов"))
-        } else {
-            Menu(L("Fixup в коммит")) {
-                ForEach(commits.recentCommits.prefix(15)) { commit in
-                    Button("\(commit.shortHash)  \(commit.subject)") { commits.commit(andPush: false, fixup: commit) }
-                }
-            }
-            Menu(L("Влить в коммит (fixup + autosquash)")) {
-                ForEach(commits.recentCommits.prefix(15)) { commit in
-                    Button("\(commit.shortHash)  \(commit.subject)") {
-                        commits.commit(andPush: false, fixup: commit, autosquash: true)
-                    }
-                }
-            }
-        }
     }
 
     @ViewBuilder

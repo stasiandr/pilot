@@ -47,12 +47,17 @@ struct GitHistoryView: View {
     // MARK: - Фильтры
 
     /// Левая половина: история файла — всегда списком с графом, иначе по режиму.
-    @ViewBuilder
+    /// Все три списка живут одновременно и только прячутся: пересоздавать
+    /// список на каждое переключение режима — это и было мигание.
     private var leftPane: some View {
-        switch history.filter.path == nil ? history.mode : .graph {
-        case .mine: MineHistoryList(workspace: workspace, history: history, client: client, commits: workspace.commits)
-        case .mainline: MainlineHistoryList(workspace: workspace, history: history, client: client)
-        case .graph: log
+        let shown = history.filter.path == nil ? history.mode : .graph
+        return ZStack {
+            MineHistoryList(workspace: workspace, history: history, client: client, commits: workspace.commits)
+                .modeLayer(shown == .mine)
+            MainlineHistoryList(workspace: workspace, history: history, client: client)
+                .modeLayer(shown == .mainline)
+            log
+                .modeLayer(shown == .graph)
         }
     }
 
@@ -66,11 +71,13 @@ struct GitHistoryView: View {
             .fixedSize()
             .disabled(history.filter.path != nil)
             .help(L("Моя ветка — что в ней сверх основной; по MR — основная ветка списком влитых MR; граф — все коммиты"))
-            if history.mode != .mine || history.filter.path != nil {
-                filters
-            }
+            // Фильтры на месте во всех режимах, иначе строка меняла форму.
+            // В «Моей ветке» искать нечего — они выключены.
+            filters
+                .disabled(history.mode == .mine && history.filter.path == nil)
             Spacer()
-            if history.isLoading { ProgressView().controlSize(.small) }
+            // Место под спиннер — всегда: иначе кнопка справа прыгала.
+            ProgressView().controlSize(.small).opacity(history.isLoading ? 1 : 0)
             Button { history.reload() } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless)
                 .help(L("Обновить"))
@@ -493,5 +500,14 @@ struct BranchNameSheet: View {
         guard GitBranch.isValidName(name) else { return }
         perform(name)
         dismiss()
+    }
+}
+
+private extension View {
+    /// Слой режима истории: виден и принимает щелчки, только когда выбран.
+    func modeLayer(_ visible: Bool) -> some View {
+        opacity(visible ? 1 : 0)
+            .allowsHitTesting(visible)
+            .accessibilityHidden(!visible)
     }
 }

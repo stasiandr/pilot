@@ -19,6 +19,7 @@ struct ChangesNavigator: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             VStack(spacing: 0) {
+                StageAllBar(commits: commits)
                 list
                 Divider()
                 CommitComposer(commits: commits, messageFocused: $messageFocused, height: 64, compact: true)
@@ -30,18 +31,17 @@ struct ChangesNavigator: View {
 
     private var list: some View {
         List(selection: $selection) {
-            if !commits.tree.staged.isEmpty {
-                Section {
-                    ForEach(commits.tree.staged) { change in row(change, staged: true) }
-                } header: {
-                    header(L("Подготовлено"), count: commits.tree.staged.count, action: L("Убрать все")) { commits.unstageAll() }
-                }
+            // Обе секции есть всегда: появляющаяся «Подготовлено» сдвигала
+            // весь список на первом же клике.
+            Section {
+                ForEach(commits.tree.staged) { change in row(change, staged: true) }
+            } header: {
+                Text(L("Подготовлено \(commits.tree.staged.count)"))
             }
             Section {
                 ForEach(commits.tree.unstaged) { change in row(change, staged: false) }
             } header: {
-                header(L("Изменения"), count: commits.tree.unstaged.count,
-                       action: commits.tree.unstaged.isEmpty ? nil : L("Подготовить все")) { commits.stageAll() }
+                Text(L("Изменения \(commits.tree.unstaged.count)"))
             }
         }
         .listStyle(.sidebar)
@@ -61,16 +61,6 @@ struct ChangesNavigator: View {
         .overlay {
             if commits.isLoaded && commits.tree.changes.isEmpty {
                 Text(L("Рабочая копия чистая")).font(.system(size: 12)).foregroundStyle(.tertiary)
-            }
-        }
-    }
-
-    private func header(_ title: String, count: Int, action: String?, perform: @escaping () -> Void) -> some View {
-        HStack {
-            Text("\(title) \(count)")
-            Spacer()
-            if let action {
-                Button(action, action: perform).buttonStyle(.borderless).font(.system(size: 10))
             }
         }
     }

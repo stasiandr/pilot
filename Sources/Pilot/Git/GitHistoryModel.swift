@@ -61,11 +61,30 @@ final class GitHistoryModel: ObservableObject {
     }
 
     @Published var mode: Mode = .mine {
-        didSet { if mode != oldValue { reload() } }
+        didSet {
+            guard mode != oldValue else { return }
+            // Выбор — у каждого режима свой: вернулись — стоит где стоял.
+            if let selection { selectionByMode[oldValue] = selection }
+            if let saved = selectionByMode[mode], registry[saved] != nil { selection = saved }
+            if !batching { reload() }
+        }
     }
 
     @Published var filter = Filter() {
-        didSet { if filter != oldValue { reload() } }
+        didSet { if filter != oldValue, !batching { reload() } }
+    }
+
+    private var selectionByMode: [Mode: String] = [:]
+    /// Режим и ветку меняют вместе — перечитать один раз, а не дважды.
+    private var batching = false
+
+    /// Клик по ветке в дереве: и ветка, и режим — одним перечитыванием.
+    func show(scope: Scope, mode: Mode) {
+        batching = true
+        filter.scope = scope
+        self.mode = mode
+        batching = false
+        reload()
     }
 
     // MARK: Моя ветка
@@ -153,6 +172,10 @@ final class GitHistoryModel: ObservableObject {
     /// Хэши загруженных — чтобы страница не повторяла предыдущую.
     private var known = Set<String>()
     private var generation = 0
+    /// То же поколение для фоновой очереди: запрос, который ещё не начался,
+    /// а его уже перебили, в git не идёт — очередь последовательная, и
+    /// лишние запросы задерживали бы нужный.
+    private let live = AtomicCounter()
     private let queue = DispatchQueue(label: "pilot.git.history", qos: .userInitiated)
     static let pageSize = 400
 
@@ -174,6 +197,7 @@ final class GitHistoryModel: ObservableObject {
     /// если он есть и в новом списке.
     func reload() {
         generation += 1
+        _ = live.bump()
         replaceOnArrival = true
         hasMore = false
         error = nil
@@ -199,24 +223,29 @@ final class GitHistoryModel: ObservableObject {
     /// Следующий ответ заменяет показанное, а не дописывается к нему.
     private var replaceOnArrival = false
 
-    /// Пришёл ответ после `reload`: старое — долой, разом.
-    private func replaceIfNeeded() {
+    /// Пришёл ответ после `reload`: старое этого режима — долой, разом.
+    /// Данные других режимов остаются: переключились туда — видно сразу.
+    private func replaceIfNeeded(_ mode: Mode) {
         guard replaceOnArrival else { return }
         replaceOnArrival = false
-        layout = GitGraphLayout()
-        commits = []
-        known = []
-        rows = []
-        mainline = []
-        children = [:]
-        hiddenBackMerges = [:]
-        registry = [:]
-        overview = nil
+        switch mode {
+        case .graph:
+            layout = GitGraphLayout()
+            commits = []
+            known = []
+            rows = []
+        case .mainline:
+            mainline = []
+            children = [:]
+            hiddenBackMerges = [:]
+        case .mine:
+            overview = nil
+        }
     }
 
-    /// После замены: прежний выбор, если он ещё есть, иначе первый.
-    private func keepSelection(first: String?) {
-        if let selection, registry[selection] != nil {
+    /// После замены: прежний выбор, если он есть в этом списке, иначе первый.
+    private func keepSelection(first: String?, among ids: Set<String>) {
+        if let selection, ids.contains(selection) {
             loadSelection()
         } else {
             selection = first
@@ -246,16 +275,19 @@ final class GitHistoryModel: ObservableObject {
         guard let repository else { return }
         isLoading = true
         let current = generation
-        queue.async { [weak self] in
+        let ticket = live.current
+        queue.async { [weak self, live] in
+            guard live.isCurrent(ticket) else { return }
             let overview = Self.overview(in: repository)
             Task { @MainActor in
                 guard let self, self.generation == current else { return }
                 self.isLoading = false
-                self.replaceIfNeeded()
+                self.replaceIfNeeded(.mine)
                 self.overview = overview
                 if let overview {
                     self.register(overview.commits + [overview.forkPoint].compactMap { $0 })
-                    self.keepSelection(first: overview.commits.first?.hash ?? overview.forkPoint?.hash)
+                    let ids = Set(overview.commits.map(\.hash) + [overview.forkPoint?.hash].compactMap { $0 })
+                    self.keepSelection(first: overview.commits.first?.hash ?? overview.forkPoint?.hash, among: ids)
                 } else {
                     self.error = L("Не нашлась основная ветка (origin/HEAD, main или master)")
                 }
@@ -273,10 +305,13 @@ final class GitHistoryModel: ObservableObject {
         let mainName = main.hasPrefix("origin/") ? String(main.dropFirst("origin/".count)) : main
         // По первому родителю: обратные слияния — одной строкой, без
         // коммитов основной ветки, которые они принесли.
-        let commits = Git.run(["log", "--first-parent", GitCommitInfo.format, "--decorate=full", "-n", "300",
-                               "HEAD", "--not", main], in: repository).map { GitCommitInfo.parse($0.stdout) } ?? []
-        let unpushed = Set(text(["rev-list", "-n", "1000", "HEAD", "--not", "--remotes"]).split(separator: "\n").map(String.init))
+        // Через общего предка, а не `--not origin/master`: на clm-client
+        // это 0,00 с против 0,41.
         let base = text(["merge-base", "HEAD", main])
+        let commits = Git.run(["log", "--first-parent", GitCommitInfo.format, "--decorate=full", "-n", "300",
+                               base.isEmpty ? "HEAD" : base + "..HEAD"], in: repository)
+            .map { GitCommitInfo.parse($0.stdout) } ?? []
+        let unpushed = Set(text(["rev-list", "-n", "1000", "HEAD", "--not", "--remotes"]).split(separator: "\n").map(String.init))
         let forkPoint = base.isEmpty ? nil
             : Git.run(["log", "-n", "1", GitCommitInfo.format, "--decorate=full", base], in: repository)
                 .flatMap { GitCommitInfo.parse($0.stdout).first }
@@ -311,7 +346,9 @@ final class GitHistoryModel: ObservableObject {
             if case .ref(let ref) = filter.scope { return ref }
             return nil
         }()
-        queue.async { [weak self] in
+        let ticket = live.current
+        queue.async { [weak self, live] in
+            guard live.isCurrent(ticket) else { return }
             guard let main = scopeRef ?? Self.mainRef(in: repository) else {
                 Task { @MainActor in
                     self?.isLoading = false
@@ -328,11 +365,14 @@ final class GitHistoryModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.generation == current else { return }
                 self.isLoading = false
-                self.replaceIfNeeded()
+                self.replaceIfNeeded(.mainline)
                 self.mainline += entries
                 self.register(page)
                 self.hasMore = page.count >= Self.pageSize
-                if skip == 0 { self.keepSelection(first: entries.first?.id) }
+                if skip == 0 {
+                    let ids = Set(self.mainline.map(\.id)).union(self.children.values.flatMap { $0.map(\.hash) })
+                    self.keepSelection(first: entries.first?.id, among: ids)
+                }
             }
         }
     }
@@ -394,7 +434,9 @@ final class GitHistoryModel: ObservableObject {
         // Хэш в поиске: сначала пробуем как ревизию.
         let text = filter.text.trimmingCharacters(in: .whitespaces)
         let hashLike = skip == 0 && text.count >= 6 && text.allSatisfy(\.isHexDigit)
-        queue.async { [weak self] in
+        let ticket = live.current
+        queue.async { [weak self, live] in
+            guard live.isCurrent(ticket) else { return }
             var page: [GitCommitInfo] = []
             var failure: String?
             if hashLike, let output = Git.run(["log", GitCommitInfo.format, "--decorate=full", "-n", "1", text, "--"], in: repository),
@@ -413,7 +455,7 @@ final class GitHistoryModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.generation == current else { return }
                 self.isLoading = false
-                self.replaceIfNeeded()
+                self.replaceIfNeeded(.graph)
                 self.error = failure
                 // Со -L git не умеет --skip — всё приходит первой страницей.
                 let fresh = page.filter { self.known.insert($0.hash).inserted }
@@ -424,7 +466,7 @@ final class GitHistoryModel: ObservableObject {
                 self.register(fresh)
                 self.rows += newRows
                 self.hasMore = page.count >= Self.pageSize && self.filter.lines == nil
-                if skip == 0 { self.keepSelection(first: self.commits.first?.hash) }
+                if skip == 0 { self.keepSelection(first: self.commits.first?.hash, among: self.known) }
             }
         }
     }
