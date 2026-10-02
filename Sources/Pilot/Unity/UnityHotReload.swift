@@ -268,7 +268,14 @@ final class UnityHotReload: ObservableObject {
         let sources = paths.filter { $0.hasSuffix(".cs") && $0.hasPrefix(project.path + "/Assets/") }
         guard !sources.isEmpty, sources.count <= 20 else { return }
         let fm = FileManager.default
-        let gone = Set(sources).filter { !fm.fileExists(atPath: $0) }.sorted()
+        // Удалён файл проекта, а не временный, через который другой редактор
+        // сохраняет атомарно (`.!123!Name.cs`, `Name.cs~`): у файла Unity
+        // остаётся `.meta` (без автообновления её никто не убирает), или
+        // Pilot его уже видел.
+        let gone = Set(sources).filter { path in
+            !fm.fileExists(atPath: path) && !(path as NSString).lastPathComponent.hasPrefix(".")
+                && (fm.fileExists(atPath: path + ".meta") || seen[path] != nil)
+        }.sorted()
         if !gone.isEmpty {
             // The editor's build still has the file's types, and reloading
             // in place on a build without them leaves what it serialized
