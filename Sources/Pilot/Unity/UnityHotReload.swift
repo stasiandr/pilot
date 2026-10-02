@@ -64,6 +64,106 @@ final class UnityHotReload: ObservableObject {
         pending.removeAll()
         patched.removeAll()
         seen.removeAll()
+        deleted = false
+        editorTimer?.invalidate()
+        editorTimer = nil
+        foreign = false
+        playing = false
+    }
+
+    // MARK: - Что делает редактор сам
+
+    private var editorTimer: Timer?
+    private var editorLogOffset: UInt64 = 0
+    /// Редактор перезагрузился не по нашей просьбе — сам скомпилировал при
+    /// входе в Play Mode или его перезапустили: заплаток в нём больше нет,
+    /// и мерить новые не от чего, пока он снова не на нашей сборке.
+    private var foreign = false
+    private var playing = false
+
+    /// Следит за журналом пробы: перезагрузки и Play Mode.
+    private func watchEditor(_ root: URL) {
+        let log = Probe.folder(root).appendingPathComponent("log.txt")
+        editorLogOffset = (try? FileManager.default.attributesOfItem(atPath: log.path)[.size] as? UInt64) ?? 0
+        editorTimer?.invalidate()
+        editorTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.readEditorLog(log) }
+        }
+    }
+
+    private func readEditorLog(_ log: URL) {
+        guard let handle = try? FileHandle(forReadingFrom: log) else { return }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        if size < editorLogOffset { editorLogOffset = 0 }
+        guard size > editorLogOffset else { return }
+        try? handle.seek(toOffset: editorLogOffset)
+        let data = handle.readDataToEndOfFile()
+        editorLogOffset += UInt64(data.count)
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            if line.contains(" started assembly=") {
+                // Свои строки «reloaded» пишет проба после нашей просьбы;
+                // «started» — всё остальное.
+                foreign = true
+                NSLog("[hot] редактор перезагрузился сам: %@", String(line))
+            } else if line.contains(" play state EnteredPlayMode") {
+                playing = true
+            } else if line.contains(" play state EnteredEditMode") {
+                playing = false
+            }
+        }
+        if foreign, !playing, !busy { resync() }
+    }
+
+    /// Редактор снова на сборке Pilot: целиком, со всем, что сохранено.
+    private func resync() {
+        guard let project, let rustlyn, let runtime = tools?.runtime.path else { return }
+        foreign = false
+        busy = true
+        pending.removeAll()
+        let started = Date()
+        work.async { [weak self] in
+            // Play Mode starts after the reload that compiling for it made:
+            // asked of the editor itself, not of what the log said so far.
+            let state = Probe.ask(project, "state", answers: ["state"], timeout: 30) ?? ""
+            if state.contains("playing=True") || state.contains("compiling=True") {
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.busy = false
+                    self.foreign = true
+                    self.playing = state.contains("playing=True")
+                    self.onRoundFinished?()
+                }
+                return
+            }
+            Probe.event(project, kind: "reload", title: "Unity reloaded on its own build",
+                        detail: "Pilot's build goes back in, with everything saved")
+            let built = rustlyn.hotRebuild()
+            var reloaded = false
+            if built["ok"] as? Bool == true, let assembly = built["assembly"] as? String,
+               let answer = Probe.ask(project, "reload \(assembly)", answers: ["reloaded", "failed"], timeout: 1800),
+               answer.hasPrefix("reloaded") {
+                _ = Probe.ask(project, "load \(runtime)", answers: ["loaded", "failed"], timeout: 60)
+                reloaded = true
+                Probe.event(project, kind: "reload", title: "Back on Pilot's build",
+                            detail: "hot reload goes on", seconds: Date().timeIntervalSince(started))
+            } else {
+                Probe.event(project, kind: "failed", title: "Pilot's build did not go back in",
+                            detail: (built["error"] as? String) ?? Probe.lastAnswer ?? "no answer",
+                            seconds: Date().timeIntervalSince(started))
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                self.busy = false
+                if reloaded {
+                    self.patched.removeAll()
+                    self.deleted = false
+                    // Своё «reloaded» уже прочитано или будет: не «started».
+                }
+                self.onRoundFinished?()
+                self.next()
+            }
+        }
     }
 
     private func start(project info: UnityProjectInfo, rustlyn: Rustlyn) {
@@ -134,6 +234,7 @@ final class UnityHotReload: ObservableObject {
                 self.tools = tools
                 self.state = .on
                 self.patched.removeAll()
+                self.watchEditor(root)
                 self.next()
             }
         }
@@ -156,6 +257,9 @@ final class UnityHotReload: ObservableObject {
     /// Текст каждого файла, каким его последний раз отдали в круг: по нему
     /// событие ФС после сохранения в Pilot узнаётся как то же сохранение.
     private var seen: [String: String] = [:]
+    /// A file was deleted since the editor's build: reloading in place is
+    /// no longer safe, only a restart of the editor is.
+    private var deleted = false
 
     /// Файлы поменялись мимо Pilot: другой редактор, скрипт. Переключение
     /// ветки — сотни файлов — заплатками не возят: такое пропускаем.
@@ -163,6 +267,19 @@ final class UnityHotReload: ObservableObject {
         guard let project, isRunning else { return }
         let sources = paths.filter { $0.hasSuffix(".cs") && $0.hasPrefix(project.path + "/Assets/") }
         guard !sources.isEmpty, sources.count <= 20 else { return }
+        let fm = FileManager.default
+        let gone = Set(sources).filter { !fm.fileExists(atPath: $0) }.sorted()
+        if !gone.isEmpty {
+            // The editor's build still has the file's types, and reloading
+            // in place on a build without them leaves what it serialized
+            // unreadable: only a fresh start of the editor is safe.
+            let names = gone.map { ($0 as NSString).lastPathComponent }
+            Probe.event(project, kind: "deleted", file: names.count == 1 ? names[0] : "\(names.count) files",
+                        title: "A file was deleted: restart Unity",
+                        detail: names.joined(separator: ", ") + " — its types stay in the running editor until it starts again")
+            for path in gone { seen[path] = nil; pending[path] = nil }
+            deleted = true
+        }
         for path in Set(sources) {
             guard let text = try? String(contentsOfFile: path, encoding: .utf8), text != seen[path] else { continue }
             let before = pending[path]?.before ?? seen[path] ?? text
@@ -173,20 +290,35 @@ final class UnityHotReload: ObservableObject {
     }
 
     private func next() {
+        if foreign {
+            // Заплатки мерить не от чего, пока редактор не на нашей сборке.
+            if !playing && !busy { resync() }
+            if playing, !pending.isEmpty, let project {
+                let names = pending.keys.map { ($0 as NSString).lastPathComponent }.sorted()
+                pending.removeAll()
+                Probe.event(project, kind: "reload", file: names.count == 1 ? names[0] : "\(names.count) files",
+                            title: "Waits for Play Mode to stop",
+                            detail: "Unity compiled its own build entering Play Mode; Pilot's goes back in when it stops")
+            }
+            return
+        }
         guard !busy, !pending.isEmpty, let project, let rustlyn else { return }
         let round = pending
         pending.removeAll()
         busy = true
         let runtime = tools?.runtime.path ?? ""
         let known = patched
+        let restartOnly = deleted
         work.async { [weak self] in
-            let outcome = Self.round(round, project: project, rustlyn: rustlyn, runtime: runtime, patched: known)
+            let outcome = Self.round(round, project: project, rustlyn: rustlyn, runtime: runtime, patched: known,
+                                     restartOnly: restartOnly)
             Task { @MainActor in
                 guard let self else { return }
                 self.busy = false
                 defer { if !self.busy { self.onRoundFinished?() } }
                 guard self.project == project else { return }
                 if outcome.reloaded { self.patched.removeAll() }
+                if outcome.resync { self.foreign = true }
                 self.patched.formUnion(outcome.patched)
                 self.next()
             }
@@ -196,11 +328,15 @@ final class UnityHotReload: ObservableObject {
     private struct Outcome: Sendable {
         var patched: [String] = []
         var reloaded = false
+        /// Заплатка не легла: в каждой следующей были бы те же методы, и
+        /// легли бы так же. Только сборка целиком.
+        var resync = false
     }
 
     /// Один круг: заплатка на все сохранения разом, и редактор её берёт.
     nonisolated private static func round(_ round: [String: (before: String, after: String)], project: URL,
-                                          rustlyn: Rustlyn, runtime: String, patched: Set<String>) -> Outcome {
+                                          rustlyn: Rustlyn, runtime: String, patched: Set<String>,
+                                          restartOnly: Bool) -> Outcome {
         let started = Date()
         let files = round.keys.sorted()
         let name = files.count == 1 ? (files[0] as NSString).lastPathComponent : "\(files.count) files"
@@ -228,6 +364,7 @@ final class UnityHotReload: ObservableObject {
             } else {
                 Probe.event(project, kind: "failed", file: name, title: "The patch did not apply",
                             detail: String((applied ?? "no answer").prefix(240)), seconds: took(), diff: diff)
+                outcome.resync = true
             }
         case "unchanged":
             Probe.event(project, kind: "same", file: name, title: "Nothing that runs changed",
@@ -235,6 +372,10 @@ final class UnityHotReload: ObservableObject {
         case "broken":
             Probe.event(project, kind: "broken", file: name, title: "Does not compile yet",
                         detail: reason, seconds: took(), diff: diff)
+        case "reload" where restartOnly:
+            Probe.event(project, kind: "deleted", file: name, title: "Needs a restart of Unity",
+                        detail: "a file was deleted, so the editor cannot reload in place — " + reason,
+                        seconds: took(), diff: diff)
         case "reload":
             Probe.event(project, kind: "reload", file: name, title: "Reloading…", detail: reason, diff: diff)
             let built = rustlyn.hotRebuild()
