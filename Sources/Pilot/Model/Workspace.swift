@@ -359,6 +359,9 @@ final class Workspace: ObservableObject {
 
     init() {
         unity.onAssetsReady = { [weak self] in self?.unityAssetsReady() }
+        unityHotReload.onRoundFinished = { [weak self] in
+            if self?.compilePending == true { self?.scheduleCompile() }
+        }
         // Статус-строка и меню смотрят на воркспейс — пусть видят и Unity.
         unityChanges = unity.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
         archiveChanges = archive.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
@@ -1190,7 +1193,7 @@ final class Workspace: ObservableObject {
     /// просьбы, пришедшие за это время, сливаются в одну следующую.
     private func scheduleCompile() {
         guard let rustlyn = rustlyn, root != nil else { return }
-        guard !compileRunning else {
+        guard !compileRunning, !unityHotReload.isBusy else {
             compilePending = true
             return
         }

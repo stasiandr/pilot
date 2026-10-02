@@ -36,6 +36,11 @@ final class UnityHotReload: ObservableObject {
     /// и уходят следующим одним кругом.
     private var pending: [String: (before: String, after: String)] = [:]
     private var busy = false
+    /// Идёт круг: он сам компилирует проект, и компиляции Pilot незачем
+    /// идти рядом и делить с ним ядра — она подождёт и найдёт всё готовым.
+    var isBusy: Bool { busy }
+    /// Круг закончился: отложенной компиляции пора.
+    var onRoundFinished: (() -> Void)?
     private let work = DispatchQueue(label: "pilot.unity.hot-reload", qos: .userInitiated)
     /// Методы, которые заплатки заменили с последней перезагрузки: новое среди
     /// них — то, что поменяло это сохранение.
@@ -179,6 +184,7 @@ final class UnityHotReload: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.busy = false
+                defer { if !self.busy { self.onRoundFinished?() } }
                 guard self.project == project else { return }
                 if outcome.reloaded { self.patched.removeAll() }
                 self.patched.formUnion(outcome.patched)
