@@ -56,6 +56,9 @@ extension Workspace {
         generatorRuns.isBusy = { [weak self] in
             guard let self else { return true }
             if case .compiling = self.compiler { return true }
+            // Горячая перезагрузка держит свой вывод генераторов, и компилятор
+            // берёт его: фоновый прогон только отнимал бы ядра у сохранений.
+            if self.unityHotReload.isRunning { return true }
             return self.isIndexing || self.isTypeIndexing
         }
         generatorRuns.workedIn = { [weak self] in
