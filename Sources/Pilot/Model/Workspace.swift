@@ -1247,7 +1247,7 @@ final class Workspace: ObservableObject {
         // Индекс эти папки не видит (Temp, Library), поэтому смотрим на
         // события до разбора: компиляция Rustlyn должна взять новый текст.
         if events.contains(where: { Self.isGeneratedCode($0.path) }) { scheduleCompile() }
-        if unityHotReload.isRunning { unityHotReload.changedOnDisk(events.map(\.path)) }
+        if unityHotReload.isRunning { unityHotReload.changedOnDisk(events: events) }
         // restore записал пакеты проекта заново — компиляции нужны их сборки.
         // obj/ обычно в .gitignore, и разбор ниже этих событий не пропустит.
         let restored = events.contains(where: { NuGetRestore.isAssets($0.path) })

@@ -265,6 +265,7 @@ final class UnityHotReload: ObservableObject {
             Task { @MainActor in
                 guard self.project == root else { return }
                 self.tools = tools
+                self.lastScan = Date()
                 self.state = .on
                 self.patched.removeAll()
                 self.watchEditor(root)
@@ -293,6 +294,43 @@ final class UnityHotReload: ObservableObject {
     /// A file was deleted since the editor's build: reloading in place is
     /// no longer safe, only a restart of the editor is.
     private var deleted = false
+
+    /// Пачка событий ФС. Папка вместо файлов — система не успела и просит
+    /// пересмотреть её (или кто-то создал папку): тогда смотрим, какие `.cs`
+    /// в ней поменялись с прошлого раза, иначе такое сохранение пропало бы.
+    func changedOnDisk(events: [FileEvent]) {
+        guard let project, isRunning else { return }
+        let assets = project.path + "/Assets"
+        let folders = events.filter { event in
+            event.structural && !event.path.hasSuffix(".cs")
+                && (assets.hasPrefix(event.path) || event.path.hasPrefix(assets + "/"))
+        }.map { assets.hasPrefix($0.path) ? assets : $0.path }
+        changedOnDisk(events.map(\.path))
+        guard !folders.isEmpty else { return }
+        let since = lastScan.addingTimeInterval(-2)
+        lastScan = Date()
+        work.async { [weak self] in
+            let fm = FileManager.default
+            var found: [String] = []
+            for folder in Set(folders) {
+                guard let walk = fm.enumerator(at: URL(fileURLWithPath: folder),
+                                               includingPropertiesForKeys: [.contentModificationDateKey],
+                                               options: [.skipsHiddenFiles]) else { continue }
+                for case let url as URL in walk where url.pathExtension == "cs" {
+                    let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                    if let date, date > since { found.append(url.path) }
+                }
+            }
+            guard !found.isEmpty else { return }
+            Task { @MainActor in
+                NSLog("[hot] пересмотр папки: %d файлов поменялись", found.count)
+                self?.changedOnDisk(found)
+            }
+        }
+    }
+
+    /// С какого времени пересмотр папки ищет изменённые файлы.
+    private var lastScan = Date()
 
     /// Файлы поменялись мимо Pilot: другой редактор, скрипт. Переключение
     /// ветки — сотни файлов — заплатками не возят: такое пропускаем.
