@@ -213,7 +213,11 @@ final class UnityHotReload: ObservableObject {
         var outcome = Outcome()
         switch kind {
         case "patch":
-            guard let assembly = answer["assembly"] as? String else { break }
+            guard let assembly = answer["assembly"] as? String, !assembly.isEmpty else {
+                Probe.event(project, kind: "same", file: name, title: "Nothing that runs changed",
+                            detail: "spacing or comments", seconds: took(), diff: diff)
+                break
+            }
             let applied = Probe.ask(project, "hotpatch \(assembly)", answers: ["hotpatched", "failed hotpatch"], timeout: 60)
             if let applied, applied.hasPrefix("hotpatched") {
                 let methods = answer["methods"] as? [String] ?? []
