@@ -15,6 +15,8 @@ enum UnityHotReloadTools {
         let gend: URL
         let minigen: URL
         let runtime: URL
+        /// `libpilotpatch.dylib`: пишет переходы в код, скомпилированный Mono.
+        let plugin: URL
 
         var json: [String: String] {
             ["dotnet": dotnet.path, "gend": gend.path, "minigen": minigen.path, "runtime": runtime.path]
@@ -41,7 +43,10 @@ enum UnityHotReloadTools {
         }
     }
 
-    static let files = ["gend/Program.cs", "gend/gend.csproj", "minigen/Program.cs", "minigen/minigen.csproj", "PilotRuntime.cs"]
+    static let files = ["gend/Program.cs", "gend/gend.csproj", "minigen/Program.cs", "minigen/minigen.csproj", "PilotRuntime.cs",
+                        "pilotpatch.c"]
+    /// Что лежит в проекте, в `Assets/PilotProbe/Editor`, кроме библиотеки.
+    static let probeFiles = ["PilotProbe.cs", "PilotHud.cs", "PilotProbe.asmdef"]
 
     static func prepare(contents: URL, progress: (String) -> Void) -> Result<Built, Failure> {
         guard let sources = sources() else { return .failure(Failure(message: "hot reload tools are not in this build of Pilot")) }
@@ -62,9 +67,10 @@ enum UnityHotReloadTools {
         let out = caches.appendingPathComponent("Pilot/HotReload/\(key)")
         let built = Built(dotnet: dotnet, gend: out.appendingPathComponent("gend/gend.dll"),
                           minigen: out.appendingPathComponent("minigen/minigen.dll"),
-                          runtime: out.appendingPathComponent("PilotRuntime.dll"))
+                          runtime: out.appendingPathComponent("PilotRuntime.dll"),
+                          plugin: out.appendingPathComponent("libpilotpatch.dylib"))
         let fm = FileManager.default
-        if [built.gend, built.minigen, built.runtime].allSatisfy { (url: URL) in fm.fileExists(atPath: url.path) } {
+        if [built.gend, built.minigen, built.runtime, built.plugin].allSatisfy { (url: URL) in fm.fileExists(atPath: url.path) } {
             return .success(built)
         }
         try? fm.removeItem(at: out)
@@ -94,7 +100,42 @@ enum UnityHotReloadTools {
             source.appendingPathComponent("PilotRuntime.cs").path,
         ])
         if let result { return .failure(Failure(message: "PilotRuntime did not build: \(result)")) }
+        progress(L("Собираю pilotpatch…"))
+        let plugin = run(URL(fileURLWithPath: "/usr/bin/xcrun"), [
+            "clang", "-O2", "-dynamiclib", "-arch", "arm64", "-arch", "x86_64",
+            "-o", built.plugin.path, source.appendingPathComponent("pilotpatch.c").path,
+        ])
+        if let plugin { return .failure(Failure(message: "pilotpatch did not build (Command Line Tools?): \(plugin)")) }
         return .success(built)
+    }
+
+    /// Что поменялось в проекте: скрипты пробы Unity компилирует (и
+    /// перезагружается), библиотеку только импортирует.
+    struct Installed {
+        var scripts = false
+        var plugin = false
+    }
+
+    /// Кладёт пробу в проект или обновляет её.
+    static func installProbe(project: URL, built: Built) -> Result<Installed, Failure> {
+        guard let sources = sources() else { return .failure(Failure(message: "the probe is not in this build of Pilot")) }
+        let fm = FileManager.default
+        let folder = project.appendingPathComponent("Assets/PilotProbe/Editor")
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            var installed = Installed()
+            let pairs = probeFiles.map { (sources.appendingPathComponent($0), folder.appendingPathComponent($0)) }
+                + [(built.plugin, folder.appendingPathComponent("libpilotpatch.dylib"))]
+            for (from, to) in pairs {
+                let fresh = try Data(contentsOf: from)
+                if (try? Data(contentsOf: to)) == fresh { continue }
+                try fresh.write(to: to, options: .atomic)
+                if to.pathExtension == "dylib" { installed.plugin = true } else { installed.scripts = true }
+            }
+            return .success(installed)
+        } catch {
+            return .failure(Failure(message: "the probe could not be put in the project: \(error.localizedDescription)"))
+        }
     }
 
     /// `nil` — получилось; иначе хвост вывода.

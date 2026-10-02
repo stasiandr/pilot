@@ -57,7 +57,7 @@ cp "$RUSTLYN_PATH/crates/rustlyn-ffi/include/rustlyn.h" Sources/CRustlyn/include
 # под установленную Unity (UnityHotReloadTools.swift).
 rm -rf "$OUT/unity"
 for file in gend/Program.cs gend/gend.csproj minigen/Program.cs minigen/minigen.csproj PilotRuntime.cs \
-            PilotProbe.cs PilotHud.cs PilotProbe.asmdef; do
+            PilotProbe.cs PilotHud.cs PilotProbe.asmdef pilotpatch.c; do
     mkdir -p "$OUT/unity/$(dirname "$file")"
     cp "$RUSTLYN_PATH/tools/unity/$file" "$OUT/unity/$file"
 done

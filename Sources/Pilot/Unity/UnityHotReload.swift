@@ -186,10 +186,6 @@ final class UnityHotReload: ObservableObject {
             state = .failed(L("Не найден редактор Unity \(info.editorVersion ?? "")"))
             return
         }
-        guard Probe.isInstalled(in: root) else {
-            state = .failed(L("В проекте нет Assets/PilotProbe/Editor/PilotProbe.cs"))
-            return
-        }
         guard Probe.editorRunning(on: root) else {
             state = .failed(L("Сначала откройте проект в Unity"))
             return
@@ -218,6 +214,29 @@ final class UnityHotReload: ObservableObject {
             switch UnityHotReloadTools.prepare(contents: contents, progress: say) {
             case .success(let built): tools = built
             case .failure(let failure): return failed(failure.message)
+            }
+            // Проба — в проекте и та же, что в этом Pilot; новую Unity
+            // компилирует сама и отвечает уже ею.
+            let hadProbe = Probe.isInstalled(in: root)
+            switch UnityHotReloadTools.installProbe(project: root, built: tools) {
+            case .failure(let failure): return failed(failure.message)
+            case .success(let installed) where !installed.scripts:
+                // Only the library: imported on a refresh, nothing to compile.
+                if installed.plugin, hadProbe {
+                    _ = Probe.ask(root, "refresh", answers: ["refreshed"], timeout: 300)
+                }
+            case .success:
+                say(L("Unity компилирует пробу — переключитесь на Unity"))
+                let log = Probe.folder(root).appendingPathComponent("log.txt")
+                let at = (try? FileManager.default.attributesOfItem(atPath: log.path)[.size] as? Int) ?? 0
+                if hadProbe {
+                    Probe.command(root, "hold off")
+                    Probe.command(root, "refresh")
+                }
+                Probe.activateEditor(on: root)
+                guard Probe.wait(for: " started assembly=", in: log, after: at, timeout: 900) else {
+                    return failed(L("Unity не скомпилировала пробу: переключитесь на Unity и включите снова"))
+                }
             }
             say(L("Генераторы и сборка целиком…"))
             Probe.note(root, "⟳ Pilot: building the project for hot reload…")
@@ -471,6 +490,21 @@ enum Probe {
         } else {
             try? data.write(to: url)
         }
+    }
+
+    /// Ждёт строки журнала пробы, написанной после `offset` (журнал
+    /// Unity пишет заново, когда стирает `Temp`).
+    static func wait(for text: String, in log: URL, after offset: Int, timeout: TimeInterval) -> Bool {
+        let end = Date().addingTimeInterval(timeout)
+        var from = offset
+        while Date() < end {
+            if let data = try? Data(contentsOf: log) {
+                if data.count < from { from = 0 }
+                if String(decoding: data[(data.startIndex + from)...], as: UTF8.self).contains(text) { return true }
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return false
     }
 
     static func ask(_ project: URL, _ command: String, answers: [String], timeout: TimeInterval) -> String? {
