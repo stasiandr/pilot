@@ -57,7 +57,10 @@ final class UnityHotReload: ObservableObject {
     }
 
     func stop() {
-        if isRunning { NSLog("[hot] выключено") }
+        if isRunning {
+            NSLog("[hot] выключено")
+            if let project { Probe.command(project, "hold off") }
+        }
         state = .off
         project = nil
         rustlyn = nil
@@ -91,7 +94,11 @@ final class UnityHotReload: ObservableObject {
         }
     }
 
+    private var heartbeatTick = 0
+
     private func readEditorLog(_ log: URL) {
+        heartbeatTick += 1
+        if heartbeatTick % 10 == 0, let project { Probe.touchHeartbeat(project) }
         guard let handle = try? FileHandle(forReadingFrom: log) else { return }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
@@ -144,6 +151,9 @@ final class UnityHotReload: ObservableObject {
                let answer = Probe.ask(project, "reload \(assembly)", answers: ["reloaded", "failed"], timeout: 1800),
                answer.hasPrefix("reloaded") {
                 _ = Probe.ask(project, "load \(runtime)", answers: ["loaded", "failed"], timeout: 60)
+                // A restarted editor does not hold any more.
+                Probe.touchHeartbeat(project)
+                _ = Probe.ask(project, "hold on", answers: ["hold"], timeout: 30)
                 reloaded = true
                 Probe.event(project, kind: "reload", title: "Back on Pilot's build",
                             detail: "hot reload goes on", seconds: Date().timeIntervalSince(started))
@@ -225,6 +235,10 @@ final class UnityHotReload: ObservableObject {
                   loaded.hasPrefix("loaded") else {
                 return failed("Unity: " + (Probe.lastAnswer ?? "no answer"))
             }
+            // Собственные компиляции Unity больше не перезагружают её: сборка,
+            // от которой меряются заплатки, и сами заплатки остаются.
+            Probe.touchHeartbeat(root)
+            _ = Probe.ask(root, "hold on", answers: ["hold"], timeout: 30)
             let seconds = Date().timeIntervalSince(started)
             NSLog("[hot] включено за %.1f с", seconds)
             Probe.event(root, kind: "reload", title: "Hot reload from Pilot is on",
@@ -480,6 +494,22 @@ enum Probe {
             Thread.sleep(forTimeInterval: 0.03)
         }
         return nil
+    }
+
+    /// Команда, ответа на которую не ждут.
+    static func command(_ project: URL, _ line: String) {
+        append(line, to: folder(project).appendingPathComponent("cmd.txt"))
+    }
+
+    /// Pilot жив: проба держит перезагрузки, пока файл свежий.
+    static func touchHeartbeat(_ project: URL) {
+        let url = folder(project).appendingPathComponent("hold")
+        if FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        } else {
+            try? FileManager.default.createDirectory(at: folder(project), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: url.path, contents: Data())
+        }
     }
 
     /// Строка поверх сцены в редакторе; ответа на неё нет.
