@@ -283,6 +283,9 @@ final class Workspace: ObservableObject {
     /// в objectWillChange — лог пишется часто, а смотрят его только панель
     /// и значок в строке состояния, подписанные сами.
     let unityConsole = UnityConsole()
+    /// Горячая перезагрузка Unity: сохранённый C# — заплатка в запущенный
+    /// редактор. Своё состояние, как у консоли: меню подписано само.
+    let unityHotReload = UnityHotReload()
     /// Локальная история: версии файлов при сохранении и изменении снаружи
     /// (см. Workspace+LocalHistory). nil — проекта нет или это архив.
     private(set) var localHistory: LocalHistory?
@@ -648,6 +651,7 @@ final class Workspace: ObservableObject {
         run.workspaceChanged(to: archived ? nil : url)
         nuget.workspaceChanged(to: archived ? nil : url)
         unityConsole.workspaceChanged(to: archived ? nil : unity.project?.root)
+        unityHotReload.stop()
         commits.workspaceChanged(to: git.repository)
         gitClient.workspaceChanged(to: git.repository)
         gitClient.refresh()
@@ -1206,6 +1210,12 @@ final class Workspace: ObservableObject {
                         self.compiler = .ready(compiled)
                         // Компилятор знает больше разбора: проверяем заново.
                         self.scheduleDiagnostics(delay: 0)
+                        // `PILOT_HOT_RELOAD=1` — горячая перезагрузка сама, как
+                        // только проект скомпилирован: для проверок без рук.
+                        if ProcessInfo.processInfo.environment["PILOT_HOT_RELOAD"] == "1",
+                           case .off = self.unityHotReload.state {
+                            self.unityHotReload.toggle(project: self.unity.project, rustlyn: rustlyn)
+                        }
                     } else {
                         self.compiler = .idle
                     }
@@ -1234,6 +1244,7 @@ final class Workspace: ObservableObject {
         // Индекс эти папки не видит (Temp, Library), поэтому смотрим на
         // события до разбора: компиляция Rustlyn должна взять новый текст.
         if events.contains(where: { Self.isGeneratedCode($0.path) }) { scheduleCompile() }
+        if unityHotReload.isRunning { unityHotReload.changedOnDisk(events.map(\.path)) }
         // restore записал пакеты проекта заново — компиляции нужны их сборки.
         // obj/ обычно в .gitignore, и разбор ниже этих событий не пропустит.
         let restored = events.contains(where: { NuGetRestore.isAssets($0.path) })
@@ -1418,6 +1429,7 @@ final class Workspace: ObservableObject {
         nugetOffer?.cancel()
         nugetOffer = nil
         unityConsole.workspaceChanged(to: nil)
+        unityHotReload.stop()
         commits.workspaceChanged(to: nil)
         gitClient.workspaceChanged(to: nil)
         gitHistory.open(repository: nil)
@@ -4739,7 +4751,9 @@ final class Workspace: ObservableObject {
     @discardableResult
     private func save(_ buffer: TextBuffer) -> Bool {
         // Каким файл был на диске — до записи: первая версия в истории.
-        let before = historyPath(for: buffer).flatMap { _ in try? String(contentsOf: buffer.url, encoding: buffer.document.encoding) }
+        let hot = unityHotReload.isRunning && buffer.url.pathExtension == "cs"
+        let before = (hot || historyPath(for: buffer) != nil)
+            ? try? String(contentsOf: buffer.url, encoding: buffer.document.encoding) : nil
         do {
             try buffer.save()
         } catch {
@@ -4755,6 +4769,7 @@ final class Workspace: ObservableObject {
         debug.fileSaved(buffer.url)
         settleWithRustlyn(buffer)
         reindexAfterSave(buffer.url)
+        if hot { unityHotReload.saved(buffer.url, before: before, after: buffer.storage.string) }
         extensionFileChanged(buffer.url)
         git.refresh()
         if buffer === self.buffer { git.documentEdited(buffer.document) }

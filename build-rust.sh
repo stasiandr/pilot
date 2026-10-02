@@ -53,5 +53,14 @@ mkdir -p "$OUT" Sources/CRustlyn/include
 cp "$RUSTLYN_PATH/target/release/librustlyn_ffi.a" "$OUT/"
 cp "$RUSTLYN_PATH/crates/rustlyn-ffi/include/rustlyn.h" Sources/CRustlyn/include/
 
+# Исходники инструментов горячей перезагрузки Unity: Pilot собирает их сам
+# под установленную Unity (UnityHotReloadTools.swift).
+rm -rf "$OUT/unity"
+for file in gend/Program.cs gend/gend.csproj minigen/Program.cs minigen/minigen.csproj PilotRuntime.cs \
+            PilotProbe.cs PilotHud.cs PilotProbe.asmdef; do
+    mkdir -p "$OUT/unity/$(dirname "$file")"
+    cp "$RUSTLYN_PATH/tools/unity/$file" "$OUT/unity/$file"
+done
+
 echo "    $(pwd)/$OUT/librustlyn_ffi.a"
 echo "    header -> Sources/CRustlyn/include/rustlyn.h"

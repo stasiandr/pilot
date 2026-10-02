@@ -5,6 +5,20 @@ extension English {
         ("Консоль Unity", "Unity Console"),
         ("Клик — консоль Unity", "Click for the Unity console"),
 
+        // UnityHotReload.swift, UnityHotReloadTools.swift
+        ("Горячая перезагрузка: включить", "Hot Reload: Turn On"),
+        ("Горячая перезагрузка: выключить", "Hot Reload: Turn Off"),
+        ("Горячая перезагрузка: %@ (выключить)", "Hot Reload: %@ (turn off)"),
+        ("Горячая перезагрузка: включить (%@)", "Hot Reload: Turn On (%@)"),
+        ("Откройте в Pilot саму папку Unity-проекта", "open the Unity project folder itself in Pilot"),
+        ("В проекте нет Assets/PilotProbe/Editor/PilotProbe.cs", "the project has no Assets/PilotProbe/Editor/PilotProbe.cs"),
+        ("Сначала откройте проект в Unity", "open the project in Unity first"),
+        ("Готовлю инструменты…", "preparing tools…"),
+        ("Генераторы и сборка целиком…", "generators and a whole build…"),
+        ("Unity перезагружается на сборке Pilot…", "Unity reloads on Pilot’s build…"),
+        ("Собираю %@…", "building %@…"),
+        ("Собираю PilotRuntime…", "building PilotRuntime…"),
+
         // UnityConsoleView.swift
         ("Unity ещё не писала Editor.log", "Unity hasn’t written Editor.log yet"),
         ("Ошибки и исключения", "Errors and exceptions"),

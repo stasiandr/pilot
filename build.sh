@@ -49,6 +49,10 @@ if [[ -f .build/jadx/engine.jar ]]; then
     # нотаризация не пропускает — убираем их из копии в бандле.
     zip -q -d "$APP/Contents/Resources/Jadx/jadx.jar" '*.dylib' '*.so' '*.jnilib' > /dev/null || true
 fi
+# Исходники инструментов горячей перезагрузки Unity (см. build-rust.sh).
+if [[ -d .build/rustlyn/unity ]]; then
+    cp -R .build/rustlyn/unity "$APP/Contents/Resources/HotReload"
+fi
 # Встроенные расширения (Extensions/<имя>/extension.json): соглашения
 # проектов, которые приносит эта сборка. В апстриме папки нет — её
 # заводит форк для своей команды.

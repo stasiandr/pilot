@@ -93,6 +93,9 @@ final class Rustlyn: @unchecked Sendable {
     func compile(_ urls: [URL] = []) -> RustlynCompiled? { nil }
     @discardableResult func saveCompilation() -> Bool { false }
     func loadCompilation() -> RustlynCompiled? { nil }
+    func hotStart(tools: [String: String]) -> [String: Any] { [:] }
+    func hotSave(_ saved: [String]) -> [String: Any] { [:] }
+    func hotRebuild() -> [String: Any] { [:] }
     func references(_ url: URL, offset: Int, text: String? = nil) -> RustlynDefinition { RustlynDefinition() }
     func completions(_ url: URL, offset: Int, text: String?) -> RustlynCompletions? { nil }
     func describe(_ url: URL, offset: Int, text: String? = nil) -> String? { nil }

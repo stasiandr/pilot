@@ -453,6 +453,10 @@ struct PilotApp: App {
             Button(showsInspector ? L("Скрыть инспектор") : L("Показать инспектор")) { showsInspector.toggle() }
                 .keyboardShortcut(keys.keyboardShortcut(.toggleInspector))
                 .disabled(workspace.document?.unityFile == nil)
+            Divider()
+            HotReloadMenuItem(hotReload: workspace.unityHotReload) {
+                workspace.unityHotReload.toggle(project: workspace.unity.project, rustlyn: workspace.rustlyn)
+            }
         }
         .disabled(!workspace.unity.isActive)
     }

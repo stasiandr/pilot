@@ -446,6 +446,40 @@ final class Rustlyn: @unchecked Sendable {
                                unchanged: raw.unchanged)
     }
 
+    // MARK: - Горячая перезагрузка Unity
+
+    /// Начать горячую перезагрузку: генераторы по всему `Assembly-CSharp`,
+    /// компиляция с их выводом и сборка, на которой редактор перезагрузится.
+    /// `tools` — пути к `dotnet`, `gend`, `minigen`, `runtime`. Десятки
+    /// секунд — только с фона. Ответ — JSON из `rln_hot_start`.
+    func hotStart(tools: [String: String]) -> [String: Any] {
+        let json = (try? JSONSerialization.data(withJSONObject: tools, options: [.withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) } ?? "{}"
+        return Self.answer(DeepStack.run { json.withCString { rln_hot_start(handle, $0, nil, 0) } })
+    }
+
+    /// Чем оборачивается сохранение `saved` (абсолютные пути): заплатка,
+    /// «ничего не поменялось», «не компилируется», «только перезагрузка».
+    func hotSave(_ saved: [String]) -> [String: Any] {
+        let copies: [UnsafeMutablePointer<CChar>?] = saved.map { strdup($0) }
+        defer { copies.forEach { free($0) } }
+        var pointers: [UnsafePointer<CChar>?] = copies.map { $0.map { UnsafePointer($0) } }
+        return Self.answer(DeepStack.run { pointers.withUnsafeMutableBufferPointer { buffer in
+            rln_hot_save(handle, buffer.baseAddress, buffer.count, nil, 0)
+        } })
+    }
+
+    /// Сборка целиком, чтобы редактор перезагрузился на ней.
+    func hotRebuild() -> [String: Any] {
+        Self.answer(DeepStack.run { rln_hot_rebuild(handle, nil, 0) })
+    }
+
+    private static func answer(_ text: RlnString) -> [String: Any] {
+        defer { rln_text_free(text) }
+        guard let bytes = text.bytes, text.length > 0 else { return [:] }
+        let data = Data(bytes: bytes, count: text.length)
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+    }
+
     /// Все использования имени в позиции `offset` по проекту, вместе с его
     /// объявлениями. `text` — как у `definition`.
     func references(_ url: URL, offset: Int, text: String? = nil) -> RustlynDefinition {
