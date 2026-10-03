@@ -786,9 +786,12 @@ enum HotDiff {
             let sign = line.prefix(1), text = line.dropFirst().trimmingCharacters(in: .whitespaces)
             guard sign == "+" || sign == "-", !text.isEmpty, !text.hasPrefix("//"), !text.hasPrefix("[") else { continue }
             let verb = sign == "+" ? "Added" : "Removed"
+            // Объявление — то, что до тела: тело в той же строке (`{ … ; }`)
+            // методом его не делает и не перестаёт.
+            let head = text.range(of: "{").map { String(text[..<$0.lowerBound]) } ?? text
             if let kind = match(#"\b(class|struct|interface|enum|record)\s+(\w+(?:<[^>]*>)?)"#, text) {
                 found.append("\(verb) \(kind[1]) \(kind[2])")
-            } else if let method = match(#"^(?:(?:public|private|protected|internal|static|virtual|override|async|abstract|sealed|partial|unsafe|extern|new)\s+)*[\w<>\[\],.?]+\s+(\w+)\s*(?:<[^>]*>)?\s*\([^;]*$"#, text),
+            } else if let method = match(#"^(?:(?:public|private|protected|internal|static|virtual|override|async|abstract|sealed|partial|unsafe|extern|new)\s+)*[\w<>\[\],.?]+\s+(\w+)\s*(?:<[^>]*>)?\s*\([^;]*$"#, head),
                       !keywords.contains(method[1]), !text.hasPrefix("return"), !text.hasPrefix("var "), !text.hasPrefix("await") {
                 found.append("\(verb) method \(method[1])")
             } else if let member = match(#"^(?:public|private|protected|internal|static|readonly|const|volatile)\b[^(=]*?\b(\w+)\s*(=|;|\{|=>)"#, text),
@@ -796,8 +799,14 @@ enum HotDiff {
                 found.append("\(verb) \(member[2] == "{" || member[2] == "=>" ? "property" : "field") \(member[1])")
             }
         }
+        // Убранное и добавленное с тем же именем — правка его, не два
+        // объявления.
+        let both = Set(found.filter { $0.hasPrefix("Added ") }.map { $0.dropFirst(6) })
+            .intersection(found.filter { $0.hasPrefix("Removed ") }.map { $0.dropFirst(8) })
         var seen = Set<String>()
-        return found.filter { seen.insert($0).inserted }
+        return found.filter { item in
+            !both.contains(item.hasPrefix("Added ") ? item.dropFirst(6) : item.dropFirst(8)) && seen.insert(item).inserted
+        }
     }
 
     /// Что поменяло сохранение, в несколько слов: добавленные или убранные
