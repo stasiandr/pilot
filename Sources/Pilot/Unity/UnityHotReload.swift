@@ -25,6 +25,8 @@ final class UnityHotReload: ObservableObject {
     }
 
     @Published private(set) var state: State = .off
+    /// Что вышло из последнего сохранения — для строки состояния Pilot.
+    @Published private(set) var lastResult: String?
 
     var isOn: Bool { state == .on }
     var isRunning: Bool { if case .off = state { false } else if case .failed = state { false } else { true } }
@@ -397,6 +399,7 @@ final class UnityHotReload: ObservableObject {
                 guard self.project == project else { return }
                 if outcome.reloaded { self.patched.removeAll() }
                 if outcome.resync { self.foreign = true }
+                if let summary = outcome.summary { self.lastResult = summary }
                 self.patched.formUnion(outcome.patched)
                 self.next()
             }
@@ -409,6 +412,8 @@ final class UnityHotReload: ObservableObject {
         /// Заплатка не легла: в каждой следующей были бы те же методы, и
         /// легли бы так же. Только сборка целиком.
         var resync = false
+        /// Одной строкой для строки состояния: «✓ Метод · 1.1 с».
+        var summary: String?
     }
 
     /// Один круг: заплатка на все сохранения разом, и редактор её берёт.
@@ -439,17 +444,21 @@ final class UnityHotReload: ObservableObject {
                 let title = HotDiff.title(file: files.count == 1 ? files[0] : nil, methods: methods, patched: patched, diff: diff)
                 Probe.event(project, kind: "patch", file: name, title: title,
                             detail: "patched into the running editor — no reload", seconds: took(), diff: diff)
+                outcome.summary = "✓ \(title) · " + L("\(String(format: "%.1f", took())) с")
             } else {
                 Probe.event(project, kind: "failed", file: name, title: "The patch did not apply",
                             detail: String((applied ?? "no answer").prefix(240)), seconds: took(), diff: diff)
+                outcome.summary = "✗ " + L("\(name): заплатка не легла")
                 outcome.resync = true
             }
         case "unchanged":
             Probe.event(project, kind: "same", file: name, title: "Nothing that runs changed",
                         detail: "spacing or comments", seconds: took(), diff: diff)
+            outcome.summary = "· " + L("\(name): ничего не поменялось")
         case "broken":
             Probe.event(project, kind: "broken", file: name, title: "Does not compile yet",
                         detail: reason, seconds: took(), diff: diff)
+            outcome.summary = "✗ " + L("\(name) не компилируется")
         case "reload" where restartOnly:
             Probe.event(project, kind: "deleted", file: name, title: "Needs a restart of Unity",
                         detail: "a file was deleted, so the editor cannot reload in place — " + reason,
@@ -469,6 +478,7 @@ final class UnityHotReload: ObservableObject {
                 outcome.reloaded = true
                 Probe.event(project, kind: "reload", file: name, title: "Reloaded on the new build",
                             detail: reason, seconds: took())
+                outcome.summary = "⟳ " + L("\(name): перезагрузка · \(String(format: "%.0f", took())) с")
             } else {
                 Probe.event(project, kind: "failed", file: name, title: "Unity did not reload",
                             detail: Probe.lastAnswer ?? "no answer", seconds: took())

@@ -551,6 +551,7 @@ struct RootView: View {
             .contentShape(Rectangle())
             .onTapGesture { workspace.unityConsole.isVisible.toggle() }
             .help(unityHelp + "\n" + KeymapStore.shared.help(L("Клик — консоль Unity"), .unityConsole))
+            HotReloadChip(hotReload: workspace.unityHotReload)
         }
     }
 
@@ -1005,6 +1006,33 @@ private struct UnityConsoleSlot: View {
             UnityConsolePanel(console: console) { url, line, column in
                 workspace.openLogLocation(url, line: line, column: column)
             }
+        }
+    }
+}
+
+/// Горячая перезагрузка в строке состояния: идёт ли и чем кончилось
+/// последнее сохранение. Подписана сама — не будит всё окно.
+private struct HotReloadChip: View {
+    @ObservedObject var hotReload: UnityHotReload
+
+    var body: some View {
+        switch hotReload.state {
+        case .off, .failed:
+            EmptyView()
+        case .starting(let step):
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.mini)
+                Text(step).lineLimit(1)
+            }
+        case .on:
+            HStack(spacing: 4) {
+                Image(systemName: "bolt.fill").font(.system(size: 9))
+                    .foregroundStyle(Color(nsColor: Theme.unityEvent))
+                Text(hotReload.lastResult ?? L("Горячая перезагрузка")).lineLimit(1)
+            }
+            .help(L("Горячая перезагрузка Unity: клик — выключить"))
+            .contentShape(Rectangle())
+            .onTapGesture { hotReload.stop() }
         }
     }
 }
