@@ -181,7 +181,8 @@ final class UnityHotReload: ObservableObject {
     }
 
     /// Редактор снова на сборке Pilot: целиком, со всем, что сохранено.
-    private func resync() {
+    /// `why` — what the editor's window says brought the whole build.
+    private func resync(_ why: String = "Unity reloaded on its own build") {
         guard let project, let rustlyn, let runtime = tools?.runtime.path else { return }
         foreign = false
         busy = true
@@ -201,7 +202,7 @@ final class UnityHotReload: ObservableObject {
                 }
                 return
             }
-            Probe.event(project, kind: "reload", title: "Unity reloaded on its own build",
+            Probe.event(project, kind: "reload", title: why,
                         detail: "Pilot's build goes back in, with everything saved")
             let built = rustlyn.hotRebuild()
             var reloaded = false
@@ -472,7 +473,7 @@ final class UnityHotReload: ObservableObject {
                         title: "Many files changed at once", detail: "Pilot builds the project whole and reloads")
             bulk = false
             pending.removeAll()
-            resync()
+            resync("Pilot builds the project whole")
             return
         }
         let round = pending
