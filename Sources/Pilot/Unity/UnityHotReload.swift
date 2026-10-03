@@ -595,7 +595,7 @@ final class UnityHotReload: ObservableObject {
             // write and say nothing of.
             if files.allSatisfy({ $0.contains("/Assets/PilotProbe/") }) { break }
             Probe.event(project, kind: "same", file: name, title: "Not in Assembly-CSharp",
-                        detail: "another assembly's file: Unity compiles it when it refreshes", seconds: took(), diff: diff)
+                        detail: "another assembly's file: Unity compiles it, and it runs once Unity reloads (Play, or hot reload off)", seconds: took(), diff: diff)
             outcome.summary = "· " + L("\(name): не Assembly-CSharp — компилирует Unity")
         default:
             Probe.event(project, kind: "failed", file: name, title: "Hot reload failed", detail: reason, seconds: took(), diff: diff)
