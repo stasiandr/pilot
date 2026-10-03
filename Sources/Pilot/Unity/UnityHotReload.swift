@@ -58,6 +58,13 @@ final class UnityHotReload: ObservableObject {
         }
     }
 
+    /// Окно Pilot Hot Reload в редакторе — открыть или вывести вперёд.
+    func showEditorWindow() {
+        guard let project else { return }
+        Probe.command(project, "hud")
+        Probe.activateEditor(on: project)
+    }
+
     func stop() {
         if isRunning {
             NSLog("[hot] выключено")
@@ -734,6 +741,8 @@ struct HotReloadMenuItem: View {
 
     var body: some View {
         Button(label, action: action)
+        Button(L("Окно горячей перезагрузки в Unity")) { hotReload.showEditorWindow() }
+            .disabled(!hotReload.isOn)
     }
 
     private var label: String {

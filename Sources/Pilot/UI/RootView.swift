@@ -551,7 +551,9 @@ struct RootView: View {
             .contentShape(Rectangle())
             .onTapGesture { workspace.unityConsole.isVisible.toggle() }
             .help(unityHelp + "\n" + KeymapStore.shared.help(L("Клик — консоль Unity"), .unityConsole))
-            HotReloadChip(hotReload: workspace.unityHotReload)
+            HotReloadChip(hotReload: workspace.unityHotReload) {
+                workspace.unityHotReload.toggle(project: workspace.unity.project, rustlyn: workspace.rustlyn)
+            }
         }
     }
 
@@ -1014,11 +1016,22 @@ private struct UnityConsoleSlot: View {
 /// последнее сохранение. Подписана сама — не будит всё окно.
 private struct HotReloadChip: View {
     @ObservedObject var hotReload: UnityHotReload
+    /// Включить снова — после отказа.
+    let retry: () -> Void
 
     var body: some View {
         switch hotReload.state {
-        case .off, .failed:
+        case .off:
             EmptyView()
+        case .failed(let why):
+            HStack(spacing: 4) {
+                Image(systemName: "bolt.slash.fill").font(.system(size: 9))
+                Text(L("Горячая перезагрузка не включилась")).lineLimit(1)
+            }
+            .foregroundStyle(Color(nsColor: Theme.diagnosticError))
+            .help(why + "\n" + L("Клик — попробовать снова"))
+            .contentShape(Rectangle())
+            .onTapGesture(perform: retry)
         case .starting(let step):
             HStack(spacing: 4) {
                 ProgressView().controlSize(.mini)
