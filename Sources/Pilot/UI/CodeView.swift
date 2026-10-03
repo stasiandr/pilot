@@ -883,10 +883,9 @@ final class CodeTextView: NSTextView {
 
     // MARK: Начало строки
 
-    /// ⌘←, ⌘⇧←: к первому непробельному символу строки, повторно — в её
-    /// начало (EditingRules.smartLineStart). Сперва — обычный переход в
-    /// начало строки, потом голова выделения шагает вправо: так NSTextView
-    /// помнит, где якорь, и ⇧→ после этого сужает выделение, а не растит.
+    /// ⌘←: к первому непробельному символу строки, повторно — в её начало
+    /// (EditingRules.smartLineStart). ⌘⇧← — то же для головы выделения,
+    /// см. doCommand.
     override func moveToLeftEndOfLine(_ sender: Any?) {
         let old = selectedRange()
         super.moveToLeftEndOfLine(sender)
@@ -896,34 +895,7 @@ final class CodeTextView: NSTextView {
         }
     }
 
-    override func moveToLeftEndOfLineAndModifySelection(_ sender: Any?) {
-        let old = selectedRange()
-        super.moveToLeftEndOfLineAndModifySelection(sender)
-        let new = selectedRange()
-        let ends = [old.location, NSMaxRange(old)]
-        // Голова — конец нового выделения, которого не было в старом.
-        let head: Int, anchor: Int
-        if new.length == 0 {
-            (head, anchor) = (new.location, new.location)
-        } else if !ends.contains(new.location) {
-            (head, anchor) = (new.location, NSMaxRange(new))
-        } else if !ends.contains(NSMaxRange(new)) {
-            (head, anchor) = (NSMaxRange(new), new.location)
-        } else {
-            // Выделение не изменилось: голова уже в начале строки.
-            let ns = string as NSString
-            let atStart = { (i: Int) in ns.lineRange(for: NSRange(location: i, length: 0)).location == i }
-            (head, anchor) = atStart(NSMaxRange(new)) ? (NSMaxRange(new), new.location) : (new.location, NSMaxRange(new))
-        }
-        let oldHead = old.length == 0 ? old.location : (anchor == old.location ? NSMaxRange(old) : old.location)
-        guard let target = smartLineStart(head: head, from: oldHead), target > head else { return }
-        steppingSelection = true
-        for _ in head..<target - 1 { moveRightAndModifySelection(sender) }
-        steppingSelection = false
-        moveRightAndModifySelection(sender)
-    }
-
-    /// Выделение идёт к цели по шагам: промежуточные смены слушателям не нужны.
+    /// Команда идёт по курсорам: промежуточные смены выделения слушателям не нужны.
     private(set) var steppingSelection = false
 
     /// Куда встать в строке, начало которой `head`, если курсор был на `from`.
@@ -978,8 +950,31 @@ final class CodeTextView: NSTextView {
     /// Все курсоры по порядку в тексте и индекс основного.
     func carets() -> (carets: [Caret], primary: Int) {
         let selection = selectedRange()
-        let primary = primaryCaret.flatMap { $0.range == selection ? $0 : nil } ?? Caret(selection)
+        var primary = primaryCaret.flatMap { $0.range == selection ? $0 : nil } ?? Caret(selection)
+        if primaryCaret?.range != selection, let anchor = selectionAnchor, anchor == NSMaxRange(selection) {
+            primary = Caret(anchor: anchor, head: selection.location)
+        }
         return MultiCaret.merged(extraCarets + [primary], primary: extraCarets.count)
+    }
+
+    /// Где стоит якорь выделения. NSTextView его знает, только пока
+    /// выделение ведут её же стрелки, и снаружи его не задать, поэтому ведём
+    /// сами: выделение меняется, а якорь остаётся одним из его концов —
+    /// значит, он прежний; иначе — тот конец, что не сдвинулся.
+    private var selectionAnchor: Int?
+
+    override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
+        let old = selectedRange()
+        super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        let new = selectedRange()
+        if selectedRanges.count > 1 || new.length == 0 {
+            selectionAnchor = new.location
+        } else if let anchor = selectionAnchor, anchor == new.location || anchor == NSMaxRange(new) {
+            return
+        } else {
+            selectionAnchor = NSMaxRange(new) == NSMaxRange(old) && new.location != old.location
+                ? NSMaxRange(new) : new.location
+        }
     }
 
     func setCarets(_ carets: [Caret], primary: Int) {
@@ -992,6 +987,7 @@ final class CodeTextView: NSTextView {
         extraCarets = others
         primaryCaret = others.isEmpty ? nil : main
         if selectedRange() != main.range { setSelectedRange(main.range) }
+        selectionAnchor = main.anchor
     }
 
     /// Esc, клик, другой файл — остаётся один основной курсор.
@@ -1058,8 +1054,15 @@ final class CodeTextView: NSTextView {
         pendingCarets = nil
         applyingCarets = false
         steppingSelection = false
+        let before = selectedRange()
         setCarets(result, primary: primary)
-        scrollRangeToVisible(selectedRange())
+        // Последний шаг оставил выделение там, где ему и быть: смены не было,
+        // и делегат о ней не узнал бы.
+        if selectedRange() == before {
+            delegate?.textViewDidChangeSelection?(Notification(name: NSTextView.didChangeSelectionNotification, object: self))
+        }
+        let (all, main) = self.carets()
+        scrollRangeToVisible(NSRange(location: all[main].head, length: 0))
     }
 
     /// Команда меню при нескольких курсорах — по каждому. `false` — курсор
@@ -1072,25 +1075,68 @@ final class CodeTextView: NSTextView {
 
     /// Команды с клавиатуры — стрелки, Return, Backspace, Tab — по каждому
     /// курсору; Esc снимает лишние.
+    /// Команды «…AndModifySelection» (⇧ со стрелками, ⌘⇧←, ⌥⇧→) — как в
+    /// Rider: голова уходит той же командой без выделения, якорь стоит, и
+    /// ⌘⇧→ после ⌘⇧← выделение сужает. У NSTextView ⌘⇧←/→ двигают левый и
+    /// правый край, а якорь чужого выделения она не знает вовсе.
     override func doCommand(by selector: Selector) {
-        guard !extraCarets.isEmpty, !applyingCarets else { return super.doCommand(by: selector) }
+        guard !applyingCarets else { return super.doCommand(by: selector) }
+        let name = NSStringFromSelector(selector)
+        let vertical = selector == #selector(moveUp(_:)) || selector == #selector(moveDown(_:))
+            || selector == #selector(moveUpAndModifySelection(_:)) || selector == #selector(moveDownAndModifySelection(_:))
+        if !vertical { verticalGoals = [:] }
+        if name.hasSuffix("AndModifySelection:") {
+            let plain = NSSelectorFromString(String(name.dropLast("AndModifySelection:".count)) + ":")
+            if responds(to: plain) {
+                // Мимо делегата: стрелка без ⇧ при открытом дополнении ходит по списку.
+                forEachCaret(modifiesSelection: true) { _ in
+                    if vertical { moveVertically(up: plain == #selector(moveUp(_:))) } else { _ = perform(plain, with: nil) }
+                }
+                return
+            }
+        }
+        guard !extraCarets.isEmpty else { return super.doCommand(by: selector) }
         if selector == #selector(cancelOperation(_:)) {
             clearExtraCarets()
             return
         }
-        let name = NSStringFromSelector(selector)
-        if name.hasSuffix("AndModifySelection:") {
-            let plain = NSSelectorFromString(String(name.dropLast("AndModifySelection:".count)) + ":")
-            if responds(to: plain) {
-                forEachCaret(modifiesSelection: true) { _ in super.doCommand(by: plain) }
-                return
-            }
+        if vertical {
+            forEachCaret { _ in moveVertically(up: selector == #selector(moveUp(_:))) }
+            return
         }
         if Self.perCaretCommands.contains(where: { name.hasPrefix($0) }) {
             forEachCaret { _ in super.doCommand(by: selector) }
             return
         }
         super.doCommand(by: selector)
+    }
+
+    /// Колонка, в которой начали ход по строкам, — у каждого курсора своя:
+    /// короткая строка по пути её не сбивает.
+    private var verticalGoals: [Int: CGFloat] = [:]
+
+    /// Курсор (без выделения) строкой выше или ниже, в той же колонке; с
+    /// первой строки вверх — в начало текста, с последней вниз — в конец.
+    private func moveVertically(up: Bool) {
+        let selection = selectedRange()
+        let head = up ? selection.location : NSMaxRange(selection)
+        let ns = string as NSString
+        guard let rect = caretRect(at: head) else { return }
+        let x = verticalGoals.removeValue(forKey: head) ?? rect.minX
+        // Первая и последняя строки — по тексту: раскладка ленивая, и её
+        // размеры за видимым — лишь оценка.
+        let line = ns.lineRange(for: NSRange(location: head, length: 0))
+        let target: Int
+        if up && line.location == 0 {
+            target = 0
+        } else if !up && MultiCaret.contentEnd(of: line, in: ns) == NSMaxRange(line) {
+            target = ns.length
+        } else {
+            let y = up ? rect.minY - 1 : rect.maxY + 1
+            target = min(max(characterIndexForInsertion(at: NSPoint(x: x, y: y)), 0), ns.length)
+        }
+        verticalGoals[target] = x
+        setSelectedRange(NSRange(location: target, length: 0))
     }
 
     private static let perCaretCommands = ["move", "delete", "insert", "transpose", "capitalize",
