@@ -125,6 +125,7 @@ final class UnityHotReload: ObservableObject {
         patched.removeAll()
         seen.removeAll()
         deleted = false
+        bulk = false
         editorTimer?.invalidate()
         editorTimer = nil
         foreign = false
@@ -352,6 +353,8 @@ final class UnityHotReload: ObservableObject {
     /// Текст каждого файла, каким его последний раз отдали в круг: по нему
     /// событие ФС после сохранения в Pilot узнаётся как то же сохранение.
     private var seen: [String: String] = [:]
+    /// More files changed at once than patches carry.
+    private var bulk = false
     /// A file was deleted since the editor's build: reloading in place is
     /// no longer safe, only a restart of the editor is.
     private var deleted = false
@@ -401,7 +404,15 @@ final class UnityHotReload: ObservableObject {
     func changedOnDisk(_ paths: [String]) {
         guard let project, isRunning else { return }
         let sources = paths.filter { $0.hasSuffix(".cs") && $0.hasPrefix(project.path + "/Assets/") }
-        guard !sources.isEmpty, sources.count <= 20 else { return }
+        guard !sources.isEmpty else { return }
+        // A branch switched, a replace over the project: no patch carries
+        // that, and reading every file to find out is time thrown away —
+        // the build goes in whole.
+        if sources.count > 50 {
+            bulk = true
+            if isOn { next() }
+            return
+        }
         let fm = FileManager.default
         // Удалён файл проекта, а не временный, через который другой редактор
         // сохраняет атомарно (`.!123!Name.cs`, `Name.cs~`): у файла Unity
@@ -452,13 +463,14 @@ final class UnityHotReload: ObservableObject {
             }
             return
         }
-        guard !busy, !pending.isEmpty, let project, let rustlyn else { return }
+        guard !busy, !pending.isEmpty || bulk, let project, let rustlyn else { return }
         // Many files at once — a branch switched, a replace over the
         // project — is no patch: the build goes in whole.
-        if pending.count > 50 {
-            NSLog("[hot] %d файлов разом: сборка целиком", pending.count)
-            Probe.event(project, kind: "reload", file: "\(pending.count) files",
+        if bulk || pending.count > 50 {
+            NSLog("[hot] много файлов разом: сборка целиком")
+            Probe.event(project, kind: "reload", file: bulk ? "many files" : "\(pending.count) files",
                         title: "Many files changed at once", detail: "Pilot builds the project whole and reloads")
+            bulk = false
             pending.removeAll()
             resync()
             return
