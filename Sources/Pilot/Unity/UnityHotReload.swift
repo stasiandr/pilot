@@ -482,9 +482,14 @@ final class UnityHotReload: ObservableObject {
         let runtime = tools?.runtime.path ?? ""
         let known = patched
         let restartOnly = deleted
+        // Сохранили из другого редактора или Unity впереди: Pilot не активен,
+        // и App Nap отдаёт его потоки эффективным ядрам — круг втрое дольше.
+        // Круг ждут, как ждут нажатия.
+        let activity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Hot reload round")
         work.async { [weak self] in
             let outcome = Self.round(round, project: project, rustlyn: rustlyn, runtime: runtime, patched: known,
                                      restartOnly: restartOnly)
+            ProcessInfo.processInfo.endActivity(activity)
             Task { @MainActor in
                 guard let self else { return }
                 self.busy = false
