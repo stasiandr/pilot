@@ -132,10 +132,43 @@ enum UnityHotReloadTools {
                 try fresh.write(to: to, options: .atomic)
                 if to.pathExtension == "dylib" { installed.plugin = true } else { installed.scripts = true }
             }
+            excludeFromGit(project: project)
             return .success(installed)
         } catch {
             return .failure(Failure(message: "the probe could not be put in the project: \(error.localizedDescription)"))
         }
+    }
+
+    /// Проба — не код проекта: в git её не видно, а коммитить её некому.
+    /// Пишется в локальный `info/exclude` репозитория, не в `.gitignore`:
+    /// ни коллегам, ни в историю это не уходит.
+    static func excludeFromGit(project: URL) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", project.path, "rev-parse", "--show-toplevel", "--git-path", "info/exclude"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return }
+        let lines = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .split(whereSeparator: \.isNewline).map(String.init)
+        process.waitUntilExit()
+        guard process.terminationStatus == 0, lines.count == 2 else { return }
+        let top = URL(fileURLWithPath: lines[0]).standardizedFileURL.path
+        let exclude = lines[1].hasPrefix("/") ? URL(fileURLWithPath: lines[1])
+            : URL(fileURLWithPath: project.path).appendingPathComponent(lines[1])
+        // Where the probe lies, from the repository's root.
+        let assets = project.appendingPathComponent("Assets").standardizedFileURL.path
+        guard assets.hasPrefix(top) else { return }
+        let relative = String(assets.dropFirst(top.count))
+        let wanted = ["\(relative)/PilotProbe/", "\(relative)/PilotProbe.meta"]
+        let existing = (try? String(contentsOf: exclude, encoding: .utf8)) ?? ""
+        let missing = wanted.filter { line in !existing.split(whereSeparator: \.isNewline).contains { $0 == line } }
+        guard !missing.isEmpty else { return }
+        let text = (existing.isEmpty || existing.hasSuffix("\n") ? existing : existing + "\n")
+            + "# Pilot hot reload's probe\n" + missing.joined(separator: "\n") + "\n"
+        try? FileManager.default.createDirectory(at: exclude.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? text.write(to: exclude, atomically: true, encoding: .utf8)
     }
 
     /// `nil` — получилось; иначе хвост вывода.
