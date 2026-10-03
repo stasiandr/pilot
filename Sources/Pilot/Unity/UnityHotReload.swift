@@ -570,7 +570,13 @@ final class UnityHotReload: ObservableObject {
         let started = Date()
         let files = round.keys.sorted()
         let name = files.count == 1 ? (files[0] as NSString).lastPathComponent : "\(files.count) files"
-        let diff = files.flatMap { HotDiff.lines(before: round[$0]!.before, after: round[$0]!.after) }
+        // Правка мимо Pilot файла, которого он ещё не видел: прежний текст —
+        // тот, из которого собран редактор.
+        let diff = files.flatMap { path -> [String] in
+            let (before, after) = round[path]!
+            let known = before != after ? before : rustlyn.hotBaseText(path) ?? before
+            return HotDiff.lines(before: known, after: after)
+        }
         let answer = rustlyn.hotSave(files)
         let kind = answer["kind"] as? String ?? "error"
         let reason = String((answer["reason"] as? String ?? "").replacingOccurrences(of: project.path + "/", with: "").prefix(240))
@@ -588,8 +594,11 @@ final class UnityHotReload: ObservableObject {
             if let applied, applied.hasPrefix("hotpatched"), Self.appliedAll(applied, of: methods.count) {
                 outcome.patched = methods
                 let title = HotDiff.title(file: files.count == 1 ? files[0] : nil, methods: methods, patched: patched, diff: diff)
+                let serialized = HotDiff.serializedFields(diff)
                 Probe.event(project, kind: "patch", file: name, title: title,
-                            detail: "patched into the running editor — no reload", seconds: took(), diff: diff)
+                            detail: "patched into the running editor — no reload"
+                                + (serialized.isEmpty ? "" : "; the Inspector shows \(serialized.joined(separator: ", ")) after a reload"),
+                            seconds: took(), diff: diff)
                 outcome.summary = "✓ \(title) · " + L("\(String(format: "%.1f", took())) с")
             } else {
                 Probe.event(project, kind: "failed", file: name, title: "The patch did not apply",
@@ -840,7 +849,7 @@ enum HotDiff {
     static func declarations(_ diff: [String]) -> [String] {
         var found: [String] = []
         for line in diff {
-            let sign = line.prefix(1), text = line.dropFirst().trimmingCharacters(in: .whitespaces)
+            let sign = line.prefix(1), text = withoutAttributes(line.dropFirst().trimmingCharacters(in: .whitespaces))
             guard sign == "+" || sign == "-", !text.isEmpty, !text.hasPrefix("//"), !text.hasPrefix("[") else { continue }
             let verb = sign == "+" ? "Added" : "Removed"
             // Объявление — то, что до тела: тело в той же строке (`{ … ; }`)
@@ -863,6 +872,31 @@ enum HotDiff {
         var seen = Set<String>()
         return found.filter { item in
             !both.contains(item.hasPrefix("Added ") ? item.dropFirst(6) : item.dropFirst(8)) && seen.insert(item).inserted
+        }
+    }
+
+    /// Строка без атрибутов в начале: `[SerializeField] private int n;` —
+    /// объявление поля, а не строка атрибута.
+    static func withoutAttributes(_ text: String) -> String {
+        var rest = Substring(text)
+        while rest.hasPrefix("[") {
+            var depth = 0
+            guard let end = rest.firstIndex(where: { character in
+                if character == "[" { depth += 1 } else if character == "]" { depth -= 1 }
+                return depth == 0
+            }) else { break }
+            rest = rest[rest.index(after: end)...].drop { $0 == " " || $0 == "\t" }
+        }
+        return String(rest)
+    }
+
+    /// Поля, которые правка добавила с `[SerializeField]`: их Inspector
+    /// увидит только после перезагрузки, на сборке, где они есть.
+    static func serializedFields(_ diff: [String]) -> [String] {
+        diff.compactMap { line -> String? in
+            guard line.hasPrefix("+"), line.contains("SerializeField") else { return nil }
+            let text = withoutAttributes(line.dropFirst().trimmingCharacters(in: .whitespaces))
+            return match(#"^(?:public|private|protected|internal|readonly|\s)*[\w<>\[\],.?]+\s+(\w+)\s*(?:=|;)"#, text)?[1]
         }
     }
 

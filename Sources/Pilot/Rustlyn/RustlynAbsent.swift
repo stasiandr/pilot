@@ -96,6 +96,7 @@ final class Rustlyn: @unchecked Sendable {
     func hotStart(tools: [String: String]) -> [String: Any] { [:] }
     func hotSave(_ saved: [String]) -> [String: Any] { [:] }
     func hotRebuild() -> [String: Any] { [:] }
+    func hotBaseText(_ path: String) -> String? { nil }
     func references(_ url: URL, offset: Int, text: String? = nil) -> RustlynDefinition { RustlynDefinition() }
     func completions(_ url: URL, offset: Int, text: String?) -> RustlynCompletions? { nil }
     func describe(_ url: URL, offset: Int, text: String? = nil) -> String? { nil }

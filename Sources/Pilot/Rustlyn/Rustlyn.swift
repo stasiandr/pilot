@@ -468,6 +468,15 @@ final class Rustlyn: @unchecked Sendable {
         } })
     }
 
+    /// Текст файла, каким его знает сборка, на которой редактор: чем была
+    /// правка, сделанная мимо Pilot.
+    func hotBaseText(_ path: String) -> String? {
+        guard let copy = strdup(path) else { return nil }
+        defer { free(copy) }
+        var pointer: UnsafePointer<CChar>? = UnsafePointer(copy)
+        return Self.answer(rln_hot_base_text(handle, &pointer))["text"] as? String
+    }
+
     /// Сборка целиком, чтобы редактор перезагрузился на ней.
     func hotRebuild() -> [String: Any] {
         Self.answer(DeepStack.run { rln_hot_rebuild(handle, nil, 0) })
