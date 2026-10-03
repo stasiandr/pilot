@@ -8856,6 +8856,31 @@ do {
     check(UnityYAMLFile.serializedField("missing", afterLine: 2, lines: yaml) == nil, "за блок объекта не выходит")
 }
 
+section("Горячая перезагрузка: что поменялось, словами")
+do {
+    // Правка тела: заголовок — метод файла.
+    let body = HotDiff.lines(before: "class A\n{\n    void M()\n    {\n    }\n}\n",
+                             after: "class A\n{\n    void M()\n    {\n        Log(1);\n    }\n}\n")
+    check(body.contains("+    Log(1);") || body.contains("+Log(1);"), "строка правки с плюсом (получено: \(body))")
+    check(HotDiff.title(file: "Assets/A.cs", methods: ["dev.A::M"], patched: [], diff: body) == "A.M", "заголовок — метод")
+    check(HotDiff.title(file: "Assets/A.cs", methods: ["dev.A::.ctor"], patched: [], diff: []) == "A.constructor", "конструктор словом")
+
+    // Поле с атрибутом — объявление, а не строка атрибута.
+    let field = ["+    [SerializeField] private int _count = 5;", "+    [Header(\"x\"), SerializeField] float speed;"]
+    check(HotDiff.declarations(field) == ["Added field _count"], "поле после [SerializeField] (получено: \(HotDiff.declarations(field)))")
+    check(HotDiff.serializedFields(field) == ["_count", "speed"], "сериализуемые поля, и в списке атрибутов")
+    check(HotDiff.withoutAttributes("[A, B(\"]\")] [C] int x;") == "int x;", "атрибуты со скобками внутри строк — до объявления")
+
+    // Объявление, правленное в одну строку с телом, — правка, а не удаление.
+    let oneLine = ["-public A(string g) : base(g) { }", "+public A(string g) : base(g) { Log(g); }"]
+    check(HotDiff.declarations(oneLine).isEmpty, "убранное и добавленное с тем же именем — правка")
+    check(HotDiff.declarations(["+else Foo(x);"]).isEmpty, "вызов в else — не объявление")
+
+    // Новый файл: всё добавлено.
+    let created = HotDiff.lines(before: "", after: "namespace N\n{\n    public static class Helper\n    {\n    }\n}\n")
+    check(HotDiff.declarations(created) == ["Added class Helper"], "новый файл — добавленный класс (получено: \(HotDiff.declarations(created)))")
+}
+
 print("\n════════════════════════════════════")
 print(failures == 0 ? "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (\(checks))" : "ПРОВАЛЕНО \(failures) из \(checks)")
 exit(failures == 0 ? 0 : 1)
