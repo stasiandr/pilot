@@ -52,11 +52,35 @@ final class UnityHotReload: ObservableObject {
 
     func toggle(project info: UnityProjectInfo?, rustlyn: Rustlyn?) {
         if isRunning {
-            if let project { Self.remember(project, on: false) }
+            if let root = project ?? waitingRoot { Self.remember(root, on: false) }
             stop()
         } else if let info, let rustlyn {
             Self.remember(info.root, on: true)
             start(project: info, rustlyn: rustlyn)
+        }
+    }
+
+    private var editorWait: Timer?
+    /// The project waited for, until the editor opens it.
+    private var waitingRoot: URL?
+
+    /// Ждёт, пока проект откроют в Unity, — раз в пять секунд, пока
+    /// перезагрузку не выключили.
+    private func waitForEditor(project info: UnityProjectInfo, rustlyn: Rustlyn) {
+        waitingRoot = info.root
+        editorWait?.invalidate()
+        editorWait = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self, case .starting = self.state, self.project == nil else {
+                    timer.invalidate()
+                    return
+                }
+                guard Probe.editorRunning(on: info.root) else { return }
+                timer.invalidate()
+                self.editorWait = nil
+                self.waitingRoot = nil
+                self.start(project: info, rustlyn: rustlyn)
+            }
         }
     }
 
@@ -94,6 +118,9 @@ final class UnityHotReload: ObservableObject {
         state = .off
         project = nil
         rustlyn = nil
+        editorWait?.invalidate()
+        editorWait = nil
+        waitingRoot = nil
         pending.removeAll()
         patched.removeAll()
         seen.removeAll()
@@ -218,7 +245,9 @@ final class UnityHotReload: ObservableObject {
             return
         }
         guard Probe.editorRunning(on: root) else {
-            state = .failed(L("Сначала откройте проект в Unity"))
+            // Pilot opened before Unity: start once the editor is there.
+            state = .starting(L("ждёт Unity…"))
+            waitForEditor(project: info, rustlyn: rustlyn)
             return
         }
         project = root
