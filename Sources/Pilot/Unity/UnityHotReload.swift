@@ -60,6 +60,22 @@ final class UnityHotReload: ObservableObject {
         }
     }
 
+    /// Включить по просьбе человека: в проект, где пробы ещё нет, — только
+    /// сказав, что Pilot туда положит и что поменяется в Unity.
+    func toggleAsked(project info: UnityProjectInfo?, rustlyn: Rustlyn?) {
+        if !isRunning, let info,
+           !FileManager.default.fileExists(atPath: info.root.appendingPathComponent("Assets/PilotProbe/Editor/PilotProbe.cs").path) {
+            let alert = NSAlert()
+            alert.messageText = L("Включить горячую перезагрузку?")
+            alert.informativeText = L("Pilot положит в проект папку Assets/PilotProbe — пробу для редактора Unity; в git её не видно, она записана в локальный .git/info/exclude. Unity один раз перезагрузится на сборке Pilot. Пока перезагрузка включена, Unity не подхватывает скрипты сама — их приносит Pilot. Если Pilot не появится больше часа, проба удалит себя, и Unity станет прежней.")
+            alert.addButton(withTitle: L("Включить"))
+            alert.addButton(withTitle: L("Отмена"))
+            // Отказ — и в следующий раз проект не включится сам.
+            guard alert.runModal() == .alertFirstButtonReturn else { Self.remember(info.root, on: false); return }
+        }
+        toggle(project: info, rustlyn: rustlyn)
+    }
+
     private var editorWait: Timer?
     /// The project waited for, until the editor opens it.
     private var waitingRoot: URL?

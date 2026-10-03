@@ -553,7 +553,7 @@ struct RootView: View {
             .onTapGesture { workspace.unityConsole.isVisible.toggle() }
             .help(unityHelp + "\n" + KeymapStore.shared.help(L("Клик — консоль Unity"), .unityConsole))
             HotReloadChip(hotReload: workspace.unityHotReload) {
-                workspace.unityHotReload.toggle(project: workspace.unity.project, rustlyn: workspace.rustlyn)
+                workspace.unityHotReload.toggleAsked(project: workspace.unity.project, rustlyn: workspace.rustlyn)
             }
         }
     }

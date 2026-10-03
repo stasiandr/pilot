@@ -1211,13 +1211,17 @@ final class Workspace: ObservableObject {
                         // Компилятор знает больше разбора: проверяем заново.
                         self.scheduleDiagnostics(delay: 0)
                         // Горячая перезагрузка, которую в этом проекте включили и
-                        // не выключали, — сама, как только он скомпилирован;
-                        // `PILOT_HOT_RELOAD=1` — так же, для проверок без рук.
-                        if ProcessInfo.processInfo.environment["PILOT_HOT_RELOAD"] == "1"
-                            || self.unity.project.map { UnityHotReload.remembered($0.root) } == true,
-                           case .off = self.unityHotReload.state {
-                            self.unityHotReload.toggle(project: self.unity.project, rustlyn: rustlyn)
-                            self.scheduleHotReloadSelfTest()
+                        // не выключали, — сама, как только он скомпилирован (а
+                        // если проба ушла из проекта — снова спросив);
+                        // `PILOT_HOT_RELOAD=1` — без вопросов, для проверок без рук.
+                        if case .off = self.unityHotReload.state {
+                            if ProcessInfo.processInfo.environment["PILOT_HOT_RELOAD"] == "1" {
+                                self.unityHotReload.toggle(project: self.unity.project, rustlyn: rustlyn)
+                                self.scheduleHotReloadSelfTest()
+                            } else if self.unity.project.map({ UnityHotReload.remembered($0.root) }) == true {
+                                self.unityHotReload.toggleAsked(project: self.unity.project, rustlyn: rustlyn)
+                                self.scheduleHotReloadSelfTest()
+                            }
                         }
                     } else {
                         self.compiler = .idle
