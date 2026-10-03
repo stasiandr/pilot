@@ -189,6 +189,8 @@ final class UnityHotReload: ObservableObject {
         pending.removeAll()
         let started = Date()
         work.async { [weak self] in
+            let activity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Hot reload: whole build")
+            defer { ProcessInfo.processInfo.endActivity(activity) }
             // Play Mode starts after the reload that compiling for it made:
             // asked of the editor itself, not of what the log said so far.
             let state = Probe.ask(project, "state", answers: ["state"], timeout: 30) ?? ""
@@ -257,6 +259,9 @@ final class UnityHotReload: ObservableObject {
         state = .starting(L("Готовлю инструменты…"))
         // Объект живёт, пока живёт окно: держать его здесь можно.
         work.async { [self] in
+            // Включают и ждут — даже из Unity, когда Pilot позади (см. круг).
+            let activity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Hot reload: starting")
+            defer { ProcessInfo.processInfo.endActivity(activity) }
             let started = Date()
             let say: @Sendable (String) -> Void = { text in
                 Task { @MainActor in
