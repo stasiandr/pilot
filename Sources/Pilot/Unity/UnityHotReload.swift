@@ -499,6 +499,18 @@ final class UnityHotReload: ObservableObject {
         }
     }
 
+    /// Whether the editor put in every method the patch carries — `hotpatched
+    /// N`, and those it skipped on purpose (their type does not initialize in
+    /// the editor). Fewer means a method it could not find: the editor would
+    /// go on running the old code without a word.
+    nonisolated static func appliedAll(_ applied: String, of count: Int) -> Bool {
+        let words = applied.split(separator: " ")
+        guard words.count > 1, let done = Int(words[1]) else { return false }
+        let skipped = applied.range(of: "skipped, their type does not initialize in the editor: ")
+            .map { applied[$0.upperBound...].components(separatedBy: ", ").count } ?? 0
+        return done + skipped >= count
+    }
+
     private struct Outcome: Sendable {
         var patched: [String] = []
         var reloaded = false
@@ -531,8 +543,8 @@ final class UnityHotReload: ObservableObject {
                 break
             }
             let applied = Probe.ask(project, "hotpatch \(assembly)", answers: ["hotpatched", "failed hotpatch"], timeout: 60)
-            if let applied, applied.hasPrefix("hotpatched") {
-                let methods = answer["methods"] as? [String] ?? []
+            let methods = answer["methods"] as? [String] ?? []
+            if let applied, applied.hasPrefix("hotpatched"), Self.appliedAll(applied, of: methods.count) {
                 outcome.patched = methods
                 let title = HotDiff.title(file: files.count == 1 ? files[0] : nil, methods: methods, patched: patched, diff: diff)
                 Probe.event(project, kind: "patch", file: name, title: title,
