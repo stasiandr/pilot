@@ -170,6 +170,7 @@ final class UnityHotReload: ObservableObject {
                 if reloaded {
                     self.patched.removeAll()
                     self.deleted = false
+                    self.startedAt = started
                     // Своё «reloaded» уже прочитано или будет: не «started».
                 }
                 self.onRoundFinished?()
@@ -268,6 +269,7 @@ final class UnityHotReload: ObservableObject {
                 guard self.project == root else { return }
                 self.tools = tools
                 self.lastScan = Date()
+                self.startedAt = started
                 self.state = .on
                 self.patched.removeAll()
                 self.watchEditor(root)
@@ -333,6 +335,9 @@ final class UnityHotReload: ObservableObject {
 
     /// С какого времени пересмотр папки ищет изменённые файлы.
     private var lastScan = Date()
+    /// Когда сборка, на которой редактор, взяла файлы с диска: что
+    /// записано раньше, в ней уже есть.
+    private var startedAt = Date()
 
     /// Файлы поменялись мимо Pilot: другой редактор, скрипт. Переключение
     /// ветки — сотни файлов — заплатками не возят: такое пропускаем.
@@ -361,6 +366,14 @@ final class UnityHotReload: ObservableObject {
             deleted = true
         }
         for path in Set(sources) {
+            // A file not seen yet is news only if its text was written since
+            // hot reload started: cloning the folder, a `touch`, new
+            // permissions send events and leave the content date alone.
+            if seen[path] == nil, pending[path] == nil,
+               let date = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+               date < startedAt {
+                continue
+            }
             guard let text = try? String(contentsOfFile: path, encoding: .utf8), text != seen[path] else { continue }
             let before = pending[path]?.before ?? seen[path] ?? text
             seen[path] = text
@@ -383,6 +396,16 @@ final class UnityHotReload: ObservableObject {
             return
         }
         guard !busy, !pending.isEmpty, let project, let rustlyn else { return }
+        // Many files at once — a branch switched, a replace over the
+        // project — is no patch: the build goes in whole.
+        if pending.count > 50 {
+            NSLog("[hot] %d файлов разом: сборка целиком", pending.count)
+            Probe.event(project, kind: "reload", file: "\(pending.count) files",
+                        title: "Many files changed at once", detail: "Pilot builds the project whole and reloads")
+            pending.removeAll()
+            resync()
+            return
+        }
         let round = pending
         pending.removeAll()
         busy = true
