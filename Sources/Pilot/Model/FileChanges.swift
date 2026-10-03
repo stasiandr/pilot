@@ -7,6 +7,9 @@ struct FileEvent: Equatable {
     /// Файл появился, исчез или переименован, — значит, список файлов проекта
     /// устарел. У простой правки содержимого этого флага нет.
     var structural: Bool
+    /// Система просит пересмотреть всё поддерево: событий не хватило буфера
+    /// или корень переехал.
+    var subtree: Bool = false
 }
 
 /// Что принесла пачка событий.
@@ -34,11 +37,15 @@ enum FileChanges {
     /// склеиваются между собой, и «создан» вместе с «удалён» в одной пачке —
     /// обычное дело, а `exists` говорит, как есть сейчас.
     ///
+    /// `known` — есть ли путь (файл или папка) в списке файлов проекта; без
+    /// него любое создание и удаление считается изменением списка.
+    ///
     /// `ownWrites` — то, что Pilot записал сам. Запись атомарная, через
     /// временный файл и переименование, и системе видна как создание файла;
     /// но список файлов проекта от своего же `⌘S` не меняется.
     static func classify(_ events: [FileEvent], root: URL, ignore: IgnoreMatcher,
                          ownWrites: Set<String> = [],
+                         known: ((String) -> Bool)? = nil,
                          exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) })
         -> FileChangeBatch {
         var batch = FileChangeBatch()
@@ -60,12 +67,18 @@ enum FileChanges {
             }
             guard !isIgnored(rel, ignore) else { continue }
 
+            if event.subtree { batch.needsRescan = true }
             if exists(event.path) {
                 batch.changed.insert(rel)
-                if event.structural, !ownWrites.contains(rel) { batch.needsRescan = true }
+                // Атомарная запись чужого редактора — тоже «создан», но файл,
+                // который уже в списке, списка не меняет.
+                if event.structural, !ownWrites.contains(rel), known?(rel) != true { batch.needsRescan = true }
             } else {
                 batch.removed.insert(rel)
-                batch.needsRescan = true
+                // Временный файл той же записи исчез, не попав в список, —
+                // список тоже прежний. `known` знает и папки: удалённая папка
+                // его меняет.
+                if known?(rel) ?? true { batch.needsRescan = true }
             }
         }
         return batch

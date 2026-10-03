@@ -104,7 +104,8 @@ final class FileWatcher {
         for i in 0..<min(count, list.count) {
             let flag = flags[i]
             events.append(FileEvent(path: list[i],
-                                    structural: flag & (structural | rescanAll) != 0))
+                                    structural: flag & (structural | rescanAll) != 0,
+                                    subtree: flag & rescanAll != 0))
         }
         guard !events.isEmpty else { return }
         Task { @MainActor in box.watcher?.onChange?(events) }

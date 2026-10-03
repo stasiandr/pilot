@@ -3779,6 +3779,30 @@ let fsForeign = FileChanges.classify(
     root: fsRoot, ignore: fsIgnore, ownWrites: ["Assets/Game/Player.cs"], exists: { _ in true })
 check(fsForeign.needsRescan, "чужое появление файла пересобирает список")
 
+// Чужой редактор (и `sed -i`) пишет так же атомарно: файл, который уже в
+// списке, и исчезнувший временный файл, которого в нём не было, список не
+// меняют. Новый файл и удалённая папка — меняют.
+let fsListed: Set<String> = ["Assets", "Assets/Game", "Assets/Game/Player.cs"]
+let fsAtomic = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets/Game/Player.cs", structural: true),
+     FileEvent(path: "/tmp/pilot-fs/Assets/Game/.!123!Player.cs", structural: true)],
+    root: fsRoot, ignore: fsIgnore, known: { fsListed.contains($0) },
+    exists: { $0.hasSuffix("/Player.cs") })
+check(fsAtomic.changed == ["Assets/Game/Player.cs"] && !fsAtomic.needsRescan,
+      "атомарная запись чужого редактора не пересобирает список (получено: \(fsAtomic))")
+let fsListedNew = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets/Game/Enemy.cs", structural: true)],
+    root: fsRoot, ignore: fsIgnore, known: { fsListed.contains($0) }, exists: { _ in true })
+check(fsListedNew.needsRescan, "новый файл пересобирает список и со списком известных")
+let fsFolderGone = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets/Game", structural: true)],
+    root: fsRoot, ignore: fsIgnore, known: { fsListed.contains($0) }, exists: { _ in false })
+check(fsFolderGone.needsRescan, "удалённая папка из списка пересобирает его")
+let fsOverflow = FileChanges.classify(
+    [FileEvent(path: "/tmp/pilot-fs/Assets", structural: true, subtree: true)],
+    root: fsRoot, ignore: fsIgnore, known: { fsListed.contains($0) }, exists: { _ in true })
+check(fsOverflow.needsRescan, "просьба системы пересмотреть поддерево пересобирает список, даже про известную папку")
+
 // Правило про папку, а событие — про файл глубоко внутри неё.
 check(FileChanges.isIgnored("Library/a/b/c.dll", fsIgnore), "правило /Library/ ловит файл внутри")
 check(!FileChanges.isIgnored("Assets/Library.cs", fsIgnore), "похожее имя файла не считается той папкой")

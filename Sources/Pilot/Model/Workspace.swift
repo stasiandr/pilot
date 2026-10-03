@@ -1267,7 +1267,12 @@ final class Workspace: ObservableObject {
         // открытого как `/tmp/…`, путь без симлинков — для открытого через
         // ссылку. Сравнивать их с корнем как он есть — значит счесть все
         // события чужими: ни списка, ни индекса, ни git после checkout.
-        let batch = FileChanges.classify(events, root: watchRoot ?? root, ignore: watchIgnore, ownWrites: ownWrites)
+        // Чужой редактор пишет атомарно — через временный файл и
+        // переименование; список файлов от этого не меняется, и пересобирать
+        // его (134 тыс. файлов — 0,6 с) на каждое сохранение незачем.
+        let known = events.contains(where: \.structural) ? knownPaths() : nil
+        let batch = FileChanges.classify(events, root: watchRoot ?? root, ignore: watchIgnore, ownWrites: ownWrites,
+                                         known: known.map { set in { set.contains($0) } })
         guard !batch.isEmpty else { return }
 
         if batch.gitTouched { git.refresh() }
@@ -1343,6 +1348,25 @@ final class Workspace: ObservableObject {
     /// свои, и повторить их один раз в конце дешевле и честнее, чем угадывать
     /// по каждому событию. Отсюда и задержка побольше, чем у переиндексации, —
     /// распаковка ветки или импорт ассетов идут пачками.
+    /// Файлы списка и папки над ними — для того же списка, пока он не сменился.
+    private var knownCache: (index: ObjectIdentifier, paths: Set<String>)?
+
+    private func knownPaths() -> Set<String>? {
+        guard let index else { return nil }
+        if let knownCache, knownCache.index == ObjectIdentifier(index) { return knownCache.paths }
+        var paths = Set<String>(minimumCapacity: index.display.count * 2)
+        for path in index.display {
+            guard paths.insert(path).inserted else { continue }
+            var folder = Substring(path)
+            while let slash = folder.lastIndex(of: "/") {
+                folder = folder[..<slash]
+                guard paths.insert(String(folder)).inserted else { break }
+            }
+        }
+        knownCache = (ObjectIdentifier(index), paths)
+        return paths
+    }
+
     private func scheduleRescan() {
         guard !rescanScheduled else { return }
         rescanScheduled = true
