@@ -124,6 +124,7 @@ final class UnityHotReload: ObservableObject {
         pending.removeAll()
         patched.removeAll()
         seen.removeAll()
+        madeHere.removeAll()
         deleted = false
         bulk = false
         editorTimer?.invalidate()
@@ -230,6 +231,7 @@ final class UnityHotReload: ObservableObject {
                 self.busy = false
                 if reloaded {
                     self.patched.removeAll()
+                    self.madeHere.removeAll()
                     self.deleted = false
                     self.startedAt = started
                     // Своё «reloaded» уже прочитано или будет: не «started».
@@ -338,6 +340,7 @@ final class UnityHotReload: ObservableObject {
                 self.startedAt = started
                 self.state = .on
                 self.patched.removeAll()
+                self.madeHere.removeAll()
                 self.watchEditor(root)
                 self.next()
             }
@@ -401,6 +404,9 @@ final class UnityHotReload: ObservableObject {
         }
     }
 
+    /// Файлы, появившиеся при включённой перезагрузке и ещё не
+    /// импортированные Unity (без `.meta`).
+    private var madeHere: Set<String> = []
     /// С какого времени пересмотр папки ищет изменённые файлы.
     private var lastScan = Date()
     /// Когда сборка, на которой редактор, взяла файлы с диска: что
@@ -426,8 +432,16 @@ final class UnityHotReload: ObservableObject {
         // сохраняет атомарно (`.!123!Name.cs`, `Name.cs~`): у файла Unity
         // остаётся `.meta` (без автообновления её никто не убирает), или
         // Pilot его уже видел.
-        let gone = Set(sources).filter { path in
-            !fm.fileExists(atPath: path) && !(path as NSString).lastPathComponent.hasPrefix(".")
+        let missing = Set(sources).filter { !fm.fileExists(atPath: $0) }
+        // Made and taken away while hot reload ran: the editor's build never
+        // had its types, nor anything Unity serialized of them.
+        for path in missing where madeHere.contains(path) {
+            madeHere.remove(path)
+            seen[path] = nil
+            pending[path] = nil
+        }
+        let gone = missing.filter { path in
+            !(path as NSString).lastPathComponent.hasPrefix(".")
                 && (fm.fileExists(atPath: path + ".meta") || seen[path] != nil)
         }.sorted()
         if !gone.isEmpty {
@@ -451,7 +465,13 @@ final class UnityHotReload: ObservableObject {
                 continue
             }
             guard let text = try? String(contentsOfFile: path, encoding: .utf8), text != seen[path] else { continue }
-            let before = pending[path]?.before ?? seen[path] ?? text
+            // A file Unity has not imported yet — no `.meta` beside it — was
+            // nothing before. Its creation date says nothing: an atomic save
+            // makes the file anew.
+            let imported = fm.fileExists(atPath: path + ".meta")
+            if !imported, seen[path] == nil { madeHere.insert(path) }
+            let unseen = imported ? text : ""
+            let before = pending[path]?.before ?? seen[path] ?? unseen
             seen[path] = text
             pending[path] = (before, text)
         }
@@ -502,7 +522,7 @@ final class UnityHotReload: ObservableObject {
                 self.busy = false
                 defer { if !self.busy { self.onRoundFinished?() } }
                 guard self.project == project else { return }
-                if outcome.reloaded { self.patched.removeAll() }
+                if outcome.reloaded { self.patched.removeAll(); self.madeHere.removeAll() }
                 if outcome.resync { self.foreign = true }
                 if let summary = outcome.summary { self.lastResult = summary }
                 self.patched.formUnion(outcome.patched)
@@ -534,6 +554,16 @@ final class UnityHotReload: ObservableObject {
     }
 
     /// Один круг: заплатка на все сохранения разом, и редактор её берёт.
+    /// Nothing that runs changed: spacing and comments — or a new type or
+    /// member nothing calls yet, which goes in with the first save that uses it.
+    nonisolated private static func nothingRuns(project: URL, file: String, diff: [String], seconds: TimeInterval) {
+        let added = HotDiff.declarations(diff).filter { $0.hasPrefix("Added ") }
+        Probe.event(project, kind: "same", file: file,
+                    title: added.isEmpty ? "Nothing that runs changed" : added.prefix(3).joined(separator: ", "),
+                    detail: added.isEmpty ? "spacing or comments" : "nothing uses it yet: it goes in with the code that does",
+                    seconds: seconds, diff: diff)
+    }
+
     nonisolated private static func round(_ round: [String: (before: String, after: String)], project: URL,
                                           rustlyn: Rustlyn, runtime: String, patched: Set<String>,
                                           restartOnly: Bool) -> Outcome {
@@ -550,8 +580,7 @@ final class UnityHotReload: ObservableObject {
         switch kind {
         case "patch":
             guard let assembly = answer["assembly"] as? String, !assembly.isEmpty else {
-                Probe.event(project, kind: "same", file: name, title: "Nothing that runs changed",
-                            detail: "spacing or comments", seconds: took(), diff: diff)
+                Self.nothingRuns(project: project, file: name, diff: diff, seconds: took())
                 break
             }
             let applied = Probe.ask(project, "hotpatch \(assembly)", answers: ["hotpatched", "failed hotpatch"], timeout: 60)
@@ -569,8 +598,7 @@ final class UnityHotReload: ObservableObject {
                 outcome.resync = true
             }
         case "unchanged":
-            Probe.event(project, kind: "same", file: name, title: "Nothing that runs changed",
-                        detail: "spacing or comments", seconds: took(), diff: diff)
+            Self.nothingRuns(project: project, file: name, diff: diff, seconds: took())
             outcome.summary = "· " + L("\(name): ничего не поменялось")
         case "broken":
             Probe.event(project, kind: "broken", file: name, title: "Does not compile yet",
