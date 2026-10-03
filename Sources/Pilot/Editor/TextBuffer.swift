@@ -283,7 +283,13 @@ final class TextBuffer: NSObject, NSTextStorageDelegate {
     func save() throws {
         guard !isReadOnly else { return }
         let text = storage.string
-        let data = text.data(using: document.encoding) ?? Data(text.utf8)
+        var data = text.data(using: document.encoding) ?? Data(text.utf8)
+        // Метки UTF-8 нет в тексте, но она была в байтах (Unity пишет её во
+        // все свои .cs): без неё каждое сохранение — дифф в первой строке.
+        let head = try? FileHandle(forReadingFrom: url).read(upToCount: 3)
+        if head == Rename.utf8BOM, !data.starts(with: Rename.utf8BOM) {
+            data = Rename.utf8BOM + data
+        }
         let fm = FileManager.default
         let permissions = (try? fm.attributesOfItem(atPath: url.path))?[.posixPermissions]
         do {

@@ -1218,6 +1218,7 @@ final class Workspace: ObservableObject {
                         if ProcessInfo.processInfo.environment["PILOT_HOT_RELOAD"] == "1",
                            case .off = self.unityHotReload.state {
                             self.unityHotReload.toggle(project: self.unity.project, rustlyn: rustlyn)
+                            self.scheduleHotReloadSelfTest()
                         }
                     } else {
                         self.compiler = .idle
