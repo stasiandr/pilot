@@ -211,10 +211,12 @@ final class UnityHotReload: ObservableObject {
             if built["ok"] as? Bool == true, let assembly = built["assembly"] as? String,
                let answer = Probe.ask(project, "reload \(assembly)", answers: ["reloaded", "failed"], timeout: 1800),
                answer.hasPrefix("reloaded") {
-                _ = Probe.ask(project, "load \(runtime)", answers: ["loaded", "failed"], timeout: 60)
-                // A restarted editor does not hold any more.
                 Probe.touchHeartbeat(project)
-                _ = Probe.ask(project, "hold on", answers: ["hold"], timeout: 30)
+                // A restarted editor has neither the runtime nor the hold.
+                if !Probe.restored(answer) {
+                    _ = Probe.ask(project, "load \(runtime)", answers: ["loaded", "failed"], timeout: 60)
+                    _ = Probe.ask(project, "hold on", answers: ["hold"], timeout: 30)
+                }
                 reloaded = true
                 Probe.event(project, kind: "reload", title: "Back on Pilot's build",
                             detail: "hot reload goes on", seconds: Date().timeIntervalSince(started))
@@ -589,7 +591,9 @@ final class UnityHotReload: ObservableObject {
             Probe.note(project, "⟳ switch to Unity: it reloads once it is in front")
             if let reloaded = Probe.ask(project, "reload \(assembly)", answers: ["reloaded", "failed"], timeout: 1800),
                reloaded.hasPrefix("reloaded") {
-                _ = Probe.ask(project, "load \(runtime)", answers: ["loaded", "failed"], timeout: 60)
+                if !Probe.restored(reloaded) {
+                    _ = Probe.ask(project, "load \(runtime)", answers: ["loaded", "failed"], timeout: 60)
+                }
                 outcome.reloaded = true
                 Probe.event(project, kind: "reload", file: name, title: "Reloaded on the new build",
                             detail: reason, seconds: took())
@@ -698,6 +702,21 @@ enum Probe {
             Thread.sleep(forTimeInterval: 0.03)
         }
         return nil
+    }
+
+    /// Проба после своей перезагрузки сама загрузила то, что в неё
+    /// загружали, и снова держит: каждая команда редактору в фоне ждёт его
+    /// обновления, а это секунды.
+    static func restored(_ reloaded: String) -> Bool {
+        let loads = match(#" loads=(\d+)"#, reloaded).flatMap { Int($0) } ?? 0
+        return loads > 0 && reloaded.contains(" holding=True")
+    }
+
+    private static func match(_ pattern: String, _ text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let found = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(found.range(at: 1), in: text) else { return nil }
+        return String(text[range])
     }
 
     /// Команда, ответа на которую не ждут.
