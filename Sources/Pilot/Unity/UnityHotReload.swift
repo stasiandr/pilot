@@ -589,7 +589,14 @@ final class UnityHotReload: ObservableObject {
                             detail: Probe.lastAnswer ?? "no answer", seconds: took())
             }
         case "outside":
-            break
+            // A file of another assembly — an asmdef's, an Editor folder's:
+            // Unity compiles it itself, and saying nothing would look like
+            // hot reload missing it. The probe's own files are Pilot's to
+            // write and say nothing of.
+            if files.allSatisfy({ $0.contains("/Assets/PilotProbe/") }) { break }
+            Probe.event(project, kind: "same", file: name, title: "Not in Assembly-CSharp",
+                        detail: "another assembly's file: Unity compiles it when it refreshes", seconds: took(), diff: diff)
+            outcome.summary = "· " + L("\(name): не Assembly-CSharp — компилирует Unity")
         default:
             Probe.event(project, kind: "failed", file: name, title: "Hot reload failed", detail: reason, seconds: took(), diff: diff)
         }

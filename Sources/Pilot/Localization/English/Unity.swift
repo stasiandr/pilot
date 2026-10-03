@@ -22,6 +22,7 @@ extension English {
         ("Горячая перезагрузка", "Hot reload"),
         ("Горячая перезагрузка не включилась", "Hot reload did not start"),
         ("ждёт Unity…", "waiting for Unity…"),
+        ("%@: не Assembly-CSharp — компилирует Unity", "%@: not Assembly-CSharp — Unity compiles it"),
         ("Окно горячей перезагрузки в Unity", "Hot Reload Window in Unity"),
         ("Клик — попробовать снова", "Click to try again"),
         ("Готовлю инструменты…", "preparing tools…"),
