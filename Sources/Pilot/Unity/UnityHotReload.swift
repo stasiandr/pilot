@@ -52,10 +52,31 @@ final class UnityHotReload: ObservableObject {
 
     func toggle(project info: UnityProjectInfo?, rustlyn: Rustlyn?) {
         if isRunning {
+            if let project { Self.remember(project, on: false) }
             stop()
         } else if let info, let rustlyn {
+            Self.remember(info.root, on: true)
             start(project: info, rustlyn: rustlyn)
         }
+    }
+
+    // MARK: - Запомнить на следующий запуск
+
+    /// Проекты, где горячую перезагрузку включили и не выключали: при
+    /// следующем открытии она включается сама. Пишется только по клику —
+    /// запись в UserDefaults будит всё окно.
+    private static let rememberedKey = "pilot.unityHotReload.projects"
+
+    static func remembered(_ project: URL) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: rememberedKey) ?? []).contains(project.standardizedFileURL.path)
+    }
+
+    private static func remember(_ project: URL, on: Bool) {
+        let path = project.standardizedFileURL.path
+        var all = UserDefaults.standard.stringArray(forKey: rememberedKey) ?? []
+        guard all.contains(path) != on else { return }
+        if on { all.append(path) } else { all.removeAll { $0 == path } }
+        UserDefaults.standard.set(all, forKey: rememberedKey)
     }
 
     /// Окно Pilot Hot Reload в редакторе — открыть или вывести вперёд.

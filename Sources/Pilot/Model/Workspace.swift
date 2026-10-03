@@ -1213,9 +1213,11 @@ final class Workspace: ObservableObject {
                         self.compiler = .ready(compiled)
                         // Компилятор знает больше разбора: проверяем заново.
                         self.scheduleDiagnostics(delay: 0)
-                        // `PILOT_HOT_RELOAD=1` — горячая перезагрузка сама, как
-                        // только проект скомпилирован: для проверок без рук.
-                        if ProcessInfo.processInfo.environment["PILOT_HOT_RELOAD"] == "1",
+                        // Горячая перезагрузка, которую в этом проекте включили и
+                        // не выключали, — сама, как только он скомпилирован;
+                        // `PILOT_HOT_RELOAD=1` — так же, для проверок без рук.
+                        if ProcessInfo.processInfo.environment["PILOT_HOT_RELOAD"] == "1"
+                            || self.unity.project.map { UnityHotReload.remembered($0.root) } == true,
                            case .off = self.unityHotReload.state {
                             self.unityHotReload.toggle(project: self.unity.project, rustlyn: rustlyn)
                             self.scheduleHotReloadSelfTest()
