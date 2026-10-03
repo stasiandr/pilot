@@ -127,6 +127,121 @@ enum EditingRules {
         return remainder == 0 ? unit : remainder
     }
 
+    // MARK: - Начало строки
+
+    /// ⌘←: куда встать в строке `line` (без перевода строки), если курсор
+    /// на `column`. Сперва к первому непробельному символу, оттуда —
+    /// в самое начало, как Home в Rider и Xcode.
+    static func smartLineStart(_ line: String, column: Int) -> Int {
+        let indent = line.utf16.prefix { $0 == 0x20 || $0 == 0x09 }.count
+        return column == indent ? 0 : indent
+    }
+
+    // MARK: - Вставка
+
+    /// Вставка нескольких строк встаёт на отступ места вставки, сохраняя
+    /// отступы строк друг относительно друга, — как «Reformat on paste:
+    /// indent block» в Rider. Строка с отступом, вставленная после отступа,
+    /// свой теряет. `text` — с переводами строк `\n`; `linePrefix` и
+    /// `lineSuffix` — строка вокруг вставки; `previousLine` — ближайшая
+    /// непустая строка выше; `firstLineIndent` — отступ (в колонках) строки,
+    /// с которой скопирована первая, если Pilot его запомнил при копировании.
+    /// `nil` — вставлять как есть.
+    static func pasteReindented(_ text: String, linePrefix: String, lineSuffix: String,
+                                previousLine: String?, indentUnit: String,
+                                colonOpensBlock: Bool, firstLineIndent: Int? = nil) -> String? {
+        let lines = text.components(separatedBy: "\n")
+        let head = lines[0].drop { $0 == " " || $0 == "\t" }
+        let isBlank = { (s: Substring) in s.allSatisfy { $0 == " " || $0 == "\t" } }
+        let tabWidth = indentUnit == "\t" ? 4 : max(1, indentUnit.count)
+        let width = { (s: Substring) in s.prefix { $0 == " " || $0 == "\t" }.reduce(0) { $0 + ($1 == "\t" ? tabWidth : 1) } }
+
+        // После кода в строке первая строка остаётся как есть.
+        let afterCode = !isBlank(linePrefix[...])
+        if lines.count == 1 {
+            guard !afterCode else { return nil }
+            if !linePrefix.isEmpty || !isBlank(lineSuffix[...]) {
+                return head.count == lines[0].count ? nil : String(head)
+            }
+        }
+
+        // Отступ, на который встаёт вставка.
+        let target: String
+        if afterCode {
+            target = String(linePrefix.prefix { $0 == " " || $0 == "\t" })
+        } else if !linePrefix.isEmpty {
+            target = linePrefix
+        } else {
+            var indent = previousLine.map { String($0.prefix { $0 == " " || $0 == "\t" }) } ?? ""
+            let last = previousLine?.trimmingCharacters(in: .whitespaces).last
+            if last == "{" || last == "(" || last == "[" || (colonOpensBlock && last == ":") { indent += indentUnit }
+            if let first = head.first, first == "}" || first == ")" || first == "]" {
+                indent = String(indent.dropLast(dedentBeforeClosing(linePrefix: indent, indentUnit: indentUnit)))
+            }
+            target = indent
+        }
+        if lines.count == 1 { return target + head == text ? nil : target + head }
+
+        // Отступ блока в источнике: самый малый у строк после первой. Первая
+        // строка без отступа взята с середины строки, и её отступ неизвестен,
+        // если его не запомнили при копировании; если она открывает скобку, а
+        // закрывающей на этом отступе нет, остальные строки — на уровень
+        // глубже неё.
+        let rest = lines.dropFirst().filter { !isBlank($0[...]) }
+        var base = rest.map { width($0[...]) }.min() ?? 0
+        if head.count != lines[0].count, !head.isEmpty {
+            base = min(base, width(lines[0][...]))
+        } else if let firstLineIndent, !head.isEmpty {
+            base = min(base, firstLineIndent)
+        } else if let last = head.trimmingCharacters(in: .whitespaces).last, "{([".contains(last),
+                  !rest.contains(where: { width($0[...]) == base && "})]".contains($0.trimmingCharacters(in: .whitespaces).first ?? " ") }) {
+            base = max(0, base - tabWidth)
+        }
+
+        let render = { (columns: Int) -> String in
+            indentUnit == "\t"
+                ? String(repeating: "\t", count: columns / tabWidth) + String(repeating: " ", count: columns % tabWidth)
+                : String(repeating: " ", count: columns)
+        }
+        var out = [(afterCode ? lines[0] : (linePrefix.isEmpty ? target : "") + head)]
+        for (i, line) in lines.enumerated().dropFirst() {
+            if isBlank(line[...]) {
+                // Последняя пустая — отступ для того, что в строке после вставки.
+                let followed = i == lines.count - 1 && !(lineSuffix.first.map { $0 == " " || $0 == "\t" } ?? true)
+                out.append(followed ? target : "")
+            } else {
+                out.append(target + render(max(0, width(line[...]) - base)) + line.drop { $0 == " " || $0 == "\t" })
+            }
+        }
+        let result = out.joined(separator: "\n")
+        return result == text ? nil : result
+    }
+
+    /// Правка форматтера меняет только отступ: пробелы и табы в начале
+    /// строки (с переводами строк перед ним — без изменения их числа).
+    /// Пробелы между словами, перенос скобок и хвосты строк — мимо: при
+    /// вставке Rider по умолчанию правит одни отступы.
+    static func isIndentEdit(in text: NSString, range: NSRange, replacement: String) -> Bool {
+        guard NSMaxRange(range) <= text.length else { return false }
+        let old = text.substring(with: range)
+        let isSpace = { (c: Character) in c == " " || c == "\t" || c == "\n" || c == "\r" }
+        guard old.allSatisfy(isSpace), replacement.allSatisfy(isSpace),
+              old.filter({ $0 == "\n" }).count == replacement.filter({ $0 == "\n" }).count else { return false }
+        // Кончается правка перед текстом строки, а не перед её концом.
+        let end = NSMaxRange(range)
+        guard end < text.length, ![0x0A, 0x0D, 0x20, 0x09].contains(text.character(at: end)) else { return false }
+        if old.contains("\n") { return true }
+        // Без перевода строки — от начала строки до правки одни пробелы.
+        var i = range.location
+        while i > 0 {
+            let c = text.character(at: i - 1)
+            if c == 0x0A { break }
+            if c != 0x20 && c != 0x09 { return false }
+            i -= 1
+        }
+        return true
+    }
+
     // MARK: - Строки целиком
 
     /// Сдвиг вправо: единица отступа в начало каждой непустой строки.

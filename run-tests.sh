@@ -15,7 +15,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/Sources/coretests"
-cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,AutoPairs,LocalHistory,Tabs,OpenRequest,FileChanges,UnifiedSearch,ContentSearch,NavigationHistory,LineEditing,FoldRegions,SelectionSteps,Rename,Keymap,StatusBarLayout,RiderImport,RiderBundledKeymaps,MediaKind,FBX,Markdown,ProjectPair,DatagramContract,ConfigLinks,PairQueries,ValueFlow,CacheStore,IndexCache,ValueOrigin}.swift "$TMP/Sources/coretests/"
+cp Sources/Pilot/Model/{FuzzyMatch,FileIndex,FileTree,GitIgnore,GitInfo,AtomicCounter,PaletteItem,TypeIndex,DoubleShift,FilePreview,GitFiles,EditingRules,MultiCaret,AutoPairs,LocalHistory,Tabs,OpenRequest,FileChanges,UnifiedSearch,ContentSearch,NavigationHistory,LineEditing,FoldRegions,SelectionSteps,Rename,Keymap,StatusBarLayout,RiderImport,RiderBundledKeymaps,MediaKind,FBX,Markdown,ProjectPair,DatagramContract,ConfigLinks,PairQueries,ValueFlow,CacheStore,IndexCache,ValueOrigin}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Highlight/{Language,Lexer,EditMap,Outline,Occurrences}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/LSP/{JSONRPC,LSPTypes,PositionMapping,ServerConfig,LSPClient,Completion}.swift "$TMP/Sources/coretests/"
 cp Sources/Pilot/Git/{LineDiff,GitParsing,Git,MergeConflicts,GitCommit,GitHistory,Merge3,GitTuning,JSONMerge,ImageDiff}.swift "$TMP/Sources/coretests/"

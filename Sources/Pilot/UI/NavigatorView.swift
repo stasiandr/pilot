@@ -31,7 +31,7 @@ struct NavigatorView: View {
         switch workspace.navigatorTab {
         case .project, .outline: return true
         case .review:            return workspace.isReviewSearchVisible
-        case .recent, .hierarchy, .changes: return false
+        case .hierarchy, .changes: return false
         }
     }
 
@@ -48,7 +48,6 @@ struct NavigatorView: View {
             case .changes: ChangesNavigator(workspace: workspace, commits: workspace.commits)
             case .outline: OutlineList(workspace: workspace)
             case .review:  ReviewNavigator(workspace: workspace)
-            case .recent:  RecentList(workspace: workspace)
             case .hierarchy:
                 if let model = workspace.hierarchy {
                     HierarchyNavigator(workspace: workspace, model: model)
@@ -280,54 +279,5 @@ struct SymbolBadge: View {
             .frame(width: size, height: size)
             .background(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
                 .fill(Color(nsColor: badge.color)))
-    }
-}
-
-// MARK: - Недавние проекты
-
-struct RecentList: View {
-    @ObservedObject var workspace: Workspace
-
-    var body: some View {
-        List {
-            ForEach(workspace.recentRoots, id: \.path) { url in
-                Button {
-                    workspace.openProject(url)
-                    workspace.navigatorTab = .project
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: url == workspace.root ? "folder.fill.badge.gearshape" : "folder.fill")
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(Color(nsColor: Theme.folderIcon.color))
-                            .font(.system(size: 14))
-                            .frame(width: 20)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(url.lastPathComponent)
-                                .font(.system(size: 13, weight: url == workspace.root ? .semibold : .regular))
-                            Text(url.deletingLastPathComponent().path
-                                    .replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                                .truncationMode(.head)
-                        }
-                    }
-                    .padding(.vertical, 2)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-            Button {
-                workspace.promptForFolder()
-            } label: {
-                Label(L("Открыть папку…"), systemImage: "folder.badge.plus")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .padding(.top, 6)
-        }
-        .listStyle(.sidebar)
-        .environment(\.sidebarRowSize, .small)
     }
 }

@@ -49,6 +49,15 @@ extension English {
         ("Вернуть кусок", "Revert"),
         ("Расширить выделение", "Expand Selection"),
         ("Сузить выделение", "Shrink Selection"),
+        ("Несколько курсоров", "Multiple Carets"),
+        ("Открыть панель", "Open Panel"),
+        ("Скрыть панель", "Hide Panel"),
+        ("Выделить следующее вхождение", "Add Selection for Next Occurrence"),
+        ("Снять последнее вхождение", "Unselect Occurrence"),
+        ("Выделить все вхождения", "Select All Occurrences"),
+        ("Курсор строкой выше", "Clone Caret Above"),
+        ("Курсор строкой ниже", "Clone Caret Below"),
+        ("Курсоры в концы строк", "Add Carets to Ends of Selected Lines"),
         ("Документация", "Quick Documentation"),
         ("Параметры вызова", "Parameter Info"),
         ("Свернуть", "Fold"),
@@ -115,7 +124,6 @@ extension English {
         ("Настроить запуск…", "Configure Run…"),
         ("Показать консоль", "Show Console"),
         ("Скрыть консоль", "Hide Console"),
-        ("Цветовая схема", "Color Scheme"),
 
         // Подменю «Правки» и «Вида»
         ("Строки", "Lines"),

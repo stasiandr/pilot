@@ -79,20 +79,3 @@ private struct SchemeCard: View {
         return head + field + method + t("  }\n}", s.punctuation)
     }
 }
-
-/// Вид → Цветовая схема: переключить, не открывая настроек. Семейства —
-/// через черту, без заголовков: имена схем и так говорят, чьи они, а
-/// заголовки секций SwiftUI обносит в меню двойными чертами.
-struct ColorSchemeMenu: View {
-    private let store = ThemeStore.shared
-
-    var body: some View {
-        ForEach(Array(EditorScheme.Family.allCases.enumerated()), id: \.element) { index, family in
-            if index > 0 { Divider() }
-            ForEach(EditorScheme.all.filter { $0.family == family }) { scheme in
-                Toggle(scheme.name, isOn: Binding(get: { store.scheme.id == scheme.id },
-                                                  set: { if $0 { store.select(scheme.id) } }))
-            }
-        }
-    }
-}

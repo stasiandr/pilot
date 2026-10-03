@@ -172,6 +172,12 @@ enum EditorCommand: String, CaseIterable {
     case toggleCase = "edit.toggleCase"
     case extendSelection = "edit.extendSelection"
     case shrinkSelection = "edit.shrinkSelection"
+    case selectNextOccurrence = "edit.selectNextOccurrence"
+    case unselectOccurrence = "edit.unselectOccurrence"
+    case selectAllOccurrences = "edit.selectAllOccurrences"
+    case cloneCaretAbove = "edit.cloneCaretAbove"
+    case cloneCaretBelow = "edit.cloneCaretBelow"
+    case caretsAtLineEnds = "edit.caretsAtLineEnds"
     case quickDocumentation = "edit.quickDocumentation"
     case parameterInfo = "edit.parameterInfo"
     case fold = "edit.fold"
@@ -297,6 +303,12 @@ enum EditorCommand: String, CaseIterable {
         case .toggleCase: return L("Заглавные ↔ строчные")
         case .extendSelection: return L("Расширить выделение")
         case .shrinkSelection: return L("Сузить выделение")
+        case .selectNextOccurrence: return L("Выделить следующее вхождение")
+        case .unselectOccurrence: return L("Снять последнее вхождение")
+        case .selectAllOccurrences: return L("Выделить все вхождения")
+        case .cloneCaretAbove: return L("Курсор строкой выше")
+        case .cloneCaretBelow: return L("Курсор строкой ниже")
+        case .caretsAtLineEnds: return L("Курсоры в концы строк")
         case .quickDocumentation: return L("Документация")
         case .parameterInfo: return L("Параметры вызова")
         case .fold: return L("Свернуть")
@@ -438,6 +450,13 @@ enum EditorCommand: String, CaseIterable {
         case .toggleCase: return Shortcut("u", command: true, shift: true)
         case .extendSelection: return Shortcut("w", control: true)
         case .shrinkSelection: return Shortcut("w", control: true, shift: true)
+        // Как в раскладке Rider для macOS; её ⌃⇧G у Pilot — «Изменённые файлы».
+        case .selectNextOccurrence: return Shortcut("g", control: true)
+        case .unselectOccurrence: return nil
+        case .selectAllOccurrences: return Shortcut("g", command: true, control: true)
+        case .cloneCaretAbove: return Shortcut("up", command: true, option: true, shift: true)
+        case .cloneCaretBelow: return Shortcut("down", command: true, option: true, shift: true)
+        case .caretsAtLineEnds: return Shortcut("g", option: true, shift: true)
         case .quickDocumentation: return Shortcut("j", control: true)
         case .parameterInfo: return Shortcut("space", command: true, shift: true)
         case .fold: return Shortcut("left", command: true, option: true)

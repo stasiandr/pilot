@@ -33,7 +33,13 @@ enum RiderBundledKeymaps {
 keymap	$default
 StepInto	F7
 FindUsages	alt F7
+EditorJoinLines	control shift J
+ReformatCode	control alt L
 FindWordAtCaret	control F3
+SelectNextOccurrence	alt J
+UnselectPreviousOccurrence	alt shift J
+SelectAllOccurrences	control alt shift J
+EditorAddCaretPerSelectedLine	shift alt G
 GotoDeclaration	control B
 GotoClass	control N
 GotoSymbol	control shift alt N
@@ -52,14 +58,18 @@ ExpandAllRegions	control shift ADD	control shift EQUALS
 CollapseRegion	control SUBTRACT	control MINUS
 FindPrevious	shift F3	control shift L
 EditorDuplicate	control D
+EditorToggleCase	control shift U
+GotoLine	control G
 FindInPath	control shift F
 Stop	control F2
 Find	control F	alt F3
 Run	shift F10
+CallHierarchy	control alt H
 GotoImplementation	control alt B
 StepOut	shift F8
 Resume	F9
 EditorDeleteLine	control Y
+ShowErrorDescription	control F1
 MethodDown	alt DOWN
 GotoNextError	F2
 GotoPreviousError	shift F2
@@ -72,6 +82,7 @@ EditorUnSelectWord	control shift W
 ToggleLineBreakpoint	control F8
 MoveLineDown	alt shift DOWN
 MoveLineUp	alt shift UP
+TypeHierarchy	control H
 EditorSelectWord	control W
 StepOver	F8
 SaveAll	control S
@@ -79,11 +90,15 @@ Forward	control alt RIGHT
 CollapseAllRegions	control shift SUBTRACT	control shift MINUS
 ActivateProjectToolWindow	alt 1
 ActivateRunToolWindow	alt 4
+ActivateVersionControlToolWindow	alt 9
 Debug	shift F9
 CommentByLineComment	control SLASH	control DIVIDE
 RenameElement	shift F6
 VcsShowNextChangeMarker	shift control alt DOWN
 VcsShowPrevChangeMarker	shift control alt UP
+NextProjectWindow	control alt CLOSE_BRACKET
+PreviousProjectWindow	control alt OPEN_BRACKET
+ActivateNuGetToolWindow	alt shift 7
 keymap	Mac OS X	$default
 CodeCompletion	control SPACE
 PreviousTab	control LEFT
@@ -91,13 +106,20 @@ QuickJavaDoc	control J
 MethodDown	control DOWN
 MethodUp	control UP
 NextTab	control RIGHT
+TypeHierarchy	control H
 ActivateProjectToolWindow	meta 1
 ActivateRunToolWindow	meta 4
+ActivateVersionControlToolWindow	meta 9
 GotoDeclaration	meta B
+EditorJoinLines	control shift J
 FindNext	F3	control L
 FindPrevious	shift F3	control shift L
+SelectNextOccurrence	control G
+UnselectPreviousOccurrence	control shift G
+SelectAllOccurrences	meta control G
 VcsShowNextChangeMarker	shift control alt DOWN
 VcsShowPrevChangeMarker	shift control alt UP
+CallHierarchy	control alt H
 FindInPath	control shift F
 GotoNextElementUnderCaretUsage	ctrl alt DOWN
 GotoPrevElementUnderCaretUsage	ctrl alt UP
@@ -106,13 +128,17 @@ CodeCompletion	control SPACE
 QuickJavaDoc	F1	control J
 MethodDown	ctrl shift DOWN
 MethodUp	ctrl shift UP
+TypeHierarchy	control H
 ActivateProjectToolWindow	meta 1
 ActivateRunToolWindow	meta 4
+ActivateVersionControlToolWindow	meta 9
 GotoDeclaration	meta B
+EditorJoinLines	control shift J
 FindNext	F3	control L
 FindPrevious	shift F3	control shift L
 VcsShowNextChangeMarker	shift control alt DOWN
 VcsShowPrevChangeMarker	shift control alt UP
+CallHierarchy	control alt H
 EditorSelectWord	alt UP
 EditorUnSelectWord	alt DOWN
 EditorDeleteLine	meta BACK_SPACE
@@ -121,33 +147,46 @@ FindInPath	meta shift F
 Find	meta F
 FindNext	meta G
 FindPrevious	meta shift G
+SelectNextOccurrence	control G
+UnselectPreviousOccurrence	control shift G
+SelectAllOccurrences	meta control G
 Run	control R
 Debug	control D
 Resume	meta alt R	F9
 GotoClass	meta O
 GotoSymbol	meta alt O
 GotoFile	meta shift O
+GotoLine	meta L
 FindWordAtCaret
 PreviousTab	meta shift OPEN_BRACKET	control LEFT
 NextTab	meta shift CLOSE_BRACKET	control RIGHT
 Back	meta OPEN_BRACKET	meta alt LEFT
 Forward	meta CLOSE_BRACKET	meta alt RIGHT
+NextProjectWindow	meta alt BACK_QUOTE
+PreviousProjectWindow	meta shift alt BACK_QUOTE
 GotoNextElementUnderCaretUsage	ctrl alt DOWN
 GotoPrevElementUnderCaretUsage	ctrl alt UP
+ActivateNuGetToolWindow	meta alt 7
 keymap	VSCode OSX	Mac OS X 10.5+
 ActivateProjectToolWindow	shift meta e
 ActivateRunToolWindow	shift meta u
+ActivateVersionControlToolWindow	shift ctrl g
 Back	ctrl minus
+CheckinProject
 EditorUnSelectWord
 CloseProject	meta k, f	meta shift w
 CollapseAllRegions	meta k, meta 0
 CollapseRegion	meta alt open_bracket
 CommentByLineComment	meta k, meta c	meta k, meta u	meta slash
 Debug	f5
+EditorCloneCaretAbove	shift meta alt up	meta alt up
+EditorCloneCaretBelow	shift meta alt down	meta alt down
 EditorDeleteLine	shift meta k
 EditorDuplicate
 EditorDuplicateLines	shift alt down
+EditorJoinLines	ctrl j
 EditorSelectWord	shift ctrl meta right	ctrl shift right
+EditorToggleCase
 EditorUnSelectWord	shift ctrl meta left
 ExpandAllRegions	meta k, meta j
 ExpandRegion	meta alt close_bracket
@@ -159,6 +198,7 @@ GotoClass
 GotoDeclaration	f12
 GotoFile	meta p
 GotoImplementation	meta f12
+GotoLine	ctrl g
 GotoNextError	alt f8
 GotoPreviousError	shift f8	alt shift f8
 GotoSymbol	meta t
@@ -172,26 +212,33 @@ OpenFile	meta o
 ParameterInfo	shift meta space
 PreviousTab	shift meta open_bracket	meta alt left
 QuickJavaDoc	meta k, meta i
+ReformatCode	shift alt f
 RenameElement	f2
 Replace	meta alt f
 Resume	f5
 Run	ctrl f5
 SaveDocument	meta S
 SaveAll	meta alt s
+SelectAllOccurrences	meta f2	ctrl meta g	shift meta l
+SelectNextOccurrence	meta d	meta f3
 ShowIntentionActions	meta period	alt enter
 StepInto	f11	f7
 StepOut	shift f11
 StepOver	f10
 Stop	shift f5
 ToggleLineBreakpoint	f9
+UnselectPreviousOccurrence	meta u
 VcsShowNextChangeMarker	alt f3	alt f5
 VcsShowPrevChangeMarker	shift alt f3	shift alt f5
 EditorDecreaseFontSize	meta minus
 EditorIncreaseFontSize	meta equals
 RecentLocations
+EditorAddCaretPerSelectedLine	shift alt i
+CallHierarchy	shift alt h
 Pause	f6
 SelectInProjectView	meta k, e
 FindUsages	shift alt f12
+NextProjectWindow	ctrl w
 CodeCompletion	meta i	alt ESCAPE	ctrl space
 CloseAllEditorsButActive	meta alt t	meta k, u
 """

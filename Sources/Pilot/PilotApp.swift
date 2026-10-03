@@ -146,6 +146,21 @@ struct PilotApp: App {
                 .keyboardShortcut(keys.keyboardShortcut(.extendSelection))
             Button(L("Сузить выделение")) { Self.editor(#selector(CodeTextView.shrinkSelection(_:))) }
                 .keyboardShortcut(keys.keyboardShortcut(.shrinkSelection))
+            Menu(L("Несколько курсоров")) {
+                Button(L("Выделить следующее вхождение")) { Self.editor(#selector(CodeTextView.selectNextOccurrence(_:))) }
+                    .keyboardShortcut(keys.keyboardShortcut(.selectNextOccurrence))
+                Button(L("Снять последнее вхождение")) { Self.editor(#selector(CodeTextView.unselectOccurrence(_:))) }
+                    .keyboardShortcut(keys.keyboardShortcut(.unselectOccurrence))
+                Button(L("Выделить все вхождения")) { Self.editor(#selector(CodeTextView.selectAllOccurrences(_:))) }
+                    .keyboardShortcut(keys.keyboardShortcut(.selectAllOccurrences))
+                Divider()
+                Button(L("Курсор строкой выше")) { Self.editor(#selector(CodeTextView.cloneCaretAbove(_:))) }
+                    .keyboardShortcut(keys.keyboardShortcut(.cloneCaretAbove))
+                Button(L("Курсор строкой ниже")) { Self.editor(#selector(CodeTextView.cloneCaretBelow(_:))) }
+                    .keyboardShortcut(keys.keyboardShortcut(.cloneCaretBelow))
+                Button(L("Курсоры в концы строк")) { Self.editor(#selector(CodeTextView.addCaretsToLineEnds(_:))) }
+                    .keyboardShortcut(keys.keyboardShortcut(.caretsAtLineEnds))
+            }
             Divider()
             // Уходят первому ответчику — тексту редактора, если фокус в нём.
             Menu(L("Строки")) {
@@ -217,7 +232,7 @@ struct PilotApp: App {
 
     /// Что открыть и куда перейти — по темам, подменю. Настройки окна
     /// (панель над редактором, кнопки тулбара) — в Настройках → Окно,
-    /// здесь их не повторяем.
+    /// цветовая схема — в Настройках → Оформление; здесь их не повторяем.
     @CommandsBuilder
     private var viewCommands: some Commands {
         // Не SidebarCommands: штатный пункт шлёт AppKit'овский toggleSidebar:,
@@ -236,7 +251,9 @@ struct PilotApp: App {
             .keyboardShortcut(keys.keyboardShortcut(.revealInTree))
             .disabled(workspace.openFilePath == nil)
         }
-        CommandGroup(after: .toolbar) {
+        // Вместо штатных пунктов тулбара: «Настроить панель инструментов…» —
+        // в Настройках → Окно и по правому клику на самой панели.
+        CommandGroup(replacing: .toolbar) {
             searchMenu
             navigationMenu
             gitMenu
@@ -250,7 +267,6 @@ struct PilotApp: App {
             Divider()
             tabsMenu
             editorMenu
-            Menu(L("Цветовая схема")) { ColorSchemeMenu() }
         }
     }
 
@@ -340,6 +356,10 @@ struct PilotApp: App {
     private var gitMenu: some View {
         Menu("Git") {
             let noRepository = workspace.git.repository == nil
+            Button(workspace.showsGitPanel ? L("Скрыть панель") : L("Открыть панель")) { workspace.toggleGitPanel() }
+                .keyboardShortcut(keys.keyboardShortcut(.gitLog))
+                .disabled(noRepository)
+            Divider()
             Button(L("Коммит…")) { workspace.openCommitWindow() }
                 .keyboardShortcut(keys.keyboardShortcut(.commit))
                 .disabled(noRepository)
@@ -355,9 +375,6 @@ struct PilotApp: App {
             Divider()
             Button(L("Ветки…")) { workspace.branchPopoverRequest += 1 }
                 .keyboardShortcut(keys.keyboardShortcut(.branches))
-                .disabled(noRepository)
-            Button(workspace.showsGitPanel ? L("Скрыть панель git") : L("Панель git")) { workspace.toggleGitPanel() }
-                .keyboardShortcut(keys.keyboardShortcut(.gitLog))
                 .disabled(noRepository)
             Button(L("История файла или выделения")) { workspace.showCurrentFileHistory() }
                 .keyboardShortcut(keys.keyboardShortcut(.fileHistory))

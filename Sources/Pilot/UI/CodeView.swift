@@ -284,7 +284,13 @@ final class CodeTextView: NSTextView {
             onLens?(lens.target)
             return
         }
+        let flags = event.modifierFlags.intersection([.command, .option, .control])
+        if flags == .option {
+            optionMouseDown(event)
+            return
+        }
         guard event.modifierFlags.contains(.command) else {
+            clearExtraCarets()
             super.mouseDown(with: event)
             return
         }
@@ -370,7 +376,9 @@ final class CodeTextView: NSTextView {
             Theme.currentLine.setFill()
             line.intersection(dirtyRect).intersection(bounds).fill()
         }
+        drawExtraSelections(in: dirtyRect)
         super.draw(dirtyRect)
+        drawExtraCarets(in: dirtyRect)
         drawRemovedLines(in: dirtyRect)
         drawPlaceholders(in: dirtyRect)
         drawInlayHints(in: dirtyRect)
@@ -568,6 +576,11 @@ final class CodeTextView: NSTextView {
 
     /// `}` в пустой строке встаёт под парную `{`, как в Xcode.
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        // Несколько курсоров — набранное в каждый.
+        if !extraCarets.isEmpty, !applyingCarets, !hasMarkedText() {
+            forEachCaret { _ in self.insertText(insertString, replacementRange: NSRange(location: NSNotFound, length: 0)) }
+            return
+        }
         let text = (insertString as? String) ?? (insertString as? NSAttributedString)?.string
         // Только набранное с клавиатуры: вставка из буфера и дополнение
         // приходят сюда же, и их скобки парными делать не надо.
@@ -608,6 +621,7 @@ final class CodeTextView: NSTextView {
 
     /// ⌘/ — закомментировать или раскомментировать строки выделения.
     @objc func toggleLineComment(_ sender: Any?) {
+        if perCaret({ toggleLineComment(sender) }) { return }
         guard let token = lineCommentToken else { NSSound.beep(); return }
         transformSelectedLines { EditingRules.toggleComment($0, token: token) }
     }
@@ -648,10 +662,12 @@ final class CodeTextView: NSTextView {
 
     /// ⌘D, ⌘⌫, ⌥⇧↑, ⌥⇧↓ — из меню, через цепочку ответчиков.
     @objc func duplicateLines(_ sender: Any?) {
+        if perCaret({ duplicateLines(sender) }) { return }
         applyLineEdit(LineEditing.duplicate(string as NSString, selection: selectedRange()))
     }
 
     @objc func deleteLines(_ sender: Any?) {
+        if perCaret({ deleteLines(sender) }) { return }
         applyLineEdit(LineEditing.deleteLines(string as NSString, selection: selectedRange()))
     }
 
@@ -670,46 +686,254 @@ final class CodeTextView: NSTextView {
 
     /// ⌘⇧U — заглавные ↔ строчные: выделение или слово под курсором.
     @objc func toggleCase(_ sender: Any?) {
+        if perCaret({ toggleCase(sender) }) { return }
         applyLineEdit(LineEditing.toggleCase(string as NSString, selection: selectedRange()))
     }
 
-    // MARK: Строка целиком в буфере обмена
+    // MARK: Буфер обмена
 
     /// Метка на скопированной без выделения строке: такая вставляется
     /// целиком над строкой курсора, а не посреди неё — как в Rider и VS Code.
     static let wholeLineType = NSPasteboard.PasteboardType("dev.pilot.whole-line")
+    /// Отступ (в колонках) строки, где начато скопированное выделение:
+    /// первая строка в буфере его обычно не несёт — выделяли от начала кода,
+    /// — а вставке он нужен, чтобы знать отступ блока. Так делает IntelliJ.
+    static let firstLineIndentType = NSPasteboard.PasteboardType("dev.pilot.first-line-indent")
+
+    /// Отступы вставленного по синтаксису — для C# правки форматтера Roslyn,
+    /// как «Fix indents» Rider при вставке. Диапазон — вставленный текст;
+    /// `nil` — язык не тот, остаются отступы EditingRules.pasteReindented.
+    var pasteIndents: ((NSRange) -> [(range: NSRange, text: String)]?)?
 
     /// ⌘C без выделения — вся строка курсора.
     override func copy(_ sender: Any?) {
-        guard selectedRange().length == 0, selectedRanges.count == 1, !string.isEmpty else { return super.copy(sender) }
+        if !extraCarets.isEmpty { return copyCarets(cut: false) }
+        guard selectedRange().length == 0, selectedRanges.count == 1, !string.isEmpty else {
+            let indent = firstLineIndent()
+            super.copy(sender)
+            markFirstLineIndent(indent)
+            return
+        }
         copyWholeLines()
     }
 
     /// ⌘X без выделения — строка уходит в буфер и из текста.
     override func cut(_ sender: Any?) {
-        guard selectedRange().length == 0, selectedRanges.count == 1, !string.isEmpty else { return super.cut(sender) }
+        if !extraCarets.isEmpty { return copyCarets(cut: isEditable) }
+        guard selectedRange().length == 0, selectedRanges.count == 1, !string.isEmpty else {
+            let indent = firstLineIndent()
+            super.cut(sender)
+            markFirstLineIndent(indent)
+            return
+        }
         guard isEditable else { return copy(sender) }
         copyWholeLines()
         applyLineEdit(LineEditing.deleteLines(string as NSString, selection: selectedRange()))
     }
 
+    /// Отступ строки, где начинается выделение, если выделение начато не
+    /// с начала строки: иначе свой отступ первая строка несёт сама.
+    private func firstLineIndent() -> Int? {
+        guard selectedRanges.count == 1 else { return nil }
+        let ns = string as NSString
+        let selection = selectedRange()
+        let line = ns.lineRange(for: NSRange(location: selection.location, length: 0))
+        guard selection.location > line.location else { return nil }
+        let tabWidth = indentUnit == "\t" ? 4 : max(1, indentUnit.count)
+        var width = 0
+        for i in line.location..<NSMaxRange(line) {
+            switch ns.character(at: i) {
+            case 0x20: width += 1
+            case 0x09: width += tabWidth
+            default: return width
+            }
+        }
+        return width
+    }
+
+    private func markFirstLineIndent(_ indent: Int?) {
+        guard let indent else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.addTypes([Self.firstLineIndentType], owner: nil)
+        pasteboard.setString(String(indent), forType: Self.firstLineIndentType)
+    }
+
+    /// ⌘V: вставка встаёт на отступ места вставки (EditingRules.pasteReindented),
+    /// в C# отступы следом правит форматтер. Курсоров несколько, и строк в
+    /// буфере столько же — каждому по строке, иначе каждому всё.
     override func paste(_ sender: Any?) {
         let pasteboard = NSPasteboard.general
-        guard isEditable, selectedRange().length == 0, selectedRanges.count == 1,
-              pasteboard.data(forType: Self.wholeLineType) != nil,
-              var text = pasteboard.string(forType: .string) else { return super.paste(sender) }
+        guard isEditable, !hasMarkedText(), let text = pasteboard.string(forType: .string) else { return super.paste(sender) }
+        let wholeLine = pasteboard.data(forType: Self.wholeLineType) != nil
+        let firstIndent = pasteboard.string(forType: Self.firstLineIndentType).flatMap { Int($0) }
+        if !extraCarets.isEmpty {
+            let pieces = MultiCaret.pieces(text, count: carets().carets.count)
+            forEachCaret { index in
+                if let pieces {
+                    insertPasted(pieces[index], wholeLine: false, firstLineIndent: nil)
+                } else {
+                    insertPasted(text, wholeLine: wholeLine && selectedRange().length == 0, firstLineIndent: firstIndent)
+                }
+            }
+            return
+        }
+        guard selectedRanges.count == 1 else { return super.paste(sender) }
+        insertPasted(text, wholeLine: wholeLine && selectedRange().length == 0, firstLineIndent: firstIndent)
+    }
+
+    /// ⌥⇧⌘V — вставить как есть, без подгонки отступа (Paste Simple в Rider).
+    override func pasteAsPlainText(_ sender: Any?) {
+        super.paste(sender)
+    }
+
+    /// Вставка на месте выделения; `wholeLine` — над строкой курсора.
+    private func insertPasted(_ pasted: String, wholeLine: Bool, firstLineIndent: Int?) {
         let ns = string as NSString
-        let caret = selectedRange().location
-        let line = ns.lineRange(for: NSRange(location: caret, length: 0))
-        // Строка скопирована из другого файла — перевод строки как у этого.
-        text = text.replacingOccurrences(of: "\r\n", with: "\n")
-        if !text.hasSuffix("\n") { text += "\n" }
+        var target = selectedRange()
+        let caret = target.location
+        if wholeLine { target = NSRange(location: ns.lineRange(for: target).location, length: 0) }
+        // Скопировано из другого файла — перевод строки как у этого.
+        var text = pasted.replacingOccurrences(of: "\r\n", with: "\n")
+        if wholeLine, !text.hasSuffix("\n") { text += "\n" }
+        let lineStart = ns.lineRange(for: NSRange(location: target.location, length: 0)).location
+        let afterCode = ns.substring(with: NSRange(location: lineStart, length: target.location - lineStart))
+            .contains { $0 != " " && $0 != "\t" }
+        text = reindented(text, at: target, firstLineIndent: firstLineIndent) ?? text
         if lineEnding != "\n" { text = text.replacingOccurrences(of: "\n", with: lineEnding) }
         breakUndoCoalescing()
-        replace(NSRange(location: line.location, length: 0), with: text)
+        replace(target, with: text)
+        let inserted = fixIndents(in: NSRange(location: target.location, length: (text as NSString).length),
+                                  keepFirstLine: afterCode)
         breakUndoCoalescing()
-        setSelectedRange(NSRange(location: caret + (text as NSString).length, length: 0))
+        setSelectedRange(NSRange(location: wholeLine ? caret + inserted.length : NSMaxRange(inserted), length: 0))
         scrollRangeToVisible(selectedRange())
+    }
+
+    /// Отступы вставленных строк — как скажет `pasteIndents`. Строку, где
+    /// вставка начата после кода, не трогаем: её отступ не наш. Возвращает
+    /// вставленное после правок.
+    private func fixIndents(in range: NSRange, keepFirstLine: Bool) -> NSRange {
+        guard let pasteIndents, range.length > 0, let edits = pasteIndents(range) else { return range }
+        let ns = string as NSString
+        var end = NSMaxRange(range)
+        while end > range.location, [0x0A, 0x0D].contains(ns.character(at: end - 1)) { end -= 1 }
+        let firstLine = ns.lineRange(for: NSRange(location: range.location, length: 0))
+        let from = keepFirstLine ? NSMaxRange(firstLine) : firstLine.location
+        var result = range
+        for edit in edits.sorted(by: { $0.range.location > $1.range.location }) {
+            // Чей это отступ: строки, где правка кончается.
+            let line = ns.lineRange(for: NSRange(location: NSMaxRange(edit.range), length: 0)).location
+            guard line >= from, line <= end, NSMaxRange(edit.range) <= ns.length else { continue }
+            replace(edit.range, with: edit.text)
+            let delta = (edit.text as NSString).length - edit.range.length
+            if edit.range.location >= result.location { result.length += delta } else { result.location += delta }
+        }
+        return result
+    }
+
+    private func reindented(_ text: String, at range: NSRange, firstLineIndent: Int?) -> String? {
+        let ns = string as NSString
+        let start = ns.lineRange(for: NSRange(location: range.location, length: 0))
+        let end = ns.lineRange(for: NSRange(location: NSMaxRange(range), length: 0))
+        var contentEnd = NSMaxRange(end)
+        while contentEnd > NSMaxRange(range), ns.character(at: contentEnd - 1) == 0x0A || ns.character(at: contentEnd - 1) == 0x0D {
+            contentEnd -= 1
+        }
+        // Ближайшая непустая строка выше: по ней отступ в пустой колонке 0.
+        var previous: String?
+        var cursor = start.location
+        while previous == nil, cursor > 0 {
+            let line = ns.lineRange(for: NSRange(location: cursor - 1, length: 0))
+            let body = ns.substring(with: line).trimmingCharacters(in: .newlines)
+            if !body.trimmingCharacters(in: .whitespaces).isEmpty { previous = body }
+            cursor = line.location
+        }
+        return EditingRules.pasteReindented(
+            text,
+            linePrefix: ns.substring(with: NSRange(location: start.location, length: range.location - start.location)),
+            lineSuffix: ns.substring(with: NSRange(location: NSMaxRange(range), length: contentEnd - NSMaxRange(range))),
+            previousLine: previous, indentUnit: indentUnit, colonOpensBlock: colonOpensBlock,
+            firstLineIndent: firstLineIndent)
+    }
+
+    /// ⌘C и ⌘X при нескольких курсорах: выделенное каждым — по строке в
+    /// буфер; без выделений — строки курсоров целиком.
+    private func copyCarets(cut: Bool) {
+        let ns = string as NSString
+        let all = carets().carets
+        let lines = all.allSatisfy(\.isEmpty)
+        let parts = all.map { caret -> String in
+            guard lines else { return ns.substring(with: caret.range) }
+            let line = ns.lineRange(for: NSRange(location: caret.head, length: 0))
+            return ns.substring(with: NSRange(location: line.location,
+                                              length: MultiCaret.contentEnd(of: line, in: ns) - line.location))
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(parts.joined(separator: lineEnding), forType: .string)
+        guard cut else { return }
+        forEachCaret { _ in
+            if lines {
+                self.applyLineEdit(LineEditing.deleteLines(self.string as NSString, selection: self.selectedRange()))
+            } else if self.selectedRange().length > 0 {
+                self.replace(self.selectedRange(), with: "")
+            }
+        }
+    }
+
+    // MARK: Начало строки
+
+    /// ⌘←, ⌘⇧←: к первому непробельному символу строки, повторно — в её
+    /// начало (EditingRules.smartLineStart). Сперва — обычный переход в
+    /// начало строки, потом голова выделения шагает вправо: так NSTextView
+    /// помнит, где якорь, и ⇧→ после этого сужает выделение, а не растит.
+    override func moveToLeftEndOfLine(_ sender: Any?) {
+        let old = selectedRange()
+        super.moveToLeftEndOfLine(sender)
+        let head = selectedRange().location
+        if let target = smartLineStart(head: head, from: old.location), target != head {
+            setSelectedRange(NSRange(location: target, length: 0))
+        }
+    }
+
+    override func moveToLeftEndOfLineAndModifySelection(_ sender: Any?) {
+        let old = selectedRange()
+        super.moveToLeftEndOfLineAndModifySelection(sender)
+        let new = selectedRange()
+        let ends = [old.location, NSMaxRange(old)]
+        // Голова — конец нового выделения, которого не было в старом.
+        let head: Int, anchor: Int
+        if new.length == 0 {
+            (head, anchor) = (new.location, new.location)
+        } else if !ends.contains(new.location) {
+            (head, anchor) = (new.location, NSMaxRange(new))
+        } else if !ends.contains(NSMaxRange(new)) {
+            (head, anchor) = (NSMaxRange(new), new.location)
+        } else {
+            // Выделение не изменилось: голова уже в начале строки.
+            let ns = string as NSString
+            let atStart = { (i: Int) in ns.lineRange(for: NSRange(location: i, length: 0)).location == i }
+            (head, anchor) = atStart(NSMaxRange(new)) ? (NSMaxRange(new), new.location) : (new.location, NSMaxRange(new))
+        }
+        let oldHead = old.length == 0 ? old.location : (anchor == old.location ? NSMaxRange(old) : old.location)
+        guard let target = smartLineStart(head: head, from: oldHead), target > head else { return }
+        steppingSelection = true
+        for _ in head..<target - 1 { moveRightAndModifySelection(sender) }
+        steppingSelection = false
+        moveRightAndModifySelection(sender)
+    }
+
+    /// Выделение идёт к цели по шагам: промежуточные смены слушателям не нужны.
+    private(set) var steppingSelection = false
+
+    /// Куда встать в строке, начало которой `head`, если курсор был на `from`.
+    private func smartLineStart(head: Int, from: Int) -> Int? {
+        let ns = string as NSString
+        let line = ns.lineRange(for: NSRange(location: head, length: 0))
+        guard line.location == head else { return nil }
+        let body = ns.substring(with: line).trimmingCharacters(in: .newlines)
+        let column = from >= line.location && from <= line.location + (body as NSString).length ? from - line.location : -1
+        return line.location + EditingRules.smartLineStart(body, column: column)
     }
 
     private func copyWholeLines() {
@@ -731,6 +955,357 @@ final class CodeTextView: NSTextView {
         breakUndoCoalescing()
         setSelectedRange(edit.selection)
         scrollRangeToVisible(edit.selection)
+    }
+
+    // MARK: Несколько курсоров
+
+    /// Курсоры, кроме основного. Основной — выделение самой NSTextView, он же
+    /// добавлен последним. Пусто — курсор один, и всё идёт как обычно.
+    private(set) var extraCarets: [Caret] = []
+    /// Основной курсор с направлением выделения: у NSTextView только диапазон.
+    private var primaryCaret: Caret?
+    /// Курсоры, пока команда обходит их по очереди: правки сдвигают и их.
+    private var pendingCarets: [Caret]?
+    private var applyingCarets = false
+    /// ⌃G начат со слова под курсором — дальше ищется слово целиком.
+    private var occurrenceWord: NSRange?
+    /// Курсоры, добавленные ⌥⇧⌘↑/↓ подряд, и куда: обратная команда снимает
+    /// последний, как в Rider.
+    private var cloneTrail: (up: Bool, carets: [Caret])?
+
+    var hasExtraCarets: Bool { !extraCarets.isEmpty }
+
+    /// Все курсоры по порядку в тексте и индекс основного.
+    func carets() -> (carets: [Caret], primary: Int) {
+        let selection = selectedRange()
+        let primary = primaryCaret.flatMap { $0.range == selection ? $0 : nil } ?? Caret(selection)
+        return MultiCaret.merged(extraCarets + [primary], primary: extraCarets.count)
+    }
+
+    func setCarets(_ carets: [Caret], primary: Int) {
+        let (merged, index) = MultiCaret.merged(carets, primary: primary)
+        guard !merged.isEmpty else { return }
+        let main = merged[index]
+        var others = merged
+        others.remove(at: index)
+        if !others.isEmpty || !extraCarets.isEmpty { setNeedsDisplay(visibleRect) }
+        extraCarets = others
+        primaryCaret = others.isEmpty ? nil : main
+        if selectedRange() != main.range { setSelectedRange(main.range) }
+    }
+
+    /// Esc, клик, другой файл — остаётся один основной курсор.
+    func clearExtraCarets() {
+        cloneTrail = nil
+        guard !extraCarets.isEmpty else { return }
+        extraCarets = []
+        primaryCaret = nil
+        setNeedsDisplay(visibleRect)
+    }
+
+    private var observesEdits = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard !observesEdits else { return }
+        observesEdits = true
+        NotificationCenter.default.addObserver(self, selector: #selector(storageEdited(_:)),
+                                               name: NSTextStorage.didProcessEditingNotification, object: nil)
+    }
+
+    /// Правки слушаем сами: хранилище у каждого буфера своё и меняется.
+    @objc private func storageEdited(_ notification: Notification) {
+        guard !extraCarets.isEmpty || pendingCarets != nil,
+              let storage = notification.object as? NSTextStorage, storage === textStorage,
+              storage.editedMask.contains(.editedCharacters) else { return }
+        let edited = storage.editedRange
+        shiftCarets(byEditAt: edited.location, from: edited.length - storage.changeInLength, to: edited.length)
+    }
+
+    /// Любая правка текста — набор, ⌘Z, форматирование — сдвигает курсоры.
+    private func shiftCarets(byEditAt location: Int, from: Int, to: Int) {
+        guard !extraCarets.isEmpty || pendingCarets != nil else { return }
+        cloneTrail = nil
+        extraCarets = extraCarets.map { MultiCaret.shift($0, byEditAt: location, from: from, to: to) }
+        primaryCaret = primaryCaret.map { MultiCaret.shift($0, byEditAt: location, from: from, to: to) }
+        pendingCarets = pendingCarets?.map { MultiCaret.shift($0, byEditAt: location, from: from, to: to) }
+        setNeedsDisplay(visibleRect)
+    }
+
+    /// Команда по каждому курсору по очереди, с конца текста, — одним шагом
+    /// ⌘Z. `body` получает индекс курсора в порядке текста и работает с
+    /// выделением NSTextView, как будто курсор один. `modifiesSelection` —
+    /// команда без выделения ведёт голову, якорь стоит (⇧ со стрелками):
+    /// NSTextView сама якорь чужого выделения не знает.
+    private func forEachCaret(modifiesSelection: Bool = false, _ body: (Int) -> Void) {
+        let (carets, primary) = self.carets()
+        pendingCarets = carets
+        applyingCarets = true
+        steppingSelection = true
+        undoManager?.beginUndoGrouping()
+        for index in carets.indices.reversed() {
+            guard let caret = pendingCarets?[index] else { break }
+            breakUndoCoalescing()
+            setSelectedRange(modifiesSelection ? NSRange(location: caret.head, length: 0) : caret.range)
+            body(index)
+            let now = selectedRange()
+            let anchor = pendingCarets?[index].anchor ?? caret.anchor
+            pendingCarets?[index] = modifiesSelection ? Caret(anchor: anchor, head: now.location) : Caret(now)
+        }
+        breakUndoCoalescing()
+        undoManager?.endUndoGrouping()
+        let result = pendingCarets ?? carets
+        pendingCarets = nil
+        applyingCarets = false
+        steppingSelection = false
+        setCarets(result, primary: primary)
+        scrollRangeToVisible(selectedRange())
+    }
+
+    /// Команда меню при нескольких курсорах — по каждому. `false` — курсор
+    /// один, команда идёт обычным путём.
+    private func perCaret(_ command: () -> Void) -> Bool {
+        guard !extraCarets.isEmpty, !applyingCarets else { return false }
+        forEachCaret { _ in command() }
+        return true
+    }
+
+    /// Команды с клавиатуры — стрелки, Return, Backspace, Tab — по каждому
+    /// курсору; Esc снимает лишние.
+    override func doCommand(by selector: Selector) {
+        guard !extraCarets.isEmpty, !applyingCarets else { return super.doCommand(by: selector) }
+        if selector == #selector(cancelOperation(_:)) {
+            clearExtraCarets()
+            return
+        }
+        let name = NSStringFromSelector(selector)
+        if name.hasSuffix("AndModifySelection:") {
+            let plain = NSSelectorFromString(String(name.dropLast("AndModifySelection:".count)) + ":")
+            if responds(to: plain) {
+                forEachCaret(modifiesSelection: true) { _ in super.doCommand(by: plain) }
+                return
+            }
+        }
+        if Self.perCaretCommands.contains(where: { name.hasPrefix($0) }) {
+            forEachCaret { _ in super.doCommand(by: selector) }
+            return
+        }
+        super.doCommand(by: selector)
+    }
+
+    private static let perCaretCommands = ["move", "delete", "insert", "transpose", "capitalize",
+                                           "uppercase", "lowercase"]
+
+    override func selectAll(_ sender: Any?) {
+        clearExtraCarets()
+        super.selectAll(sender)
+    }
+
+    /// ⌃G (⌘D в раскладке VS Code): сперва слово под курсором, потом каждое
+    /// следующее его вхождение — ещё одним курсором с выделением.
+    @objc func selectNextOccurrence(_ sender: Any?) {
+        let ns = string as NSString
+        var (all, primary) = carets()
+        let main = all[primary]
+        if main.isEmpty {
+            guard let word = MultiCaret.word(in: ns, at: main.head) else { NSSound.beep(); return }
+            all[primary] = Caret(word)
+            occurrenceWord = word
+            setCarets(all, primary: primary)
+            return
+        }
+        // Выделено руками — ищем подстроку; со слова — слово целиком.
+        if all.count == 1, occurrenceWord != main.range { occurrenceWord = nil }
+        let needle = ns.substring(with: main.range)
+        guard let next = MultiCaret.nextOccurrence(of: needle, in: ns, after: NSMaxRange(main.range),
+                                                   wholeWord: occurrenceWord != nil,
+                                                   taken: all.map(\.range)) else { NSSound.beep(); return }
+        all.append(Caret(next))
+        setCarets(all, primary: all.count - 1)
+        scrollRangeToVisible(next)
+    }
+
+    /// ⌃⇧G (⌘U в VS Code): снять последнее добавленное вхождение.
+    @objc func unselectOccurrence(_ sender: Any?) {
+        var (all, primary) = carets()
+        guard all.count > 1 else {
+            if !all[0].isEmpty { setSelectedRange(NSRange(location: all[0].head, length: 0)) }
+            return
+        }
+        all.remove(at: primary)
+        // Основным становится добавленный перед ним — обычно он выше по тексту.
+        let previous = (primary - 1 + all.count) % all.count
+        setCarets(all, primary: previous)
+        scrollRangeToVisible(selectedRange())
+    }
+
+    /// ⌃⌘G (⇧⌘L в VS Code): все вхождения выделенного или слова под курсором.
+    @objc func selectAllOccurrences(_ sender: Any?) {
+        let ns = string as NSString
+        let (all, primary) = carets()
+        var main = all[primary].range
+        var wholeWord = occurrenceWord == main
+        if main.length == 0 {
+            guard let word = MultiCaret.word(in: ns, at: main.location) else { NSSound.beep(); return }
+            main = word
+            wholeWord = true
+        }
+        let found = MultiCaret.occurrences(of: ns.substring(with: main), in: ns, wholeWord: wholeWord)
+        guard !found.isEmpty else { NSSound.beep(); return }
+        occurrenceWord = wholeWord ? main : nil
+        setCarets(found.map { Caret($0) }, primary: found.firstIndex(of: main) ?? 0)
+    }
+
+    /// ⌥⇧G (⇧⌥I в VS Code): курсор в конце каждой выделенной строки.
+    @objc func addCaretsToLineEnds(_ sender: Any?) {
+        let selection = carets().carets.count == 1 ? selectedRange() : NSRange(location: NSNotFound, length: 0)
+        guard selection.location != NSNotFound, selection.length > 0 else { NSSound.beep(); return }
+        let ends = MultiCaret.lineEnds(in: string as NSString, selection: selection)
+        guard ends.count > 1 else { NSSound.beep(); return }
+        setCarets(ends, primary: ends.count - 1)
+    }
+
+    /// ⌥⇧⌘↑ и ⌥⇧⌘↓ (⌥⌘↑/↓ в VS Code): ещё курсор строкой выше или ниже
+    /// крайнего. Обратная команда сразу следом снимает добавленный.
+    @objc func cloneCaretAbove(_ sender: Any?) { cloneCaret(up: true) }
+    @objc func cloneCaretBelow(_ sender: Any?) { cloneCaret(up: false) }
+
+    private func cloneCaret(up: Bool) {
+        var (all, primary) = carets()
+        if let trail = cloneTrail, trail.up != up, trail.carets.count > 1, all[primary] == trail.carets.last {
+            all.remove(at: primary)
+            let back = Array(trail.carets.dropLast())
+            let index = all.firstIndex(of: back.last!) ?? all.count - 1
+            setCarets(all, primary: index)
+            cloneTrail = back.count > 1 ? (trail.up, back) : nil
+            scrollRangeToVisible(selectedRange())
+            return
+        }
+        let edge = up ? all.min { $0.head < $1.head }! : all.max { $0.head < $1.head }!
+        guard let clone = MultiCaret.cloned(edge, in: string as NSString, up: up) else { NSSound.beep(); return }
+        let trail = cloneTrail.flatMap { $0.up == up && $0.carets.last == all[primary] ? $0.carets : nil } ?? [all[primary]]
+        all.append(clone)
+        setCarets(all, primary: all.count - 1)
+        cloneTrail = (up, trail + [clone])
+        scrollRangeToVisible(clone.range)
+    }
+
+    /// ⌥-клик (и ⌥⇧-клик) — добавить курсор или убрать тот, что под мышью;
+    /// протяжка с ⌥ — выделение столбцом, по курсору на строку.
+    private func optionMouseDown(_ event: NSEvent) {
+        window?.makeFirstResponder(self)
+        let start = convert(event.locationInWindow, from: nil)
+        var dragged = false
+        while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp { break }
+            let point = convert(next.locationInWindow, from: nil)
+            if !dragged, hypot(point.x - start.x, point.y - start.y) < 3 { continue }
+            dragged = true
+            autoscroll(with: next)
+            let column = columnCarets(from: start, to: point)
+            guard !column.isEmpty else { continue }
+            clearExtraCarets()
+            setCarets(column, primary: point.y >= start.y ? column.count - 1 : 0)
+        }
+        guard !dragged else { return }
+        let index = characterIndexForInsertion(at: start)
+        guard index >= 0, index <= (textStorage?.length ?? 0) else { return }
+        cloneTrail = nil
+        var (all, primary) = carets()
+        if let hit = all.firstIndex(where: { $0.isEmpty ? $0.head == index : NSLocationInRange(index, $0.range) }) {
+            guard all.count > 1 else { return }
+            all.remove(at: hit)
+            setCarets(all, primary: hit == primary ? all.count - 1 : (primary > hit ? primary - 1 : primary))
+        } else {
+            all.append(Caret(at: index))
+            setCarets(all, primary: all.count - 1)
+        }
+    }
+
+    /// Курсоры столбца: на каждой строке от `start` до `end` — от колонки
+    /// одной точки до колонки другой. Короткая строка — курсор в её конце.
+    private func columnCarets(from start: NSPoint, to end: NSPoint) -> [Caret] {
+        guard let layout = layoutManager, let storage = textStorage else { return [] }
+        let ns = storage.string as NSString
+        let first = ns.lineRange(for: NSRange(location: characterIndexForInsertion(at: start), length: 0)).location
+        let last = ns.lineRange(for: NSRange(location: characterIndexForInsertion(at: end), length: 0)).location
+        var result: [Caret] = []
+        var position = min(first, last)
+        while position <= max(first, last) {
+            let line = ns.lineRange(for: NSRange(location: position, length: 0))
+            let rect: NSRect
+            if line.location >= ns.length {
+                rect = layout.extraLineFragmentRect
+            } else {
+                rect = layout.lineFragmentRect(forGlyphAt: layout.glyphIndexForCharacter(at: line.location), effectiveRange: nil)
+            }
+            // Свёрнутые строки высоты не имеют — их пропускаем.
+            if rect.height > 0 {
+                let y = rect.midY + textContainerOrigin.y
+                let contentEnd = MultiCaret.contentEnd(of: line, in: ns)
+                let clamp = { (x: CGFloat) -> Int in
+                    min(max(self.characterIndexForInsertion(at: NSPoint(x: x, y: y)), line.location), contentEnd)
+                }
+                result.append(Caret(anchor: clamp(start.x), head: clamp(end.x)))
+            }
+            guard NSMaxRange(line) > position else { break }
+            position = NSMaxRange(line)
+        }
+        return result
+    }
+
+    /// Где рисовать курсор перед символом `index`; `nil` — он свёрнут.
+    private func caretRect(at index: Int) -> NSRect? {
+        guard let layout = layoutManager, let container = textContainer, let storage = textStorage else { return nil }
+        let length = storage.length
+        let ns = storage.string as NSString
+        let line: NSRect
+        let x: CGFloat
+        if length == 0 || (index >= length && ns.character(at: length - 1) == 0x0A) {
+            line = layout.extraLineFragmentRect
+            x = line.minX + container.lineFragmentPadding
+        } else if index >= length {
+            let glyph = layout.glyphIndexForCharacter(at: length - 1)
+            line = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+            x = layout.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: container).maxX
+        } else {
+            let glyph = layout.glyphIndexForCharacter(at: index)
+            line = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+            x = line.minX + layout.location(forGlyphAt: glyph).x
+        }
+        guard line.height > 0 else { return nil }
+        return NSRect(x: x + textContainerOrigin.x, y: line.minY + textContainerOrigin.y, width: 2, height: line.height)
+    }
+
+    /// Видимые позиции курсора — рисуем только курсоры в них.
+    private func visibleCaretPositions() -> NSRange? {
+        guard let layout = layoutManager, let container = textContainer else { return nil }
+        let glyphs = layout.glyphRange(forBoundingRect: visibleRect.offsetBy(dx: -textContainerOrigin.x,
+                                                                             dy: -textContainerOrigin.y), in: container)
+        let characters = layout.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+        return NSRange(location: characters.location, length: characters.length + 1)
+    }
+
+    /// Выделения лишних курсоров — под текстом, как своё у NSTextView.
+    private func drawExtraSelections(in dirtyRect: NSRect) {
+        guard !extraCarets.isEmpty, let layout = layoutManager, let container = textContainer,
+              let visible = visibleCaretPositions() else { return }
+        ((selectedTextAttributes[.backgroundColor] as? NSColor) ?? .selectedTextBackgroundColor).setFill()
+        for caret in extraCarets where !caret.isEmpty && NSIntersectionRange(caret.range, visible).length > 0 {
+            let glyphs = layout.glyphRange(forCharacterRange: caret.range, actualCharacterRange: nil)
+            layout.enumerateEnclosingRects(forGlyphRange: glyphs, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                                           in: container) { rect, _ in
+                rect.offsetBy(dx: self.textContainerOrigin.x, dy: self.textContainerOrigin.y).intersection(dirtyRect).fill()
+            }
+        }
+    }
+
+    private func drawExtraCarets(in dirtyRect: NSRect) {
+        guard !extraCarets.isEmpty, let visible = visibleCaretPositions() else { return }
+        insertionPointColor.setFill()
+        for caret in extraCarets where NSLocationInRange(caret.head, visible) {
+            if let rect = caretRect(at: caret.head), rect.intersects(dirtyRect) { rect.fill() }
+        }
     }
 
     // MARK: Расширение выделения
@@ -1323,6 +1898,10 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     var selectionSteps: ((NSRange) -> [NSRange]?)? {
         didSet { if isViewLoaded { textView.selectionSteps = selectionSteps } }
     }
+    /// Отступы вставленного по синтаксису — для C#.
+    var pasteIndents: ((NSRange) -> [(range: NSRange, text: String)]?)? {
+        didSet { if isViewLoaded { textView.pasteIndents = pasteIndents } }
+    }
 
     private let scrollView = CodeScrollView()
     private var textView: CodeTextView!
@@ -1454,6 +2033,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         textView.onFoldCommand = { [weak self] command in self?.fold(command) }
         textView.onLens = { [weak self] target in self?.onLensClick?(target) }
         textView.selectionSteps = selectionSteps
+        textView.pasteIndents = pasteIndents
         textView.textMenuActions = textMenuActions
         textView.onUserInput = { [weak self] in self?.cancelLanding() }
         scrollView.onUserScroll = { [weak self] in self?.cancelLanding() }
@@ -1561,6 +2141,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
         hideCompletion()
         closePopover()
         commandHovered(nil)   // слово под мышью было в прежнем тексте
+        textView.clearExtraCarets()
         self.buffer = buffer
         painted = nil
         unpainted = nil
@@ -1996,6 +2577,7 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     // MARK: - Курсор и правки
 
     func textViewDidChangeSelection(_ notification: Notification) {
+        if textView.steppingSelection { return }
         if textView.updateCurrentLineHighlight() { ruler?.needsDisplay = true }
         if let model {
             ruler?.currentLine = model.line(containing: min(textView.selectedRange().location,
@@ -2098,7 +2680,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     private func suggestionAfterEdit(_ input: String?) {
         editGeneration += 1
         suggestionTask?.cancel()
-        guard let input, requestSuggestion != nil else {
+        // Курсоров несколько — серый текст был бы лишь у одного.
+        guard let input, requestSuggestion != nil, !textView.hasExtraCarets else {
             dropGhost()
             return
         }
@@ -2360,6 +2943,8 @@ final class CodeViewController: NSViewController, NSTextViewDelegate {
     }
 
     private func completionAfterEdit(_ input: String?) {
+        // Курсоров несколько — дополнение досталось бы лишь одному.
+        if textView.hasExtraCarets { hideCompletion(); return }
         // Скобка и запятая открывают подсказку параметров; закрывающая —
         // переспрашивает: курсор мог выйти во внешний вызов или из всех.
         if let input, input.hasSuffix("(") || input.hasSuffix(",") || (info.isSignatureHelp && input.hasSuffix(")")) {
@@ -4394,6 +4979,7 @@ struct CodeView: NSViewControllerRepresentable {
     var requestDocumentation: ((Int) async -> RustlynDocumentation?)? = nil
     var requestSignatures: ((Int) async -> RustlynSignatures?)? = nil
     var selectionSteps: ((NSRange) -> [NSRange]?)? = nil
+    var pasteIndents: ((NSRange) -> [(range: NSRange, text: String)]?)? = nil
 
     func makeNSViewController(context: Context) -> CodeViewController {
         let controller = CodeViewController()
@@ -4427,6 +5013,7 @@ struct CodeView: NSViewControllerRepresentable {
         controller.requestDocumentation = requestDocumentation
         controller.requestSignatures = requestSignatures
         controller.selectionSteps = selectionSteps
+        controller.pasteIndents = pasteIndents
         controller.onLensClick = onLensClick
         // «.» — всегда: и без сервера после точки ждёшь список членов.
         controller.completionTriggers = Set(completionTriggers).union(["."])

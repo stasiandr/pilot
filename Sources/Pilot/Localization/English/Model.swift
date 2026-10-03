@@ -96,7 +96,6 @@ extension English {
 
         // Workspace.swift
         ("Проект", "Project"),
-        ("Недавние проекты", "Recent Projects"),
         ("Открыть", "Open"),
         ("Выберите папку проекта или архив: APK, AAB, JAR, AAR, DEX", "Choose a project folder or an archive: APK, AAB, JAR, AAR, DEX"),
         ("%@ изменён на диске — несохранённые правки остались в редакторе", "%@ changed on disk — your unsaved edits are still in the editor"),

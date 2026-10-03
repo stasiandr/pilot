@@ -179,7 +179,7 @@ final class Workspace: ObservableObject {
     // MARK: Навигатор
 
     enum NavigatorTab: Hashable, CaseIterable {
-        case project, changes, outline, review, recent, hierarchy
+        case project, changes, outline, review, hierarchy
 
         var icon: String {
             switch self {
@@ -187,7 +187,6 @@ final class Workspace: ObservableObject {
             case .changes: return "plusminus.circle"
             case .outline: return "list.bullet.indent"
             case .review:  return "arrow.triangle.pull"
-            case .recent:  return "clock"
             case .hierarchy: return "list.bullet.below.rectangle"
             }
         }
@@ -198,7 +197,6 @@ final class Workspace: ObservableObject {
             case .changes: return "plusminus.circle.fill"
             case .outline: return "list.bullet.indent"
             case .review:  return "arrow.triangle.pull"
-            case .recent:  return "clock.fill"
             case .hierarchy: return "list.bullet.below.rectangle"
             }
         }
@@ -209,7 +207,6 @@ final class Workspace: ObservableObject {
             case .changes: return L("Изменения и коммит")
             case .outline: return L("Структура файла")
             case .review:  return L("Ревью мерж-реквестов")
-            case .recent:  return L("Недавние проекты")
             case .hierarchy: return L("Иерархия")
             }
         }
@@ -4207,6 +4204,20 @@ final class Workspace: ObservableObject {
     func selectionSteps(around selection: NSRange) -> [NSRange]? {
         guard let buffer, Rustlyn.understands(buffer.url), let rustlyn = rustlyn else { return nil }
         return rustlyn.selectionRanges(buffer.url, selection: selection, text: buffer.model.text)
+    }
+
+    /// Отступы вставленного кода по правилам Roslyn и `.editorconfig` —
+    /// «Fix indents» Rider при вставке: из правок форматтера только те, что
+    /// меняют пробелы в начале строк. Только разбор, миллисекунды. `nil` — не C#.
+    func pasteIndents(in range: NSRange) -> [(range: NSRange, text: String)]? {
+        guard let buffer, !buffer.isReadOnly, Rustlyn.understands(buffer.url), let rustlyn = rustlyn else { return nil }
+        let url = buffer.url, text = buffer.model.text
+        guard let result = rustlyn.formatRange(url, range: range, text: text) else { return nil }
+        let ns = text as NSString
+        return result.edits
+            .filter { $0.url.standardizedFileURL == url.standardizedFileURL
+                && EditingRules.isIndentEdit(in: ns, range: $0.range, replacement: $0.text) }
+            .map { (range: $0.range, text: $0.text) }
     }
 
     /// ⇧F6 — имя под курсором и все его использования по проекту.

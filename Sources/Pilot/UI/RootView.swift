@@ -223,7 +223,8 @@ struct RootView: View {
                          onLensClick: { workspace.findReferences(at: $0) },
                          requestDocumentation: { offset in await workspace.documentation(at: offset) },
                          requestSignatures: { offset in await workspace.signatures(at: offset) },
-                         selectionSteps: { selection in workspace.selectionSteps(around: selection) })
+                         selectionSteps: { selection in workspace.selectionSteps(around: selection) },
+                         pasteIndents: { range in workspace.pasteIndents(in: range) })
             }
         } else if workspace.root == nil {
             StartView(workspace: workspace)
@@ -286,8 +287,8 @@ struct RootView: View {
 
     // MARK: - Тулбар
 
-    /// Тулбар настраивается, как в Finder: «Вид → Настроить панель
-    /// инструментов…» или правый клик по нему. У каждого элемента свой id —
+    /// Тулбар настраивается, как в Finder: правый клик по нему или
+    /// Настройки → Окно → «Кнопки на панели». У каждого элемента свой id —
     /// по нему macOS помнит раскладку. Кнопки, которым сейчас нечего делать
     /// (▶ без целей, Markdown не в .md), просто исчезают, и тулбар сдвигается.
     @ToolbarContentBuilder

@@ -3105,6 +3105,79 @@ check(EditingRules.backspaceWidth(linePrefix: "      ", indentUnit: "    ") == 2
 check(EditingRules.backspaceWidth(linePrefix: "        ", indentUnit: "    ") == 4, "backspace — целый уровень")
 check(EditingRules.backspaceWidth(linePrefix: "  x", indentUnit: "    ") == 1, "backspace после кода — один символ")
 
+check(EditingRules.smartLineStart("    foo();", column: 10) == 4, "⌘← сперва к началу кода")
+check(EditingRules.smartLineStart("    foo();", column: 4) == 0, "⌘← от начала кода — в начало строки")
+check(EditingRules.smartLineStart("    foo();", column: 0) == 4, "⌘← из начала строки — снова к коду")
+check(EditingRules.smartLineStart("foo();", column: 3) == 0, "⌘← без отступа — в начало")
+
+func pasted(_ text: String, _ prefix: String, _ suffix: String = "", prev: String? = nil, unit: String = "    ") -> String? {
+    EditingRules.pasteReindented(text, linePrefix: prefix, lineSuffix: suffix, previousLine: prev,
+                                 indentUnit: unit, colonOpensBlock: false)
+}
+check(pasted("    foo();", "        ") == "foo();", "строка с отступом после отступа его теряет")
+check(pasted("foo();", "        ") == nil, "строка без отступа — как есть")
+check(pasted("  x", "a = ") == nil, "после кода строка — как есть")
+check(pasted("foo();", "", prev: "    if (x) {") == "        foo();", "в пустой колонке 0 — отступ по строке выше")
+check(pasted("        a();\n        b();\n", "    ") == "a();\n    b();\n", "строки целиком — на отступ места вставки")
+check(pasted("a();\n            if (x) {\n                b();\n            }", "    ") == "a();\n    if (x) {\n        b();\n    }",
+      "начато с кода: отступы остальных относительно друг друга")
+check(pasted("if (x) {\n            b();\n        }", "    ") == "if (x) {\n        b();\n    }", "первая строка открывает блок")
+check(pasted("foo(\n            a,\n            b)", "    ") == "foo(\n        a,\n        b)",
+      "продолжение скобки — на уровень глубже первой строки")
+check(pasted("\t\ta();\n\t\t\tb();\n", "", "    }", prev: "    if (x) {") == "        a();\n            b();\n",
+      "табы в пробелы, над строкой с отступом последний перевод без отступа")
+check(pasted("a();\n    b();\n", "    ", "c();") == "a();\n    b();\n    ", "после вставки текст строки встаёт на отступ")
+check(pasted("    a();\n\n    b();", "\t", unit: "\t") == "a();\n\n\tb();", "пустые строки без хвостовых пробелов")
+check(pasted("}\n", "", prev: "        x();", unit: "    ") == "    }\n", "закрывающая скобка — на уровень мельче")
+
+check(EditingRules.pasteReindented("Foo(new A {\n            B = 1,\n        });", linePrefix: "    ", lineSuffix: "",
+                                   previousLine: nil, indentUnit: "    ", colonOpensBlock: false, firstLineIndent: 8)
+      == "Foo(new A {\n        B = 1,\n    });", "отступ первой строки запомнен при копировании")
+let indentText = "class A {\n  void F() {\nx = a+b;\n  }\n}" as NSString
+check(EditingRules.isIndentEdit(in: indentText, range: NSRange(location: 23, length: 0), replacement: "        "),
+      "отступ перед кодом — правка отступа")
+check(EditingRules.isIndentEdit(in: indentText, range: NSRange(location: 22, length: 1), replacement: "\n        "),
+      "отступ вместе с переводом строки — тоже")
+check(!EditingRules.isIndentEdit(in: indentText, range: NSRange(location: 28, length: 0), replacement: " "),
+      "пробелы между словами — нет")
+check(!EditingRules.isIndentEdit(in: indentText, range: NSRange(location: 9, length: 1), replacement: "\n\n"),
+      "лишний перевод строки — нет")
+
+// ────────────────────────── Несколько курсоров ──────────────────────────
+section("Несколько курсоров")
+
+let mc = MultiCaret.merged([Caret(at: 5), Caret(at: 1), Caret(at: 5), Caret(anchor: 8, head: 3)], primary: 1)
+check(mc.carets == [Caret(at: 1), Caret(anchor: 8, head: 3)] && mc.primary == 0, "совпавшие и пересекающиеся сливаются (получено \(mc))")
+let mc2 = MultiCaret.merged([Caret(at: 9), Caret(at: 2)], primary: 0)
+check(mc2.carets == [Caret(at: 2), Caret(at: 9)] && mc2.primary == 1, "основной остаётся основным после сортировки")
+check(MultiCaret.shift(10, byEditAt: 3, from: 2, to: 5) == 13, "правка выше сдвигает курсор")
+check(MultiCaret.shift(2, byEditAt: 3, from: 2, to: 5) == 2, "правка ниже не трогает")
+check(MultiCaret.shift(4, byEditAt: 3, from: 2, to: 0) == 3, "стёртый вокруг курсора — курсор на месте стёртого")
+check(MultiCaret.shift(3, byEditAt: 3, from: 0, to: 2) == 5, "вставка на месте курсора — курсор после неё")
+let occText = "foo fooBar foo xfoo foo" as NSString
+check(MultiCaret.word(in: occText, at: 2) == NSRange(location: 0, length: 3), "слово под курсором")
+check(MultiCaret.word(in: occText, at: 3) == NSRange(location: 0, length: 3), "слово прямо перед курсором")
+check(MultiCaret.occurrences(of: "foo", in: occText, wholeWord: true).map(\.location) == [0, 11, 20], "вхождения слова целиком")
+check(MultiCaret.occurrences(of: "foo", in: occText, wholeWord: false).count == 5, "вхождения подстроки")
+check(MultiCaret.nextOccurrence(of: "foo", in: occText, after: 14, wholeWord: true,
+                                taken: [NSRange(location: 11, length: 3)]) == NSRange(location: 20, length: 3), "следующее вхождение")
+check(MultiCaret.nextOccurrence(of: "foo", in: occText, after: 23, wholeWord: true,
+                                taken: [NSRange(location: 20, length: 3)]) == NSRange(location: 0, length: 3), "за концом — с начала")
+check(MultiCaret.nextOccurrence(of: "foo", in: occText, after: 0, wholeWord: true,
+                                taken: [NSRange(location: 0, length: 3), NSRange(location: 11, length: 3), NSRange(location: 20, length: 3)]) == nil,
+      "все выделены — nil")
+let linesText = "ab\ncdef\n\ngh\n" as NSString
+check(MultiCaret.lineEnds(in: linesText, selection: NSRange(location: 1, length: 9)) == [Caret(at: 2), Caret(at: 7), Caret(at: 8), Caret(at: 11)],
+      "курсоры в концы выделенных строк")
+check(MultiCaret.lineEnds(in: linesText, selection: NSRange(location: 0, length: 8)) == [Caret(at: 2), Caret(at: 7)],
+      "строка, в начале которой выделение кончается, не считается")
+check(MultiCaret.cloned(Caret(at: 6), in: linesText, up: true) == Caret(at: 2), "курсор выше — в конец короткой строки")
+check(MultiCaret.cloned(Caret(at: 1), in: linesText, up: false) == Caret(at: 4), "курсор ниже в той же колонке")
+check(MultiCaret.cloned(Caret(at: 1), in: linesText, up: true) == nil, "выше первой строки — некуда")
+check(MultiCaret.cloned(Caret(at: 10), in: linesText, up: false) == Caret(at: 12), "ниже — на пустую последнюю строку")
+check(MultiCaret.pieces("a\nb\nc\n", count: 3) == ["a", "b", "c"], "строк столько же, сколько курсоров, — каждому по строке")
+check(MultiCaret.pieces("a\nb", count: 3) == nil, "иначе — каждому всё")
+
 check(EditingRules.indent(["a", "", "  b"], unit: "    ") == ["    a", "", "      b"], "сдвиг вправо не трогает пустые строки")
 check(EditingRules.outdent(["      a", "\tb", " c"], unit: "    ") == ["  a", "b", "c"], "сдвиг влево")
 let commented = EditingRules.toggleComment(["    a", "", "  b"], token: "//")
